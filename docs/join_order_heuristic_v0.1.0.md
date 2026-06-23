@@ -117,12 +117,14 @@ ordering, used in the `explain()` output and as a proxy for the SM-1 metric:
 intermediate_rows = min(rel_filter_matches, vector_topk)
 ```
 After the relational filter, at most `rel_filter_matches` rows remain. The
-vector leg then limits to `k`, so the peak is the smaller of the two.
+vector leg then limits to `k`, so the peak is the smaller of the two. The
+graph traversal is treated as a pass-through in this reference model; the C
+counterpart (`tridb_estimate_intermediate`) will incorporate the
+`avg_out_degree` fan-out into the estimate.
 
 **vector_first:**
 ```
-overfetch_factor = max(vector_topk * 50, vector_topk)
-intermediate_rows = overfetch_factor
+intermediate_rows = vector_topk * 50
 ```
 ANN over-fetches by approximately 50× `k` to maintain recall under HNSW's
 approximate search guarantee. This is the dominant intermediate cost of the
@@ -215,7 +217,7 @@ The acceptance criterion for FR-6 is:
 - `avg_out_degree = 5.0`
 - `vector_topk = 5`
 - Expected: `choose_order(stats) == "filter_first"`
-- Peak intermediate: `min(50, 5) = 5` rows
+- Peak intermediate: `min(50, 5) = 5` rows (reference model; C impl will add graph fan-out)
 
 **Corpus B — low selectivity (vector-first expected):**
 - `table_size = 10_000`

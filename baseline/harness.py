@@ -181,10 +181,10 @@ def _read_edges(seed_dir: Path) -> list[tuple[int, int]]:
 def _read_queries(seed_dir: Path) -> list[dict]:
     out: list[dict] = []
     with open(seed_dir / "queries.jsonl") as f:
-        for line in f:
-            line = line.strip()
-            if line:
-                out.append(json.loads(line))
+        for raw in f:
+            stripped = raw.strip()
+            if stripped:
+                out.append(json.loads(stripped))
     return out
 
 
@@ -230,18 +230,20 @@ def load(seed_dir: Path, conn: Conn) -> None:
 
     # --- Postgres: entity table ---------------------------------------------
     pg = connect_postgres(conn)
-    with pg.cursor() as cur:
-        cur.execute(
-            "CREATE TABLE IF NOT EXISTS entity ("
-            "id INT PRIMARY KEY, timestamp INT, chunk TEXT)"
-        )
-        cur.execute("TRUNCATE entity")
-        with cur.copy("COPY entity (id, timestamp, chunk) FROM STDIN") as cp:
-            for e in entities:
-                cp.write_row((e["id"], e["timestamp"], e["chunk"]))
-        cur.execute("CREATE INDEX IF NOT EXISTS entity_ts_idx ON entity (timestamp)")
-    pg.commit()
-    pg.close()
+    try:
+        with pg.cursor() as cur:
+            cur.execute(
+                "CREATE TABLE IF NOT EXISTS entity ("
+                "id INT PRIMARY KEY, timestamp INT, chunk TEXT)"
+            )
+            cur.execute("TRUNCATE entity")
+            with cur.copy("COPY entity (id, timestamp, chunk) FROM STDIN") as cp:
+                for e in entities:
+                    cp.write_row((e["id"], e["timestamp"], e["chunk"]))
+            cur.execute("CREATE INDEX IF NOT EXISTS entity_ts_idx ON entity (timestamp)")
+        pg.commit()
+    finally:
+        pg.close()
     print("[load] postgres: entity table loaded")
 
 
@@ -290,7 +292,7 @@ def vector_topk(alias, question_embedding: list[float], k: int, m: QueryMetrics,
     # graph/time predicates down into the ANN scan -- this over-fetch is exactly
     # the intermediate-result blowup SM-1 measures. Tune the multiplier once the
     # live recall numbers are known.
-    search_limit = max(k * 32, k)
+    search_limit = k * 32
     res = collection.search(
         data=[question_embedding],
         anns_field="embedding",
@@ -413,10 +415,16 @@ def run(seed_dir: Path, k: int, out_path: Path, conn: Conn) -> None:
     queries = _read_queries(seed_dir)
     print(f"[run] {len(queries)} queries, k={k}")
 
+    # Open connections before the try so partial failures are handled correctly:
+    # if any connect_*() call raises here the exception propagates naturally
+    # without hitting a finally block that references an unbound 'drivers' name.
+    neo4j_driver = connect_neo4j(conn)
+    milvus_alias = connect_milvus(conn)
+    pg = connect_postgres(conn)
     drivers = {
-        "neo4j": connect_neo4j(conn),
-        "milvus": connect_milvus(conn),
-        "postgres": connect_postgres(conn),
+        "neo4j": neo4j_driver,
+        "milvus": milvus_alias,
+        "postgres": pg,
     }
 
     metrics: list[dict] = []
@@ -431,7 +439,10 @@ def run(seed_dir: Path, k: int, out_path: Path, conn: Conn) -> None:
                 f"final={m.final_results}"
             )
     finally:
+        from pymilvus import connections as milvus_connections
+
         drivers["neo4j"].close()
+        milvus_connections.disconnect(milvus_alias)
         drivers["postgres"].close()
 
     payload = {

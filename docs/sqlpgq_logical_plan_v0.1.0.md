@@ -71,41 +71,40 @@ physical separation between "graph query" and "relational query" in the plan tre
 are sub-nodes of a single rooted tree.
 
 ```
-TopK (k=5)
-│   ORDER BY src_embedding <-> :question_embedding
-│   [TR-1: stops pulling tuples once k=5 confirmed — early termination root]
+TJS (Tri-modal Join & Score)                         ← DEV-1169
+│   Composes the three legs with one global score accumulator.
+│   Maintains an internal streaming k-heap (k=5) for the ORDER BY.
+│   Join-order heuristic selects which leg drives (DEV-1170).
+│   Emits tuples one at a time via Open/Next/Close (Volcano).
+│   [TR-1 root: TJS.Next() returns NULL once k=5 heap is confirmed;
+│    TJS.Close() propagates immediately to all three child legs.
+│    No separate TopK node — the k-heap lives inside TJS to avoid an
+│    extra blocking boundary. See §9 physical mapping.]
 │
-└── TJS (Tri-modal Join & Score)                     ← DEV-1169
-    │   Composes the three legs with one global score accumulator.
-    │   Join-order heuristic selects which leg drives (DEV-1170).
-    │   Emits (chunk, src_embedding, timestamp, score) tuples lazily.
-    │
-    ├── [LEG-G] GraphTraversalScan
-    │   │   Access method: native adjacency-list (DEV-1164/1165)
-    │   │   Pattern: (src:entity)-[:related_to]->(dst:entity)
-    │   │   Projects: src.embedding, dst.chunk, dst.timestamp
-    │   │   Iterator: Open/Next/Close; yields one (src,dst) pair per Next()
-    │   │   [TR-1: no full materialization of the edge set]
-    │   │
-    │   └── NodeLabelFilter (label = 'entity')
-    │           Applied at Next() time, not before full scan
-    │
-    ├── [LEG-V] HNSWRelaxedScan                      ← DEV-1168
-    │   │   Input: :question_embedding (parameter)
-    │   │   Index: HNSW on src.embedding column (MSVBASE segment)
-    │   │   Iterator: Open/Next/Close; yields candidates in ascending
-    │   │             distance order using relaxed monotonicity
-    │   │   [TR-1: HNSW beam search stops once top-k is stable — no full
-    │   │           corpus scan; satisfies SM-3 <25% corpus examined]
-    │   │
-    │   └── (no child — HNSW drives its own traversal internally)
-    │
-    └── [LEG-R] RelationalFilter
-            Predicate: timestamp IN :selected_time_range
-            Access: B-tree index on timestamp column (PG table)
-            Iterator: Open/Next/Close over IndexScan
-            [TR-1: index range scan terminates when range exhausted;
-                   never scans outside the time window]
+├── [LEG-G] GraphTraversalScan
+│   Access method: native adjacency-list (DEV-1164/1165)
+│   Pattern: (src:entity)-[:related_to]->(dst:entity)
+│   Projects: src.embedding, dst.chunk, dst.timestamp
+│   Iterator: Open/Next/Close; yields one (src,dst) pair per Next()
+│   NodeLabelFilter applied as predicate arg to amgettuple() — NOT a
+│   separate child iterator node (see §9: "Predicate in amgettuple filter arg")
+│   [TR-1: no full materialization of the edge set]
+│
+├── [LEG-V] HNSWRelaxedScan                          ← DEV-1168
+│   Input: :question_embedding (parameter)
+│   Index: HNSW on src.embedding column (MSVBASE segment)
+│   Iterator: Open/Next/Close; yields candidates in approximately
+│             ascending distance order using relaxed monotonicity
+│   [TR-1: HNSW beam search stops once top-k is stable — no full
+│           corpus scan; satisfies SM-3 <25% corpus examined]
+│   (no child — HNSW drives its own traversal internally)
+│
+└── [LEG-R] RelationalFilter
+        Predicate: timestamp IN :selected_time_range
+        Access: B-tree index on timestamp column (PG table)
+        Iterator: Open/Next/Close over IndexScan
+        [TR-1: index range scan terminates when range exhausted;
+               never scans outside the time window]
 ```
 
 ### Why one tree, not three sub-queries
@@ -113,8 +112,8 @@ TopK (k=5)
 The canonical query has a single `ORDER BY <-> LIMIT 5`. A plan that materializes all
 graph matches, then ANN-ranks them, then filters, is the multi-system baseline TriDB
 replaces. The LogicalPlan tree above enforces top-k globally at the TJS level: every leg
-yields tuples lazily, the TJS accumulates a running top-k heap, and the TopK node pulls
-exactly k tuples before issuing Close to all legs.
+yields tuples lazily, the TJS accumulates a running k-heap, and TJS.Next() returns NULL
+(issuing Close to all legs) once the k-th result is confirmed.
 
 ---
 
@@ -134,7 +133,8 @@ chains that would break streaming. See `docs/graph_store_layout_v0.1.0.md` for t
 layout spec.
 
 TR-1 compliance: `amgettuple` returns one row per call. No pre-fetch of the full neighbor
-list. Early termination is issued via `amclose` when the TJS receives a Close() from TopK.
+list. Early termination is issued via `amclose` when TJS.Close() propagates downward after
+the k-heap is full and confirmed.
 
 ### LEG-V — HNSWRelaxedScan
 
@@ -144,10 +144,10 @@ contribution). The iterator yields candidate (node_id, distance) pairs in approx
 ascending distance order.
 
 "Relaxed monotonicity" means the iterator does not guarantee strict ascending order on each
-Next() call, but guarantees that after consuming b candidates the true top-k (for k << b)
-is contained in the output. The TopK node uses this property: it continues pulling from
-HNSWRelaxedScan until the k-th candidate's distance bound is tighter than the
-(k+1)-th candidate's lower bound.
+Next() call, but guarantees that after consuming `ef_search` candidates (the HNSW beam
+width parameter) the true top-k (for k << ef_search) is contained in the output. The TJS
+k-heap uses this property: it continues pulling from HNSWRelaxedScan until the k-th
+candidate's distance bound is tighter than the (k+1)-th candidate's lower bound.
 
 TR-1 compliance: no full corpus scan. The HNSW beam search is bounded by the ef_search
 parameter and the relaxed-monotonicity termination condition. SM-3 (<25% corpus examined)
@@ -171,15 +171,17 @@ The **Tri-modal Join & Score** operator is the composition point. It is the only
 the plan that has access to all three legs simultaneously.
 
 Responsibilities:
-1. **Open()**: calls Open() on all three child legs with the join-order-selected driving
-   leg first.
+1. **Open()**: calls Open() on all three child legs (order of Open() calls is
+   immaterial; join order is determined by which leg's Next() the driver loop
+   calls first, encoded in the child-slot ordering set at plan time by DEV-1170).
 2. **Next()**: pulls one tuple from the driving leg, probes the other two legs for
    matching node_ids, assembles the full output tuple (chunk, src_embedding, timestamp,
    distance), and returns it.
 3. **Close()**: calls Close() on all three child legs. This is the early-termination
-   propagation path: when TopK issues Close() after receiving k tuples, TJS immediately
-   propagates Close() to all legs, stopping HNSW beam search, graph traversal, and index
-   scan simultaneously.
+   propagation path: once the internal k-heap is confirmed full, TJS stops calling Next()
+   on legs and invokes Close() on all three, stopping HNSW beam search, graph traversal,
+   and index scan simultaneously. The executor above TJS (the standard Postgres LIMIT node
+   or query end) triggers this by calling TJS.Close() after receiving k tuples.
 
 The TJS does not materialize any intermediate result. It holds at most one "in-flight"
 tuple assembly at a time. Intermediate-result reduction (SM-1, target ≥5×) comes from the
@@ -200,22 +202,27 @@ emission. The logical plan tree (§4) is join-order-independent — the TJS node
 three children. The heuristic selects which child is promoted to "driving" role and which
 two become "probe" legs.
 
-The heuristic evaluates three selectivity proxies at plan time:
+The heuristic makes a single two-way choice — relational-first vs. vector-first — using
+one selectivity signal at plan time:
 
-| Proxy | Estimated by |
-|---|---|
-| Graph fan-out | avg degree of `:entity` nodes (stored in graph metadata catalog) |
-| Vector k candidates | ef_search parameter / corpus size ratio |
-| Relational selectivity | timestamp range width / total timestamp span (column stats) |
+| Input | Estimated by | Role |
+|---|---|---|
+| Relational selectivity | `rel_filter_matches / table_size` via `pg_statistic` | **Driver-selection signal**: if ≤ 0.10 → filter_first, else vector_first |
+| Graph avg_out_degree | avg degree of `:entity` nodes (graph metapage) | Feeds intermediate-row **estimate** for EXPLAIN; not used in the driver selection itself |
+| Vector ef_search | HNSW beam width config | Bounds the over-fetch cost estimate for the vector-first path |
 
-The leg with the lowest estimated output cardinality drives. The heuristic is a single
-decision function — no cost model, no cardinality estimation machinery. This is the "20%
-effort for 80% of the ordering win" referenced in spec §2.
+The leg with the lowest estimated output cardinality drives, but v1 only compares relational
+vs. vector; the graph leg is never a standalone driver (its cost scales with whatever seed set
+the leading leg produces, so it is always in the middle). See `join_order_heuristic_v0.1.0.md`
+§2 for the full two-ordering table and `src/planner/join_order_ref.py` for the reference
+implementation.
 
-The heuristic reference model is implemented in Python for design validation and unit
-testing (DEV-1170 deliverable: `docs/join_order_heuristic_v0.1.0.md` + `tests/`).
-The production implementation is a C function in the planner (`src/planner/join_order.c`,
-GX10-gated).
+The heuristic is a single decision function — no cost model, no cardinality estimation
+machinery. This is the "20% effort for 80% of the ordering win" referenced in spec §2.
+
+The reference model is implemented in Python for design validation and unit testing
+(DEV-1170 deliverable: `docs/join_order_heuristic_v0.1.0.md` + `tests/`). The production
+implementation is a C function in the planner (`src/planner/join_order.c`, GX10-gated).
 
 ---
 
@@ -227,23 +234,22 @@ early termination. The LIMIT 5 must push down so no leg fully materializes.
 Flow trace for `LIMIT 5`:
 
 ```
-TopK.Open(k=5)
-  → TJS.Open()
-      → LEG-G.Open()    [graph traversal cursor positioned, no rows fetched]
-      → LEG-V.Open()    [HNSW beam initialized, no candidates fetched]
-      → LEG-R.Open()    [index scan cursor positioned, no tuples fetched]
+TJS.Open(k=5)                                [k embedded in TrimodalJoinState]
+    → LEG-G.Open()    [graph traversal cursor positioned, no rows fetched]
+    → LEG-V.Open()    [HNSW beam initialized, no candidates fetched]
+    → LEG-R.Open()    [index scan cursor positioned, no tuples fetched]
 
-[loop: TopK pulls tuples]
-TopK.Next() × 5
-  → TJS.Next() × N  (N ≥ 5; TJS may discard non-joining tuples)
-      → driving leg.Next() per iteration
+[loop: executor pulls tuples from TJS via the standard LIMIT 5 node]
+TJS.Next() × N  (N ≥ 5; TJS discards non-joining tuples internally)
+    → driving leg.Next() per iteration
+    → TJS inserts qualifying tuples into internal k-heap
 
-TopK sees k=5 confirmed (relaxed-monotonicity bound satisfied for LEG-V)
-TopK.Close()
-  → TJS.Close()
-      → LEG-G.Close()   [graph traversal cursor released; adjacency-list AM amclose()]
-      → LEG-V.Close()   [HNSW beam search aborted; ef_search budget not fully consumed]
-      → LEG-R.Close()   [index scan cursor released]
+TJS k-heap confirmed full (relaxed-monotonicity bound satisfied for LEG-V);
+TJS.Next() returns NULL to executor (LIMIT node receives 5 tuples and calls Close)
+TJS.Close()
+    → LEG-G.Close()   [graph traversal cursor released; adjacency-list AM amclose()]
+    → LEG-V.Close()   [HNSW beam search aborted; ef_search budget not fully consumed]
+    → LEG-R.Close()   [index scan cursor released]
 ```
 
 No leg runs to completion. LEG-V's HNSW beam is the most computationally expensive
@@ -256,9 +262,9 @@ operator in the plan is blocking, the LIMIT 5 cannot propagate downward through 
 every leg upstream of the blocking operator runs to completion regardless of k. This
 forfeits the TriDB efficiency thesis (spec §2) and fails SM-1 and SM-3.
 
-The plan tree in §4 contains no blocking operators. TopK is a streaming top-k heap (size
-k), not a full sort. TJS is a probe-join with one in-flight tuple. All three legs are
-index-driven iterators.
+The plan tree in §4 contains no blocking operators. The TJS internal k-heap is a streaming
+heap (size k), not a full sort — it evicts as it fills. TJS is a probe-join with one
+in-flight tuple. All three legs are index-driven iterators.
 
 ---
 
@@ -266,12 +272,11 @@ index-driven iterators.
 
 | Logical node | Physical realization | Status |
 |---|---|---|
-| TopK | Streaming k-heap in TJS driver loop | Design (this doc) |
-| TJS | `TrimodalJoinState` executor node | DEV-1169, GX10-gated |
+| TJS (with embedded k-heap) | `TrimodalJoinState` executor node; k-heap (k=5) is a field of `TrimodalJoinState`, not a separate plan node | DEV-1169, GX10-gated |
 | GraphTraversalScan | Adjacency-list AM (`amopen`/`amgettuple`/`amclose`) | DEV-1164/1165, GX10-gated |
 | HNSWRelaxedScan | MSVBASE HNSW iterator, wrapped | DEV-1168, GX10-gated |
 | RelationalFilter | Postgres IndexScan (existing) | Inherited from PG 13.4 |
-| NodeLabelFilter | Predicate in `amgettuple` filter arg | DEV-1164, GX10-gated |
+| NodeLabelFilter | Predicate arg to `amgettuple`; no separate iterator node | DEV-1164, GX10-gated |
 
 ---
 

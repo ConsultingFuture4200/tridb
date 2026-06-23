@@ -76,7 +76,7 @@ primitive operation:
 
 | Store | Access method | Index | Primitive |
 |-------|---------------|-------|-----------|
-| Vector | HNSW (from MSVBASE) | graph-structured ANN | similarity (`<->`) |
+| Vector | HNSW (from MSVBASE) | HNSW (hierarchical navigable small-world) | similarity (`<->`) |
 | Graph | native adjacency-list (BUILD) | B-tree over edge lists | traversal (`MATCH`) |
 | Relational | Postgres heap | B-tree | filter (`WHERE`/`IN`) |
 
@@ -101,11 +101,16 @@ constraint, not a performance nicety:
   of its subtree, which collapses SM-1 (intermediate-result reduction) and SM-3
   (<25% corpus examined) back to the baseline's materialize-then-merge cost. The
   efficiency thesis is forfeit the moment one operator blocks.
-- Early termination is what lets the vector `ORDER BY ... LIMIT 5` push a bound
-  *into* the traversal and the filter, so the plan examines a fraction of the
-  corpus instead of all of it. This pruning is only sound because MSVBASE's HNSW
-  iterator supports VBASE-style relaxed-monotonicity early stop; we extend the
-  same discipline to the new graph iterator.
+- Early termination is what lets the `TopK` node issue `Close()` to the `TJS`
+  after k tuples are confirmed, which immediately propagates `Close()` to all
+  three legs — stopping the HNSW beam search, the graph traversal, and the index
+  scan before any of them runs to completion. No leg examines more than the
+  fraction of the corpus needed to stabilize the top-k. This is only sound
+  because MSVBASE's HNSW iterator supports VBASE-style relaxed-monotonicity early
+  stop (the iterator does not guarantee strict ascending distance order per
+  `Next()`, but guarantees the true top-k is contained in the output after
+  consuming a bounded candidate set); we extend the same `Open/Next/Close`
+  discipline to the new graph iterator.
 
 TR-1 is therefore a *correctness-of-design* gate: any new operator that cannot be
 expressed as an early-terminating iterator is rejected at review, not optimized

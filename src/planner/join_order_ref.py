@@ -60,12 +60,18 @@ def estimated_intermediate_rows(stats: LegStats, order: str) -> int:
         Estimated number of rows in the largest intermediate result
     """
     if order == "filter_first":
-        # After filtering, we have rel_filter_matches rows, but vector topk limits this
+        # Spec §5: after filtering, at most rel_filter_matches rows remain; the
+        # vector leg then limits to topk.  Peak intermediate is the smaller of the
+        # two — the graph leg is a pass-through at this level of the model.
+        # avg_out_degree is carried in LegStats for the C counterpart
+        # (tridb_estimate_intermediate) which will include graph fan-out; the
+        # Python reference model is intentionally simplified per §5.
         return min(stats.rel_filter_matches, stats.vector_topk)
     elif order == "vector_first":
-        # ANN over-fetches: assume 50x over-scan or just topk, whichever is larger
-        overfetch_factor = max(stats.vector_topk * 50, stats.vector_topk)
-        return int(overfetch_factor)
+        # ANN over-fetches by ~50x topk to maintain recall under HNSW's approximate
+        # search guarantee.  vector_topk * 50 >= vector_topk always, so no max()
+        # guard is needed (previously dead code).
+        return stats.vector_topk * 50
     else:
         raise ValueError(f"Unknown order: {order}")
 

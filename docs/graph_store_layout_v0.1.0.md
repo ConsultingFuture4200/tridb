@@ -43,7 +43,7 @@ Offset    Size     Field
                                     pd_upper, pd_special, pd_pagesize_version)
 24        2        gph_page_type   (0x0001 = VERTEX_PAGE)
 26        2        gph_vertex_count
-28        4        gph_reserved    (pad to 8-byte alignment)
+28        4        gph_reserved    (pad to 8-byte alignment; future use)
 32        ...      Vertex records  (variable-length, packed upward)
 ...       ...      Free space
 (pd_upper - N*4)  N*4  SlotDirectory: N entries of (uint16 offset, uint16 flags)
@@ -87,14 +87,16 @@ Offset    Size     Field
 24        2        gph_page_type   (0x0002 = ADJ_PAGE)
 26        2        gph_edge_count  (total EdgeSlots on this page)
 28        4        gph_next_pageno (0 = no overflow; follows adjacency chain)
-32        4        gph_owner_vid   (vertex this page was first allocated for; informational)
-36        4        gph_reserved
-40        ...      EdgeSlot array, packed
+32        8        gph_owner_vid   (uint64; vertex this page was first allocated for; informational)
+40        4        gph_reserved    (pad to 8-byte alignment; future use)
+44        ...      EdgeSlot array, packed
 ...       ...      EdgePropBlock area (co-located edge properties, packed after EdgeSlots)
 32736     32       SpecialSpace
 ```
 
-Usable payload: 32 704 bytes (same calculation as vertex pages).
+Usable payload: 32 768 − 24 (PageHeader) − 2 (gph_page_type) − 2 (gph_edge_count) −
+4 (gph_next_pageno) − 8 (gph_owner_vid) − 4 (gph_reserved) − 32 (SpecialSpace) =
+**32 692 bytes**.
 
 #### EdgeSlot
 
@@ -114,7 +116,7 @@ typedef struct EdgeSlot {
 /* sizeof(EdgeSlot) = 32 bytes */
 ```
 
-Capacity: 32 704 / 32 = **1 022 EdgeSlots per adjacency page** (before property storage).
+Capacity: 32 692 / 32 = **1 021 EdgeSlots per adjacency page** (before property storage).
 In practice, property blocks reduce this; the AM splits pages once `gph_edge_count` would
 exceed the threshold leaving < 256 bytes of free space.
 
@@ -139,9 +141,14 @@ Rationale:
 
 **Overflow:** If `vr_prop_length` or `es_prop_length` exceeds the remaining free space on
 the owning page, the property blob is written to a dedicated `PROP_OVERFLOW_PAGE`
-(page type `0x0003`). The offset field stores the page number × 2^32 | slot index as a
-packed `uint64` when the sentinel `0xFFFFFFFF` is in the 32-bit field. The AM reads the
-high 32 bits as the overflow page number and the low 32 bits as the byte offset within it.
+(page type `0x0003`). When the `_prop_offset` field contains the sentinel `0xFFFFFFFF`,
+the `_prop_length` field is repurposed to hold the overflow page number (`BlockNumber`),
+and the byte offset within that page is zero (the PROP_OVERFLOW_PAGE stores exactly one
+blob per page, beginning immediately after its own 32-byte header). The AM checks the
+sentinel first; if set, it reads `_prop_length` as a `BlockNumber` and ignores the offset.
+Note: the `_prop_offset` and `_prop_length` fields are each `uint32`; there is no `uint64`
+packing. The previous encoding description (page × 2^32 | slot) was incorrect and is
+withdrawn.
 
 ### 2.4 PropBlock Wire Format
 
@@ -259,9 +266,14 @@ typedef struct GraphScanState {
 
 ```
 GraphOpen(GraphScanState *state, uint64 src_vid, Snapshot snapshot):
-    1. Resolve src_vid → VertexRecord via vertex page lookup (pin page, read vr_adj_pageno).
-    2. Pin the first adjacency page (ReleaseBuffer deferred to Next/Close).
-    3. Set gss_cur_slot = 0; gss_next_pageno from gph_next_pageno.
+    1. Resolve src_vid → VertexRecord via vertex page lookup:
+         vpage = ReadBuffer(vertex_pageno_for(src_vid))
+         LockBuffer(vpage, BUFFER_LOCK_SHARE)
+         Read vr_adj_pageno, vr_adj_slot from VertexRecord.
+         LockBuffer(vpage, BUFFER_LOCK_UNLOCK)
+         ReleaseBuffer(vpage)          /* vertex page pin released immediately */
+    2. Pin the first adjacency page: gss_cur_buf = ReadBuffer(vr_adj_pageno).
+    3. Set gss_cur_slot = vr_adj_slot; gss_next_pageno from gph_next_pageno on that page.
     4. Return; no tuple emitted.
 ```
 
@@ -383,8 +395,8 @@ returns false for xmin > A's snapshot horizon).
 At 1M vertices with average 10 properties at 32 bytes each:
 - Vertex pages: 1M × 32 bytes (VertexRecord) + 1M × 320 bytes (PropBlock avg) ≈ 352 MB
   → ~11 000 vertex pages
-- Adjacency pages at 10 edges/vertex: 10M × 32 bytes (EdgeSlot) ÷ 32 704 bytes/page
-  ≈ 9 800 adjacency pages
+- Adjacency pages at 10 edges/vertex: 10M × 32 bytes (EdgeSlot) ÷ 32 692 bytes/page
+  ≈ 9 790 adjacency pages
 
 At 32KB pages these fit comfortably within the GX10's 128GB. The buffer pool hit rate for
 the canonical query's k=5 traversal (touching O(50) adjacency pages) will be high once

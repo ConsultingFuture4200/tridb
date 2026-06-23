@@ -114,8 +114,14 @@ typedef GraphScanDesc *GraphScanDescHandle;
 typedef uint64_t GraphVertexId;
 typedef uint64_t GraphEdgeId;
 
-/* Sentinel for "no vertex" / "no edge". */
-#define GRAPHSTORE_INVALID_ID  ((uint64_t) 0)
+/*
+ * Sentinel for "no vertex" / "no edge".
+ *
+ * Using UINT64_MAX (not 0) so that 0 remains a valid allocated id.
+ * Matches the PostgreSQL pattern of InvalidBlockNumber = 0xFFFFFFFF.
+ * graphstore_insert_vertex / graphstore_insert_edge never return this value.
+ */
+#define GRAPHSTORE_INVALID_ID  ((uint64_t) UINT64_MAX)
 
 /*
  * Traversal direction for a scan. v1 canonical query is a forward
@@ -258,8 +264,10 @@ extern GraphEdgeId graphstore_insert_edge(GraphStoreHandle store,
  *     `src:entity` bound by the GRAPH_TABLE MATCH pattern.
  *   - `direction` selects which adjacency to walk (v1: GRAPH_SCAN_OUTGOING).
  *   - Returns a scan descriptor positioned BEFORE the first element; the first
- *     gs_getnext() returns the first element. Returns NULL only if `start`
- *     does not exist.
+ *     gs_getnext() returns the first element.
+ *   - Raises (ereport ERROR) if `start` does not exist — consistent with the
+ *     "no error return codes" contract in the lifecycle section above. Never
+ *     returns NULL; the caller must not NULL-check the return value.
  *   - Allocates lazily: opening a scan must NOT read the whole adjacency list.
  *   - The scan pins buffers from the host shared buffer pool; gs_close()
  *     releases them.
