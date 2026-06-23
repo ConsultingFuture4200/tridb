@@ -1,7 +1,14 @@
 # TriDB Build Status — per-issue gating
 
-Updated: 2026-06-23 (kickoff). Legend: 🟢 unblocked here · 🟡 partial (design here,
+Updated: 2026-06-23. Legend: 🟢 unblocked here · 🟡 partial (design here,
 build on GX10) · 🔴 GX10-gated (needs live MSVBASE build).
+
+> **RE-GATED 2026-06-23:** the dev workstation was proven a viable **x86_64 standin** —
+> `scripts/x86build.sh --docker` builds the MSVBASE fork and `scripts/smoke_test.sh`
+> passes (vectordb + HNSW + early-terminating ANN scan). See `docs/BUILD_NOTES.md`.
+> Consequence: the native C work (DEV-1164–1170) is **buildable & testable here now**, not
+> GX10-gated. The GX10 is reserved for ARM64 build sign-off (DEV-1160 as written) and the
+> 128 GB headline benchmark.
 
 | Issue | Title | Phase | Gating | Autonomous deliverable this repo |
 | -- | -- | -- | -- | -- |
