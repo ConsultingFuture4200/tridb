@@ -57,6 +57,13 @@ patch_upstream_dockerfile() {
     log "patching dead Boost URL (boostorg.jfrog.io left JFrog in 2024) -> archives.boost.io"
     sed -i 's#https://boostorg.jfrog.io/artifactory/main/release/1.81.0/source/boost_1_81_0.tar.gz#https://archives.boost.io/release/1.81.0/source/boost_1_81_0.tar.gz#g' "$df"
   fi
+  # Hardcoded GID/UID 999 collides with a pre-existing group in current gcc:12.3.0 base.
+  # Add -o (allow non-unique id) so the postgres group/user reuses 999 without erroring.
+  if grep -q 'groupadd -r postgres --gid=' "$df"; then
+    log "patching postgres GID/UID 999 collision (add -o for non-unique id)"
+    sed -i 's/groupadd -r postgres --gid=/groupadd -r -o postgres --gid=/g' "$df"
+    sed -i 's/useradd -m -r -g postgres --uid=/useradd -m -r -o -g postgres --uid=/g' "$df"
+  fi
 }
 
 require() { command -v "$1" >/dev/null 2>&1 || die "missing required tool: $1"; }
