@@ -80,14 +80,13 @@ FORCE_INC='-include cstdint -include mutex -include shared_mutex -include memory
 patch_modern_gcc_includes() {
   local root="$1"
   local sptag_cm="$root/thirdparty/SPTAG/CMakeLists.txt"
-  local top_cm="$root/CMakeLists.txt"
+  # SPTAG only: it sets CXX-only flags, so force-includes never leak onto the C compiler.
+  # (Do NOT touch the top vectordb CMakeLists — it derives CMAKE_C_FLAGS from CMAKE_CXX_FLAGS,
+  # so a C++-header force-include there breaks cmake's OpenMP_C probe. Use a CXX-only genexp
+  # if vectordb sources ever need it.)
   if [[ -f "$sptag_cm" ]] && grep -q -- '-std=c++14 -fopenmp"' "$sptag_cm" && ! grep -q 'include cstdint' "$sptag_cm"; then
     log "force-including dropped std headers into SPTAG build (modern GCC transitive-include fix)"
     sed -i "s/-std=c++14 -fopenmp\"/-std=c++14 -fopenmp ${FORCE_INC}\"/" "$sptag_cm"
-  fi
-  if [[ -f "$top_cm" ]] && grep -q -- '-msse4.2 -maes -mavx2 -fPIC"' "$top_cm" && ! grep -q 'include cstdint' "$top_cm"; then
-    log "force-including dropped std headers into vectordb build"
-    sed -i "s/-msse4.2 -maes -mavx2 -fPIC\"/-msse4.2 -maes -mavx2 -fPIC ${FORCE_INC}\"/" "$top_cm"
   fi
 }
 
