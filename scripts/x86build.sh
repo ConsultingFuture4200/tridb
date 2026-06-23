@@ -72,6 +72,25 @@ patch_upstream_dockerfile() {
   fi
 }
 
+# Modern GCC (12/13 in the gcc:12.3.0 base) no longer transitively includes <mutex>,
+# <cstdint>, etc. — old SPTAG/vectordb code assumed it did. Force-include the dropped
+# headers via each CMakeLists' own CXX flags (SPTAG resets CMAKE_CXX_FLAGS, so a global
+# -D won't reach it). Idempotent. Arch-independent; same fix needed on the GX10.
+FORCE_INC='-include cstdint -include mutex -include shared_mutex -include memory -include cstring -include limits -include functional'
+patch_modern_gcc_includes() {
+  local root="$1"
+  local sptag_cm="$root/thirdparty/SPTAG/CMakeLists.txt"
+  local top_cm="$root/CMakeLists.txt"
+  if [[ -f "$sptag_cm" ]] && grep -q -- '-std=c++14 -fopenmp"' "$sptag_cm" && ! grep -q 'include cstdint' "$sptag_cm"; then
+    log "force-including dropped std headers into SPTAG build (modern GCC transitive-include fix)"
+    sed -i "s/-std=c++14 -fopenmp\"/-std=c++14 -fopenmp ${FORCE_INC}\"/" "$sptag_cm"
+  fi
+  if [[ -f "$top_cm" ]] && grep -q -- '-msse4.2 -maes -mavx2 -fPIC"' "$top_cm" && ! grep -q 'include cstdint' "$top_cm"; then
+    log "force-including dropped std headers into vectordb build"
+    sed -i "s/-msse4.2 -maes -mavx2 -fPIC\"/-msse4.2 -maes -mavx2 -fPIC ${FORCE_INC}\"/" "$top_cm"
+  fi
+}
+
 require() { command -v "$1" >/dev/null 2>&1 || die "missing required tool: $1"; }
 require git
 
@@ -84,6 +103,7 @@ if [[ "$USE_DOCKER" -eq 1 ]]; then
   [[ -n "$PIN_COMMIT" ]] && git checkout -q "$PIN_COMMIT"
   git submodule update --init --recursive
   patch_upstream_dockerfile "$SRC/Dockerfile"
+  patch_modern_gcc_includes "$SRC"
   log "building MSVBASE via its native x86_64 Dockerfile"
   docker build -t tridb/msvbase:dev .
   log "image built: tridb/msvbase:dev   (run: docker run --rm -it tridb/msvbase:dev)"
