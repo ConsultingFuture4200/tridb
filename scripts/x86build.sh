@@ -64,6 +64,12 @@ patch_upstream_dockerfile() {
     sed -i 's/groupadd -r postgres --gid=/groupadd -r -o postgres --gid=/g' "$df"
     sed -i 's/useradd -m -r -g postgres --uid=/useradd -m -r -o -g postgres --uid=/g' "$df"
   fi
+  # PG 13.4 plpython.h #include "eval.h" — removed in Python 3.11+, so --with-python fails
+  # against the base image's modern Python. PL/Python is not used by TriDB (all C), so drop it.
+  if grep -q -- '--with-python' "$df"; then
+    log "dropping --with-python from PG configure (eval.h gone in Python 3.11+; PL/Python unused by TriDB v1)"
+    sed -i '/--with-python/d' "$df"
+  fi
 }
 
 require() { command -v "$1" >/dev/null 2>&1 || die "missing required tool: $1"; }
