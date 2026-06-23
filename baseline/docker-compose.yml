@@ -1,0 +1,125 @@
+# DEV-1171 multi-system baseline (AkasicDB Scenario 2: out-of-DB integration).
+#
+# Three independent systems that TriDB is measured against. The harness
+# (harness.py) merges their results in Python at the app layer:
+#   - neo4j     : graph 1-hop :related_to expansion
+#   - milvus    : ANN top-k on src embedding (+ its etcd + minio deps)
+#   - postgres  : timestamp range filter
+#
+# Bring up with:  docker compose up -d
+# Volumes land under ./volumes (gitignored).
+#
+# NOTE: this is the BASELINE stack only. It is deliberately three separate
+# systems with three separate transaction managers -- that separation is the
+# whole point of the comparison and must not be "fixed".
+
+name: tridb-baseline
+
+services:
+  # --- Graph store -----------------------------------------------------------
+  neo4j:
+    image: neo4j:5.20
+    container_name: tridb-baseline-neo4j
+    ports:
+      - "7474:7474"   # HTTP browser
+      - "7687:7687"   # Bolt (neo4j python driver)
+    environment:
+      # Dev-only credentials. Override NEO4J_AUTH for anything non-local.
+      NEO4J_AUTH: "neo4j/testpassword"
+      # APOC is optional but commonly expected for graph workloads.
+      NEO4J_PLUGINS: '["apoc"]'
+      NEO4J_dbms_security_procedures_unrestricted: "apoc.*"
+    volumes:
+      - ./volumes/neo4j/data:/data
+      - ./volumes/neo4j/logs:/logs
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:7474 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  # --- Vector store (Milvus standalone + its deps) ---------------------------
+  etcd:
+    image: quay.io/coreos/etcd:v3.5.5
+    container_name: tridb-baseline-etcd
+    environment:
+      ETCD_AUTO_COMPACTION_MODE: revision
+      ETCD_AUTO_COMPACTION_RETENTION: "1000"
+      ETCD_QUOTA_BACKEND_BYTES: "4294967296"
+      ETCD_SNAPSHOT_COUNT: "50000"
+    command:
+      - etcd
+      - -advertise-client-urls=http://127.0.0.1:2379
+      - -listen-client-urls=http://0.0.0.0:2379
+      - --data-dir=/etcd
+    volumes:
+      - ./volumes/milvus/etcd:/etcd
+    healthcheck:
+      test: ["CMD", "etcdctl", "endpoint", "health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  minio:
+    image: minio/minio:RELEASE.2023-03-20T20-16-18Z
+    container_name: tridb-baseline-minio
+    environment:
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin
+    command: minio server /minio_data --console-address ":9001"
+    ports:
+      - "9000:9000"   # S3 API
+      - "9001:9001"   # console
+    volumes:
+      - ./volumes/milvus/minio:/minio_data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  milvus:
+    image: milvusdb/milvus:v2.4.5
+    container_name: tridb-baseline-milvus
+    command: ["milvus", "run", "standalone"]
+    environment:
+      ETCD_ENDPOINTS: etcd:2379
+      MINIO_ADDRESS: minio:9000
+    ports:
+      - "19530:19530"   # gRPC (pymilvus)
+      - "9091:9091"     # metrics / health
+    volumes:
+      - ./volumes/milvus/data:/var/lib/milvus
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9091/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 60s
+    depends_on:
+      etcd:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+
+  # --- Relational store ------------------------------------------------------
+  postgres:
+    image: postgres:16
+    container_name: tridb-baseline-postgres
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: tridb_baseline
+    volumes:
+      - ./volumes/postgres/data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d tridb_baseline"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s

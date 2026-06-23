@@ -1,0 +1,31 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+
+# Build artifacts (MSVBASE fork — built on GX10, never committed)
+/vendor/MSVBASE/
+/build/
+*.o
+*.so
+
+# Data / corpora
+/data/
+*.bin
+*.npy
+
+# Benchmark output
+/bench/out/
+/baseline/volumes/
+
+# Env / secrets
+.env
+.env.*
+*.pem
+*.key
+
+# Editor
+.vscode/
+.idea/
