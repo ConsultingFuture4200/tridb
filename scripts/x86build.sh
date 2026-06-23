@@ -48,6 +48,17 @@ die() { printf '\033[1;31m[x86build] FATAL:\033[0m %s\n' "$*" >&2; exit 1; }
 ARCH="$(uname -m)"
 [[ "$ARCH" == "x86_64" ]] || die "this is the x86_64 dev build; got '$ARCH'. For the GX10 use scripts/gx10build.sh."
 
+# Patch known-dead upstream URLs in the MSVBASE Dockerfile. Arch-independent bit-rot —
+# applies equally to the GX10 build. Idempotent.
+patch_upstream_dockerfile() {
+  local df="$1"
+  [[ -f "$df" ]] || return 0
+  if grep -q 'boostorg.jfrog.io' "$df"; then
+    log "patching dead Boost URL (boostorg.jfrog.io left JFrog in 2024) -> archives.boost.io"
+    sed -i 's#https://boostorg.jfrog.io/artifactory/main/release/1.81.0/source/boost_1_81_0.tar.gz#https://archives.boost.io/release/1.81.0/source/boost_1_81_0.tar.gz#g' "$df"
+  fi
+}
+
 require() { command -v "$1" >/dev/null 2>&1 || die "missing required tool: $1"; }
 require git
 
@@ -59,6 +70,7 @@ if [[ "$USE_DOCKER" -eq 1 ]]; then
   cd "$SRC"
   [[ -n "$PIN_COMMIT" ]] && git checkout -q "$PIN_COMMIT"
   git submodule update --init --recursive
+  patch_upstream_dockerfile "$SRC/Dockerfile"
   log "building MSVBASE via its native x86_64 Dockerfile"
   docker build -t tridb/msvbase:dev .
   log "image built: tridb/msvbase:dev   (run: docker run --rm -it tridb/msvbase:dev)"
