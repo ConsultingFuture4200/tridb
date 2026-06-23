@@ -76,6 +76,21 @@ patch_upstream_dockerfile() {
 # <cstdint>, etc. — old SPTAG/vectordb code assumed it did. Force-include the dropped
 # headers via each CMakeLists' own CXX flags (SPTAG resets CMAKE_CXX_FLAGS, so a global
 # -D won't reach it). Idempotent. Arch-independent; same fix needed on the GX10.
+# The Dockerfile COPYs the host tree and never runs scripts/patch.sh, so the MSVBASE
+# submodule patches (spann/hnsw/Postgres) — which ADD relaxed monotonicity:
+# amcanrelaxedorderbyop + xs_inorder on PostgreSQL, ResultIterator/QueryResult on hnswlib —
+# must be applied on the host BEFORE docker build. scripts/patch.sh uses `git apply` (not
+# idempotent), so guard on a sentinel the Postgres patch introduces.
+apply_msvbase_patches() {
+  local root="$1"
+  if grep -rq 'amcanrelaxedorderbyop' "$root/thirdparty/Postgres/src/include/access/" 2>/dev/null; then
+    log "MSVBASE submodule patches already applied"
+    return 0
+  fi
+  log "applying MSVBASE submodule patches (scripts/patch.sh: spann, hnsw, Postgres) — relaxed monotonicity"
+  ( cd "$root" && bash scripts/patch.sh )
+}
+
 FORCE_INC='-include cstdint -include mutex -include shared_mutex -include memory -include cstring -include limits -include functional'
 patch_modern_gcc_includes() {
   local root="$1"
@@ -101,6 +116,7 @@ if [[ "$USE_DOCKER" -eq 1 ]]; then
   cd "$SRC"
   [[ -n "$PIN_COMMIT" ]] && git checkout -q "$PIN_COMMIT"
   git submodule update --init --recursive
+  apply_msvbase_patches "$SRC"        # spann/hnsw/Postgres — relaxed monotonicity. MUST precede force-includes.
   patch_upstream_dockerfile "$SRC/Dockerfile"
   patch_modern_gcc_includes "$SRC"
   log "building MSVBASE via its native x86_64 Dockerfile"
