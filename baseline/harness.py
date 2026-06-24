@@ -97,13 +97,13 @@ class QueryMetrics:
     latency_merge_ms: float = 0.0
 
     # intermediate-result set sizes (row counts)
-    graph_pairs: int = 0            # candidate (src, dst) pairs from Neo4j
-    graph_distinct_src: int = 0     # distinct src entities expanded
-    graph_distinct_dst: int = 0     # distinct dst entities reached
-    vector_candidates: int = 0      # rows returned by Milvus ANN top-k
-    relational_filtered: int = 0    # dst rows surviving the timestamp filter
-    merged_candidates: int = 0      # rows after the app-side join
-    final_results: int = 0          # rows in the final top-k answer
+    graph_pairs: int = 0  # candidate (src, dst) pairs from Neo4j
+    graph_distinct_src: int = 0  # distinct src entities expanded
+    graph_distinct_dst: int = 0  # distinct dst entities reached
+    vector_candidates: int = 0  # rows returned by Milvus ANN top-k
+    relational_filtered: int = 0  # dst rows surviving the timestamp filter
+    merged_candidates: int = 0  # rows after the app-side join
+    final_results: int = 0  # rows in the final top-k answer
 
     result_chunks: list[str] = field(default_factory=list)
 
@@ -240,7 +240,9 @@ def load(seed_dir: Path, conn: Conn) -> None:
             with cur.copy("COPY entity (id, timestamp, chunk) FROM STDIN") as cp:
                 for e in entities:
                     cp.write_row((e["id"], e["timestamp"], e["chunk"]))
-            cur.execute("CREATE INDEX IF NOT EXISTS entity_ts_idx ON entity (timestamp)")
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS entity_ts_idx ON entity (timestamp)"
+            )
         pg.commit()
     finally:
         pg.close()
@@ -277,8 +279,9 @@ def graph_expand(driver, seeds: list[int], m: QueryMetrics) -> list[tuple[int, i
     return pairs
 
 
-def vector_topk(alias, question_embedding: list[float], k: int, m: QueryMetrics,
-                conn: Conn) -> list[tuple[int, float]]:
+def vector_topk(
+    alias, question_embedding: list[float], k: int, m: QueryMetrics, conn: Conn
+) -> list[tuple[int, float]]:
     """ANN top-k on src embedding (Milvus).
 
     Returns [(entity_id, distance)] ranked by similarity to the question
@@ -307,8 +310,9 @@ def vector_topk(alias, question_embedding: list[float], k: int, m: QueryMetrics,
     return hits
 
 
-def relational_filter(pg, dst_ids: list[int], time_range: list[int],
-                      m: QueryMetrics) -> dict[int, str]:
+def relational_filter(
+    pg, dst_ids: list[int], time_range: list[int], m: QueryMetrics
+) -> dict[int, str]:
     """Timestamp range filter on dst entities (Postgres).
 
     Returns {dst_id: chunk} for dst rows whose timestamp is in the selected
@@ -336,8 +340,13 @@ def relational_filter(pg, dst_ids: list[int], time_range: list[int],
 # --------------------------------------------------------------------------- #
 
 
-def merge(pairs: list[tuple[int, int]], vector_hits: list[tuple[int, float]],
-          kept_dst: dict[int, str], k: int, m: QueryMetrics) -> list[str]:
+def merge(
+    pairs: list[tuple[int, int]],
+    vector_hits: list[tuple[int, float]],
+    kept_dst: dict[int, str],
+    k: int,
+    m: QueryMetrics,
+) -> list[str]:
     """Merge the three intermediate sets into the final top-k.
 
     Mirrors the canonical query semantics:
@@ -391,9 +400,7 @@ def run_query(query: dict, k: int, drivers: dict, conn: Conn) -> QueryMetrics:
     t_start = time.perf_counter()
 
     # 1) Vector ANN top-k -> ranked src entities. These seed the graph hop.
-    vector_hits = vector_topk(
-        drivers["milvus"], question_embedding, k, m, conn
-    )
+    vector_hits = vector_topk(drivers["milvus"], question_embedding, k, m, conn)
     seeds = [eid for eid, _ in vector_hits]
 
     # 2) Graph 1-hop expansion from the ANN-ranked seeds.
@@ -408,6 +415,14 @@ def run_query(query: dict, k: int, drivers: dict, conn: Conn) -> QueryMetrics:
 
     m.latency_total_ms = (time.perf_counter() - t_start) * 1000.0
     return m
+
+
+def _cleanup(label: str, fn) -> None:
+    """Run one teardown call; log and swallow failures so the others still run."""
+    try:
+        fn()
+    except Exception as exc:  # noqa: BLE001 - teardown must not mask the real error
+        print(f"[run] WARNING: {label} cleanup failed: {exc}")
 
 
 def run(seed_dir: Path, k: int, out_path: Path, conn: Conn) -> None:
@@ -439,11 +454,16 @@ def run(seed_dir: Path, k: int, out_path: Path, conn: Conn) -> None:
                 f"final={m.final_results}"
             )
     finally:
-        from pymilvus import connections as milvus_connections
+        # Each teardown runs independently: a failure in one must not leak the
+        # other two connections (the original single try-less block did exactly that).
+        def _disconnect_milvus() -> None:
+            from pymilvus import connections as milvus_connections
 
-        drivers["neo4j"].close()
-        milvus_connections.disconnect(milvus_alias)
-        drivers["postgres"].close()
+            milvus_connections.disconnect(milvus_alias)
+
+        _cleanup("neo4j", drivers["neo4j"].close)
+        _cleanup("milvus", _disconnect_milvus)
+        _cleanup("postgres", drivers["postgres"].close)
 
     payload = {
         "baseline": "akasicdb-scenario-2-out-of-db",
@@ -473,9 +493,7 @@ def main() -> None:
     p_run = sub.add_parser("run", help="run queries and record metrics")
     p_run.add_argument("--seed-dir", required=True, type=Path)
     p_run.add_argument("--k", type=int, default=5)
-    p_run.add_argument(
-        "--out", type=Path, default=Path("baseline_metrics.json")
-    )
+    p_run.add_argument("--out", type=Path, default=Path("baseline_metrics.json"))
 
     args = parser.parse_args()
     conn = Conn()

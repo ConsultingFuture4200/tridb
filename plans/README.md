@@ -19,7 +19,7 @@ MSVBASE source except through the build scripts' patch layer.
 | 005 | Fix the scalar l2_distance fork bug | P2 | M | 003 | TODO |
 | 006 | Docs consistency pass | P2 | S | — | DONE (advisor/006-docs-consistency) |
 | 007 | Integrity-check build downloads | P2 | M | — | TODO |
-| 008 | Python tooling hardening | P3 | S | — | TODO |
+| 008 | Python tooling hardening | P3 | S | — | DONE (advisor/008-python-hardening) |
 
 Status values: TODO | IN PROGRESS | DONE | BLOCKED (one-line reason) | REJECTED (one-line rationale)
 
