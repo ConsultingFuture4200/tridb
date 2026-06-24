@@ -81,14 +81,33 @@ patch_upstream_dockerfile() {
 # amcanrelaxedorderbyop + xs_inorder on PostgreSQL, ResultIterator/QueryResult on hnswlib —
 # must be applied on the host BEFORE docker build. scripts/patch.sh uses `git apply` (not
 # idempotent), so guard on a sentinel the Postgres patch introduces.
+# Sentinels proving each MSVBASE patch applied. The vendored scripts/patch.sh has no `set -e`
+# and ignores `git apply`'s exit code, so a failed patch yields a clean build of the WRONG
+# database (stock Postgres, no relaxed monotonicity). Verify the end-state and die on any miss.
+#   Postgres.patch -> amcanrelaxedorderbyop (relaxed monotonicity, amapi.h)
+#   hnsw.patch     -> ResultIterator       (VBASE iterator, hnswlib)
+#   spann.patch    -> MultiIndexScan       (new SPTAG header AnnService/inc/Core/MultiIndexScan.h)
+verify_patches() {
+  local root="$1"
+  grep -rq 'amcanrelaxedorderbyop' "$root/thirdparty/Postgres/src/include/access/" \
+    || die "Postgres.patch NOT applied (no amcanrelaxedorderbyop) — relaxed monotonicity missing; upstream drift?"
+  grep -rq 'ResultIterator' "$root/thirdparty/hnsw/hnswlib/" \
+    || die "hnsw.patch NOT applied (no ResultIterator) — VBASE iterator missing; upstream drift?"
+  grep -rq 'MultiIndexScan' "$root/thirdparty/SPTAG/" \
+    || die "spann.patch NOT applied (no MultiIndexScan) — upstream drift?"
+  log "all three MSVBASE patches verified present"
+}
+
 apply_msvbase_patches() {
   local root="$1"
   if grep -rq 'amcanrelaxedorderbyop' "$root/thirdparty/Postgres/src/include/access/" 2>/dev/null; then
     log "MSVBASE submodule patches already applied"
+    verify_patches "$root"
     return 0
   fi
   log "applying MSVBASE submodule patches (scripts/patch.sh: spann, hnsw, Postgres) — relaxed monotonicity"
   ( cd "$root" && bash scripts/patch.sh )
+  verify_patches "$root"
 }
 
 FORCE_INC='-include cstdint -include mutex -include shared_mutex -include memory -include cstring -include limits -include functional'

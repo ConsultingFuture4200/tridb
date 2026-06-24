@@ -79,11 +79,26 @@ if [[ "$SKIP_CLONE" -eq 0 ]]; then
 fi
 cd "$SRC"
 
+# Sentinels proving each MSVBASE patch applied (patch.sh exits 0 even on a partial failure, so
+# the `|| die` above is not enough — verify the end-state and fail loud on upstream drift):
+#   Postgres.patch -> amcanrelaxedorderbyop · hnsw.patch -> ResultIterator · spann.patch -> MultiIndexScan
+verify_patches() {
+  local root="$1"
+  grep -rq 'amcanrelaxedorderbyop' "$root/thirdparty/Postgres/src/include/access/" \
+    || die "Postgres.patch NOT applied (no amcanrelaxedorderbyop) — relaxed monotonicity missing; upstream drift?"
+  grep -rq 'ResultIterator' "$root/thirdparty/hnsw/hnswlib/" \
+    || die "hnsw.patch NOT applied (no ResultIterator) — VBASE iterator missing; upstream drift?"
+  grep -rq 'MultiIndexScan' "$root/thirdparty/SPTAG/" \
+    || die "spann.patch NOT applied (no MultiIndexScan) — upstream drift?"
+  log "all three MSVBASE patches verified present"
+}
+
 # Apply MSVBASE's submodule patches (Postgres.patch et al). Acceptance: all three apply.
 if [[ -f scripts/patch.sh ]]; then
   log "applying submodule patches (scripts/patch.sh)"
   bash scripts/patch.sh || die "patch step failed — capture failing hunk for marker #1 (Postgres.patch on ARM)"
 fi
+verify_patches "$SRC"
 
 # --- delta #2: exclude SPTAG (x86-assuming, not on v1 critical path) --------
 # HNSW (hnswlib) is the only v1 vector index per spec §4. SPTAG/SPANN deferred (IVF/Vamana).

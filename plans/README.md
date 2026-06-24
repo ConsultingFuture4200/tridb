@@ -14,7 +14,7 @@ MSVBASE source except through the build scripts' patch layer.
 |------|-------|----------|--------|------------|--------|
 | 001 | One-command engine verification + CI | P1 | M | — | TODO |
 | 002 | Pin the MSVBASE commit | P1 | S | — | DONE (advisor/002-pin-msvbase-commit) |
-| 003 | Verify all MSVBASE patches applied | P1 | S | — | TODO |
+| 003 | Verify all MSVBASE patches applied | P1 | S | — | DONE (advisor/003-verify-patches) |
 | 004 | Regenerate gx10build.sh from the proven recipe | P1 | M | 002, 003 | TODO |
 | 005 | Fix the scalar l2_distance fork bug | P2 | M | 003 | TODO |
 | 006 | Docs consistency pass | P2 | S | — | TODO |
