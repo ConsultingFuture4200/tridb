@@ -22,15 +22,21 @@ def test_selectivity_basic():
 
 def test_inverted_selectivity_picks_opposite_orders():
     # FR-6: highly selective relational filter -> filter_first
-    selective = LegStats(rel_filter_matches=50, table_size=100_000, avg_out_degree=5.0, vector_topk=5)
+    selective = LegStats(
+        rel_filter_matches=50, table_size=100_000, avg_out_degree=5.0, vector_topk=5
+    )
     # low selectivity -> vector_first
-    broad = LegStats(rel_filter_matches=90_000, table_size=100_000, avg_out_degree=5.0, vector_topk=5)
+    broad = LegStats(
+        rel_filter_matches=90_000, table_size=100_000, avg_out_degree=5.0, vector_topk=5
+    )
     assert choose_order(selective) == "filter_first"
     assert choose_order(broad) == "vector_first"
 
 
 def test_filter_first_reduces_intermediate_on_selective_case():
-    selective = LegStats(rel_filter_matches=50, table_size=100_000, avg_out_degree=5.0, vector_topk=5)
+    selective = LegStats(
+        rel_filter_matches=50, table_size=100_000, avg_out_degree=5.0, vector_topk=5
+    )
     ff = estimated_intermediate_rows(selective, "filter_first")
     vf = estimated_intermediate_rows(selective, "vector_first")
     # the whole point of SM-1: filter-first must yield a smaller intermediate set
