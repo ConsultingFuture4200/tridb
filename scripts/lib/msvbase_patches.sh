@@ -13,6 +13,15 @@
 # Validated upstream base (plan 002). Honors a prior assignment (e.g. from --commit).
 PIN_COMMIT="${PIN_COMMIT:-1a548db14d7a3f6f64808c99b9bc1aa01a25b71f}"   # MSVBASE "Fix vector constant parsing (#20)"
 
+# Official checksums for build-time downloads (supply-chain integrity, plan 007). Update these
+# whenever a version changes or MSVBASE is re-pinned.
+#   Boost 1.81.0 source  : boost.org 1.81.0 release, confirmed against the archives.boost.io tarball
+#   CMake 3.14.4 x86_64  : Kitware cmake-3.14.4-SHA-256.txt (x86 build)
+#   CMake 3.27.9 aarch64 : Kitware cmake-3.27.9-SHA-256.txt (GX10 build, via patch_cmake_aarch64)
+BOOST_1_81_0_SHA256="205666dea9f6a7cfed87c7a6dfbeb52a2c1b9de55712c9c1a87735d7181452b6"
+CMAKE_3_14_4_X86_64_SHA256="9f414df8e432c4a143c2d6d81e170581badba8d89df1cf8944735b9122765c50"
+CMAKE_3_27_9_AARCH64_SHA256="11bf3d30697df465cdf43664a9473a586f010c528376a966fd310a3a22082461"
+
 # Sentinels proving each MSVBASE patch applied. The vendored scripts/patch.sh has no `set -e`
 # and ignores `git apply`'s exit code, so a failed patch yields a clean build of the WRONG
 # database (stock Postgres, no relaxed monotonicity). Verify the end-state and die on any miss.
@@ -66,6 +75,31 @@ patch_upstream_dockerfile() {
     log "dropping --with-python from PG configure (eval.h gone in Python 3.11+; PL/Python unused by TriDB v1)"
     sed -i '/--with-python/d' "$df"
   fi
+  harden_dockerfile_downloads "$df"
+}
+
+# Supply-chain integrity (plan 007): the upstream Dockerfile streams Boost + CMake tarballs
+# (`wget -O - | tar`) with `--no-check-certificate` and no hash check — a tampered mirror could
+# inject code into the image undetected. Restore TLS verification and rewrite each download into
+# download-to-file -> `sha256sum -c` -> extract. Idempotent (the streaming form is gone after the
+# first pass). CMake here is the x86_64 3.14.4 tarball; patch_cmake_aarch64 swaps URL+hash on ARM.
+harden_dockerfile_downloads() {
+  local df="$1"
+  [[ -f "$df" ]] || return 0
+  if grep -q -- '--no-check-certificate' "$df"; then
+    log "restoring TLS verification on Dockerfile downloads (drop --no-check-certificate)"
+    sed -i 's/ --no-check-certificate//g' "$df"
+  fi
+  if grep -q 'boost_1_81_0.tar.gz" -q -O -' "$df"; then
+    log "hardening Boost download (sha256sum -c before extract)"
+    sed -i 's#boost_1_81_0.tar.gz" -q -O - \\#boost_1_81_0.tar.gz" -q -O boost.tgz \&\& \\#' "$df"
+    sed -i 's#| tar -xz && \\#echo "'"$BOOST_1_81_0_SHA256"'  boost.tgz" | sha256sum -c - \&\& tar -xzf boost.tgz \&\& rm -f boost.tgz \&\& \\#' "$df"
+  fi
+  if grep -q 'cmake-3.14.4-Linux-x86_64.tar.gz" -q -O -' "$df"; then
+    log "hardening CMake download (sha256sum -c before extract)"
+    sed -i 's#cmake-3.14.4-Linux-x86_64.tar.gz" -q -O - \\#cmake-3.14.4-Linux-x86_64.tar.gz" -q -O cmake.tgz \&\& \\#' "$df"
+    sed -i 's#| tar -xz --strip-components=1 -C /usr/local#echo "'"$CMAKE_3_14_4_X86_64_SHA256"'  cmake.tgz" | sha256sum -c - \&\& tar -xzf cmake.tgz --strip-components=1 -C /usr/local \&\& rm -f cmake.tgz#' "$df"
+  fi
 }
 
 # Modern GCC (12/13 in the gcc:12.3.0 base) no longer transitively includes <mutex>,
@@ -97,5 +131,8 @@ patch_cmake_aarch64() {
   if grep -q 'cmake-3.14.4-Linux-x86_64.tar.gz' "$df"; then
     log "patching Dockerfile CMake download for aarch64 (3.14.4 x86_64 -> 3.27.9 aarch64; GX10 delta)"
     sed -i 's#https://github.com/Kitware/CMake/releases/download/v3.14.4/cmake-3.14.4-Linux-x86_64.tar.gz#https://github.com/Kitware/CMake/releases/download/v3.27.9/cmake-3.27.9-linux-aarch64.tar.gz#g' "$df"
+    # If harden_dockerfile_downloads already injected the x86_64 checksum, swap it to the
+    # aarch64 one too (no-op if hardening has not run). Keeps URL and hash consistent on ARM.
+    sed -i "s#${CMAKE_3_14_4_X86_64_SHA256}#${CMAKE_3_27_9_AARCH64_SHA256}#g" "$df"
   fi
 }

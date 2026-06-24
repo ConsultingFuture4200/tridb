@@ -26,6 +26,15 @@ Both build scripts default `PIN_COMMIT` to MSVBASE
 upstream commit this build was validated against, so the x86 standin and the GX10 compile the
 same source. Override with `--commit <sha>` to build a different revision (and re-validate).
 
+## Download integrity
+
+Build-time downloads are **checksum-verified** (`sha256sum -c`) and TLS verification is on
+(`--no-check-certificate` removed). `harden_dockerfile_downloads` in
+`scripts/lib/msvbase_patches.sh` rewrites the Dockerfile's Boost and CMake `wget … | tar`
+streams into download → verify → extract; the pinned hashes (Boost 1.81.0, CMake 3.14.4 x86_64,
+CMake 3.27.9 aarch64) live as constants at the top of that lib. Update them whenever a version
+changes or MSVBASE is re-pinned.
+
 ## What the standin proves vs. what still needs the GX10
 
 | Proven here (x86_64) | Still GX10-only |
