@@ -16,6 +16,7 @@ from dataclasses import dataclass
 @dataclass
 class LegStats:
     """Statistics for a query leg in a cross-modal join."""
+
     rel_filter_matches: int
     table_size: int
     avg_out_degree: float
@@ -25,7 +26,7 @@ class LegStats:
 def relational_selectivity(stats: LegStats) -> float:
     """
     Compute the selectivity of the relational filter.
-    
+
     Returns rel_filter_matches / table_size, with guard against division by zero.
     """
     if stats.table_size == 0:
@@ -36,11 +37,11 @@ def relational_selectivity(stats: LegStats) -> float:
 def choose_order(stats: LegStats, threshold: float = 0.10) -> str:
     """
     Decide the optimal order of operations based on relational selectivity.
-    
+
     Args:
         stats: Statistics for the query leg
         threshold: Selectivity threshold to decide order (default 0.10)
-        
+
     Returns:
         "filter_first" if selectivity <= threshold, else "vector_first"
     """
@@ -51,11 +52,11 @@ def choose_order(stats: LegStats, threshold: float = 0.10) -> str:
 def estimated_intermediate_rows(stats: LegStats, order: str) -> int:
     """
     Estimate the size of the largest intermediate result for the given order.
-    
+
     Args:
         stats: Statistics for the query leg
         order: Either "filter_first" or "vector_first"
-        
+
     Returns:
         Estimated number of rows in the largest intermediate result
     """
@@ -79,14 +80,14 @@ def estimated_intermediate_rows(stats: LegStats, order: str) -> int:
 def explain(stats: LegStats, threshold: float = 0.10) -> dict:
     """
     Provide a detailed explanation of the ordering decision.
-    
+
     Returns:
         Dictionary with order, selectivity, intermediate rows, and rationale
     """
     selectivity = relational_selectivity(stats)
     order = choose_order(stats, threshold)
     intermediate_rows = estimated_intermediate_rows(stats, order)
-    
+
     if order == "filter_first":
         rationale = (
             f"Relational filter is highly selective (selectivity={selectivity:.2%} <= {threshold:.0%}). "
@@ -97,27 +98,30 @@ def explain(stats: LegStats, threshold: float = 0.10) -> dict:
             f"Relational filter is low-selective (selectivity={selectivity:.2%} > {threshold:.0%}). "
             "Running vector search first allows ANN to find candidates before applying filters."
         )
-    
+
     return {
         "order": order,
         "selectivity": selectivity,
         "intermediate_rows": intermediate_rows,
-        "rationale": rationale
+        "rationale": rationale,
     }
 
 
 if __name__ == "__main__":
     # Demo usage
     stats = LegStats(
-        rel_filter_matches=100,
-        table_size=10000,
-        avg_out_degree=5.0,
-        vector_topk=10
+        rel_filter_matches=100, table_size=10000, avg_out_degree=5.0, vector_topk=10
     )
-    
+
     print("Demo stats:", stats)
     print("Selectivity:", relational_selectivity(stats))
     print("Chosen order:", choose_order(stats))
-    print("Intermediate rows (filter_first):", estimated_intermediate_rows(stats, "filter_first"))
-    print("Intermediate rows (vector_first):", estimated_intermediate_rows(stats, "vector_first"))
+    print(
+        "Intermediate rows (filter_first):",
+        estimated_intermediate_rows(stats, "filter_first"),
+    )
+    print(
+        "Intermediate rows (vector_first):",
+        estimated_intermediate_rows(stats, "vector_first"),
+    )
     print("Explanation:", explain(stats))
