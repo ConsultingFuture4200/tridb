@@ -1,0 +1,30 @@
+name: CI
+
+# Fast layer (python) runs on every push/PR. The engine layer builds a ~9.5 GB
+# Docker image and is gated behind workflow_dispatch — far too heavy for per-PR runners.
+on:
+  push: {}
+  pull_request: {}
+  workflow_dispatch: {}
+
+jobs:
+  python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install -r requirements.txt
+      - run: pytest tests/ -q
+      - run: ruff check . && ruff format --check .
+
+  engine:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+      - run: scripts/x86build.sh --docker
+      - run: make graph-test
