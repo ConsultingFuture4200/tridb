@@ -26,27 +26,34 @@ BEGIN
     RAISE NOTICE 'PASS traversal: neighbors(1) = %', got;
 END $$;
 
--- 2) TR-1 early termination --------------------------------------------------
--- Vertex 7 has 100 neighbors; pulling only 3 (LIMIT 3) must do a small constant
--- amount of traversal work (~k), NOT visit all 100 — the iterator stops early
--- rather than materializing the full adjacency. (The executor may pull one past
--- the limit, so we assert a small bound, not an exact count.)
+-- 2) TR-1 lazy emission (operator-level early termination) -------------------
+-- Vertex 7 has 100 neighbors; pulling 3 (LIMIT 3) EMITS ~3, not 100 — the
+-- iterator yields lazily and a top-k above it stops without the iterator
+-- blocking. This proves emission-level laziness (the TR-1 contract the TJS
+-- operator composes), NOT storage-level early termination: v0 reads the whole
+-- adjacency tuple in Open(); reading neighbors incrementally is a v1 custom-AM
+-- property (see docs/graph_store_v0_limitations.md).
+-- Target-list SRF form: ProjectSet -> Limit is pulled lazily (the FROM-clause
+-- form materializes via ExecMakeTableFunctionResult and would NOT be lazy).
 DO $$
 DECLARE before bigint; after bigint; delta bigint;
 BEGIN
     SELECT graph_store.visits() INTO before;
-    -- Target-list SRF form: ProjectSet -> Limit is pulled lazily (the FROM-clause
-    -- form materializes via ExecMakeTableFunctionResult and would NOT early-terminate).
     PERFORM graph_store.neighbors(7) LIMIT 3;
     SELECT graph_store.visits() INTO after;
     delta := after - before;
     IF delta > 10 THEN
-        RAISE EXCEPTION 'early-termination FAILED: visited % of 100 neighbors under LIMIT 3', delta;
+        RAISE EXCEPTION 'lazy-emission FAILED: emitted % of 100 neighbors under LIMIT 3', delta;
     END IF;
-    RAISE NOTICE 'PASS early termination: LIMIT 3 visited % of 100 neighbors (iterator stopped early)', delta;
+    RAISE NOTICE 'PASS lazy emission: LIMIT 3 emitted % of 100 neighbors (iterator did not block)', delta;
 END $$;
 
 -- 3) FR-7 shared transaction manager: cross-store ATOMIC ROLLBACK ------------
+-- Proves the PRINCIPLE: because the graph store lives in the same Postgres
+-- process as the relational store, one transaction spans both atomically — no
+-- second txn manager exists to diverge. CAVEAT: this is "free" precisely because
+-- v0 uses a heap relation; it does NOT prove the v1 custom-AM will be atomic
+-- (that needs aminsert + WAL + MVCC + a crash-recovery test). See limitations doc.
 BEGIN;
     INSERT INTO rel_store VALUES (999, 'doomed');
     SELECT graph_store.add_edge(999, 1000);

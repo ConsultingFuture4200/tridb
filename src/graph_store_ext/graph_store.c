@@ -22,14 +22,22 @@
 #include "executor/spi.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
+#include "utils/lsyscache.h"
 #include "miscadmin.h"
 
 PG_MODULE_MAGIC;
 
 /*
- * Session-scoped count of traversal steps (Next() calls). Lets a test prove
- * early termination: visiting K of N neighbors under LIMIT K must increment
- * this by exactly K, never N.
+ * Per-backend count of neighbors EMITTED (one per Next() call). Demonstrates
+ * iterator-emission laziness: pulling K of N neighbors under LIMIT K emits ~K,
+ * not N, so a top-k operator above can stop early without the iterator blocking.
+ *
+ * NOTE (honesty): this counts emission, NOT storage I/O. v0 reads the whole
+ * adjacency tuple in Open() (one heap fetch of a per-vertex array), so it does
+ * not early-terminate at the STORAGE level — that property belongs to the v1
+ * custom 32KB-page access method, which reads adjacency incrementally via
+ * amgettuple. See docs/graph_store_v0_limitations.md. Process-global static =
+ * per-backend; with a session pooler it accumulates across pooled sessions.
  */
 static int64 graph_visit_counter = 0;
 
@@ -88,10 +96,25 @@ graph_neighbors(PG_FUNCTION_ARGS)
 					Datum	   *elems;
 					bool	   *nulls;
 					int			n, i;
+					int16		typlen;
+					bool		typbyval;
+					char		typalign;
 
-					deconstruct_array(arr, INT8OID, 8, FLOAT8PASSBYVAL, 'd',
+					/* look up int8's storage attrs rather than hardcoding them */
+					get_typlenbyvalalign(INT8OID, &typlen, &typbyval, &typalign);
+					deconstruct_array(arr, INT8OID, typlen, typbyval, typalign,
 									  &elems, &nulls, &n);
-					st->neighbors  = (int64 *) palloc(sizeof(int64) * (n > 0 ? n : 1));
+
+					/*
+					 * Allocate the surviving adjacency in the SRF's multi-call
+					 * context explicitly. SPI_connect() switched CurrentMemoryContext
+					 * to SPI's exec context, which SPI_finish() frees — a plain
+					 * palloc() here would dangle on the first Next(). (Caught by the
+					 * Linus loop; tests had masked it.)
+					 */
+					st->neighbors  = (int64 *) MemoryContextAlloc(
+						funcctx->multi_call_memory_ctx,
+						sizeof(int64) * (n > 0 ? n : 1));
 					st->nneighbors = 0;
 					for (i = 0; i < n; i++)
 						if (!nulls[i])
