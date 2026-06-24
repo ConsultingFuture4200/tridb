@@ -10,6 +10,11 @@
 # Single source of truth: both build scripts share this so they cannot drift. The only
 # target-specific delta is patch_cmake_aarch64 (GX10/ARM only).
 
+# Absolute dir of THIS lib, resolved at source time. Callers cd into the MSVBASE tree before
+# invoking these functions, so a call-time relative ${BASH_SOURCE} would not resolve — capture
+# it now (read-only path resolution; no other side effects on source).
+_MSVBASE_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 # Validated upstream base (plan 002). Honors a prior assignment (e.g. from --commit).
 PIN_COMMIT="${PIN_COMMIT:-1a548db14d7a3f6f64808c99b9bc1aa01a25b71f}"   # MSVBASE "Fix vector constant parsing (#20)"
 
@@ -36,7 +41,9 @@ verify_patches() {
     || die "hnsw.patch NOT applied (no ResultIterator) — VBASE iterator missing; upstream drift?"
   grep -rq 'MultiIndexScan' "$root/thirdparty/SPTAG/" \
     || die "spann.patch NOT applied (no MultiIndexScan) — upstream drift?"
-  log "all three MSVBASE patches verified present"
+  grep -q 'TRIDB: real scalar L2 distance' "$root/src/operator.cpp" \
+    || die "TriDB l2_distance_scalar.patch NOT applied — scalar distance still broken; drift?"
+  log "all MSVBASE + TriDB fork patches verified present"
 }
 
 # Apply MSVBASE's submodule patches (spann/hnsw/Postgres — relaxed monotonicity), idempotent
@@ -45,12 +52,31 @@ apply_msvbase_patches() {
   local root="$1"
   if grep -rq 'amcanrelaxedorderbyop' "$root/thirdparty/Postgres/src/include/access/" 2>/dev/null; then
     log "MSVBASE submodule patches already applied"
-    verify_patches "$root"
+  else
+    log "applying MSVBASE submodule patches (scripts/patch.sh: spann, hnsw, Postgres) — relaxed monotonicity"
+    ( cd "$root" && bash scripts/patch.sh )
+  fi
+  apply_tridb_fork_patches "$root"
+  verify_patches "$root"
+}
+
+# TriDB's own fork patches, applied on top of MSVBASE's (scripts/patch.sh). These live under
+# scripts/patches/ in THIS repo because vendor/MSVBASE/ is gitignored + re-cloned, so a patch
+# placed there would be wiped. Idempotent via each patch's sentinel.
+#   l2_distance_scalar.patch (plan 005): scalar l2_distance returned 0 for any dim < 16 (static
+#     L2Space built with dim=0 -> hnswlib L2SqrSIMD16Ext sums only full 16-float blocks). Fixed
+#     to compute the Euclidean distance directly; unblocks SQL exact re-rank / DEV-1168 tests.
+apply_tridb_fork_patches() {
+  local root="$1"
+  local patch="${_MSVBASE_LIB_DIR}/../patches/l2_distance_scalar.patch"
+  [[ -f "$patch" ]] || die "missing TriDB fork patch: $patch"
+  if grep -q 'TRIDB: real scalar L2 distance' "$root/src/operator.cpp" 2>/dev/null; then
+    log "TriDB fork patch (scalar l2_distance) already applied"
     return 0
   fi
-  log "applying MSVBASE submodule patches (scripts/patch.sh: spann, hnsw, Postgres) — relaxed monotonicity"
-  ( cd "$root" && bash scripts/patch.sh )
-  verify_patches "$root"
+  log "applying TriDB fork patch: real scalar l2_distance (plan 005)"
+  ( cd "$root" && git apply "$patch" ) \
+    || die "l2_distance_scalar.patch did not apply — MSVBASE drift? re-generate from src/operator.cpp"
 }
 
 # Patch known-dead upstream URLs / build-breakers in the MSVBASE Dockerfile. Arch-independent

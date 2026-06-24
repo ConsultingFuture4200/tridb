@@ -16,7 +16,7 @@ MSVBASE source except through the build scripts' patch layer.
 | 002 | Pin the MSVBASE commit | P1 | S | — | DONE (advisor/002-pin-msvbase-commit) |
 | 003 | Verify all MSVBASE patches applied | P1 | S | — | DONE (advisor/003-verify-patches) |
 | 004 | Regenerate gx10build.sh from the proven recipe | P1 | M | 002, 003 | DONE (advisor/004-regenerate-gx10build) |
-| 005 | Fix the scalar l2_distance fork bug | P2 | M | 003 | TODO |
+| 005 | Fix the scalar l2_distance fork bug | P2 | M | 003 | DONE (advisor/005-fix-l2distance) |
 | 006 | Docs consistency pass | P2 | S | — | DONE (advisor/006-docs-consistency) |
 | 007 | Integrity-check build downloads | P2 | M | — | DONE (advisor/007-download-integrity) |
 | 008 | Python tooling hardening | P3 | S | — | DONE (advisor/008-python-hardening) |
