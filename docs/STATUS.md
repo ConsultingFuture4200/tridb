@@ -10,6 +10,14 @@ build on GX10) · 🔴 GX10-gated (needs live MSVBASE build).
 > GX10-gated. The GX10 is reserved for ARM64 build sign-off (DEV-1160 as written) and the
 > 128 GB headline benchmark.
 
+> **PHASE-1 PROGRESS 2026-06-23 (v0, tested on the fork):** `src/graph_store_ext/` — a
+> native graph-store extension. `scripts/graph_test.sh` is green:
+> DEV-1165 traversal iterator (Open/Next/Close, lazy emission), DEV-1166 FR-7 (cross-store
+> atomic rollback+commit). `test/trimodal_compose.sql` composes all three legs (graph +
+> relational + vector) in one query. Linus loop caught + fixed a use-after-free and
+> tempered overclaims. **v0 is heap-backed**, not the custom 32KB-page AM — honest scope
+> and per-issue TODOs in `docs/graph_store_v0_limitations.md`.
+
 | Issue | Title | Phase | Gating | Autonomous deliverable this repo |
 | -- | -- | -- | -- | -- |
 | DEV-1160 | SPIKE MSVBASE build on GX10 | 0 | 🔴 GX10 | Desk-spike findings already captured in issue; live build is GX10-only |
