@@ -10,7 +10,7 @@ set -euo pipefail
 IMAGE="${1:-tridb/msvbase:dev}"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 EXT="$ROOT/src/graph_store_ext"
-TEST="$ROOT/test/graph_store_test.sql"
+TEST="$(cd "$ROOT" && realpath "${2:-test/graph_store_test.sql}")"
 
 docker image inspect "$IMAGE" >/dev/null 2>&1 || { echo "image $IMAGE not built — run scripts/x86build.sh --docker" >&2; exit 1; }
 
