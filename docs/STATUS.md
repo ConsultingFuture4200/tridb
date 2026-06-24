@@ -18,6 +18,16 @@ build on GX10) · 🔴 GX10-gated (needs live MSVBASE build).
 > tempered overclaims. **v0 is heap-backed**, not the custom 32KB-page AM — honest scope
 > and per-issue TODOs in `docs/graph_store_v0_limitations.md`.
 
+> **EARLY-TERMINATING COMPOSITION 2026-06-23 (DEV-1167/1169 functional shape):**
+> `test/trimodal_early_term.sql` — the canonical-shaped pipeline driven by the HNSW ANN
+> index scan (early-terminating), graph traversal + relational filter per candidate. Plan
+> is `Limit -> NestLoop(NestLoop(IndexScan hnsw, FuncScan neighbors), IndexScan d)`; ANN
+> scan emitted 8 of 2000 sources. Linus-verified (3 lenses + re-run); filter proof made
+> deterministic. Two fork constraints found → `docs/fork_findings.md`: FROM-SRFs
+> materialize (production iterator must be custom-scan), and scalar `<->`/`l2_distance`
+> return 0 (exact top-k must be the DEV-1168 C operator, not a SQL re-rank;
+> `test/fork_distance_probe.sql` confirms).
+
 | Issue | Title | Phase | Gating | Autonomous deliverable this repo |
 | -- | -- | -- | -- | -- |
 | DEV-1160 | SPIKE MSVBASE build on GX10 | 0 | 🔴 GX10 | Desk-spike findings already captured in issue; live build is GX10-only |
