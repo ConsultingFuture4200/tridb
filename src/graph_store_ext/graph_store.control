@@ -1,0 +1,4 @@
+comment = 'TriDB native adjacency-list graph store (v0: heap-backed, shared txn manager)'
+default_version = '0.1.0'
+module_pathname = '$libdir/graph_store'
+relocatable = false
