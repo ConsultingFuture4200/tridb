@@ -14,10 +14,15 @@ userland SRF in FROM would block. (The v0 `graph_store.neighbors` SRF is fine as
 a per-source LATERAL leg, because the *outer* driver early-terminates; see below.)
 
 ## 2. No working scalar vector distance — distances live only in the index scan
-`l2_distance(float8[], float8[])` and the `<->` operator return **0 for every
-input** when evaluated as a scalar (outside an HNSW index scan) — confirmed for
-both fractional and integer vectors, with and without an index present. Real
-distances are produced ONLY inside the HNSW index scan's internal computation.
+**Observed:** `l2_distance(float8[], float8[])` and the `<->` operator return a
+**constant (0) for every input** when evaluated as a scalar (outside an HNSW index
+scan) — seen for both fractional and integer vectors, with and without an index,
+and with explicit `ARRAY[...]::float8[]` casts (ruling out literal coercion). Real,
+correctly-ordered distances are produced ONLY inside the HNSW index scan.
+Reproducible probe: `test/fork_distance_probe.sql` (asserts the index path is
+correct and reports the scalar behavior, so it stays informative if the fork is
+fixed). Treat as a confirmed-by-probe fork bug pending a root-cause patch in
+`l2_distance`'s C implementation.
 **Implications:**
 - Exact top-k **cannot** be done by a SQL over-fetch + re-rank, and exact ground
   truth **cannot** be computed by a seq-scan — there is no usable distance scalar.
