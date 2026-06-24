@@ -77,6 +77,9 @@ if [[ "$USE_DOCKER" -eq 1 ]]; then
 fi
 
 # --- native (non-docker) build ----------------------------------------------
+# NOTE: the --docker path is the VALIDATED recipe. This native path is a secondary,
+# not-regularly-exercised build; it now shares the same patch+verify layer, but treat a green
+# native build as unproven until run.
 require curl; require make; require gcc; require cmake
 log "cmake: $(cmake --version | head -1)  (native x86_64 — no aarch64 substitution needed)"
 
@@ -91,7 +94,10 @@ if [[ "$SKIP_CLONE" -eq 0 ]]; then
 fi
 cd "$SRC"
 
-[[ -f scripts/patch.sh ]] && { log "applying submodule patches"; bash scripts/patch.sh || die "patch step failed"; }
+# Same patch+verify layer as the --docker path: submodule patches (relaxed monotonicity),
+# the TriDB l2_distance fix, and the fail-loud sentinel check. (Previously this path ran
+# scripts/patch.sh inline with no l2 patch and no verify — H2.)
+apply_msvbase_patches "$SRC"
 
 export MSVBASE_DISABLE_SPTAG=1
 log "SPTAG excluded (HNSW-only v1). Postgres fork: --with-blocksize=32 (drives DEV-1163 layout)."
