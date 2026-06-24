@@ -4,6 +4,11 @@ This directory holds the **interface skeleton** for TriDB's native graph store:
 the adjacency-list access method plus its Volcano traversal iterator, declared
 against the PostgreSQL 13.4 access-method API.
 
+> **Not to be confused with `src/graph_store_ext/`.** That is the *working* v0
+> heap-backed extension (built and tested on the x86 standin, `scripts/graph_test.sh`
+> green). **This** directory is the GX10-gated C *contract/skeleton* for the v1 custom
+> 32KB-page access method (DEV-1164) — a known shape to implement against, never compiled here.
+
 > **GX10-GATED: not built off-target.**
 > Nothing here is compiled on the dev box. The implementing C must build against
 > a live MSVBASE / PostgreSQL 13.4 fork built with `--with-blocksize=32` (32KB

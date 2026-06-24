@@ -6,9 +6,12 @@ build on GX10) · 🔴 GX10-gated (needs live MSVBASE build).
 > **RE-GATED 2026-06-23:** the dev workstation was proven a viable **x86_64 standin** —
 > `scripts/x86build.sh --docker` builds the MSVBASE fork and `scripts/smoke_test.sh`
 > passes (vectordb + HNSW + early-terminating ANN scan). See `docs/BUILD_NOTES.md`.
-> Consequence: the native C work (DEV-1164–1170) is **buildable & testable here now**, not
-> GX10-gated. The GX10 is reserved for ARM64 build sign-off (DEV-1160 as written) and the
-> 128 GB headline benchmark.
+> Consequence: the native C work (DEV-1164–1170) is now **developed and smoke-tested on this
+> standin** (proven: graph_store v0 in `src/graph_store_ext/`, `scripts/graph_test.sh` green)
+> rather than blocked on hardware. The 🔴 markers below therefore mean **final acceptance is
+> on-target** — the issue builds here but is signed off on the GX10; they are not "cannot build
+> off-target." What stays strictly GX10-only: the ARM64 build sign-off (DEV-1160 as written)
+> and the 128 GB headline benchmark.
 
 > **PHASE-1 PROGRESS 2026-06-23 (v0, tested on the fork):** `src/graph_store_ext/` — a
 > native graph-store extension. `scripts/graph_test.sh` is green:

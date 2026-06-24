@@ -6,6 +6,12 @@
 
 ---
 
+> **This is the FUTURE v1 design, not what is built today.** This document specifies the
+> **v1 custom adjacency-list access method** (DEV-1164): a first-class PostgreSQL AM over 32KB
+> pages. The **current v0** implementation in `src/graph_store_ext/` uses a **heap relation**,
+> not this layout — see `docs/graph_store_v0_limitations.md` for the v0 scope and deltas. Read
+> this spec as the target, not as a description of the working extension.
+
 ## 1. Scope and Anti-Requirements
 
 This document specifies the on-disk layout and access-method contract for TriDB's native
