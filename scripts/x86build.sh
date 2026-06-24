@@ -21,7 +21,7 @@
 set -euo pipefail
 
 REPO_URL="https://github.com/microsoft/MSVBASE.git"
-PIN_COMMIT=""
+PIN_COMMIT="1a548db14d7a3f6f64808c99b9bc1aa01a25b71f"   # MSVBASE "Fix vector constant parsing (#20)"; the validated build base. Override with --commit.
 JOBS="$(nproc)"
 VENDOR_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/vendor"
 PREFIX="${VENDOR_DIR}/MSVBASE/install"
@@ -114,7 +114,7 @@ if [[ "$USE_DOCKER" -eq 1 ]]; then
   SRC="${VENDOR_DIR}/MSVBASE"
   [[ -d "$SRC/.git" ]] || git clone "$REPO_URL" "$SRC"
   cd "$SRC"
-  [[ -n "$PIN_COMMIT" ]] && git checkout -q "$PIN_COMMIT"
+  if [[ -n "$PIN_COMMIT" ]]; then git fetch --quiet origin && git checkout -q "$PIN_COMMIT"; fi
   git submodule update --init --recursive
   apply_msvbase_patches "$SRC"        # spann/hnsw/Postgres — relaxed monotonicity. MUST precede force-includes.
   patch_upstream_dockerfile "$SRC/Dockerfile"
@@ -134,7 +134,7 @@ mkdir -p "$VENDOR_DIR"
 if [[ "$SKIP_CLONE" -eq 0 ]]; then
   [[ -d "$SRC/.git" ]] || { log "cloning MSVBASE -> $SRC"; git clone "$REPO_URL" "$SRC"; }
   cd "$SRC"
-  [[ -n "$PIN_COMMIT" ]] && git checkout -q "$PIN_COMMIT"
+  if [[ -n "$PIN_COMMIT" ]]; then git fetch --quiet origin && git checkout -q "$PIN_COMMIT"; fi
   log "init submodules"
   git submodule update --init --recursive
 fi

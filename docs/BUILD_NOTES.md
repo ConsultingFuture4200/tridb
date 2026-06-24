@@ -19,6 +19,13 @@ create index ... using hnsw(...);     -- HNSW index builds
 
 This validates the relational + vector legs (DEV-1162 acceptance) on the standin.
 
+## Pinned upstream
+
+Both build scripts default `PIN_COMMIT` to MSVBASE
+`1a548db14d7a3f6f64808c99b9bc1aa01a25b71f` ("Fix vector constant parsing. (#20)") — the exact
+upstream commit this build was validated against, so the x86 standin and the GX10 compile the
+same source. Override with `--commit <sha>` to build a different revision (and re-validate).
+
 ## What the standin proves vs. what still needs the GX10
 
 | Proven here (x86_64) | Still GX10-only |

@@ -17,7 +17,7 @@ set -euo pipefail
 
 # --- config / args ---------------------------------------------------------
 REPO_URL="https://github.com/microsoft/MSVBASE.git"
-PIN_COMMIT=""                       # set to the pinned commit once DEV-1160 confirms it
+PIN_COMMIT="1a548db14d7a3f6f64808c99b9bc1aa01a25b71f"   # MSVBASE "Fix vector constant parsing (#20)"; the validated build base. Override with --commit.
 JOBS="$(nproc)"
 VENDOR_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/vendor"
 PREFIX="${VENDOR_DIR}/MSVBASE/install"
@@ -73,7 +73,7 @@ if [[ "$SKIP_CLONE" -eq 0 ]]; then
     git clone "$REPO_URL" "$SRC"
   fi
   cd "$SRC"
-  [[ -n "$PIN_COMMIT" ]] && { log "checking out pinned commit $PIN_COMMIT"; git checkout -q "$PIN_COMMIT"; }
+  if [[ -n "$PIN_COMMIT" ]]; then log "checking out pinned commit $PIN_COMMIT"; git fetch --quiet origin && git checkout -q "$PIN_COMMIT"; fi
   log "init submodules (Postgres fork, hnsw, SPTAG)"
   git submodule update --init --recursive
 fi
