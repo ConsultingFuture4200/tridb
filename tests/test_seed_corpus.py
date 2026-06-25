@@ -13,11 +13,22 @@ GEN = ROOT / "tools" / "seed_corpus.py"
 def _run(out_dir, seed=42, entities=40, dim=16, epn=4):
     subprocess.run(
         [
-            sys.executable, str(GEN),
-            "--entities", str(entities), "--dim", str(dim),
-            "--edges-per-node", str(epn), "--seed", str(seed), "--out", str(out_dir),
+            sys.executable,
+            str(GEN),
+            "--entities",
+            str(entities),
+            "--dim",
+            str(dim),
+            "--edges-per-node",
+            str(epn),
+            "--seed",
+            str(seed),
+            "--out",
+            str(out_dir),
         ],
-        check=True, capture_output=True, text=True,
+        check=True,
+        capture_output=True,
+        text=True,
     )
 
 

@@ -1,10 +1,29 @@
-.PHONY: test lint baseline-up baseline-down seed clean
+.PHONY: test lint graph-test smoke-test test-all baseline-up baseline-down seed clean
+
+IMAGE ?= tridb/msvbase:dev
+ENGINE_TESTS := test/graph_store_test.sql test/trimodal_compose.sql \
+                test/trimodal_early_term.sql test/fork_distance_probe.sql
 
 test:
 	pytest tests/ -q
 
 lint:
 	ruff check . && ruff format --check .
+
+# Engine test suites — require the tridb/msvbase:dev image (scripts/x86build.sh --docker).
+graph-test:
+	@docker image inspect $(IMAGE) >/dev/null 2>&1 || \
+	  { echo "image $(IMAGE) not built — run scripts/x86build.sh --docker"; exit 1; }
+	@for t in $(ENGINE_TESTS); do \
+	  echo "=== $$t ==="; bash scripts/graph_test.sh $(IMAGE) $$t || exit 1; done
+
+smoke-test:
+	@docker image inspect $(IMAGE) >/dev/null 2>&1 || \
+	  { echo "image $(IMAGE) not built — run scripts/x86build.sh --docker"; exit 1; }
+	bash scripts/smoke_test.sh
+
+# Full verification: fast Python+lint layer, then the engine (smoke + graph) layer.
+test-all: test lint smoke-test graph-test
 
 seed:
 	python3 tools/seed_corpus.py --entities 1000 --dim 768 --out data/seed/
