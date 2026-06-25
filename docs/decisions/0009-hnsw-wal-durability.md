@@ -167,10 +167,16 @@ path (it remains on disk as a dead artifact but is not read by `LoadIndex`).
 3. `table_open(heapOid, AccessShareLock)` → heap `Relation`.
 4. `table_index_build_scan(heap, index, indexInfo, false, false, HNSWRebuildCallback, &state, NULL)`:
    - `scan=NULL` → heap AM creates its own `HeapScanDesc` with `SnapshotAny`.
-   - `SnapshotAny` + `HeapTupleSatisfiesVacuum`: `HEAPTUPLE_DEAD` → `tupleIsAlive=false`
-     → callback returns early → aborted rows excluded (Oracle C).
-   - `HEAPTUPLE_LIVE`, `HEAPTUPLE_RECENTLY_DEAD`-with-alive-check, and
-     `HEAPTUPLE_INSERT_IN_PROGRESS` (own-xact) → `tupleIsAlive=true` → `addPoint`.
+   - `SnapshotAny` + `HeapTupleSatisfiesVacuum`: `HEAPTUPLE_DEAD` and
+     `HEAPTUPLE_RECENTLY_DEAD` → `tupleIsAlive=false` → callback returns early →
+     aborted/dead rows excluded (Oracle C).
+   - `HEAPTUPLE_LIVE` and `HEAPTUPLE_INSERT_IN_PROGRESS` (own-xact) →
+     `tupleIsAlive=true` → `addPoint`.
+   - Correction (Linus review): `HEAPTUPLE_RECENTLY_DEAD` sets `tupleIsAlive=false`
+     in the heap AM; the rebuild callback skips it. A row whose concurrent DELETE
+     is in-progress at rebuild time is excluded, and if that delete later ABORTS the
+     live row is missing from this backend's index until its next rebuild — a known
+     v1 gap closed by the Phase C scan-time xmin/xmax visibility filter.
 5. `HNSWRebuildCallback` encodes each TID as `(blockId << 32) | offset` — identical
    to `hnsw_insert` — and calls `vector_index->addPoint`.
 6. `table_close(heap, AccessShareLock)`.

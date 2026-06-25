@@ -35,26 +35,59 @@
 #   src/hnswindex_scan.cpp    — LoadIndex body: rebuild from heap on cache-miss.
 #   src/hnswindex.cpp         — 3 call sites (hnsw_insert, hnsw_bulkdelete, hnsw_begin_scan).
 #   src/tridb_vector_iter.cpp — 1 call site (tridb_vec_open).
-diff --git a/src/hnswindex_scan.hpp b/src/hnswindex_scan.hpp
---- a/src/hnswindex_scan.hpp
-+++ b/src/hnswindex_scan.hpp
-@@ -34,7 +34,14 @@
- 	    std::vector<float> array;
-         std::priority_queue<float> distanceQueue;
-     };
--    static void LoadIndex(const std::string &p_path,
-+    // DEV-1235 (ADR-0009 rebuild-on-recovery): LoadIndex now takes the index Relation
-+    // so it can open the heap and rebuild the in-RAM index from WAL-durable heap tuples
-+    // on cache-miss, instead of trusting the stale flat file. Callers must pass the
-+    // index Relation (available at all call sites: hnsw_insert, hnsw_begin_scan,
-+    // hnsw_bulkdelete, and tridb_vec_open). Cache is keyed by p_path and populated
-+    // at most once per backend per index — O(heap) cost on first access only.
-+    static void LoadIndex(Relation index,
-+                          const std::string &p_path,
-                           DistanceMethod distance_method, int dim);
-     static std::shared_ptr<hnswlib::ResultIterator<float>> BeginScan(
-         const void *p_target, const std::string &p_path);
+diff --git a/src/hnswindex.cpp b/src/hnswindex.cpp
+index da98789..fc81f38 100644
+--- a/src/hnswindex.cpp
++++ b/src/hnswindex.cpp
+@@ -160,14 +160,15 @@ bool hnsw_insert(Relation index,
+         switch(hnsw_ParaGetDistmethod(index))
+         {
+             case hnsw_Inner_Product:
+-                HNSWIndexScan::LoadIndex(path, DistanceMethod::InnerProduct, dim);
++                // DEV-1235: pass index Relation so LoadIndex can rebuild from heap on cache-miss.
++                HNSWIndexScan::LoadIndex(index, path, DistanceMethod::InnerProduct, dim);
+                 break;
+             case hnsw_L2_Distance:
+-                HNSWIndexScan::LoadIndex(path, DistanceMethod::L2, dim);
++                HNSWIndexScan::LoadIndex(index, path, DistanceMethod::L2, dim);
+                 break;
+             default:
+                 elog(ERROR, "hnsw index parameter value error.");
+-        }	
++        }
+ 	return HNSWIndexScan::Insert(path,
+ 		values,
+ 		isnull,
+@@ -187,10 +188,11 @@ IndexBulkDeleteResult* hnsw_bulkdelete(IndexVacuumInfo* info, IndexBulkDeleteRes
+         switch(hnsw_ParaGetDistmethod(index))
+         {
+             case hnsw_Inner_Product:
+-                HNSWIndexScan::LoadIndex(path, DistanceMethod::InnerProduct, dim);
++                // DEV-1235: pass index Relation so LoadIndex can rebuild from heap on cache-miss.
++                HNSWIndexScan::LoadIndex(index, path, DistanceMethod::InnerProduct, dim);
+                 break;
+             case hnsw_L2_Distance:
+-                HNSWIndexScan::LoadIndex(path, DistanceMethod::L2, dim);
++                HNSWIndexScan::LoadIndex(index, path, DistanceMethod::L2, dim);
+                 break;
+             default:
+                 elog(ERROR, "hnsw index parameter value error.");
+@@ -212,10 +214,11 @@ IndexScanDesc hnsw_begin_scan(Relation index, int nkeys, int norderbys)
+     switch(hnsw_ParaGetDistmethod(index))
+     {
+         case hnsw_Inner_Product:
+-            HNSWIndexScan::LoadIndex(path, DistanceMethod::InnerProduct, hnsw_ParaGetDimension(index));
++            // DEV-1235: pass index Relation so LoadIndex can rebuild from heap on cache-miss.
++            HNSWIndexScan::LoadIndex(index, path, DistanceMethod::InnerProduct, hnsw_ParaGetDimension(index));
+             break;
+         case hnsw_L2_Distance:
+-            HNSWIndexScan::LoadIndex(path, DistanceMethod::L2, hnsw_ParaGetDimension(index));
++            HNSWIndexScan::LoadIndex(index, path, DistanceMethod::L2, hnsw_ParaGetDimension(index));
+             break;
+         default:
+             elog(ERROR, "hnsw index parameter value error.");
 diff --git a/src/hnswindex_scan.cpp b/src/hnswindex_scan.cpp
+index 3b66350..cab0f25 100644
 --- a/src/hnswindex_scan.cpp
 +++ b/src/hnswindex_scan.cpp
 @@ -4,6 +4,15 @@
@@ -73,7 +106,7 @@ diff --git a/src/hnswindex_scan.cpp b/src/hnswindex_scan.cpp
  // TRIDB(DEV-1228 / ADR-0004): the hnswlib-backed HNSW AM is the reference implementer of the
  // TriDB-owned vector-index scan contract. Assert conformance at compile time so a future
  // refactor that breaks Open/Next/Close fails the build here, not at runtime.
-@@ -12,29 +21,153 @@
+@@ -12,29 +21,170 @@ TRIDB_ASSERT_VECTOR_BACKEND(HNSWIndexScan);
  std::map<std::string, std::shared_ptr<hnswlib::SpaceInterface<float>>> HNSWIndexScan::distanceFunction_map;
  std::map<std::string, std::shared_ptr<hnswlib::HierarchicalNSW<float>>> HNSWIndexScan::vector_index_map;
  
@@ -202,11 +235,15 @@ diff --git a/src/hnswindex_scan.cpp b/src/hnswindex_scan.cpp
 +    Relation heap = table_open(heapOid, AccessShareLock);
 +
 +    // Capacity estimate: use pg_class.reltuples * 10 (same factor as
-+    // ConstructInternalBuilder). reltuples may be 0 after ANALYZE hasn't run
-+    // or on a fresh table; floor at 16 to avoid a zero-capacity HierarchicalNSW
-+    // which would panic on the first addPoint.
++    // ConstructInternalBuilder). reltuples may be 0 (no ANALYZE / fresh table)
++    // or -1 (PG 13 "statistics never collected" sentinel). A negative double
++    // cast to size_t wraps to a huge value -> giant malloc -> NULL -> crash, so
++    // only multiply when positive; otherwise floor at 16 (HierarchicalNSW grows
++    // on demand past the initial capacity).
 +    double reltuples = heap->rd_rel->reltuples;
-+    size_t capacity = static_cast<size_t>(reltuples * 10.0);
++    size_t capacity = (reltuples > 0.0)
++                          ? static_cast<size_t>(reltuples * 10.0)
++                          : 16;
 +    if (capacity < 16)
 +        capacity = 16;
 +
@@ -227,6 +264,19 @@ diff --git a/src/hnswindex_scan.cpp b/src/hnswindex_scan.cpp
 +    // (non-concurrent, non-bootstrap) and calls HeapTupleSatisfiesVacuum on
 +    // each tuple. Dead/aborted tuples are skipped (tupleIsAlive=false). The
 +    // callback adds only live tuples to the in-RAM index.
++    //
++    // Notes (Linus review):
++    //  - If a concurrent DELETE is in progress on the heap during rebuild, the
++    //    heap AM emits a WARNING "concurrent delete in progress" and the tuple
++    //    is correctly excluded (tupleIsAlive=false). Expected under load; not a bug.
++    //  - If HNSWRebuildCallback ereport(ERROR)s (e.g. dimension mismatch), the
++    //    longjmp skips table_close below; the AccessShareLock is still released by
++    //    the lock manager at transaction abort (not by table_close), and the
++    //    half-built HierarchicalNSW leaks until backend exit. No map entry is
++    //    cached, so the next LoadIndex retries cleanly. Acceptable for v1.
++    //  - Known v1 gap (ADR-0009 Phase C): a row whose concurrent DELETE is
++    //    in-progress at rebuild time is excluded; if that delete later ABORTS, the
++    //    still-live row is missing from this backend's index until its next rebuild.
 +    table_index_build_scan(heap,
 +                           index,
 +                           indexInfo,
@@ -245,60 +295,31 @@ diff --git a/src/hnswindex_scan.cpp b/src/hnswindex_scan.cpp
  }
  
  std::shared_ptr<hnswlib::ResultIterator<float>> HNSWIndexScan::BeginScan(
-diff --git a/src/hnswindex.cpp b/src/hnswindex.cpp
---- a/src/hnswindex.cpp
-+++ b/src/hnswindex.cpp
-@@ -160,14 +160,15 @@
-         switch(hnsw_ParaGetDistmethod(index))
-         {
-             case hnsw_Inner_Product:
--                HNSWIndexScan::LoadIndex(path, DistanceMethod::InnerProduct, dim);
-+                // DEV-1235: pass index Relation so LoadIndex can rebuild from heap on cache-miss.
-+                HNSWIndexScan::LoadIndex(index, path, DistanceMethod::InnerProduct, dim);
-                 break;
-             case hnsw_L2_Distance:
--                HNSWIndexScan::LoadIndex(path, DistanceMethod::L2, dim);
-+                HNSWIndexScan::LoadIndex(index, path, DistanceMethod::L2, dim);
-                 break;
-             default:
-                 elog(ERROR, "hnsw index parameter value error.");
--        }	
-+        }
- 	return HNSWIndexScan::Insert(path,
- 		values,
- 		isnull,
-@@ -187,10 +188,11 @@
-         switch(hnsw_ParaGetDistmethod(index))
-         {
-             case hnsw_Inner_Product:
--                HNSWIndexScan::LoadIndex(path, DistanceMethod::InnerProduct, dim);
-+                // DEV-1235: pass index Relation so LoadIndex can rebuild from heap on cache-miss.
-+                HNSWIndexScan::LoadIndex(index, path, DistanceMethod::InnerProduct, dim);
-                 break;
-             case hnsw_L2_Distance:
--                HNSWIndexScan::LoadIndex(path, DistanceMethod::L2, dim);
-+                HNSWIndexScan::LoadIndex(index, path, DistanceMethod::L2, dim);
-                 break;
-             default:
-                 elog(ERROR, "hnsw index parameter value error.");
-@@ -212,10 +214,11 @@
-     switch(hnsw_ParaGetDistmethod(index))
-     {
-         case hnsw_Inner_Product:
--            HNSWIndexScan::LoadIndex(path, DistanceMethod::InnerProduct, hnsw_ParaGetDimension(index));
-+            // DEV-1235: pass index Relation so LoadIndex can rebuild from heap on cache-miss.
-+            HNSWIndexScan::LoadIndex(index, path, DistanceMethod::InnerProduct, hnsw_ParaGetDimension(index));
-             break;
-         case hnsw_L2_Distance:
--            HNSWIndexScan::LoadIndex(path, DistanceMethod::L2, hnsw_ParaGetDimension(index));
-+            HNSWIndexScan::LoadIndex(index, path, DistanceMethod::L2, hnsw_ParaGetDimension(index));
-             break;
-         default:
-             elog(ERROR, "hnsw index parameter value error.");
+diff --git a/src/hnswindex_scan.hpp b/src/hnswindex_scan.hpp
+index 315f030..b9f378e 100644
+--- a/src/hnswindex_scan.hpp
++++ b/src/hnswindex_scan.hpp
+@@ -34,7 +34,14 @@ public:
+ 	    std::vector<float> array;
+         std::priority_queue<float> distanceQueue;
+     };
+-    static void LoadIndex(const std::string &p_path,
++    // DEV-1235 (ADR-0009 rebuild-on-recovery): LoadIndex now takes the index Relation
++    // so it can open the heap and rebuild the in-RAM index from WAL-durable heap tuples
++    // on cache-miss, instead of trusting the stale flat file. Callers must pass the
++    // index Relation (available at all call sites: hnsw_insert, hnsw_begin_scan,
++    // hnsw_bulkdelete, and tridb_vec_open). Cache is keyed by p_path and populated
++    // at most once per backend per index — O(heap) cost on first access only.
++    static void LoadIndex(Relation index,
++                          const std::string &p_path,
+                           DistanceMethod distance_method, int dim);
+     static std::shared_ptr<hnswlib::ResultIterator<float>> BeginScan(
+         const void *p_target, const std::string &p_path);
 diff --git a/src/tridb_vector_iter.cpp b/src/tridb_vector_iter.cpp
+index 3a55810..3169b22 100644
 --- a/src/tridb_vector_iter.cpp
 +++ b/src/tridb_vector_iter.cpp
-@@ -119,7 +119,8 @@
+@@ -119,7 +119,8 @@ TridbVectorIter *tridb_vec_open(Relation index, const float *query_vec, int dim,
      // any failure return nullptr after the unique_ptr cleans up; release() only on success.
      try
      {
