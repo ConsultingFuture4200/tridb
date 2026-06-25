@@ -71,20 +71,7 @@ diff --git a/src/hnswindex_scan.cpp b/src/hnswindex_scan.cpp
 index 9f79e99..3b66350 100644
 --- a/src/hnswindex_scan.cpp
 +++ b/src/hnswindex_scan.cpp
-@@ -2,6 +2,12 @@
- // Licensed under the MIT License.
- 
- #include "hnswindex_scan.hpp"
-+#include "tridb_vector_index.hpp"
-+
-+// TRIDB(DEV-1228 / ADR-0004): the hnswlib-backed HNSW AM is the reference implementer of the
-+// TriDB-owned vector-index scan contract. Assert conformance at compile time so a future
-+// refactor that breaks Open/Next/Close fails the build here, not at runtime.
-+TRIDB_ASSERT_VECTOR_BACKEND(HNSWIndexScan);
- 
- std::map<std::string, std::shared_ptr<hnswlib::SpaceInterface<float>>> HNSWIndexScan::distanceFunction_map;
- std::map<std::string, std::shared_ptr<hnswlib::HierarchicalNSW<float>>> HNSWIndexScan::vector_index_map;
-@@ -46,7 +52,12 @@ hnswlib::QueryResult<float>* HNSWIndexScan::GetNet(
+@@ -52,7 +52,12 @@ hnswlib::QueryResult<float>* HNSWIndexScan::GetNet(
  void HNSWIndexScan::EndScan(
      std::shared_ptr<hnswlib::ResultIterator<float>> &resultIterator)
  {
