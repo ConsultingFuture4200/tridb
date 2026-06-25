@@ -242,7 +242,7 @@ The acceptance criterion for FR-6 is:
 - `avg_out_degree = 5.0`
 - `vector_topk = 5`
 - Expected: `choose_order(stats) == "vector_first"`
-- Peak intermediate: `max(5 * 50, 5) = 250` rows
+- Peak intermediate: `vector_topk * avg_degree = 5 * 50 = 250` rows
 
 The test must assert both the ordering choice and that the filter-first
 intermediate count is materially smaller than the vector-first intermediate
