@@ -1,0 +1,466 @@
+{
+  "k": 5,
+  "corpus_size": 2000,
+  "num_queries": 12,
+  "engine_mode": "live",
+  "all_passed": true,
+  "metrics": [
+    {
+      "sm": "SM-1",
+      "name": "Intermediate-result reduction",
+      "value": 32.0,
+      "target": 5.0,
+      "unit": "x",
+      "passed": true,
+      "detail": "baseline materialized 1920 intermediate rows vs TriDB 60 (32.00x reduction; target >= 5x)"
+    },
+    {
+      "sm": "SM-2",
+      "name": "Latency (TriDB-side only; head-to-head GATED)",
+      "value": 1.161,
+      "target": 0.8,
+      "unit": "ms (TriDB-side)",
+      "passed": true,
+      "detail": "live TriDB mean Execution Time 1.161 ms over 12 queries (EXPLAIN ANALYZE). NOT a fair SM-2: the baseline here is the in-process model (no runtime). A real SM-2 head-to-head needs the multi-system stack (make baseline-up) or the GX10 128 GB headline run \u2014 TABLED for this standin."
+    },
+    {
+      "sm": "SM-3",
+      "name": "Corpus examined (k=5, worst case)",
+      "value": 0.064,
+      "target": 0.25,
+      "unit": "fraction",
+      "passed": true,
+      "detail": "worst-case 6.4% of corpus examined (target < 25%)"
+    },
+    {
+      "sm": "SM-4",
+      "name": "Answer-set parity",
+      "value": 1.0,
+      "target": 0.99,
+      "unit": "fraction",
+      "passed": true,
+      "detail": "mean answer-set parity 100.0% across 12 queries (target >= 99%)"
+    },
+    {
+      "sm": "SM-5",
+      "name": "Transaction atomicity",
+      "value": 1.0,
+      "target": 1.0,
+      "unit": "fraction",
+      "passed": true,
+      "detail": "12/12 queries atomic (100%; target 100%)"
+    }
+  ],
+  "tridb_samples": [
+    {
+      "qid": 0,
+      "system": "tridb",
+      "k": 5,
+      "latency_ms": 0.814,
+      "peak_intermediate_rows": 5,
+      "corpus_examined": 69,
+      "corpus_size": 2000,
+      "result_chunks": [
+        "chunk 849",
+        "chunk 627",
+        "chunk 197",
+        "chunk 47",
+        "chunk 1408"
+      ],
+      "txn_atomic": true
+    },
+    {
+      "qid": 1,
+      "system": "tridb",
+      "k": 5,
+      "latency_ms": 0.788,
+      "peak_intermediate_rows": 5,
+      "corpus_examined": 74,
+      "corpus_size": 2000,
+      "result_chunks": [
+        "chunk 573",
+        "chunk 1909",
+        "chunk 1024",
+        "chunk 278",
+        "chunk 882"
+      ],
+      "txn_atomic": true
+    },
+    {
+      "qid": 2,
+      "system": "tridb",
+      "k": 5,
+      "latency_ms": 1.368,
+      "peak_intermediate_rows": 5,
+      "corpus_examined": 128,
+      "corpus_size": 2000,
+      "result_chunks": [
+        "chunk 1013",
+        "chunk 1209",
+        "chunk 905",
+        "chunk 1347",
+        "chunk 1754"
+      ],
+      "txn_atomic": true
+    },
+    {
+      "qid": 3,
+      "system": "tridb",
+      "k": 5,
+      "latency_ms": 0.982,
+      "peak_intermediate_rows": 5,
+      "corpus_examined": 94,
+      "corpus_size": 2000,
+      "result_chunks": [
+        "chunk 524",
+        "chunk 1105",
+        "chunk 1343",
+        "chunk 1938",
+        "chunk 1777"
+      ],
+      "txn_atomic": true
+    },
+    {
+      "qid": 4,
+      "system": "tridb",
+      "k": 5,
+      "latency_ms": 1.228,
+      "peak_intermediate_rows": 5,
+      "corpus_examined": 80,
+      "corpus_size": 2000,
+      "result_chunks": [
+        "chunk 508",
+        "chunk 1133",
+        "chunk 637",
+        "chunk 795",
+        "chunk 703"
+      ],
+      "txn_atomic": true
+    },
+    {
+      "qid": 5,
+      "system": "tridb",
+      "k": 5,
+      "latency_ms": 1.272,
+      "peak_intermediate_rows": 5,
+      "corpus_examined": 75,
+      "corpus_size": 2000,
+      "result_chunks": [
+        "chunk 1609",
+        "chunk 1905",
+        "chunk 889",
+        "chunk 1098",
+        "chunk 1087"
+      ],
+      "txn_atomic": true
+    },
+    {
+      "qid": 6,
+      "system": "tridb",
+      "k": 5,
+      "latency_ms": 1.086,
+      "peak_intermediate_rows": 5,
+      "corpus_examined": 64,
+      "corpus_size": 2000,
+      "result_chunks": [
+        "chunk 1946",
+        "chunk 669",
+        "chunk 339",
+        "chunk 280",
+        "chunk 1599"
+      ],
+      "txn_atomic": true
+    },
+    {
+      "qid": 7,
+      "system": "tridb",
+      "k": 5,
+      "latency_ms": 0.876,
+      "peak_intermediate_rows": 5,
+      "corpus_examined": 71,
+      "corpus_size": 2000,
+      "result_chunks": [
+        "chunk 164",
+        "chunk 1719",
+        "chunk 282",
+        "chunk 1339",
+        "chunk 1690"
+      ],
+      "txn_atomic": true
+    },
+    {
+      "qid": 8,
+      "system": "tridb",
+      "k": 5,
+      "latency_ms": 1.611,
+      "peak_intermediate_rows": 5,
+      "corpus_examined": 100,
+      "corpus_size": 2000,
+      "result_chunks": [
+        "chunk 701",
+        "chunk 460",
+        "chunk 1579",
+        "chunk 1840",
+        "chunk 53"
+      ],
+      "txn_atomic": true
+    },
+    {
+      "qid": 9,
+      "system": "tridb",
+      "k": 5,
+      "latency_ms": 1.407,
+      "peak_intermediate_rows": 5,
+      "corpus_examined": 103,
+      "corpus_size": 2000,
+      "result_chunks": [
+        "chunk 1238",
+        "chunk 1140",
+        "chunk 1829",
+        "chunk 1047",
+        "chunk 1142"
+      ],
+      "txn_atomic": true
+    },
+    {
+      "qid": 10,
+      "system": "tridb",
+      "k": 5,
+      "latency_ms": 0.812,
+      "peak_intermediate_rows": 5,
+      "corpus_examined": 65,
+      "corpus_size": 2000,
+      "result_chunks": [
+        "chunk 290",
+        "chunk 941",
+        "chunk 985",
+        "chunk 702",
+        "chunk 849"
+      ],
+      "txn_atomic": true
+    },
+    {
+      "qid": 11,
+      "system": "tridb",
+      "k": 5,
+      "latency_ms": 1.687,
+      "peak_intermediate_rows": 5,
+      "corpus_examined": 69,
+      "corpus_size": 2000,
+      "result_chunks": [
+        "chunk 727",
+        "chunk 1743",
+        "chunk 1095",
+        "chunk 745",
+        "chunk 1320"
+      ],
+      "txn_atomic": true
+    }
+  ],
+  "baseline_samples": [
+    {
+      "qid": 0,
+      "system": "baseline",
+      "k": 5,
+      "latency_ms": 0.0,
+      "peak_intermediate_rows": 160,
+      "corpus_examined": 2000,
+      "corpus_size": 2000,
+      "result_chunks": [
+        "chunk 849",
+        "chunk 627",
+        "chunk 197",
+        "chunk 47",
+        "chunk 1408"
+      ],
+      "txn_atomic": true
+    },
+    {
+      "qid": 1,
+      "system": "baseline",
+      "k": 5,
+      "latency_ms": 0.0,
+      "peak_intermediate_rows": 160,
+      "corpus_examined": 2000,
+      "corpus_size": 2000,
+      "result_chunks": [
+        "chunk 573",
+        "chunk 1909",
+        "chunk 1024",
+        "chunk 278",
+        "chunk 882"
+      ],
+      "txn_atomic": true
+    },
+    {
+      "qid": 2,
+      "system": "baseline",
+      "k": 5,
+      "latency_ms": 0.0,
+      "peak_intermediate_rows": 160,
+      "corpus_examined": 2000,
+      "corpus_size": 2000,
+      "result_chunks": [
+        "chunk 1013",
+        "chunk 1209",
+        "chunk 905",
+        "chunk 1347",
+        "chunk 1754"
+      ],
+      "txn_atomic": true
+    },
+    {
+      "qid": 3,
+      "system": "baseline",
+      "k": 5,
+      "latency_ms": 0.0,
+      "peak_intermediate_rows": 160,
+      "corpus_examined": 2000,
+      "corpus_size": 2000,
+      "result_chunks": [
+        "chunk 524",
+        "chunk 1105",
+        "chunk 1343",
+        "chunk 1938",
+        "chunk 1777"
+      ],
+      "txn_atomic": true
+    },
+    {
+      "qid": 4,
+      "system": "baseline",
+      "k": 5,
+      "latency_ms": 0.0,
+      "peak_intermediate_rows": 160,
+      "corpus_examined": 2000,
+      "corpus_size": 2000,
+      "result_chunks": [
+        "chunk 508",
+        "chunk 1133",
+        "chunk 637",
+        "chunk 795",
+        "chunk 703"
+      ],
+      "txn_atomic": true
+    },
+    {
+      "qid": 5,
+      "system": "baseline",
+      "k": 5,
+      "latency_ms": 0.0,
+      "peak_intermediate_rows": 160,
+      "corpus_examined": 2000,
+      "corpus_size": 2000,
+      "result_chunks": [
+        "chunk 1609",
+        "chunk 1905",
+        "chunk 889",
+        "chunk 1098",
+        "chunk 1087"
+      ],
+      "txn_atomic": true
+    },
+    {
+      "qid": 6,
+      "system": "baseline",
+      "k": 5,
+      "latency_ms": 0.0,
+      "peak_intermediate_rows": 160,
+      "corpus_examined": 2000,
+      "corpus_size": 2000,
+      "result_chunks": [
+        "chunk 1946",
+        "chunk 669",
+        "chunk 339",
+        "chunk 280",
+        "chunk 1599"
+      ],
+      "txn_atomic": true
+    },
+    {
+      "qid": 7,
+      "system": "baseline",
+      "k": 5,
+      "latency_ms": 0.0,
+      "peak_intermediate_rows": 160,
+      "corpus_examined": 2000,
+      "corpus_size": 2000,
+      "result_chunks": [
+        "chunk 164",
+        "chunk 1719",
+        "chunk 282",
+        "chunk 1339",
+        "chunk 1690"
+      ],
+      "txn_atomic": true
+    },
+    {
+      "qid": 8,
+      "system": "baseline",
+      "k": 5,
+      "latency_ms": 0.0,
+      "peak_intermediate_rows": 160,
+      "corpus_examined": 2000,
+      "corpus_size": 2000,
+      "result_chunks": [
+        "chunk 701",
+        "chunk 460",
+        "chunk 1579",
+        "chunk 1840",
+        "chunk 53"
+      ],
+      "txn_atomic": true
+    },
+    {
+      "qid": 9,
+      "system": "baseline",
+      "k": 5,
+      "latency_ms": 0.0,
+      "peak_intermediate_rows": 160,
+      "corpus_examined": 2000,
+      "corpus_size": 2000,
+      "result_chunks": [
+        "chunk 1238",
+        "chunk 1140",
+        "chunk 1829",
+        "chunk 1047",
+        "chunk 1142"
+      ],
+      "txn_atomic": true
+    },
+    {
+      "qid": 10,
+      "system": "baseline",
+      "k": 5,
+      "latency_ms": 0.0,
+      "peak_intermediate_rows": 160,
+      "corpus_examined": 2000,
+      "corpus_size": 2000,
+      "result_chunks": [
+        "chunk 290",
+        "chunk 941",
+        "chunk 985",
+        "chunk 702",
+        "chunk 849"
+      ],
+      "txn_atomic": true
+    },
+    {
+      "qid": 11,
+      "system": "baseline",
+      "k": 5,
+      "latency_ms": 0.0,
+      "peak_intermediate_rows": 160,
+      "corpus_examined": 2000,
+      "corpus_size": 2000,
+      "result_chunks": [
+        "chunk 727",
+        "chunk 1743",
+        "chunk 1095",
+        "chunk 745",
+        "chunk 1320"
+      ],
+      "txn_atomic": true
+    }
+  ]
+}

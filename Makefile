@@ -1,4 +1,4 @@
-.PHONY: test lint graph-test smoke-test test-all baseline-up baseline-down seed bench clean
+.PHONY: test lint graph-test smoke-test test-all baseline-up baseline-down seed bench bench-live clean
 
 IMAGE ?= tridb/msvbase:dev
 ENGINE_TESTS := test/graph_store_test.sql test/trimodal_compose.sql \
@@ -48,6 +48,18 @@ bench:
 	  python3 tools/seed_corpus.py --entities 200 --dim 32 --out data/seed/
 	python3 -m bench.harness --seed-dir data/seed --k 5 --engine stub \
 	  --out bench/out/bench_metrics.json --html bench/out/report.html
+
+# LIVE TriDB Phase-3 benchmark (DEV-1172/1173): drives the canonical query on the
+# REAL forked-MSVBASE engine (tridb/msvbase:dev) over a real corpus across many
+# queries, captures the actual TriDB-side numbers (tjs answer set + parity oracle,
+# tjs_candidates_examined -> SM-3, EXPLAIN ANALYZE latency), derives SM-1..SM-5 vs
+# the in-process baseline model, and renders bench/results/report_live.html.
+# Needs the image (scripts/x86build.sh --docker). The TriDB side is live-measured;
+# SM-2 head-to-head + the 128 GB headline are GX10-/stack-gated (see the report).
+bench-live:
+	@docker image inspect $(IMAGE) >/dev/null 2>&1 || \
+	  { echo "image $(IMAGE) not built — run scripts/x86build.sh --docker"; exit 1; }
+	bash scripts/bench_live.sh $(IMAGE)
 
 baseline-up:
 	docker compose -f baseline/docker-compose.yml up -d
