@@ -1,12 +1,26 @@
 # SQL/PGQ Surface → Logical Plan v0.1.0
 
 > **Date:** 2026-06-23
-> **Status:** Draft — design deliverable for DEV-1167 (Phase 2)
-> **Gating:** 🟡 design unblocked here; TJS operator implementation is GX10-gated (DEV-1169)
+> **Status:** Implemented (surface) — DEV-1167 landed on `dustin/dev-1167` (2026-06-25)
+> **Gating:** surface is hardware-independent (plpgsql); `tjs()` it lowers to is in the
+>   `tridb/msvbase:dev` image (DEV-1169)
 > **Depends on:** `spec/tridb_spec_v0.1.0.md §5`, `docs/graph_store_layout_v0.1.0.md`,
 >   DEV-1169 (TJS operator), DEV-1170 (join-order heuristic)
+> **Implementation decision:** see §11 below + ADR-0008.
 
 ---
+
+## 0. Implementation note (DEV-1167, 2026-06-25)
+
+§§3–4 below describe the *logical* parse→plan model (analyzer expanding `GraphTableExpr`,
+a `GraphTableScan` rtable node). The **v1 surface does not build that querytree machinery** —
+it does not need to, because `tjs()` (DEV-1169) already IS the one logical plan. The shipped
+front door is `graph_store.graph_query(canonical_sql text)`: a plpgsql set-returning function
+that takes the FULL canonical statement as text, validates it against the single canonical
+template (the scope guard), and lowers it to exactly one `tjs(...)` call. The §3 "RangeFunction
+in the FROM list" approach was **disproven empirically** (stock PG 13.4 raises a syntax error on
+the unquoted MATCH payload — see §11 and ADR-0008); §§3–4 are retained as the target logical
+model for the future CustomScan upgrade. The actual mapping landed is in §11.
 
 ## 1. The One Canonical Query
 
@@ -293,3 +307,61 @@ in-flight tuple. All three legs are index-driven iterators.
 - **Adaptive re-planning:** join-order is fixed at plan time. If the driving leg's
   selectivity estimate is wrong at runtime (e.g., the timestamp range is wider than
   statistics suggest), the plan does not adapt. Deferred to v2.
+
+---
+
+## 11. Landed surface (DEV-1167) — how the canonical text lowers to `tjs()`
+
+**Surface mechanism.** `graph_store.graph_query(canonical_sql text) RETURNS SETOF text`
+(plpgsql, in the `graph_store` extension; install SQL `src/graph_store_ext/graph_store--0.1.0.sql`).
+The whole canonical statement is passed as one text argument with the three `:params`
+substituted to literals. Rationale (both verified on `tridb/msvbase:dev`, ADR-0008):
+
+1. The verbatim canonical `GRAPH_TABLE ( MATCH (src:entity)-[:related_to]->… )` is a **PG 13.4
+   syntax error** (`syntax error at or near ":"`) — `(:label)` / `-[:edge]->` are not valid SQL
+   expression grammar, so a bare RangeFunction call never reaches the function body. Carrying the
+   payload verbatim without a grammar fork is only possible as a string literal.
+2. The single global top-k must live inside `tjs()`. An outer `ORDER BY <-> LIMIT` is a blocking
+   sort over the scalar `<->`, which returns 0 outside an index scan (ADR-0006) — wrong rankings,
+   forfeits TR-1. So the front door owns WHERE + ORDER BY + LIMIT, not just the MATCH.
+
+**Scope guard.** One anchored, case-insensitive regex over the whitespace-normalized statement
+validates the single canonical template. Off-template variants (wrong edge label, extra hop,
+wrong COLUMNS projection, missing `<->`, missing LIMIT) fail to match and `RAISE EXCEPTION` —
+golden rule 4.
+
+**Lowering (argument mapping).**
+
+```
+SELECT chunk
+FROM GRAPH_TABLE ( MATCH (src:entity)-[:related_to]->(dst:entity)
+  COLUMNS ( src.embedding AS src_embedding, dst.chunk AS chunk, dst.timestamp AS timestamp ) )
+WHERE src.id = <N> AND timestamp IN (<window>)
+ORDER BY src_embedding <-> '<vector>'
+LIMIT <k>
+        │
+        ▼
+tjs('entities', <k>, 0, <N>::bigint, 'id, chunk', 'ts IN (<window>)', 'embedding <-> ''<vector>''')
+```
+
+| `tjs` arg | from |
+|---|---|
+| `table_name = 'entities'` | the `:entity` label backing relation |
+| `k` | `LIMIT <k>` |
+| `term_cond = 0` | canonical has no override |
+| `src` | `WHERE src.id = <N>` (the v1 single-src binding) |
+| `attr_exp = 'id, chunk'` | 1st col = candidate graph id (tjs reachability contract); chunk returned |
+| `filter_exp` | `timestamp IN (<window>)`, canonical `timestamp` → physical `ts` |
+| `orderby_exp` | `embedding <-> '<vector>'` (the dst embedding) |
+
+**Surface ↔ operator contract gaps (real, bridged by a documented v1 binding — ADR-0008):**
+(1) the canonical `src` is a pattern variable (a SET); `tjs` takes one vertex → v1 **requires**
+`WHERE src.id = <const>`. (2) The canonical `ORDER BY src_embedding` cannot rank a single pinned
+src; it is mapped onto the dst `embedding` column (exactly what the oracle does). Both match
+`test/trimodal_compose.sql` / `test/canonical_e2e_test.sql`. Recommend a spec §5 addendum.
+
+**Test.** `test/parse_canonical.sql` (wired into `Makefile` `ENGINE_TESTS`; run via
+`scripts/tjs_test.sh … test/parse_canonical.sql`) asserts: (1) canonical via the surface returns
+`{20,10}` = the direct `tjs()` answer (FR-4 one plan); (2) the timestamp filter is load-bearing
+(window `IN (100)` → 30, `IN (100,999)` → 40); (3) the scope guard rejects 5 off-template
+variants. All green.
