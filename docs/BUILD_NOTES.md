@@ -19,6 +19,22 @@ create index ... using hnsw(...);     -- HNSW index builds
 
 This validates the relational + vector legs (DEV-1162 acceptance) on the standin.
 
+## Pinned upstream
+
+Both build scripts default `PIN_COMMIT` to MSVBASE
+`1a548db14d7a3f6f64808c99b9bc1aa01a25b71f` ("Fix vector constant parsing. (#20)") — the exact
+upstream commit this build was validated against, so the x86 standin and the GX10 compile the
+same source. Override with `--commit <sha>` to build a different revision (and re-validate).
+
+## Download integrity
+
+Build-time downloads are **checksum-verified** (`sha256sum -c`) and TLS verification is on
+(`--no-check-certificate` removed). `harden_dockerfile_downloads` in
+`scripts/lib/msvbase_patches.sh` rewrites the Dockerfile's Boost and CMake `wget … | tar`
+streams into download → verify → extract; the pinned hashes (Boost 1.81.0, CMake 3.14.4 x86_64,
+CMake 3.27.9 aarch64) live as constants at the top of that lib. Update them whenever a version
+changes or MSVBASE is re-pinned.
+
 ## What the standin proves vs. what still needs the GX10
 
 | Proven here (x86_64) | Still GX10-only |
@@ -53,3 +69,17 @@ must confirm the same recipe on ARM64.
 scripts/x86build.sh --docker     # build tridb/msvbase:dev (applies all 7 fixes)
 scripts/smoke_test.sh            # prove relational + vector legs work
 ```
+
+## Build-script parity (x86build / gx10build)
+
+Both build scripts share `scripts/lib/msvbase_patches.sh` — the single source of truth for the
+pinned commit, the submodule-patch apply+verify, the Dockerfile fixes, and the modern-GCC
+force-includes — so they cannot drift. Both build the image via MSVBASE's own Dockerfile (not a
+hand-rolled `make`/`configure`). The ONLY difference is one target delta: `gx10build.sh` calls
+`patch_cmake_aarch64`, which swaps the Dockerfile's hardcoded x86_64 CMake tarball
+(`cmake-3.14.4-Linux-x86_64`) for an aarch64 release (`cmake-3.27.9-linux-aarch64`) — 3.14.4
+predates Kitware's aarch64 Linux builds, and MSVBASE only requires CMake ≥ 3.14.
+
+`gx10build.sh` is **correct-by-construction against the proven x86 recipe but NOT independently
+validated** until actually run on the GX10 (DEV-1160/1161). The GX10 run is the real ARM64
+sign-off; until then, treat the aarch64 build as unverified.

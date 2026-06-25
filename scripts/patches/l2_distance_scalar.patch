@@ -1,0 +1,32 @@
+diff --git a/src/operator.cpp b/src/operator.cpp
+index cdb3c68..84900ef 100644
+--- a/src/operator.cpp
++++ b/src/operator.cpp
+@@ -45,19 +45,19 @@ Datum l2_distance(PG_FUNCTION_ARGS)
+                         rhs.size())));
+     }
+ 
+-    size_t dim = lhs.size();
+-
+-    PG_RETURN_FLOAT8(L2Distance.get_dist_func()(lhs.data(), rhs.data(), &dim));
+-
+-    /*
++    // TRIDB: real scalar L2 distance (plan 005 / DEV-1168). The static L2Space was built with
++    // dim=0, so get_dist_func() selected hnswlib's L2SqrSIMD16Ext, which sums only full
++    // 16-float blocks (qty16 = qty >> 4) -- for any dim < 16 (or not a multiple of 16) it drops
++    // the residual and returns 0 outside an index scan. Compute the Euclidean distance directly
++    // from the two arrays, independent of any HNSW scan state. The index path is unaffected: it
++    // builds its own correctly-dimensioned L2Space in the HNSW scan, not this static one.
++    double distance = 0.0;
+     for (size_t i = 0; i < lhs.size(); i++)
+     {
+-        diff = lhs[i] - rhs[i];
++        double diff = static_cast<double>(lhs[i]) - static_cast<double>(rhs[i]);
+         distance += diff * diff;
+     }
+-
+     PG_RETURN_FLOAT8(std::sqrt(distance));
+-    */
+ }
+ 
+ Datum range_l2_distance(PG_FUNCTION_ARGS)

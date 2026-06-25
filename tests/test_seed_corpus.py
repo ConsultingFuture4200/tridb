@@ -67,3 +67,61 @@ def test_deterministic(tmp_path):
     _run(b, seed=7)
     assert (a / "entities.csv").read_bytes() == (b / "entities.csv").read_bytes()
     assert (a / "edges.csv").read_bytes() == (b / "edges.csv").read_bytes()
+
+
+def _run_raw(out_dir, *extra):
+    """Invoke the generator directly with arbitrary flags; return the CompletedProcess."""
+    return subprocess.run(
+        [sys.executable, str(GEN), "--out", str(out_dir), *extra],
+        capture_output=True,
+        text=True,
+    )
+
+
+def test_rejects_zero_dim(tmp_path):
+    r = _run_raw(tmp_path / "s", "--dim", "0")
+    assert r.returncode != 0
+    assert "Traceback" not in r.stderr
+    assert "--dim" in r.stderr
+
+
+def test_rejects_zero_entities(tmp_path):
+    r = _run_raw(tmp_path / "s", "--entities", "0")
+    assert r.returncode != 0
+    assert "Traceback" not in r.stderr
+    assert "--entities" in r.stderr
+
+
+def test_rejects_negative_edges(tmp_path):
+    r = _run_raw(tmp_path / "s", "--edges-per-node", "-1")
+    assert r.returncode != 0
+    assert "Traceback" not in r.stderr
+    assert "--edges-per-node" in r.stderr
+
+
+def test_rejects_narrow_time_window(tmp_path):
+    r = _run_raw(tmp_path / "s", "--time-min", "1000", "--time-max", "1010")
+    assert r.returncode != 0
+    assert "Traceback" not in r.stderr
+    assert "--time-max" in r.stderr
+
+
+def test_single_entity_boundary(tmp_path):
+    # --entities 1: no self-edges possible -> zero edges, but must not crash.
+    out = tmp_path / "s"
+    _run(out, entities=1, epn=4)
+    rows = list(csv.DictReader((out / "entities.csv").open()))
+    assert len(rows) == 1
+    edges = list(csv.DictReader((out / "edges.csv").open()))
+    assert edges == []
+
+
+def test_embeddings_are_l2_normalized(tmp_path):
+    import math
+
+    out = tmp_path / "s"
+    _run(out, entities=8, dim=16)
+    for row in csv.DictReader((out / "entities.csv").open()):
+        vals = [float(x) for x in row["embedding"].strip("{}").split(",")]
+        norm = math.sqrt(sum(v * v for v in vals))
+        assert abs(norm - 1.0) < 1e-4

@@ -21,7 +21,7 @@
 set -euo pipefail
 
 REPO_URL="https://github.com/microsoft/MSVBASE.git"
-PIN_COMMIT=""
+PIN_COMMIT="${PIN_COMMIT:-}"   # default supplied by scripts/lib/msvbase_patches.sh; --commit overrides
 JOBS="$(nproc)"
 VENDOR_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/vendor"
 PREFIX="${VENDOR_DIR}/MSVBASE/install"
@@ -45,65 +45,16 @@ done
 log() { printf '\033[1;34m[x86build]\033[0m %s\n' "$*"; }
 die() { printf '\033[1;31m[x86build] FATAL:\033[0m %s\n' "$*" >&2; exit 1; }
 
+# Shared MSVBASE clone/patch/verify logic (PIN_COMMIT default, apply_msvbase_patches,
+# verify_patches, patch_upstream_dockerfile, patch_modern_gcc_includes, patch_cmake_aarch64).
+# Sourced AFTER arg parsing so --commit survives the PIN_COMMIT default. Defines only.
+LIB="$(dirname "${BASH_SOURCE[0]}")/lib/msvbase_patches.sh"
+[[ -f "$LIB" ]] || die "missing shared lib: $LIB"
+# shellcheck source=lib/msvbase_patches.sh
+source "$LIB"
+
 ARCH="$(uname -m)"
 [[ "$ARCH" == "x86_64" ]] || die "this is the x86_64 dev build; got '$ARCH'. For the GX10 use scripts/gx10build.sh."
-
-# Patch known-dead upstream URLs in the MSVBASE Dockerfile. Arch-independent bit-rot —
-# applies equally to the GX10 build. Idempotent.
-patch_upstream_dockerfile() {
-  local df="$1"
-  [[ -f "$df" ]] || return 0
-  if grep -q 'boostorg.jfrog.io' "$df"; then
-    log "patching dead Boost URL (boostorg.jfrog.io left JFrog in 2024) -> archives.boost.io"
-    sed -i 's#https://boostorg.jfrog.io/artifactory/main/release/1.81.0/source/boost_1_81_0.tar.gz#https://archives.boost.io/release/1.81.0/source/boost_1_81_0.tar.gz#g' "$df"
-  fi
-  # Hardcoded GID/UID 999 collides with a pre-existing group in current gcc:12.3.0 base.
-  # Add -o (allow non-unique id) so the postgres group/user reuses 999 without erroring.
-  if grep -q 'groupadd -r postgres --gid=' "$df"; then
-    log "patching postgres GID/UID 999 collision (add -o for non-unique id)"
-    sed -i 's/groupadd -r postgres --gid=/groupadd -r -o postgres --gid=/g' "$df"
-    sed -i 's/useradd -m -r -g postgres --uid=/useradd -m -r -o -g postgres --uid=/g' "$df"
-  fi
-  # PG 13.4 plpython.h #include "eval.h" — removed in Python 3.11+, so --with-python fails
-  # against the base image's modern Python. PL/Python is not used by TriDB (all C), so drop it.
-  if grep -q -- '--with-python' "$df"; then
-    log "dropping --with-python from PG configure (eval.h gone in Python 3.11+; PL/Python unused by TriDB v1)"
-    sed -i '/--with-python/d' "$df"
-  fi
-}
-
-# Modern GCC (12/13 in the gcc:12.3.0 base) no longer transitively includes <mutex>,
-# <cstdint>, etc. — old SPTAG/vectordb code assumed it did. Force-include the dropped
-# headers via each CMakeLists' own CXX flags (SPTAG resets CMAKE_CXX_FLAGS, so a global
-# -D won't reach it). Idempotent. Arch-independent; same fix needed on the GX10.
-# The Dockerfile COPYs the host tree and never runs scripts/patch.sh, so the MSVBASE
-# submodule patches (spann/hnsw/Postgres) — which ADD relaxed monotonicity:
-# amcanrelaxedorderbyop + xs_inorder on PostgreSQL, ResultIterator/QueryResult on hnswlib —
-# must be applied on the host BEFORE docker build. scripts/patch.sh uses `git apply` (not
-# idempotent), so guard on a sentinel the Postgres patch introduces.
-apply_msvbase_patches() {
-  local root="$1"
-  if grep -rq 'amcanrelaxedorderbyop' "$root/thirdparty/Postgres/src/include/access/" 2>/dev/null; then
-    log "MSVBASE submodule patches already applied"
-    return 0
-  fi
-  log "applying MSVBASE submodule patches (scripts/patch.sh: spann, hnsw, Postgres) — relaxed monotonicity"
-  ( cd "$root" && bash scripts/patch.sh )
-}
-
-FORCE_INC='-include cstdint -include mutex -include shared_mutex -include memory -include cstring -include limits -include functional'
-patch_modern_gcc_includes() {
-  local root="$1"
-  local sptag_cm="$root/thirdparty/SPTAG/CMakeLists.txt"
-  # SPTAG only: it sets CXX-only flags, so force-includes never leak onto the C compiler.
-  # (Do NOT touch the top vectordb CMakeLists — it derives CMAKE_C_FLAGS from CMAKE_CXX_FLAGS,
-  # so a C++-header force-include there breaks cmake's OpenMP_C probe. Use a CXX-only genexp
-  # if vectordb sources ever need it.)
-  if [[ -f "$sptag_cm" ]] && grep -q -- '-std=c++14 -fopenmp"' "$sptag_cm" && ! grep -q 'include cstdint' "$sptag_cm"; then
-    log "force-including dropped std headers into SPTAG build (modern GCC transitive-include fix)"
-    sed -i "s/-std=c++14 -fopenmp\"/-std=c++14 -fopenmp ${FORCE_INC}\"/" "$sptag_cm"
-  fi
-}
 
 require() { command -v "$1" >/dev/null 2>&1 || die "missing required tool: $1"; }
 require git
@@ -114,7 +65,7 @@ if [[ "$USE_DOCKER" -eq 1 ]]; then
   SRC="${VENDOR_DIR}/MSVBASE"
   [[ -d "$SRC/.git" ]] || git clone "$REPO_URL" "$SRC"
   cd "$SRC"
-  [[ -n "$PIN_COMMIT" ]] && git checkout -q "$PIN_COMMIT"
+  if [[ -n "$PIN_COMMIT" ]]; then git fetch --quiet origin && git checkout -q "$PIN_COMMIT"; fi
   git submodule update --init --recursive
   apply_msvbase_patches "$SRC"        # spann/hnsw/Postgres — relaxed monotonicity. MUST precede force-includes.
   patch_upstream_dockerfile "$SRC/Dockerfile"
@@ -126,6 +77,9 @@ if [[ "$USE_DOCKER" -eq 1 ]]; then
 fi
 
 # --- native (non-docker) build ----------------------------------------------
+# NOTE: the --docker path is the VALIDATED recipe. This native path is a secondary,
+# not-regularly-exercised build; it now shares the same patch+verify layer, but treat a green
+# native build as unproven until run.
 require curl; require make; require gcc; require cmake
 log "cmake: $(cmake --version | head -1)  (native x86_64 — no aarch64 substitution needed)"
 
@@ -134,13 +88,16 @@ mkdir -p "$VENDOR_DIR"
 if [[ "$SKIP_CLONE" -eq 0 ]]; then
   [[ -d "$SRC/.git" ]] || { log "cloning MSVBASE -> $SRC"; git clone "$REPO_URL" "$SRC"; }
   cd "$SRC"
-  [[ -n "$PIN_COMMIT" ]] && git checkout -q "$PIN_COMMIT"
+  if [[ -n "$PIN_COMMIT" ]]; then git fetch --quiet origin && git checkout -q "$PIN_COMMIT"; fi
   log "init submodules"
   git submodule update --init --recursive
 fi
 cd "$SRC"
 
-[[ -f scripts/patch.sh ]] && { log "applying submodule patches"; bash scripts/patch.sh || die "patch step failed"; }
+# Same patch+verify layer as the --docker path: submodule patches (relaxed monotonicity),
+# the TriDB l2_distance fix, and the fail-loud sentinel check. (Previously this path ran
+# scripts/patch.sh inline with no l2 patch and no verify — H2.)
+apply_msvbase_patches "$SRC"
 
 export MSVBASE_DISABLE_SPTAG=1
 log "SPTAG excluded (HNSW-only v1). Postgres fork: --with-blocksize=32 (drives DEV-1163 layout)."

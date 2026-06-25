@@ -24,6 +24,20 @@ def main():
 
     args = parser.parse_args()
 
+    # Validate before doing any work — degenerate inputs otherwise crash deep in
+    # numpy (dim=0 -> divide-by-zero embedding; entities=0 -> negative rng.choice
+    # size; a time window narrower than the 30-wide query span -> rng.integers low>=high).
+    if args.dim < 1:
+        parser.error("--dim must be >= 1")
+    if args.entities < 1:
+        parser.error("--entities must be >= 1")
+    if args.edges_per_node < 0:
+        parser.error("--edges-per-node must be >= 0")
+    if args.time_max - args.time_min < 30:
+        parser.error(
+            "--time-max must be at least 30 greater than --time-min (query span is 30)"
+        )
+
     os.makedirs(args.out, exist_ok=True)
 
     rng = np.random.default_rng(args.seed)

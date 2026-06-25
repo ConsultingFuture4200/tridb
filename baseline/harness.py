@@ -417,6 +417,14 @@ def run_query(query: dict, k: int, drivers: dict, conn: Conn) -> QueryMetrics:
     return m
 
 
+def _cleanup(label: str, fn) -> None:
+    """Run one teardown call; log and swallow failures so the others still run."""
+    try:
+        fn()
+    except Exception as exc:  # noqa: BLE001 - teardown must not mask the real error
+        print(f"[run] WARNING: {label} cleanup failed: {exc}")
+
+
 def run(seed_dir: Path, k: int, out_path: Path, conn: Conn) -> None:
     """Run every query in the corpus and write per-query metrics to JSON."""
     queries = _read_queries(seed_dir)
@@ -446,11 +454,16 @@ def run(seed_dir: Path, k: int, out_path: Path, conn: Conn) -> None:
                 f"final={m.final_results}"
             )
     finally:
-        from pymilvus import connections as milvus_connections
+        # Each teardown runs independently: a failure in one must not leak the
+        # other two connections (the original single try-less block did exactly that).
+        def _disconnect_milvus() -> None:
+            from pymilvus import connections as milvus_connections
 
-        drivers["neo4j"].close()
-        milvus_connections.disconnect(milvus_alias)
-        drivers["postgres"].close()
+            milvus_connections.disconnect(milvus_alias)
+
+        _cleanup("neo4j", drivers["neo4j"].close)
+        _cleanup("milvus", _disconnect_milvus)
+        _cleanup("postgres", drivers["postgres"].close)
 
     payload = {
         "baseline": "akasicdb-scenario-2-out-of-db",

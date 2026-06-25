@@ -55,12 +55,14 @@ Kickoff: 2026-06-23. Tracked in Linear project **TriDB**
 
 ### Hardware gating
 
-The target hardware is the **GX10 (ARM64 + CUDA, 128 GB)**. The MSVBASE fork build
-(DEV-1160) and the native C access-method work (DEV-1164/1165/1166, DEV-1168/1169/1170)
-**must run on the GX10** and cannot be compiled on a non-target workstation. This repo
-contains the hardware-independent layer that is buildable anywhere — design specs, the
-reproducible build script, the seed-corpus tooling, and the benchmark baseline harness —
-plus interface-level skeletons for the gated C work.
+The target hardware is the **GX10 (ARM64 + CUDA, 128 GB)**. The MSVBASE fork build was the
+original gate, but the fork now **builds and runs on an x86_64 standin**
+(`scripts/x86build.sh --docker`; see `docs/BUILD_NOTES.md`), so the native C access-method work
+(DEV-1164/1165/1166, DEV-1168/1169/1170) is developed and tested there. What remains strictly
+**GX10-only**: the ARM64 build sign-off (DEV-1160) and the 128 GB headline benchmark. This repo
+also contains the hardware-independent layer that is buildable anywhere — design specs, the
+reproducible build scripts, the seed-corpus tooling, and the benchmark baseline harness — plus
+interface-level skeletons for the gated C work.
 
 See `docs/STATUS.md` for the per-issue gated/unblocked breakdown.
 
