@@ -69,6 +69,8 @@ verify_patches() {
     || die "TriDB tridb_hnsw_scan_no_orderby.patch NOT applied in hnswindex.cpp — no-ORDER-BY scan guard missing (DEV-1236); drift?"
   grep -q 'null-safe teardown' "$root/src/hnswindex_scan.cpp" 2>/dev/null \
     || die "TriDB tridb_hnsw_scan_no_orderby.patch NOT applied in hnswindex_scan.cpp — null-safe EndScan missing (DEV-1236); drift?"
+  grep -q 'TRIDB: HNSW rebuild-on-recovery (DEV-1235)' "$root/src/hnswindex_scan.cpp" 2>/dev/null \
+    || die "TriDB tridb_hnsw_rebuild_on_recovery.patch NOT applied — heap-rebuild-on-load missing (DEV-1235); drift?"
   log "all MSVBASE + TriDB fork patches verified present"
 }
 
@@ -203,10 +205,27 @@ apply_tridb_fork_patches() {
       || die "tridb_hnsw_scan_no_orderby.patch did not apply — MSVBASE drift? re-generate per DEV-1236"
   fi
 
+  #   tridb_hnsw_rebuild_on_recovery.patch (DEV-1235, ADR-0009): fixes Defect A — the flat-file
+  #     LoadIndex path stale after crash or in any fresh backend that didn't run ambuild. LoadIndex
+  #     now rebuilds the in-RAM HierarchicalNSW by scanning the WAL-durable HEAP (SnapshotAny +
+  #     HeapTupleSatisfiesVacuum) on cache-miss. The heap is the source of truth. aminsert double-add
+  #     is handled by hnswlib::addPoint's built-in label idempotency. Must apply AFTER
+  #     tridb_hnsw_scan_no_orderby.patch. BUILT AND VERIFIED on x86 standin: git apply --check exit 0;
+  #     oracles A (crash recovery), B (cross-session), C (abort exclusion), D (recall/no-dup) all PASS.
+  local rebuild_patch="${_MSVBASE_LIB_DIR}/../patches/tridb_hnsw_rebuild_on_recovery.patch"
+  [[ -f "$rebuild_patch" ]] || die "missing TriDB fork patch: $rebuild_patch"
+  if grep -q 'TRIDB: HNSW rebuild-on-recovery (DEV-1235)' "$root/src/hnswindex_scan.cpp" 2>/dev/null; then
+    log "TriDB fork patch (HNSW rebuild-on-recovery, DEV-1235) already applied"
+  else
+    log "applying TriDB fork patch: HNSW rebuild-on-recovery — heap as source of truth (DEV-1235 / ADR-0009)"
+    ( cd "$root" && git apply "$rebuild_patch" ) \
+      || die "tridb_hnsw_rebuild_on_recovery.patch did not apply — MSVBASE drift? re-generate per DEV-1235"
+  fi
+
   # ----------------------------------------------------------------------------
-  # DRAFT / UNBUILT — DO NOT ENABLE (DEV-1235 / ADR-0009): HNSW WAL durability.
+  # SUPERSEDED / DO NOT ENABLE (DEV-1235 / ADR-0009): original GenericXLog draft.
   # ----------------------------------------------------------------------------
-  #   hnsw_wal_durability.patch makes the vendored HNSW index crash/abort-durable
+  #   hnsw_wal_durability.patch was the DRAFT GenericXLog approach for HNSW durability.
   #   by routing every index mutation through the SAME Postgres WAL the native
   #   graph store uses (GenericXLog) — see docs/decisions/0009-hnsw-wal-durability.md
   #   and docs/hnsw_wal_durability_bug_analysis_v0.1.0.md. The patch is a SPIKE
