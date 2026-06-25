@@ -65,6 +65,10 @@ verify_patches() {
     || die "TriDB tridb_fix_double_scan_snapshot.patch NOT applied in topk.cpp — snapshot lifecycle fix missing (DEV-1236); drift?"
   grep -q 'DEV-1236' "$root/src/multicol_topk.cpp" 2>/dev/null \
     || die "TriDB tridb_fix_double_scan_snapshot.patch NOT applied in multicol_topk.cpp — snapshot lifecycle fix missing (DEV-1236); drift?"
+  grep -q 'hnsw index scan requires an ORDER BY' "$root/src/hnswindex.cpp" 2>/dev/null \
+    || die "TriDB tridb_hnsw_scan_no_orderby.patch NOT applied in hnswindex.cpp — no-ORDER-BY scan guard missing (DEV-1236); drift?"
+  grep -q 'DEV-1236' "$root/src/hnswindex_scan.cpp" 2>/dev/null \
+    || die "TriDB tridb_hnsw_scan_no_orderby.patch NOT applied in hnswindex_scan.cpp — null-safe EndScan missing (DEV-1236); drift?"
   log "all MSVBASE + TriDB fork patches verified present"
 }
 
@@ -167,7 +171,10 @@ apply_tridb_fork_patches() {
   #     PushActiveSnapshot/PopActiveSnapshot around each child drive (PG_TRY/PG_CATCH for error
   #     path), UnregisterSnapshot in teardown. Also fixes UAF in topk/multicol_topk EndFaginsState
   #     (free(state) then free(state->qDescs) reads freed memory; new-allocated vectors were
-  #     free()'d instead of delete'd). BUILT AND VERIFIED on the x86 standin (2026-06-25).
+  #     free()'d instead of delete'd). Builds clean. NOTE: this is latent-UB HARDENING (correct per
+  #     Postgres snapshot-ownership rules + a real teardown UAF) — but no reproducible crash was
+  #     demonstrated for it under controlled stock-vs-patched testing. The REPRODUCIBLE DEV-1236
+  #     crash is the HNSW no-ORDER-BY bug fixed by tridb_hnsw_scan_no_orderby.patch (below).
   local snapshot_patch="${_MSVBASE_LIB_DIR}/../patches/tridb_fix_double_scan_snapshot.patch"
   [[ -f "$snapshot_patch" ]] || die "missing TriDB fork patch: $snapshot_patch"
   if grep -q 'DEV-1236' "$root/src/tjs_operator.cpp" 2>/dev/null; then
@@ -176,6 +183,24 @@ apply_tridb_fork_patches() {
     log "applying TriDB fork patch: snapshot lifecycle + teardown UAF fix (DEV-1236 / ADR-0010)"
     ( cd "$root" && git apply "$snapshot_patch" ) \
       || die "tridb_fix_double_scan_snapshot.patch did not apply — MSVBASE drift? re-generate per DEV-1236"
+  fi
+
+  #   tridb_hnsw_scan_no_orderby.patch (DEV-1236, the REPRODUCIBLE crash): with enable_seqscan off
+  #     the planner picks an Index-Only Scan on the HNSW index for an unordered/aggregate scan
+  #     (e.g. count(*)). hnsw_gettuple's no-ORDER-BY/no-key branch returned false WITHOUT creating a
+  #     ResultIterator, so hnsw_endscan -> HNSWIndexScan::EndScan -> Close() on a null shared_ptr
+  #     SIGSEGV'd the backend (and count(*) silently returned 0). Fix: null-safe EndScan +
+  #     ereport(ERROR) on the unordered-scan branch. BUILT AND VERIFIED on the x86 standin (backtrace
+  #     + deterministic repro flips crash -> clean error). This is the reproducible DEV-1236 crash;
+  #     tridb_fix_double_scan_snapshot.patch above is separate latent-UB hardening.
+  local hnsw_scan_patch="${_MSVBASE_LIB_DIR}/../patches/tridb_hnsw_scan_no_orderby.patch"
+  [[ -f "$hnsw_scan_patch" ]] || die "missing TriDB fork patch: $hnsw_scan_patch"
+  if grep -q 'hnsw index scan requires an ORDER BY' "$root/src/hnswindex.cpp" 2>/dev/null; then
+    log "TriDB fork patch (HNSW no-ORDER-BY scan guard, DEV-1236) already applied"
+  else
+    log "applying TriDB fork patch: HNSW no-ORDER-BY scan guard (DEV-1236)"
+    ( cd "$root" && git apply "$hnsw_scan_patch" ) \
+      || die "tridb_hnsw_scan_no_orderby.patch did not apply — MSVBASE drift? re-generate per DEV-1236"
   fi
 
   # ----------------------------------------------------------------------------

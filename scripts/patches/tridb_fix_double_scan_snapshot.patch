@@ -1,11 +1,17 @@
-# tridb_fix_double_scan_snapshot.patch — DEV-1236 snapshot lifecycle fix
+# tridb_fix_double_scan_snapshot.patch — DEV-1236 snapshot-lifetime HARDENING (not the repro crash)
 #
-# STATUS: patch applies cleanly (git apply --check exit 0) against vendor/MSVBASE after prior
-# patches (l2_distance_scalar, sptag_optional_build, tridb_vector_index_seam, tridb_vector_iter,
-# tridb_tjs_operator). Verified 2026-06-25 on the x86 standin. Full x86build.sh --docker build
-# + repro flip (scripts/smoke_test.sh against _fork_bug_multicol_double_scan.sql) is the
-# required bar to mark fully accepted. See docs/fork_segfault_double_scan.md for evidence.
-# See docs/decisions/0010-fork-operator-snapshot-lifecycle.md for design record.
+# STATUS: applies cleanly (git apply --check exit 0) against vendor/MSVBASE after the prior patches
+# (l2_distance_scalar, sptag_optional_build, tridb_vector_index_seam, tridb_vector_iter,
+# tridb_tjs_operator) and builds clean via x86build.sh --docker.
+#
+# IMPORTANT — what this is, honestly: this is latent-UB HARDENING. The SRF operators borrowed
+# GetActiveSnapshot() across multi-call SRF re-entry without RegisterSnapshot/PushActiveSnapshot,
+# which is incorrect per Postgres snapshot-ownership rules, and topk/multicol_topk teardown had a
+# real use-after-free. BOTH are worth fixing. HOWEVER, controlled stock-vs-patched testing did NOT
+# reproduce a crash that this patch flips: the operator+own-table-scan plpgsql shape survives with
+# AND without this patch. The crash originally filed under DEV-1236 reproduces deterministically as
+# the HNSW no-ORDER-BY bug — fixed by tridb_hnsw_scan_no_orderby.patch, NOT this one.
+# See docs/fork_segfault_double_scan.md and docs/decisions/0010-fork-operator-snapshot-lifecycle.md.
 #
 # WHAT IT FIXES (DEV-1236 diagnosis):
 #   Co-issuing a second executor-driven scan in the SAME plpgsql block as topk()/multicol_topk()/tjs()

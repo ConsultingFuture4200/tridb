@@ -1,6 +1,18 @@
 # ADR-0010: Fork operators must own their snapshot for the full SRF lifetime
 
-**Status:** Accepted — **BUILT AND VERIFIED on the x86 standin** (2026-06-25); GX10/ARM sign-off tabled
+> **CORRECTION (post controlled verification).** This ADR's thesis — that the DEV-1236 SIGSEGV is a
+> snapshot/resource-owner lifecycle collision — did **not** hold up under controlled stock-vs-patched
+> testing: the operator + sibling-scan plpgsql shape **survives with AND without** the snapshot patch
+> (the snapshot UB is latent, not a reliable crash). The change in
+> `tridb_fix_double_scan_snapshot.patch` is therefore accepted as **latent-UB HARDENING** (correct per
+> Postgres snapshot-ownership rules, plus a real teardown use-after-free), **not** as a verified fix
+> for a reproducible crash. The crash actually filed under DEV-1236 reproduces deterministically as the
+> **HNSW no-ORDER-BY bug** (backtrace: `HNSWIndexScan::EndScan` on a null `ResultIterator` for a
+> `count(*)` Index-Only Scan when `enable_seqscan=off`), fixed by `tridb_hnsw_scan_no_orderby.patch`.
+> See `docs/fork_segfault_double_scan.md` for the corrected evidence.
+
+**Status:** Accepted as latent-UB HARDENING (builds clean on the x86 standin); NOT a verified
+reproducible-crash fix (see Correction above). GX10/ARM sign-off tabled.
 **Issue:** DEV-1236 (spike / diagnose)
 **Related:** ADR-0007 (TJS operator), ADR-0006 (relaxed-monotonicity vector iterator),
 DEV-1169 (TJS), DEV-1168 (vector iterator), `docs/fork_segfault_double_scan.md` (full evidence chain),

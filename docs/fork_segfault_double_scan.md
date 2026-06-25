@@ -1,7 +1,20 @@
 # Fork segfault: a second table scan in the same plpgsql block as topk()/multicol_topk()/tjs()
 
-**Issue:** DEV-1236 · **Status:** **BUILT AND VERIFIED on the x86 standin** (`tridb/msvbase:dev`, 2026-06-25)
+**Issue:** DEV-1236 · **Status:** corrected — see banner.
 **Date:** 2026-06-25 · **Box:** x86 standin (not GX10); GX10/ARM sign-off tabled.
+
+> **CORRECTION (post controlled verification — read this first).** The snapshot/resource-owner thesis
+> in the TL;DR and "Evidence chain" below is **not** the operative cause of the reproducible DEV-1236
+> crash. Controlled stock-vs-patched testing (a stock `.so` built by reverting the patch from the same
+> baseline) showed the operator + sibling-scan plpgsql shape **survives with AND without** the snapshot
+> patch — the snapshot UB is latent, not a reliable crash. A gdb backtrace pinned the actual
+> deterministic crash to `HNSWIndexScan::EndScan` → `hnsw_endscan` → `ExecEndIndexOnlyScan`: with
+> `enable_seqscan=off` the planner picks an Index-Only Scan on the HNSW index for `count(*)`, and the
+> HNSW AM's no-ORDER-BY path leaves the `ResultIterator` null → `Close()` on a null `shared_ptr` →
+> SIGSEGV (and `count(*)` silently returned 0). That is fixed by `tridb_hnsw_scan_no_orderby.patch`
+> (null-safe `EndScan` + `ereport(ERROR)` on the unordered-scan branch), verified to flip crash → clean
+> error. The `tridb_fix_double_scan_snapshot.patch` change is kept as **latent-UB hardening** (correct
+> per Postgres snapshot rules + a real teardown UAF), not as the reproducible-crash fix.
 
 ## TL;DR
 
@@ -10,14 +23,11 @@ in the **same plpgsql block** as a call to `topk()` / `multicol_topk()` / `tjs()
 backend (`SIGSEGV`). All three operators share one lifecycle, forked from `topk.cpp`: they build a
 child `IndexScan` via SPI, capture the **caller's active snapshot once** at `CreateQueryDesc`, and
 then drive `ExecProcNode` **across multiple SRF per-call invocations** without ever taking
-ownership of a snapshot (`PushActiveSnapshot` / `RegisterSnapshot`). The sibling scan in the same
-block mutates the active-snapshot stack and the plpgsql/SPI eval state out from under the
-operator's still-open child executor. The most-likely fault is a **dangling/registered-away active
-snapshot** read during `ExecProcNode` on a later SRF call (a snapshot/resource-owner lifecycle
-collision), with a confirmed, separate **use-after-free in `EndFaginsState`** as an aggravating
-second defect. The fix is to make the operator own its snapshot for the whole SRF lifetime
-(register it on the multi-call context / push-pop around each drive) and to correct the teardown
-ordering. ****BUILT AND VERIFIED on the x86 standin (2026-06-25). GX10/ARM sign-off tabled.**
+ownership of a snapshot (`PushActiveSnapshot` / `RegisterSnapshot`). This was the original hypothesis.
+**Per the CORRECTION banner above, it is real latent UB but NOT the reproducible crash** — the
+operator's snapshot borrowing + the confirmed `EndFaginsState` use-after-free are fixed as hardening
+(`tridb_fix_double_scan_snapshot.patch`), while the deterministic crash is the HNSW no-ORDER-BY bug
+(`tridb_hnsw_scan_no_orderby.patch`). GX10/ARM sign-off tabled.
 
 This is a **pre-existing MSVBASE fork bug**, not introduced by TJS (DEV-1169). TJS inherits it by
 forking the same `execFagins` lifecycle. Attribution was already proved with **unmodified

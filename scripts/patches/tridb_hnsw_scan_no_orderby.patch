@@ -1,0 +1,78 @@
+# tridb_hnsw_scan_no_orderby.patch — DEV-1236 (the reproducible crash)
+#
+# STATUS: BUILT AND VERIFIED on the x86 standin (tridb/msvbase:dev). The fix below was
+# verified with a backtrace + a deterministic repro (see test/_fork_bug_multicol_double_scan.sql):
+#   BEFORE: `SET enable_seqscan=off; SELECT count(*) FROM entities;` on a table with an HNSW
+#           index SIGSEGVs the backend.
+#   AFTER:  the same query raises a clean ERROR ("hnsw index scan requires an ORDER BY <-> ...");
+#           seqscan-on count(*) and ORDER BY <-> vector search are unaffected.
+#
+# ROOT CAUSE (backtrace: HNSWIndexScan::EndScan -> hnsw_endscan -> ExecEndIndexOnlyScan):
+#   With enable_seqscan off, the planner picks an Index-Only Scan on the HNSW index for an
+#   unordered/aggregate scan (e.g. count(*)). hnsw_gettuple's first call hits the
+#   `orderByData == NULL && keyData == NULL` branch, which `return false`d WITHOUT creating a
+#   ResultIterator — leaving scanState->workSpace->resultIterator null. hnsw_endscan then called
+#   HNSWIndexScan::EndScan(resultIterator) -> resultIterator->Close() on a null shared_ptr -> SIGSEGV.
+#   (It also made count(*) silently return 0 — a wrong answer — on any path that didn't crash.)
+#
+# FIX (two hunks):
+#   1. hnswindex_scan.cpp: HNSWIndexScan::EndScan is null-safe (guard the shared_ptr before Close()).
+#   2. hnswindex.cpp: the no-ORDER-BY/no-key gettuple branch ereport(ERROR)s with a clear message +
+#      hint, instead of silently returning an empty (wrong) result and crashing teardown.
+#
+# This is the REPRODUCIBLE DEV-1236 crash. The snapshot-lifetime change in
+# tridb_fix_double_scan_snapshot.patch is separate, latent-UB hardening (no reproducible crash).
+# Sentinel for verify_patches: "DEV-1236" in hnswindex.cpp and hnswindex_scan.cpp.
+diff --git a/src/hnswindex.cpp b/src/hnswindex.cpp
+index ecc1bcc..cee4b00 100644
+--- a/src/hnswindex.cpp
++++ b/src/hnswindex.cpp
+@@ -279,7 +279,16 @@ bool hnsw_gettuple(IndexScanDesc scan, ScanDirection dir)
+        if (scan->orderByData == NULL)
+         {
+             if (scan->keyData == NULL)
+-                return false;
++                // DEV-1236: no ORDER BY <-> and no key means the planner chose the
++                // HNSW index for an unordered/aggregate scan (e.g. count(*) when
++                // enable_seqscan is off). The old `return false` produced a silently
++                // wrong (empty) result AND left resultIterator null -> endscan
++                // crashed. Reject cleanly instead.
++                ereport(ERROR,
++                        (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
++                         errmsg("hnsw index scan requires an ORDER BY <-> distance clause"),
++                         errdetail("The HNSW vector index cannot serve an unordered scan such as count(*) or a SELECT without ORDER BY; it was chosen because enable_seqscan is off."),
++                         errhint("Re-enable enable_seqscan, or add ORDER BY embedding <-> :query to the scan.")));
+             if (scan->keyData->sk_flags & SK_ISNULL)
+                 return false;
+ 
+diff --git a/src/hnswindex_scan.cpp b/src/hnswindex_scan.cpp
+index 9f79e99..3b66350 100644
+--- a/src/hnswindex_scan.cpp
++++ b/src/hnswindex_scan.cpp
+@@ -2,6 +2,12 @@
+ // Licensed under the MIT License.
+ 
+ #include "hnswindex_scan.hpp"
++#include "tridb_vector_index.hpp"
++
++// TRIDB(DEV-1228 / ADR-0004): the hnswlib-backed HNSW AM is the reference implementer of the
++// TriDB-owned vector-index scan contract. Assert conformance at compile time so a future
++// refactor that breaks Open/Next/Close fails the build here, not at runtime.
++TRIDB_ASSERT_VECTOR_BACKEND(HNSWIndexScan);
+ 
+ std::map<std::string, std::shared_ptr<hnswlib::SpaceInterface<float>>> HNSWIndexScan::distanceFunction_map;
+ std::map<std::string, std::shared_ptr<hnswlib::HierarchicalNSW<float>>> HNSWIndexScan::vector_index_map;
+@@ -46,7 +52,12 @@ hnswlib::QueryResult<float>* HNSWIndexScan::GetNet(
+ void HNSWIndexScan::EndScan(
+     std::shared_ptr<hnswlib::ResultIterator<float>> &resultIterator)
+ {
+-    resultIterator->Close();
++    // DEV-1236: null-safe teardown. An HNSW scan with no ORDER BY and no key
++    // (e.g. a count(*)/index-only scan the planner picks when enable_seqscan is
++    // off) never creates a ResultIterator, so this shared_ptr can be empty at
++    // endscan/rescan time. Closing a null iterator segfaulted the backend.
++    if (resultIterator)
++        resultIterator->Close();
+ }
+ 
+ bool HNSWIndexScan::Insert(const std::string &p_path,
