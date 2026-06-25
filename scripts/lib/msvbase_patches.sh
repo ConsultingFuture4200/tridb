@@ -55,6 +55,10 @@ verify_patches() {
     || die "TriDB tridb_vector_iter.patch NOT applied — relaxed-mono vector iterator missing (DEV-1168); drift?"
   grep -q 'src/tridb_vector_iter.cpp' "$root/CMakeLists.txt" \
     || die "TriDB tridb_vector_iter.patch NOT wired into CMakeLists vectordb sources (DEV-1168); drift?"
+  grep -q 'TRIDB: TJS operator' "$root/src/tjs_operator.cpp" 2>/dev/null \
+    || die "TriDB tridb_tjs_operator.patch NOT applied — Traversal-Join-Similarity operator missing (DEV-1169); drift?"
+  grep -q 'src/tjs_operator.cpp' "$root/CMakeLists.txt" \
+    || die "TriDB tridb_tjs_operator.patch NOT wired into CMakeLists vectordb sources (DEV-1169); drift?"
   log "all MSVBASE + TriDB fork patches verified present"
 }
 
@@ -128,6 +132,25 @@ apply_tridb_fork_patches() {
     log "applying TriDB fork patch: relaxed-monotonicity vector iterator (DEV-1168 / FR-3)"
     ( cd "$root" && git apply "$iter_patch" ) \
       || die "tridb_vector_iter.patch did not apply — MSVBASE drift? re-generate per DEV-1168"
+  fi
+
+  #   tridb_tjs_operator.patch (DEV-1169, FR-4): the Traversal-Join-Similarity operator — the
+  #     tri-modal keystone. A C SRF tjs(...) (registered like multicol_topk) whose body is a
+  #     generalized execFagins (execTJS): it drives the HNSW IndexScan via SPI as the SOLE rank
+  #     authority (xs_orderbyvals[0]), pushes the relational filter into the leg's WHERE, and tests
+  #     a graph-reachability predicate (graph_store.neighbors(src), probed once + cached) per
+  #     candidate — all under ONE early-terminating top-k (VBASE consecutive_drops). Adds
+  #     src/tjs_operator.cpp, wires it into the UNCONDITIONAL vectordb sources, and registers
+  #     tjs()/tjs_candidates_examined() in sql/vectordb.sql. Must apply AFTER tridb_vector_iter.patch
+  #     (it appends to the same CMakeLists source list and SQL tail). hnswlib-only — no SPTAG.
+  local tjs_patch="${_MSVBASE_LIB_DIR}/../patches/tridb_tjs_operator.patch"
+  [[ -f "$tjs_patch" ]] || die "missing TriDB fork patch: $tjs_patch"
+  if grep -q 'TRIDB: TJS operator' "$root/src/tjs_operator.cpp" 2>/dev/null; then
+    log "TriDB fork patch (Traversal-Join-Similarity operator, DEV-1169) already applied"
+  else
+    log "applying TriDB fork patch: Traversal-Join-Similarity operator (DEV-1169 / FR-4)"
+    ( cd "$root" && git apply "$tjs_patch" ) \
+      || die "tridb_tjs_operator.patch did not apply — MSVBASE drift? re-generate per DEV-1169"
   fi
 }
 

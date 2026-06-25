@@ -1,0 +1,682 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index bc2e875..25ff54a 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -115,6 +115,10 @@ set(VECTORDB_SOURCES
+     # UNCONDITIONAL (hnswlib-backed) — must NOT sit inside the if(WITH_SPTAG) block (ADR-0004).
+     src/tridb_vector_iter.cpp
+     src/tridb_vector_probe.cpp
++    # TRIDB(DEV-1169 / FR-4): Traversal-Join-Similarity (TJS) operator — the tri-modal keystone.
++    # UNCONDITIONAL (hnswlib-backed; drives the HNSW IndexScan like topk) — must NOT sit inside
++    # the if(WITH_SPTAG) block (ADR-0004/0007). The graph leg probes graph_store via SPI at runtime.
++    src/tjs_operator.cpp
+ )
+ if(WITH_SPTAG)
+     list(APPEND VECTORDB_SOURCES
+diff --git a/sql/vectordb.sql b/sql/vectordb.sql
+index 8bd02e7..53d041d 100644
+--- a/sql/vectordb.sql
++++ b/sql/vectordb.sql
+@@ -121,3 +121,19 @@ CREATE FUNCTION multicol_topk(table_name text, k integer, term_cond integer, att
+ CREATE FUNCTION tridb_vec_probe(index regclass, query float8[], k integer, stop boolean)
+ 	RETURNS TABLE(tid text, distance float8, examined integer)
+ 	AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
++
++-- TRIDB(DEV-1169 / FR-4): Traversal-Join-Similarity (TJS) operator. Composes all three modalities —
++-- graph traversal + relational filter + vector similarity — in ONE plan with a single global,
++-- early-terminating top-k. The VECTOR leg (HNSW IndexScan, xs_orderbyvals[0]) is the sole rank
++-- authority; the RELATIONAL filter is pushed into its WHERE; the GRAPH leg is a reachability
++-- predicate probing graph_store.neighbors(src). attr_exp's FIRST column must be the candidate's
++-- graph id. src < 0 disables the graph leg. NOT IMMUTABLE/PARALLEL SAFE: it drives the executor
++-- via SPI and reads live graph state. See docs/decisions/0007-tjs-operator.md.
++CREATE FUNCTION tjs(table_name text, k integer, term_cond integer, src bigint,
++                    attr_exp text, filter_exp text, orderby_exp text) RETURNS SETOF record
++	AS 'MODULE_PATHNAME' LANGUAGE C STABLE;
++
++-- TR-1 / SM-3 probe: ANN candidates pulled by the last TJS scan in this backend. Asserting this
++-- << corpus proves early termination (no blocking full scan). Mirrors graph_store.visits().
++CREATE FUNCTION tjs_candidates_examined() RETURNS bigint
++	AS 'MODULE_PATHNAME' LANGUAGE C;
+diff --git a/src/tjs_operator.cpp b/src/tjs_operator.cpp
+new file mode 100644
+index 0000000..401e354
+--- /dev/null
++++ b/src/tjs_operator.cpp
+@@ -0,0 +1,637 @@
++// Copyright (c) TriDB. Licensed under the MIT License.
++//
++// tjs_operator.cpp — TriDB Traversal-Join-Similarity (TJS) operator (DEV-1169 / FR-4).
++//
++// Marker for the patch sentinel grep (scripts/lib/msvbase_patches.sh): TRIDB: TJS operator.
++//
++// WHAT THIS IS
++// ------------
++// TJS composes all THREE TriDB modalities — graph traversal, relational filter, and vector
++// similarity — in ONE Volcano plan with a SINGLE global, early-terminating top-k. It is the
++// keystone the whole "tri-modal in one process, one query" thesis rests on (CLAUDE.md TR-1 /
++// golden rule 4, spec §5). It is a forked, generalized execFagins (the topk.cpp / multicol_topk.cpp
++// Fagin-merge): it builds a child HNSW IndexScan via SPI exactly like multicol_topk (enable_seqscan
++// off, extractIndexScanNode, ExecProcNode), reads the TRUE per-candidate distance from
++// node->iss_ScanDesc->xs_orderbyvals[0] (the ONLY authoritative distance — the fork's scalar `<->`
++// returns 0 outside an index scan; see test/trimodal_early_term.sql), and terminates early on
++// consecutive_drops >= term_cond.
++//
++// THE THREE LEGS (synthesis decision, ADR-0007)
++// ---------------------------------------------
++//   VECTOR leg   — the HNSW IndexScan built via SPI. xs_orderbyvals[0] is the SOLE rank authority.
++//                  This is the one ordered stream; everything else is a predicate on it.
++//   RELATIONAL   — the filter is pushed INTO the vector leg's SQL WHERE (multicol_topk already
++//                  builds `select ... from <t> where <filter> order by <orderby>`), so the index
++//                  scan never even emits filtered-out rows.
++//   GRAPH        — a reachability PREDICATE on each vector candidate: is candidate dst reachable
++//                  (src)-[:related_to]->(dst)? We probe graph_store.neighbors(src) via SPI ONCE at
++//                  init and cache the reachable-id set, then test membership at the seen-set point
++//                  in the merge. Probing once (not interleaved with the SPI-driven IndexScan) avoids
++//                  nesting a second SPI cursor inside the executor-driven scan — the reachable set is
++//                  finite, so caching it is exact, not an approximation.
++//
++// Because graph + relational are PREDICATES on the single ordered (vector) stream — not a second
++// ordered stream to merge — there is no order-merge to reconcile, and the VBASE consecutive_drops
++// early-termination stays correct: a candidate that fails the graph or relational predicate simply
++// is not inserted into the result priority queue, exactly like a candidate that loses on distance.
++//
++// TR-1 (CLAUDE.md golden rule 1): Open/Next/Close + EARLY TERMINATION, no blocking operator. The
++// bounded priority queue is size k; the merge stops once consecutive_drops >= term_cond and then
++// Close()s the children (ExecutorFinish/End on each child QueryDesc), propagating the stop into the
++// HNSW beam. The merge does NOT materialize the full corpus — it drains the ANN stream only until
++// the top-k is provably settled, the same bound multicol_topk relies on.
++//
++// SRF-NOW / CUSTOMSCAN-LATER: this ships as a C SRF tjs(...) registered like multicol_topk (NOT a
++// CustomScan, which would couple to the unfinished parser). execTJS() is a pure
++// `TupleTableSlot* execTJS(PlanState*)` so a future CustomScan node can reuse it verbatim — the SRF
++// is just a thin driver around it. See docs/decisions/0007-tjs-operator.md.
++
++#include "util.hpp"
++#include <vector>
++#include <assert.h>
++#include <queue>
++#include <stack>
++#include <unordered_set>
++#include <utility> // std::pair
++#include <algorithm> // std::min, std::max
++#include <string>
++
++extern "C"
++{
++#include <postgres.h>
++#include <catalog/pg_type_d.h>
++#include <utils/array.h>
++#include <funcapi.h>
++
++#include <nodes/print.h>
++#include <nodes/plannodes.h>
++#include <nodes/execnodes.h>
++
++#include <executor/spi.h>
++#include <executor/executor.h>
++
++#include <utils/snapmgr.h>
++#include <optimizer/cost.h>
++
++#include <access/table.h>
++#include <access/tableam.h>
++#include <access/relation.h>
++
++#include <access/genam.h>
++#include <access/relscan.h>
++#include <access/printtup.h>
++
++#include <commands/vacuum.h>
++#include <miscadmin.h>
++#include <utils/elog.h>
++#include <utils/rel.h>
++#include <utils/selfuncs.h>
++
++#include "libpq/pqformat.h"
++#include <utils/builtins.h>
++}
++
++extern "C"
++{
++    PGDLLEXPORT PG_FUNCTION_INFO_V1(tjs);
++}
++
++#ifdef NDEBUG
++#define DEBUG_PRINT(...) ;
++#else
++#define DEBUG_PRINT(...) do{ elog(WARNING, __VA_ARGS__); } while (false)
++#endif
++
++// ---------------------------------------------------------------------------
++// Shared helpers — forked verbatim from multicol_topk.cpp (the validated v1 merge). Kept local
++// (static / file-scope) so this translation unit links independently and a future CustomScan that
++// pulls in only execTJS() does not drag the SRF in. The "T" suffix avoids ODR clashes with the
++// identically-named multicol_topk symbols in the same shared library.
++// ---------------------------------------------------------------------------
++
++inline float castAttrToFloatT(TupleTableSlot *slot, int attno){
++	bool isNull;
++	Datum value = slot_getattr(slot, attno, &isNull);
++	float retval = 0;
++
++	if ( isNull)
++		return 0;
++
++	TupleDesc tupdesc = slot->tts_tupleDescriptor;
++	Form_pg_attribute attr = TupleDescAttr(tupdesc, attno-1);
++	switch (attr->atttypid)	 {
++	case INT4OID:
++		retval = (float)DatumGetInt32(value);
++		break;
++	case INT8OID:
++		retval = (float)DatumGetInt64(value);
++		break;
++	case FLOAT8OID:
++		retval = (float)DatumGetFloat8(value);
++		break;
++	default:
++		elog(ERROR, "castAttrToFloatT unsupported oid = %d", attr->atttypid);
++	}
++	return retval;
++}
++
++// Read attribute `attno` (1-based) of `slot` as an int64 — the candidate's graph vertex id, used
++// for the reachability predicate. NULL ids can never be reachable, so they are reported as such.
++inline bool getAttrAsInt64T(TupleTableSlot *slot, int attno, int64 *out){
++	bool isNull;
++	Datum value = slot_getattr(slot, attno, &isNull);
++	if (isNull)
++		return false;
++
++	TupleDesc tupdesc = slot->tts_tupleDescriptor;
++	Form_pg_attribute attr = TupleDescAttr(tupdesc, attno-1);
++	switch (attr->atttypid) {
++	case INT4OID:
++		*out = (int64) DatumGetInt32(value);
++		return true;
++	case INT8OID:
++		*out = DatumGetInt64(value);
++		return true;
++	default:
++		elog(ERROR, "TJS graph predicate: candidate id column must be int4/int8, got oid = %d",
++			 attr->atttypid);
++	}
++	return false;
++}
++
++inline Oid getrelidT(const std::string relname){
++	char cmd[256];
++	int cmd_len = snprintf(cmd, sizeof(cmd), "SELECT oid FROM pg_catalog.pg_class WHERE relname = '%s';", relname.c_str());
++	if ( cmd_len < 0 ) {
++		elog(ERROR, "getrelidT:: relname '%s' is too long", relname.c_str());
++		return InvalidOid;
++	}
++	SPI_connect();
++	int ret = SPI_exec(cmd, 1);
++	uint64 proc = SPI_processed;
++	Oid retval = InvalidOid;
++	if ( ret > 0 && SPI_tuptable != NULL ){
++		TupleDesc tupdesc = SPI_tuptable->tupdesc;
++		SPITupleTable *tuptable = SPI_tuptable;
++		if ( proc > 1 )
++			ereport(ERROR, (errcode(ERRCODE_DATA_EXCEPTION), errmsg("only a single relname should be returned")));
++		if ( tupdesc->natts != 1 )
++			ereport(ERROR, (errcode(ERRCODE_DATA_EXCEPTION), errmsg("only a single attribute should be returned")));
++		if ( proc == 1 ) {
++			HeapTuple tuple = tuptable->vals[0];
++			bool isnull;
++			Datum value = SPI_getbinval(tuple, tupdesc, 1, &isnull);
++			if ( isnull )
++				ereport(ERROR, (errcode(ERRCODE_DATA_EXCEPTION), errmsg("Non-null value should be returned")));
++			retval = DatumGetObjectId(value);
++		} else {
++			elog(ERROR, "getrelidT:: cannot find relid for relname (%s)", relname.c_str());
++		}
++	}
++	SPI_finish();
++	return retval;
++}
++
++// DFS for the IndexScanState / IndexScan nodes — identical to multicol_topk's, renamed.
++IndexScanState* findIndexScanStateT(PlanState* node){
++	if (!node) return NULL;
++	if (nodeTag(node) == T_IndexScanState) return (IndexScanState*)node;
++	IndexScanState* r = findIndexScanStateT(outerPlanState(node));
++	if (r) return r;
++	return findIndexScanStateT(innerPlanState(node));
++}
++
++IndexScan* findIndexScanNodeT(Plan* node){
++	if (!node) return NULL;
++	if (nodeTag(node) == T_IndexScan) return (IndexScan*)node;
++	IndexScan* r = findIndexScanNodeT(outerPlan(node));
++	if (r) return r;
++	return findIndexScanNodeT(innerPlan(node));
++}
++
++PlannedStmt* extractIndexScanNodeT(char* query){
++	CachedPlan *cplan = NULL;
++	bool old_enable_seqscan = enable_seqscan;
++	enable_seqscan = false;
++	PlannedStmt* plan = NULL;
++	SPIPlanPtr planptr = SPI_prepare(query, 0, NULL);
++	cplan = SPI_plan_get_cached_plan(planptr);
++	List* stmt_list = cplan->stmt_list;
++	ListCell* lc;
++	IndexScan* node = NULL;
++	foreach(lc, stmt_list){
++		PlannedStmt *stmt = lfirst_node(PlannedStmt, lc);
++		if ( (node = findIndexScanNodeT(stmt->planTree)) != NULL ){
++			plan = stmt;
++		}
++	}
++	enable_seqscan = old_enable_seqscan;
++	return plan;
++}
++
++inline uint64_t castToUint64T(const ItemPointerData& key)
++{
++	return (((uint64_t)key.ip_blkid.bi_hi)<<32) |
++		(((uint64_t)key.ip_blkid.bi_lo)<<16) | (uint64_t)key.ip_posid;
++}
++
++typedef std::pair<float, HeapTuple> pq_item_t;
++
++struct pq_item_compare_lt_t
++{
++	bool operator()(const pq_item_t& lhs, const pq_item_t& rhs)
++	{
++		return lhs.first < rhs.first;
++	}
++};
++
++inline HeapTuple copyItemT(TupleTableSlot* slot){
++	return ExecCopySlotHeapTuple(slot);
++}
++
++// ---------------------------------------------------------------------------
++// The graph reachability predicate.
++//
++// graphReachableT(src) probes graph_store.neighbors(src) — the v0 native graph store's
++// adjacency-list traversal iterator (src/graph_store_ext/graph_store.c) — via SPI and returns the
++// set of reachable destination ids. We resolve this ONCE at init (TJS Open) and cache it, rather
++// than interleaving a graph SPI probe inside the SPI-driven IndexScan loop: nesting a second SPI
++// cursor under the executor-driven scan risks SPI-stack confusion, and the reachable set is finite
++// so caching it is exact. Membership is then an O(1) hash lookup per vector candidate.
++//
++// This honors golden rule 3 (graph is native traversal, NOT a relational join): we call the graph
++// store's own iterator, not a join over an edge table.
++// ---------------------------------------------------------------------------
++static std::unordered_set<int64> graphReachableT(int64 src){
++	std::unordered_set<int64> reachable;
++	char cmd[256];
++	snprintf(cmd, sizeof(cmd),
++			 "SELECT dst FROM graph_store.neighbors(%lld) AS dst", (long long) src);
++
++	SPI_connect();
++	int ret = SPI_exec(cmd, 0);
++	if (ret != SPI_OK_SELECT)
++		elog(ERROR, "TJS graph predicate: graph_store.neighbors(%lld) probe failed (%d)",
++			 (long long) src, ret);
++
++	uint64 proc = SPI_processed;
++	TupleDesc tupdesc = SPI_tuptable->tupdesc;
++	for (uint64 i = 0; i < proc; i++) {
++		bool isnull;
++		Datum d = SPI_getbinval(SPI_tuptable->vals[i], tupdesc, 1, &isnull);
++		if (!isnull)
++			reachable.insert(DatumGetInt64(d));
++	}
++	SPI_finish();
++	return reachable;
++}
++
++// ---------------------------------------------------------------------------
++// TJSState — the generalized FaginsState. One vector orderby leg (the rank authority) plus the
++// cached graph-reachability set; the relational filter is already baked into the vector leg's SQL.
++// ---------------------------------------------------------------------------
++typedef struct{
++	PlanState ps;
++	uint32_t topk;
++	uint32_t term_cond;
++	bool finish;
++
++	std::priority_queue<pq_item_t, std::vector<pq_item_t>, pq_item_compare_lt_t> *proc_pq;
++	std::unordered_set<uint64_t> *seenSet;
++	std::stack<pq_item_t> *result_stack;
++
++	// Graph leg: the reachability predicate. graphEnabled=false means "no graph constraint"
++	// (src < 0), in which case TJS degenerates to vector+relational (and matches multicol_topk on a
++	// single orderby — increment 0's parity check).
++	bool graphEnabled;
++	std::unordered_set<int64> *reachable;
++	int idAttno; // 1-based attribute of the candidate's graph id in the result slot (the first attr).
++
++	IndexFetchTableData *result_heap_scan;
++	Relation relation;
++	std::vector<IndexScanState*> *children;
++	std::vector<QueryDesc*>* qDescs;
++
++	// Instrumentation (increment 3 / SM-3): candidates pulled from the ANN stream this scan.
++	int64 examined;
++} TJSState;
++
++// Process-global examined counter for the last TJS scan in this backend (TR-1 probe, SM-3). Mirrors
++// graph_store.c's graph_visit_counter pattern: per-backend, read via tjs_candidates_examined().
++static int64 tjs_last_examined = 0;
++
++// ---------------------------------------------------------------------------
++// execTJS — the pure operator body. `TupleTableSlot* execTJS(PlanState*)` exactly as the prompt
++// requires, so a future CustomScan node reuses it without change. On the FIRST call it drains the
++// ANN stream (early-terminating) into the bounded priority queue and unspools it into result_stack;
++// each subsequent call pops one row. This is the multicol_topk execFagins merge, generalized with
++// the graph-reachability predicate inserted at the seen-set point.
++// ---------------------------------------------------------------------------
++extern "C" TupleTableSlot* execTJS(PlanState* node){
++	TJSState* estate = (TJSState*) node;
++	uint32_t k = estate->topk;
++	uint32_t term_cond = estate->term_cond;
++	uint32_t consecutive_drops = 0;
++
++	auto proc_pq = estate->proc_pq;
++	auto seenSet = estate->seenSet;
++	auto result_stack = estate->result_stack;
++
++	TupleTableSlot* result_slot = estate->ps.ps_ResultTupleSlot;
++
++	// Drain only on the first call (result_stack empty AND not finished). On later calls we just pop
++	// the already-computed top-k. The std::stack emptiness alone is ambiguous (a genuinely empty
++	// top-k also leaves it empty), so guard on estate->finish: it is set true exactly once the merge
++	// has run to completion below.
++	if (!estate->finish) {
++		while (!estate->finish){
++			TupleTableSlot* slot;
++
++			// Single ordered stream: the vector leg. (children->size()==1; the loop keeps the
++			// execFagins shape so the structure stays recognizable / reusable.)
++			for ( unsigned int orderby_id = 0; orderby_id < estate->children->size(); orderby_id++){
++				auto child      = estate->children->at(orderby_id);
++				auto q_estate   = estate->qDescs->at(orderby_id)->estate;
++				auto oldcontext = MemoryContextSwitchTo(q_estate->es_query_cxt);
++
++				slot = ExecProcNode((PlanState*) child);
++
++				if ( TupIsNull(slot) ) {
++					estate->finish = true;
++					MemoryContextSwitchTo(oldcontext);
++					break;
++				}
++
++				estate->examined++;
++
++				// VECTOR leg: the TRUE distance is xs_orderbyvals[0] — the sole rank authority.
++				float rank_score = DatumGetFloat4(child->iss_ScanDesc->xs_orderbyvals[0]);
++
++				ItemPointerData tid = child->iss_ScanDesc->xs_heaptid_orig;
++				uint64_t tid_uint = castToUint64T(tid);
++				if ( seenSet->find(tid_uint) != seenSet->end() ) {
++					MemoryContextSwitchTo(oldcontext);
++					continue;
++				}
++				seenSet->insert(tid_uint);
++
++				// GRAPH leg: reachability predicate. The candidate's graph id is attribute idAttno
++				// of the slot (attr_exp's first column, by contract `id`). A candidate that is not
++				// reachable from src is DROPPED — counted as a consecutive_drop just like a
++				// distance loss, so it neither pollutes the result PQ nor breaks early termination.
++				bool graph_ok = true;
++				if (estate->graphEnabled) {
++					int64 cand_id;
++					if (getAttrAsInt64T(slot, estate->idAttno, &cand_id))
++						graph_ok = (estate->reachable->find(cand_id) != estate->reachable->end());
++					else
++						graph_ok = false; // NULL id is never reachable.
++				}
++
++				consecutive_drops++;
++				// RELATIONAL leg already applied in the WHERE clause; here only graph + distance can
++				// drop a survivor. Insert into the bounded top-k PQ iff reachable AND it beats the
++				// current k-th best (or the PQ is not yet full).
++				if ( graph_ok && ( proc_pq->size() < k || proc_pq->top().first > rank_score ) ){
++					if ( proc_pq->size() == k )
++						proc_pq->pop();
++					proc_pq->push(std::make_pair(rank_score, copyItemT(slot)));
++					consecutive_drops = 0;
++				}
++
++				MemoryContextSwitchTo(oldcontext);
++			}
++
++			// EARLY TERMINATION (TR-1): reuse VBASE's consecutive_drops bound verbatim — do NOT
++			// invent a new stop. Once `term_cond` consecutive candidates fail to improve the top-k,
++			// the ANN stream provably cannot beat the current k-th best, so finish (which then
++			// Close()s the child below, propagating the stop into the HNSW beam).
++			if ( consecutive_drops >= term_cond ) {
++				estate->finish = true;
++			}
++		}
++
++		// Smallest score first.
++		while (!proc_pq->empty()){
++			result_stack->push(proc_pq->top());
++			proc_pq->pop();
++		}
++		tjs_last_examined = estate->examined;
++	}
++
++	if (result_stack->size() == 0)
++		return ExecClearTuple(result_slot);
++
++	auto top = result_stack->top();
++	HeapTuple tuple = top.second;
++	result_stack->pop();
++
++	ExecForceStoreHeapTuple(tuple, result_slot, true);
++	return result_slot;
++}
++
++TJSState* InitTJSState(Relation relation, uint32_t k, uint32_t term_cond,
++					   std::vector<IndexScanState*> scans, std::vector<QueryDesc*> qDescs,
++					   bool graphEnabled, std::unordered_set<int64> reachable){
++	TJSState* state = (TJSState*)malloc(sizeof(TJSState));
++	memset(&(state->ps), 0, sizeof(PlanState));
++
++	// Single-leg: the result tuple desc is the child's verbatim (no rank column to drop, unlike the
++	// multi-orderby multicol_topk path).
++	state->ps.ps_ResultTupleDesc = scans[0]->ss.ps.ps_ResultTupleDesc;
++	state->ps.ps_ResultTupleSlot = MakeTupleTableSlot(state->ps.ps_ResultTupleDesc,
++													  scans[0]->ss.ps.ps_ResultTupleSlot->tts_ops);
++	state->ps.ExecProcNode = execTJS;
++
++	state->relation        = relation;
++	state->finish          = false;
++	state->topk            = k;
++	state->term_cond       = term_cond;
++
++	state->result_heap_scan = table_index_fetch_begin(relation);
++	state->proc_pq          = new std::priority_queue<pq_item_t, std::vector<pq_item_t>, pq_item_compare_lt_t>();
++	state->seenSet          = new std::unordered_set<uint64_t>();
++	state->result_stack     = new std::stack<pq_item_t>();
++	state->children         = new std::vector<IndexScanState*>(scans);
++	state->qDescs           = new std::vector<QueryDesc*>(qDescs);
++
++	state->graphEnabled     = graphEnabled;
++	state->reachable        = new std::unordered_set<int64>(std::move(reachable));
++	state->idAttno          = 1; // attr_exp's first column is the candidate id by contract.
++	state->examined         = 0;
++
++	return state;
++}
++
++void EndTJSState(TJSState *state){
++	if (!state) return;
++	table_index_fetch_end(state->result_heap_scan);
++	table_close(state->relation, AccessShareLock);
++	ExecDropSingleTupleTableSlot(state->ps.ps_ResultTupleSlot);
++
++	for (QueryDesc* queryDesc: *(state->qDescs)) {
++		ExecutorFinish(queryDesc);
++		ExecutorEnd(queryDesc);
++		FreeQueryDesc(queryDesc);
++	}
++	delete(state->proc_pq);
++	delete(state->seenSet);
++	delete(state->result_stack);
++	delete(state->reachable);
++	auto qDescs = state->qDescs;
++	free(state);
++	delete(qDescs);
++	return;
++}
++
++void parseVectorConstantT(std::string &src) {
++	std::size_t pos = 0;
++	while ((pos = src.find("{", pos)) != std::string::npos) {
++		src.replace(pos, 1, "\'{");
++		pos += 2;
++	}
++	pos = 0;
++	while ((pos = src.find("}", pos)) != std::string::npos) {
++		src.replace(pos, 1, "}\'");
++		++pos;
++	}
++}
++
++// ---------------------------------------------------------------------------
++// tjs(table_name, k, term_cond, src, attr_exp, filter_exp, orderby_exp) RETURNS SETOF record
++//
++//   table_name  — the relational+vector table (e.g. 'entities').
++//   k           — global top-k.
++//   term_cond   — VBASE consecutive-drops early-termination bound (0 -> default 50).
++//   src         — graph source vertex; the predicate keeps only candidates reachable
++//                 (src)-[:related_to]->(cand). src < 0 disables the graph leg (vector+relational
++//                 only — the increment-0 parity case).
++//   attr_exp    — output columns; the FIRST must be the candidate's graph id (used by the
++//                 reachability predicate). e.g. 'id'.
++//   filter_exp  — RELATIONAL leg: pushed into the vector leg's SQL WHERE (e.g. 'ts < 500'). '' = none.
++//   orderby_exp — VECTOR leg: the HNSW orderby (e.g. 'embedding <-> ''{19,0,0,0,0,0,0,0}''').
++// ---------------------------------------------------------------------------
++Datum tjs(PG_FUNCTION_ARGS) {
++
++	FuncCallContext		*funcctx;
++	int					 call_cntr;
++	int					 max_calls;
++	TupleDesc			 tupdesc;
++	AttInMetadata		*attinmeta;
++
++	if (SRF_IS_FIRSTCALL()) {
++		MemoryContext	oldcontext;
++		funcctx = SRF_FIRSTCALL_INIT();
++		oldcontext = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
++
++		int argc = 0;
++		text *tablename = PG_GETARG_TEXT_PP(argc++);
++		uint32 k = PG_GETARG_UINT32(argc++);
++		Oid table_oid = getrelidT(std::string(text_to_cstring(tablename)));
++
++		uint32 termCond = PG_GETARG_UINT32(argc++);
++		if (termCond == 0)
++			termCond = 50;
++
++		int64 src = PG_GETARG_INT64(argc++);
++		bool graphEnabled = (src >= 0);
++
++		text* attr_exp_text   = PG_GETARG_TEXT_PP(argc++);
++		text* filter_exp_text = PG_GETARG_TEXT_PP(argc++);
++		text* orderby_text    = PG_GETARG_TEXT_PP(argc++);
++
++		DEBUG_PRINT("TJS: table=%s k=%u term=%u src=%lld attr=%s filter=%s orderby=%s",
++					text_to_cstring(tablename), k, termCond, (long long) src,
++					text_to_cstring(attr_exp_text), text_to_cstring(filter_exp_text),
++					text_to_cstring(orderby_text));
++
++		// GRAPH leg: resolve the reachable set ONCE (before driving the SPI IndexScan).
++		std::unordered_set<int64> reachable;
++		if (graphEnabled)
++			reachable = graphReachableT(src);
++
++		std::vector<IndexScanState*> scannodes;
++		std::vector<QueryDesc*> qDescs;
++		SPI_connect();
++
++		// Build the vector leg: a single index-scan SQL with the relational filter in WHERE.
++		std::string orderby(text_to_cstring(orderby_text));
++		char sourceText[102400];
++		if ( strlen(text_to_cstring(filter_exp_text)) == 0 ){
++			snprintf(sourceText, sizeof(sourceText), "select %s from %s order by %s",
++					 text_to_cstring(attr_exp_text), text_to_cstring(tablename), orderby.c_str());
++		} else {
++			snprintf(sourceText, sizeof(sourceText), "select %s from %s where %s order by %s",
++					 text_to_cstring(attr_exp_text), text_to_cstring(tablename),
++					 text_to_cstring(filter_exp_text), orderby.c_str());
++		}
++		DEBUG_PRINT("TJS vector leg SQL: %s", sourceText);
++
++		PlannedStmt* plan = NULL;
++		if ( !(plan = extractIndexScanNodeT(sourceText)) )
++			elog(ERROR, "TJS: cannot find HNSW index for vector leg = %s", sourceText);
++
++		QueryEnvironment *queryEnv = create_queryEnv();
++		DestReceiver * dest = CreateDestReceiver(DestNone);
++		QueryDesc* queryDesc = CreateQueryDesc(plan, sourceText,
++											   GetActiveSnapshot(), InvalidSnapshot,
++											   dest, NULL, queryEnv, 0);
++		qDescs.push_back(queryDesc);
++		standard_ExecutorStart(queryDesc, 0);
++
++		IndexScanState* scannode = findIndexScanStateT(queryDesc->planstate);
++		if (!scannode)
++			elog(ERROR, "TJS: no IndexScanState in vector leg plan");
++		scannodes.push_back(scannode);
++
++		TJSState* top_execNode = InitTJSState(table_open(table_oid, AccessShareLock),
++											  k, termCond, scannodes, qDescs,
++											  graphEnabled, std::move(reachable));
++
++		funcctx->user_fctx = top_execNode;
++		funcctx->max_calls = k;
++		tupdesc = top_execNode->ps.ps_ResultTupleDesc;
++		attinmeta = TupleDescGetAttInMetadata(tupdesc);
++		funcctx->attinmeta = attinmeta;
++
++		MemoryContextSwitchTo(oldcontext);
++	}
++
++	funcctx = SRF_PERCALL_SETUP();
++	call_cntr = funcctx->call_cntr;
++	max_calls = funcctx->max_calls;
++	attinmeta = funcctx->attinmeta;
++
++	TJSState* top_execNode = (TJSState*)funcctx->user_fctx;
++
++	if (call_cntr < max_calls) {
++		TupleTableSlot *slot = execTJS((PlanState*) top_execNode);
++		if ( TupIsNull(slot) )
++			goto finish;
++		Datum result = ExecFetchSlotHeapTupleDatum(slot);
++		SRF_RETURN_NEXT(funcctx, result);
++	}
++	else {
++		goto finish;
++	}
++
++ finish:
++	EndTJSState(top_execNode);
++	SPI_finish();
++	DEBUG_PRINT("TJS done, processed = %u", call_cntr);
++	SRF_RETURN_DONE(funcctx);
++}
++
++// ---------------------------------------------------------------------------
++// tjs_candidates_examined() — TR-1 / SM-3 probe: ANN candidates pulled by the last TJS scan in this
++// backend. Asserting this << corpus proves early termination (no blocking full scan). Mirrors
++// graph_store.visits().
++// ---------------------------------------------------------------------------
++extern "C"
++{
++    PGDLLEXPORT PG_FUNCTION_INFO_V1(tjs_candidates_examined);
++}
++
++Datum tjs_candidates_examined(PG_FUNCTION_ARGS) {
++	PG_RETURN_INT64(tjs_last_examined);
++}
