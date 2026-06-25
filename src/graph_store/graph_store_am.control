@@ -1,0 +1,6 @@
+# TriDB native adjacency-list graph store (v1 core, DEV-1164)
+comment = 'TriDB native adjacency-list graph store (v1 core, DEV-1164)'
+default_version = '0.1.0'
+module_pathname = '$libdir/graph_store_am'
+relocatable = false
+schema = graph_store
