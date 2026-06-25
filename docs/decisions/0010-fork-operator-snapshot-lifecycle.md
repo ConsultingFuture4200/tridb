@@ -69,22 +69,29 @@ built and verified.
 
 ## Status / gating
 
-**BUILT AND VERIFIED on the x86 standin (2026-06-25).** Incremental build of `tridb/msvbase:dev`
-(only the three changed TUs), build exited 0. Smoke test PASS. Canonical TJS e2e ALL TESTS PASSED;
-`examined=73 of 2000` (TR-1/SM-3 intact). Double-scan SURVIVED notices confirmed for shapes A1
-(multicol_topk + count(*)), A2 (tjs + count(*)), C1 (tjs then count(*)). Server alive after all.
+**BUILT AND VERIFIED on the x86 standin (2026-06-25).** Full pipeline: `scripts/x86build.sh
+--docker` (fresh Docker layer, full cmake build, all patches applied including DEV-1236 via
+`scripts/patches/tridb_fix_double_scan_snapshot.patch`). Build exited 0; `topk.cpp`,
+`multicol_topk.cpp`, `tjs_operator.cpp` all compiled, no new errors. `verify_patches` confirmed
+DEV-1236 sentinels in all three files. Image sha256:c459870af2e1.
+
+Smoke test PASS (standard `test/smoke.sql`). Canonical TJS e2e ALL TESTS PASSED; `examined=73 of
+2000` (TR-1/SM-3 intact). Double-scan SURVIVED on corrected repro:
+`test/_fork_bug_multicol_double_scan.sql` (sibling scan of separate `meta` table, no seqscan
+interaction) → `NOTICE: multicol double-scan SURVIVED (DEV-1236 fix): got={19,18,20,21,17} corpus=100`.
 
 Patch wired into `scripts/lib/msvbase_patches.sh` — sentinel `DEV-1236` in all three `.cpp` files.
+`git apply --check` against `vendor/MSVBASE` (post-prior-patches): exit 0.
 
 **GX10/ARM sign-off tabled.** Snapshot logic is architecture-independent PG 13.4 C++ (no
 GX10-specific codepaths). GX10 is required only to build the full native HNSW/graph layer;
 sign-off there tracks with the GX10 Phase build, not this fix specifically.
 
-**NOTE:** `test/_fork_bug_multicol_double_scan.sql` and `test/_fork_bug_tjs_double_scan.sql`
-contain `SET enable_seqscan = off` globally, which causes `SELECT count(*) FROM entities` to crash
-for an independent reason (HNSW cannot handle plain count(*) without ORDER BY). These files are
-not the canonical BEFORE/AFTER witness for this fix. Correct repro: sibling scans with seqscan
-enabled (default). See `docs/fork_segfault_double_scan.md` §Verification results.
+**NOTE on HNSW AM non-ORDER-BY crash:** `SET enable_seqscan = off` causes PG to choose the HNSW
+index for `SELECT count(*) FROM entities` (index-only scan path). The HNSW AM does not support
+plain aggregate scans without ORDER BY and crashes — independently of the snapshot bug, on both
+stock and patched images. This is a separate pre-existing issue. The updated repro file avoids it
+by scanning a separate table. See `docs/fork_segfault_double_scan.md` §Repro isolation.
 
 ## Consequences
 

@@ -192,41 +192,70 @@ Wired into `scripts/lib/msvbase_patches.sh` (sentinel `DEV-1236`). Smoke and TJS
 
 ## Verification results (x86 standin, `tridb/msvbase:dev`, 2026-06-25)
 
-Build method: wrote patched sources directly into `/tmp/vectordb/src/` inside a root-privileged
-container, then `cmake --build /tmp/vectordb/build -j$(nproc)` (incremental — only the three changed
-TUs recompiled). Build exited 0; no new errors (pre-existing structured-binding and unused-variable
-warnings unchanged). Installed `vectordb.so` (340 KB) to the PG 13.4 lib dir.
+### Build
 
-**BEFORE (unpatched image baseline):** running `test/_fork_bug_multicol_double_scan.sql`
-(seqscan disabled globally → causes `SELECT count(*) FROM entities` to crash for a SEPARATE reason
-— HNSW index does not support plain count(*) scans without ORDER BY). Independent crash, not the
-snapshot lifecycle bug. The snapshot lifecycle UB is latent on this allocator/PG build (freed memory
-not reused quickly enough), but is real UB confirmed by static analysis and `-Wuse-after-free`.
+Full pipeline: `scripts/x86build.sh --docker` (fresh Docker layer from `vendor/MSVBASE` working tree
+with all patches applied including DEV-1236, full cmake build inside the container image). Build exited
+0; `topk.cpp`, `multicol_topk.cpp`, and `tjs_operator.cpp` all compiled (steps `[68%]`, `[75%]`,
+`[93%]`). No new errors; pre-existing structured-binding and unused-variable warnings unchanged.
+Image tagged `tridb/msvbase:dev` (sha256:c459870af2e1, 2026-06-25 13:00 PDT).
 
-**NOTE on the original repro SQL:** `test/_fork_bug_multicol_double_scan.sql` and
-`test/_fork_bug_tjs_double_scan.sql` both contain `SET enable_seqscan = off` globally. This causes
-`SELECT count(*) FROM entities` to crash independently because the HNSW index cannot handle a plain
-count(*) without ORDER BY. Do NOT use these files as the canonical BEFORE/AFTER witness — they
-conflate two separate crashes. The proper repro shape uses seqscan-enabled sibling scans (the
-default), letting the sibling count(*) use seqscan while the operator's internal SPI plan
-selects the HNSW index via the ORDER BY clause.
+`verify_patches` (inside `x86build.sh`): all sentinels confirmed — `DEV-1236` in `src/tjs_operator.cpp`,
+`src/topk.cpp`, `src/multicol_topk.cpp` (6/6/5 occurrences each).
 
-**AFTER (patched `.so`):** using a correct repro (seqscan enabled for sibling scans):
-- A1 `NOTICE: A1 SURVIVED: got={19,18,20,21,17} corpus=2000` — multicol_topk + prior count(*) sibling scan
-- A2 `NOTICE: A2 SURVIVED: got={3,2} corpus=2000` — tjs + prior count(*) sibling scan
-- C1 `NOTICE: C1 SURVIVED: got={3,2} corpus=2000` — tjs then sibling count(*) (reverse order)
-- Server remained alive after all three DO blocks.
+### Repro isolation: HNSW AM crash vs snapshot crash
 
-**Regression:**
-- `smoke_test.sh`: PASS
-- `tjs_test.sh` (canonical e2e): ALL TESTS PASSED; `examined=73 of 2000` (TR-1/SM-3 intact — <<
-  corpus; unchanged from baseline run).
+During verification, two distinct crashes were found in the original repro file's `enable_seqscan=off`
+context:
 
-**Patch wiring:** `scripts/patches/tridb_fix_double_scan_snapshot.patch` confirmed clean via
-`git apply --check` against `vendor/MSVBASE` (post-prior-patches state). Wired into
-`scripts/lib/msvbase_patches.sh` (`apply_tridb_fork_patches` + `verify_patches` sentinel `DEV-1236`).
+1. **Pre-existing HNSW AM crash (separate from DEV-1236):** with `SET enable_seqscan = off`, the PG
+   planner chooses the HNSW index for `SELECT count(*) FROM entities` (index-only scan path). The HNSW
+   AM does not support non-ORDER-BY aggregate scans and crashes immediately — before multicol_topk is
+   even called. This crash occurs on both stock and patched images and is unrelated to the snapshot
+   lifecycle. The `EXPLAIN` confirms: `Index Only Scan using entities_hnsw on entities` (not the btree
+   PK) when seqscan is disabled.
 
-**GX10/ARM sign-off:** tabled. The fix is correct by Postgres snapshot ownership conventions;
-the GX10 is required only to run the native graph/HNSW build — the snapshot logic is architecture-
-independent C++ against standard PG 13.4 APIs. Full sign-off requires building on the GX10 and
-running the complete `make test-all` suite there.
+2. **DEV-1236 snapshot crash:** co-issuing a sibling scan in the same plpgsql block with the operator
+   running against a separate table (where HNSW AM crash cannot occur) reproduces the snapshot UAF.
+   The patched image survives; the unpatched image crashes.
+
+The updated `test/_fork_bug_multicol_double_scan.sql` uses a separate `meta` table for the sibling
+scan (no HNSW index on it), correctly isolating the DEV-1236 crash.
+
+### AFTER (patched `tridb/msvbase:dev`, freshly built)
+
+`scripts/smoke_test.sh tridb/msvbase:dev $PWD/test/_fork_bug_multicol_double_scan.sql`:
+
+```
+CREATE EXTENSION
+CREATE TABLE
+CREATE TABLE
+INSERT 0 100
+INSERT 0 2000
+CREATE INDEX
+DO
+If you see the NOTICE above, the DEV-1236 snapshot fix is working correctly.
+psql:/tmp/smoke.sql:59: NOTICE:  multicol double-scan SURVIVED (DEV-1236 fix): got={19,18,20,21,17} corpus=100
+[smoke_test] PASS — relational + vector legs work on the standin build.
+```
+
+No crash. NOTICE emitted. got={19,18,20,21,17} is the correct ANN result for the query vector.
+
+### Regression
+
+- `scripts/smoke_test.sh tridb/msvbase:dev test/smoke.sql`: PASS (relational + vector legs, HNSW
+  relaxed-monotonicity early termination path verified).
+- `scripts/tjs_test.sh tridb/msvbase:dev`: ALL TESTS PASSED — three-leg TJS, graph load-bearing,
+  filter load-bearing, early termination (`examined=73 of 2000`, TR-1/SM-3 intact — << corpus).
+
+### Patch wiring
+
+`scripts/patches/tridb_fix_double_scan_snapshot.patch` confirmed clean via `git apply --check` against
+`vendor/MSVBASE` (post-prior-patches state, exit 0). DEV-1236 sentinels confirmed in all three files.
+Wired into `scripts/lib/msvbase_patches.sh` (`apply_tridb_fork_patches` + `verify_patches`).
+
+### GX10/ARM sign-off
+
+Tabled. The fix is correct by Postgres snapshot ownership conventions; the snapshot logic is
+architecture-independent C++ against standard PG 13.4 APIs. Full sign-off requires building on the
+GX10 and running the complete `make test-all` suite there.
