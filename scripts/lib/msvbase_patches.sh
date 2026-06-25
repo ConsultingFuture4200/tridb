@@ -152,6 +152,39 @@ apply_tridb_fork_patches() {
     ( cd "$root" && git apply "$tjs_patch" ) \
       || die "tridb_tjs_operator.patch did not apply — MSVBASE drift? re-generate per DEV-1169"
   fi
+
+  # ----------------------------------------------------------------------------
+  # DRAFT / UNBUILT — DO NOT ENABLE (DEV-1235 / ADR-0009): HNSW WAL durability.
+  # ----------------------------------------------------------------------------
+  #   hnsw_wal_durability.patch makes the vendored HNSW index crash/abort-durable
+  #   by routing every index mutation through the SAME Postgres WAL the native
+  #   graph store uses (GenericXLog) — see docs/decisions/0009-hnsw-wal-durability.md
+  #   and docs/hnsw_wal_durability_bug_analysis_v0.1.0.md. The patch is a SPIKE
+  #   DRAFT against vendored C++ that has NOT been compiled or run; its
+  #   GenericXLog page bodies are TODO(GX10) stubs. It MUST be implemented and
+  #   BUILT on the GX10 (Docker), and the crash/abort tests in
+  #   docs/hnsw_wal_durability_bug_analysis_v0.1.0.md / test/crash_recovery_assert.sql
+  #   must pass, BEFORE it is moved into the active apply path above.
+  #
+  #   When graduating it (GX10 Phase B), follow the existing convention exactly:
+  #   sentinel-guarded idempotent apply + a verify_patches grep for the sentinel
+  #   "TRIDB: HNSW WAL durability (DEV-1235)". The activation sketch:
+  #
+  #     local wal_patch="${_MSVBASE_LIB_DIR}/../patches/hnsw_wal_durability.patch"
+  #     [[ -f "$wal_patch" ]] || die "missing TriDB fork patch: $wal_patch"
+  #     if grep -q 'TRIDB: HNSW WAL durability (DEV-1235)' "$root/src/hnswindex_scan.cpp" 2>/dev/null; then
+  #       log "TriDB fork patch (HNSW WAL durability, DEV-1235) already applied"
+  #     else
+  #       log "applying TriDB fork patch: HNSW WAL durability (DEV-1235 / ADR-0009)"
+  #       ( cd "$root" && git apply "$wal_patch" ) \
+  #         || die "hnsw_wal_durability.patch did not apply — MSVBASE drift? re-generate per DEV-1235"
+  #     fi
+  #     # and add to verify_patches():
+  #     #   grep -q 'TRIDB: HNSW WAL durability (DEV-1235)' "$root/src/hnswindex_scan.cpp" \
+  #     #     || die "TriDB hnsw_wal_durability.patch NOT applied — vector-index WAL durability missing (DEV-1235); drift?"
+  #     #   grep -q 'src/tridb_hnsw_wal.cpp' "$root/CMakeLists.txt" \
+  #     #     || die "TriDB hnsw_wal_durability.patch NOT wired into CMakeLists vectordb sources (DEV-1235); drift?"
+  # ----------------------------------------------------------------------------
 }
 
 # Patch known-dead upstream URLs / build-breakers in the MSVBASE Dockerfile. Arch-independent

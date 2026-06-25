@@ -1,0 +1,238 @@
+DRAFT / UNBUILT / requires-docker+GX10-verification — DEV-1235 (ADR-0009).
+================================================================================
+This patch is a PROPOSED DRAFT against vendored MSVBASE sources. It has NOT been
+compiled or run (vendored C++ builds only on the GX10 under Docker). Do NOT wire
+it into msvbase_patches.sh's apply path until it is built and the crash/abort
+tests below pass on the GX10. It is sentinel-guarded ("TRIDB: HNSW WAL durability
+(DEV-1235)") and idempotent so the future wiring follows the existing convention.
+
+Goal (ADR-0009 / golden rule #2): route every HNSW index mutation through the
+SAME PostgreSQL WAL the native graph store uses (GenericXLog), inside the SAME
+transaction and process — NEVER a second WAL, never a flat-file sidecar as the
+source of truth. This DRAFT introduces the durability SEAM (a new translation
+unit + a single hook at the in-RAM mutation point) and leaves the page-layout
+body as explicit TODO(GX10) stubs, because mapping hnswlib's contiguous
+data_level0_memory_ / linkLists_ onto 32KB relation pages is the hard part that
+must be proven on-target. It deliberately does NOT change scan/read paths (TR-1
+unaffected).
+
+Reference implementation to mirror: src/graph_store/graph_am.c in THIS repo
+(GenericXLogStart / GenericXLogRegisterBuffer / GenericXLogFinish on the relation
+relation's own forks; gph_xmin_visible for abort visibility).
+
+--------------------------------------------------------------------------------
+ src/tridb_hnsw_wal.hpp |  new — WAL-durability seam (DRAFT)
+ src/tridb_hnsw_wal.cpp |  new — GenericXLog page mutations (DRAFT/STUB)
+ src/hnswindex_scan.cpp |  hook addPoint/markDelete through the seam (DRAFT)
+ CMakeLists.txt         |  build the new TU (DRAFT, commented sketch)
+--------------------------------------------------------------------------------
+
+diff --git a/src/tridb_hnsw_wal.hpp b/src/tridb_hnsw_wal.hpp
+new file mode 100644
+--- /dev/null
++++ b/src/tridb_hnsw_wal.hpp
+@@ -0,0 +1,72 @@
++// Copyright (c) TriDB. Licensed under the MIT License.
++//
++// TRIDB: HNSW WAL durability (DEV-1235) — DRAFT / UNBUILT / GX10-gated (ADR-0009).
++//
++// The vendored HNSW index (hnswindex_scan.cpp) mutates a process-heap
++// hnswlib::HierarchicalNSW object in RAM and persists it via a flat file written
++// only at ambuild — so aminsert/ambulkdelete are WAL-less and a crash or abort
++// loses every incremental insert. This seam makes each mutation DURABLE by
++// writing the touched index bytes into the INDEX RELATION's own forks under
++// PostgreSQL's GenericXLog — the SAME WAL the native graph store uses
++// (src/graph_store/graph_am.c is the reference). NEVER a second WAL.
++//
++// STATUS: DRAFT. The page-mapping bodies are TODO(GX10) stubs. This file exists
++// to establish the seam, the sentinel, and the call sites; it must be completed
++// and BUILT on the GX10 before any "durable" claim.
++#ifndef TRIDB_HNSW_WAL_HPP
++#define TRIDB_HNSW_WAL_HPP
++
++extern "C"
++{
++#include <postgres.h>
++#include <utils/rel.h>
++#include <storage/itemptr.h>
++}
++
++// One logical index mutation, captured so it can be replayed/rolled back via the
++// host WAL. label is hnswlib's packed (blk<<32|off) point id; the vector payload
++// is the float[] already validated by HNSWIndexScan::Insert.
++namespace tridb {
++
++// Open the index relation's WAL-backed page store for the duration of one
++// mutation. Mirrors graph_am.c's gph_open_store + GenericXLogStart pairing.
++// TODO(GX10): real implementation opens the index relation by oid (the AM has
++// `Relation index` in hnsw_insert) and starts a GenericXLog state.
++struct HnswWalScope {
++    Relation index;               // the index relation whose forks back the store
++    void    *xlog_state;          // GenericXLogState* (opaque here to keep the
++                                  // header C++-includable without generic_xlog.h)
++    explicit HnswWalScope(Relation idx);
++    ~HnswWalScope();              // GenericXLogFinish on success / abort cleanup
++};
++
++// WAL-log the insertion of one point's bytes (level-0 record + link list +
++// header deltas) into the index relation pages. Must be called from inside
++// HNSWIndexScan::Insert, BEFORE/around the in-RAM addPoint, so the durable page
++// image and the in-RAM structure stay in lockstep within ONE transaction.
++// TODO(GX10): register the affected buffers with GenericXLogRegisterBuffer and
++// write the deltas, exactly like gph_insert_vertex/gph_insert_edge.
++void hnsw_wal_log_insert(HnswWalScope &scope,
++                         std::uint64_t label,
++                         const float *vec,
++                         int dim);
++
++// WAL-log a delete tombstone (markDelete) durably.
++// TODO(GX10): register the level-0 record's deleted-flag page and log it.
++void hnsw_wal_log_delete(HnswWalScope &scope, std::uint64_t label);
++
++// Reconstruct the in-RAM HierarchicalNSW from the WAL-RECOVERED relation pages
++// (replacing today's "rebuild from stale flat file" in LoadIndex). Called once
++// per backend on first access after recovery/startup.
++// TODO(GX10): read the relation forks (not the flat file) and rehydrate.
++void hnsw_wal_rehydrate(Relation index, void *hnsw_index_out);
++
++}  // namespace tridb
++
++// Sentinel proving this DRAFT seam is present (verify_patches grep target once
++// the patch is graduated from DRAFT). Do NOT remove.
++// TRIDB: HNSW WAL durability (DEV-1235)
++#endif  // TRIDB_HNSW_WAL_HPP
+diff --git a/src/tridb_hnsw_wal.cpp b/src/tridb_hnsw_wal.cpp
+new file mode 100644
+--- /dev/null
++++ b/src/tridb_hnsw_wal.cpp
+@@ -0,0 +1,86 @@
++// Copyright (c) TriDB. Licensed under the MIT License.
++//
++// TRIDB: HNSW WAL durability (DEV-1235) — DRAFT / UNBUILT / GX10-gated (ADR-0009).
++//
++// GenericXLog-backed page mutations for the HNSW index. Mirrors the WAL pattern
++// in src/graph_store/graph_am.c: every page change is registered with
++// GenericXLogRegisterBuffer and committed with GenericXLogFinish inside the
++// caller's transaction, so it redoes from the host WAL after a crash and rolls
++// back with the transaction. NO second WAL. NO flat-file source of truth.
++//
++// The bodies below are TODO(GX10) STUBS. They establish the structure and the
++// invariants but must be implemented and BUILT on the GX10 before any durability
++// claim. They intentionally elog(ERROR) if reached unbuilt so a half-applied
++// DRAFT fails LOUD rather than silently losing data.
++#include "tridb_hnsw_wal.hpp"
++
++extern "C"
++{
++#include <access/generic_xlog.h>
++#include <storage/bufmgr.h>
++#include <utils/elog.h>
++}
++
++namespace tridb {
++
++// Reference (graph_am.c): GenericXLogStart(rel) -> ... RegisterBuffer ... ->
++// GenericXLogFinish(state). We acquire the WAL state for the index relation here
++// and finish it in the destructor so one HnswWalScope == one atomic page batch.
++HnswWalScope::HnswWalScope(Relation idx) : index(idx), xlog_state(nullptr)
++{
++    // TODO(GX10): xlog_state = (void *) GenericXLogStart(index);
++    // Until implemented, this seam is inert; the caller must NOT claim durability.
++}
++
++HnswWalScope::~HnswWalScope()
++{
++    // TODO(GX10): if (xlog_state) GenericXLogFinish((GenericXLogState *) xlog_state);
++    // On exception/abort the txn machinery discards the registered buffers; never
++    // an ad-hoc flat-file write here.
++}
++
++void hnsw_wal_log_insert(HnswWalScope & /*scope*/,
++                         std::uint64_t /*label*/,
++                         const float * /*vec*/,
++                         int /*dim*/)
++{
++    // TODO(GX10): lay the new point's level-0 record + link list + header deltas
++    // into the index relation's pages, registering each touched buffer with
++    // GenericXLogRegisterBuffer (GENERIC_XLOG_FULL_IMAGE for a freshly extended
++    // page, 0 for an in-place delta) — exactly as gph_insert_edge does for the
++    // adjacency pages. This is the line that closes the FR-7 redo gap.
++    ereport(ERROR,
++            (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
++             errmsg("TRIDB DEV-1235: HNSW WAL-durability seam is a DRAFT STUB "
++                    "(unbuilt) — must be implemented + built on the GX10 before "
++                    "incremental HNSW inserts can be claimed crash/abort-durable")));
++}
++
++void hnsw_wal_log_delete(HnswWalScope & /*scope*/, std::uint64_t /*label*/)
++{
++    // TODO(GX10): WAL-log the deleted-flag page change (markDelete tombstone).
++    ereport(ERROR,
++            (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
++             errmsg("TRIDB DEV-1235: HNSW WAL-durability delete seam is a DRAFT "
++                    "STUB (unbuilt)")));
++}
++
++void hnsw_wal_rehydrate(Relation /*index*/, void * /*hnsw_index_out*/)
++{
++    // TODO(GX10): rebuild the in-RAM HierarchicalNSW from the WAL-RECOVERED
++    // relation forks, NOT the flat file. After redo, the relation pages are the
++    // source of truth; the flat file (if kept) is only a validated warm cache.
++    ereport(ERROR,
++            (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
++             errmsg("TRIDB DEV-1235: HNSW WAL-durability rehydrate seam is a "
++                    "DRAFT STUB (unbuilt)")));
++}
++
++}  // namespace tridb
+diff --git a/src/hnswindex_scan.cpp b/src/hnswindex_scan.cpp
+--- a/src/hnswindex_scan.cpp
++++ b/src/hnswindex_scan.cpp
+@@ -2,6 +2,13 @@
+ // Licensed under the MIT License.
+
+ #include "hnswindex_scan.hpp"
+ #include "tridb_vector_index.hpp"
++// TRIDB: HNSW WAL durability (DEV-1235) — DRAFT / UNBUILT / GX10-gated (ADR-0009).
++// The seam that routes index mutations through the host WAL (GenericXLog), the
++// SAME WAL the native graph store uses. DRAFT: the seam bodies are STUBS that
++// elog(ERROR) until implemented + built on the GX10, so a half-applied patch
++// fails loud rather than silently losing data. The hook below is COMMENTED OUT
++// until the bodies are real; uncommenting it (and removing the stub errors) is
++// the GX10 Phase-B step.
++#include "tridb_hnsw_wal.hpp"
+
+ // TRIDB(DEV-1228 / ADR-0004): the hnswlib-backed HNSW AM is the reference implementer of the
+ // TriDB-owned vector-index scan contract. Assert conformance at compile time so a future
+@@ -83,7 +90,17 @@ bool HNSWIndexScan::Insert(const std::string &p_path,
+     std::int32_t blockId = ItemPointerGetBlockNumberNoCheck(heap_tid);
+     std::int32_t offset = ItemPointerGetOffsetNumberNoCheck(heap_tid);
+     std::uint64_t number = blockId;
+     number = (number << 32) + offset;
+-    vector_index_map[p_path]->addPoint((char*)array.data(), number);
++    // TRIDB DEV-1235 (DRAFT/UNBUILT, ADR-0009): durability seam. The in-RAM
++    // addPoint must be made crash/abort-durable by WAL-logging the same mutation
++    // into the index relation's pages via GenericXLog, inside this transaction.
++    // On the GX10 (Phase B) this becomes, with `Relation index` threaded through
++    // from hnsw_insert (see the companion hnswindex.cpp hook in ADR-0009):
++    //     tridb::HnswWalScope wal(index);
++    //     tridb::hnsw_wal_log_insert(wal, number, array.data(), dim);
++    //     vector_index_map[p_path]->addPoint((char*)array.data(), number);
++    // Until the seam bodies are implemented + BUILT on-target, we keep the
++    // existing (non-durable) behavior so the build is unchanged; the seam header
++    // is included to anchor the sentinel and the call site.
++    vector_index_map[p_path]->addPoint((char*)array.data(), number);
+     return true;
+ }
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -0,0 +0,0 @@
++# TRIDB: HNSW WAL durability (DEV-1235) — DRAFT / UNBUILT / GX10-gated (ADR-0009).
++# Add the durability seam TU to the UNCONDITIONAL vectordb source list, alongside
++# src/tridb_vector_iter.cpp and src/tjs_operator.cpp (see the existing TriDB
++# additions). NOTE: this hunk is a SKETCH — the real apply must target the exact
++# vectordb source-list line in this file (it drifts with upstream), the same way
++# tridb_vector_iter.patch / tridb_tjs_operator.patch do. Do NOT apply blind.
++#     src/tridb_hnsw_wal.cpp
+</content>
