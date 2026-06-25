@@ -154,6 +154,16 @@ def sm2_latency_win_fraction(
 
     Pairs TriDB and baseline samples by qid; counts queries where TriDB latency
     is strictly lower. Passes when the win fraction >= 0.80.
+
+    .. warning::
+       **SM-2 is structurally unmeasurable in stub mode.** The StubDriver and the
+       in-process baseline are both Python simulations; both pay the same
+       O(N*D) ``sorted()`` over all entities, and their ``latency_ms`` ratio
+       reflects how much *Python* work each does after that sort, NOT the
+       in-DB-engine vs out-of-DB-overhead difference SM-2 is meant to capture. A
+       stub SM-2 "pass" is a simulation artifact, not a latency claim. Only the
+       LiveDriver (GX10) produces a real SM-2 number. Treat the stub verdict as
+       "simulation only" — see bench/README.md.
     """
     base_by_qid = {s.qid: s for s in baseline}
     paired = [(t, base_by_qid[t.qid]) for t in tridb if t.qid in base_by_qid]

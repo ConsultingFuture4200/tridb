@@ -13,6 +13,15 @@ HTML report comparing the two against their targets.
 | SM-4 | ≥99% answer-set parity with baseline | per-query Jaccard, averaged |
 | SM-5 | 100% transaction atomicity | TriDB (one txn manager, one WAL) |
 
+> **SM-2 is a real number ONLY in live mode.** In stub mode the StubDriver and
+> the in-process baseline are both Python simulations that pay the same
+> `O(N*D)` sort; their `latency_ms` ratio reflects Python work-units, not the
+> in-DB vs out-of-DB-overhead difference SM-2 exists to measure. A stub "SM-2
+> PASS" is a **simulation artifact, not a latency claim** — never quote it. SM-1
+> (intermediate-row counts) and SM-3/SM-4 (corpus-examined / parity) are
+> structural and meaningful in stub mode; SM-2 latency is not. Re-run with
+> `--engine live` on the GX10 for a real SM-2.
+
 ## Layout
 
 | File | Role |

@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import abc
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from bench.metrics import QuerySample
 
@@ -46,10 +46,25 @@ class Corpus:
     entities: dict[int, dict]
     edges: list[tuple[int, int]]
     queries: list[dict]
+    #: Lazily-built src -> [dst, ...] adjacency cache. Excluded from init/repr/eq
+    #: so the corpus stays a plain data record; built once on first adjacency().
+    _adj: dict[int, list[int]] | None = field(default=None, repr=False, compare=False)
 
     @property
     def size(self) -> int:
         return len(self.entities)
+
+    def adjacency(self) -> dict[int, list[int]]:
+        """src -> [dst, ...] over the native graph edges, built once and cached.
+
+        Drivers call this per query; without the cache a multi-query run rebuilds
+        the same dict from ``edges`` every invocation (O(queries * edges))."""
+        if self._adj is None:
+            adj: dict[int, list[int]] = {}
+            for src, dst in self.edges:
+                adj.setdefault(src, []).append(dst)
+            self._adj = adj
+        return self._adj
 
 
 class EngineDriver(abc.ABC):
@@ -111,10 +126,9 @@ class StubDriver(EngineDriver):
         q_emb = query["embedding"]
         time_range = set(query["selected_time_range"])
 
-        # Adjacency list: src -> [dst, ...] (the native graph access method).
-        adj: dict[int, list[int]] = {}
-        for src, dst in corpus.edges:
-            adj.setdefault(src, []).append(dst)
+        # Adjacency list: src -> [dst, ...] (the native graph access method),
+        # built once and cached on the corpus across queries.
+        adj = corpus.adjacency()
 
         # Sources ranked by similarity to the question embedding. The live HNSW
         # iterator yields these incrementally; the stub computes the exact order

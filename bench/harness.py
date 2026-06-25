@@ -35,7 +35,7 @@ import json
 import time
 from pathlib import Path
 
-from bench.driver import Corpus, EngineDriver, make_driver
+from bench.driver import Corpus, EngineDriver, _l2_sq, make_driver
 from bench.metrics import BenchmarkReport, QuerySample, derive_metrics
 
 # Over-fetch multiplier the out-of-DB baseline pays on the ANN leg because it
@@ -80,10 +80,6 @@ def load_corpus(seed_dir: Path) -> Corpus:
 # --------------------------------------------------------------------------- #
 # In-process baseline model (mirrors baseline/harness.py, runs anywhere)
 # --------------------------------------------------------------------------- #
-
-
-def _l2_sq(a: list[float], b: list[float]) -> float:
-    return sum((x - y) * (x - y) for x, y in zip(a, b))
 
 
 def baseline_query_inprocess(query: dict, k: int, corpus: Corpus) -> QuerySample:
