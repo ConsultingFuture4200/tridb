@@ -1,21 +1,26 @@
 -- _fork_bug_multicol_double_scan.sql — NOT IN CI (leading underscore; absent from Makefile
--- ENGINE_TESTS). This file DELIBERATELY CRASHES THE BACKEND. Run it by hand only.
+-- ENGINE_TESTS). Manual diagnostic. Deterministic repro of the REPRODUCIBLE DEV-1236 crash.
 --
--- Purpose (DEV-1169 / Linus review #9): PROVE that the "double-scan segfault" — issuing another
--- query against the operator's own target table in the SAME plpgsql block as the operator call —
--- is a PRE-EXISTING MSVBASE fork bug in the topk/multicol_topk SPI-driven-executor lifecycle, NOT
--- introduced by the TJS operator (DEV-1169). It uses UNMODIFIED multicol_topk only: no tjs(), no
--- graph_store extension, no graph leg.
+-- ROOT CAUSE (backtrace: HNSWIndexScan::EndScan -> hnsw_endscan -> ExecEndIndexOnlyScan):
+--   With enable_seqscan off, the PG planner picks an Index-Only Scan on the HNSW index for an
+--   unordered/aggregate scan such as count(*). hnsw_gettuple's no-ORDER-BY/no-key branch returned
+--   false WITHOUT creating a ResultIterator, leaving scanState->workSpace->resultIterator null;
+--   hnsw_endscan then called EndScan -> resultIterator->Close() on a null shared_ptr -> SIGSEGV.
+--   (On any non-crashing path it also made count(*) silently return 0 — a wrong answer.)
 --
--- VERIFIED 2026-06-25 on tridb/msvbase:dev: the DO block below terminates the backend with
---   "server process (PID …) was terminated by signal 11: Segmentation fault"
--- (postgres server log). Because tjs() forks the same execFagins lifecycle, it inherits the bug;
--- the canonical e2e test (test/canonical_e2e_test.sql) sidesteps it by NOT co-issuing a second
--- scan of the operator's table in the early-termination block. The real fix belongs to the fork's
--- executor-driving lifecycle (a separate hardening task). See docs/decisions/0007-tjs-operator.md.
+-- BEFORE (stock tridb/msvbase:dev): the `SELECT count(*)` line below terminates the backend
+--   (server log: "terminated by signal 11"); the connection is lost and nothing after it runs.
+-- AFTER  (tridb_hnsw_scan_no_orderby.patch): that line raises a clean ERROR
+--   ("hnsw index scan requires an ORDER BY <-> distance clause") and the backend STAYS UP — the
+--   backend_alive probe returns 1 and the ORDER BY <-> control still returns rows.
 --
--- Run: scripts/smoke_test.sh tridb/msvbase:dev test/_fork_bug_multicol_double_scan.sql
--- (smoke_test.sh loads vectordb only — proving graph_store is not involved.)
+-- NOTE: the sibling-scan-in-a-plpgsql-block shape originally suspected for DEV-1236 is a separate,
+-- latent snapshot/UAF issue hardened by tridb_fix_double_scan_snapshot.patch; controlled
+-- stock-vs-patched testing did NOT reproduce a crash for that shape. THIS file reproduces the
+-- actual deterministic crash. See docs/fork_segfault_double_scan.md.
+--
+-- Run WITHOUT -v ON_ERROR_STOP=1 so the expected post-fix ERROR does not halt the liveness probe:
+--   scripts/smoke_test.sh tridb/msvbase:dev $PWD/test/_fork_bug_multicol_double_scan.sql
 
 CREATE EXTENSION vectordb;
 
@@ -25,20 +30,15 @@ SELECT k, 'c' || k, 100, ARRAY[k,0,0,0,0,0,0,0]::float8[]
 FROM generate_series(1, 2000) AS k;
 CREATE INDEX entities_hnsw ON entities USING hnsw(embedding)
     WITH (dimension = 8, distmethod = l2_distance);
-SET enable_seqscan = off;
 
--- A sibling scan of the SAME table (SELECT count(*) FROM entities) in the SAME plpgsql block as the
--- multicol_topk() call segfaults the backend. No tjs, no graph_store.
-DO $$
-DECLARE got bigint[]; corpus bigint;
-BEGIN
-    SELECT count(*) INTO corpus FROM entities;     -- sibling scan of multicol_topk's own table
-    SELECT array_agg(id) INTO got FROM (
-        SELECT t.id
-        FROM multicol_topk('entities', 5, 0, 'id', '', '',
-                           'embedding <-> ''{19,0,0,0,0,0,0,0}''') AS t(id bigint, d float8)
-    ) q;
-    RAISE NOTICE 'multicol double-scan SURVIVED (unexpected): got=% corpus=%', got, corpus;
-END $$;
+SET enable_seqscan = off;  -- forces the planner onto the HNSW index for the unordered count(*)
 
-\echo 'If you see this line, the fork bug did NOT reproduce — investigate (TJS may then be the cause).'
+-- CRASH line on stock; clean ERROR on the patched build:
+SELECT count(*) FROM entities;
+
+-- Liveness probe: prints 1 iff the backend survived (the fix is in). On the stock/crashed
+-- backend the connection is already gone and this never executes.
+SELECT 1 AS backend_alive;
+
+-- Positive control: ORDER BY <-> vector search is unaffected (returns 5 rows).
+SELECT id FROM entities ORDER BY embedding <-> '{19,0,0,0,0,0,0,0}' LIMIT 5;

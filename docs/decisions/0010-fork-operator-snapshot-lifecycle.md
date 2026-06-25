@@ -1,6 +1,18 @@
 # ADR-0010: Fork operators must own their snapshot for the full SRF lifetime
 
-**Status:** Accepted (diagnosis); fix DRAFTED, **UNBUILT-HERE** (GX10-gated)
+> **CORRECTION (post controlled verification).** This ADR's thesis — that the DEV-1236 SIGSEGV is a
+> snapshot/resource-owner lifecycle collision — did **not** hold up under controlled stock-vs-patched
+> testing: the operator + sibling-scan plpgsql shape **survives with AND without** the snapshot patch
+> (the snapshot UB is latent, not a reliable crash). The change in
+> `tridb_fix_double_scan_snapshot.patch` is therefore accepted as **latent-UB HARDENING** (correct per
+> Postgres snapshot-ownership rules, plus a real teardown use-after-free), **not** as a verified fix
+> for a reproducible crash. The crash actually filed under DEV-1236 reproduces deterministically as the
+> **HNSW no-ORDER-BY bug** (backtrace: `HNSWIndexScan::EndScan` on a null `ResultIterator` for a
+> `count(*)` Index-Only Scan when `enable_seqscan=off`), fixed by `tridb_hnsw_scan_no_orderby.patch`.
+> See `docs/fork_segfault_double_scan.md` for the corrected evidence.
+
+**Status:** Accepted as latent-UB HARDENING (builds clean on the x86 standin); NOT a verified
+reproducible-crash fix (see Correction above). GX10/ARM sign-off tabled.
 **Issue:** DEV-1236 (spike / diagnose)
 **Related:** ADR-0007 (TJS operator), ADR-0006 (relaxed-monotonicity vector iterator),
 DEV-1169 (TJS), DEV-1168 (vector iterator), `docs/fork_segfault_double_scan.md` (full evidence chain),
@@ -69,13 +81,29 @@ built and verified.
 
 ## Status / gating
 
-- **UNBUILT-HERE.** Authored on the x86 standin in a static-verify run with no docker image. The
-  fix is a DRAFT patch (`scripts/patches/tridb_fix_double_scan_snapshot.patch`, labeled UNBUILT)
-  plus a repro (`test/_fork_bug_tjs_double_scan.sql`, NOT in CI — crashes the backend).
-- **Not claimed to compile, pass, or fix anything.** Verification (baseline crash → apply → re-run
-  shapes → `make test-all` green → promote a minimized survivor block to CI) must run on a built
-  `tridb/msvbase:dev` image (x86 standin) or the GX10. Steps in
-  `docs/fork_segfault_double_scan.md` §Verify wiring and the patch trailer.
+**BUILT AND VERIFIED on the x86 standin (2026-06-25).** Full pipeline: `scripts/x86build.sh
+--docker` (fresh Docker layer, full cmake build, all patches applied including DEV-1236 via
+`scripts/patches/tridb_fix_double_scan_snapshot.patch`). Build exited 0; `topk.cpp`,
+`multicol_topk.cpp`, `tjs_operator.cpp` all compiled, no new errors. `verify_patches` confirmed
+DEV-1236 sentinels in all three files. Image sha256:c459870af2e1.
+
+Smoke test PASS (standard `test/smoke.sql`). Canonical TJS e2e ALL TESTS PASSED; `examined=73 of
+2000` (TR-1/SM-3 intact). Double-scan SURVIVED on corrected repro:
+`test/_fork_bug_multicol_double_scan.sql` (sibling scan of separate `meta` table, no seqscan
+interaction) → `NOTICE: multicol double-scan SURVIVED (DEV-1236 fix): got={19,18,20,21,17} corpus=100`.
+
+Patch wired into `scripts/lib/msvbase_patches.sh` — sentinel `DEV-1236` in all three `.cpp` files.
+`git apply --check` against `vendor/MSVBASE` (post-prior-patches): exit 0.
+
+**GX10/ARM sign-off tabled.** Snapshot logic is architecture-independent PG 13.4 C++ (no
+GX10-specific codepaths). GX10 is required only to build the full native HNSW/graph layer;
+sign-off there tracks with the GX10 Phase build, not this fix specifically.
+
+**NOTE on HNSW AM non-ORDER-BY crash:** `SET enable_seqscan = off` causes PG to choose the HNSW
+index for `SELECT count(*) FROM entities` (index-only scan path). The HNSW AM does not support
+plain aggregate scans without ORDER BY and crashes — independently of the snapshot bug, on both
+stock and patched images. This is a separate pre-existing issue. The updated repro file avoids it
+by scanning a separate table. See `docs/fork_segfault_double_scan.md` §Repro isolation.
 
 ## Consequences
 
