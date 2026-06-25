@@ -61,15 +61,26 @@ used for the graph store. Concretely:
    with the transaction (the registered buffers are part of the abort's WAL/redo
    accounting; uncommitted page images do not survive a crash-abort).
 
-3. **Abort durability** is achieved the GraphAM way: either (a) version the
-   touched index bytes with the inserting xid and filter on scan
-   (`xmin`-visible), or (b) for v1 scope, rely on `GenericXLog`'s
-   register-and-finish semantics so that an aborted transaction's index page
-   mutations are not durably committed (no second WAL means no torn sidecar), and
-   defer per-node xmin to a follow-on — mirroring how ADR-0003a split atomicity
-   (shipped) from snapshot isolation (deferred). The chosen sub-option is settled
-   during the GX10 build of the spike; this ADR mandates only that the mechanism
-   is `GenericXLog` on the index relation, never a sidecar.
+3. **Abort durability** is achieved the GraphAM way: version the touched index
+   bytes with the inserting xid and filter on scan (`xmin`-visible). This is
+   **mandatory, not deferrable**, and the spike must not pretend otherwise:
+
+   > **Correction (Linus review):** `GenericXLog`'s register-and-finish does
+   > **not** by itself give abort durability. Finish writes the WAL record and
+   > leaves the shared buffer dirty with the mutated page image; a later
+   > same-transaction abort does not undo that page mutation, and crash recovery
+   > replays it. Worse, `addPoint` is irreversible at the `hnswlib` level — the
+   > in-memory `HierarchicalNSW` still has the aborted node woven into its link
+   > lists. So WAL-logging alone (the discarded "option (b)") fixes ONLY the
+   > **crash-redo** gap (committed inserts survive restart); it does **nothing**
+   > for the **abort-corruption** gap. Retiring ADR-0003a KNOWN-LIMITATION #3 and
+   > passing the abort-stress test require the `xmin` visibility filter (option a)
+   > **plus** rebuilding the in-memory structure to honor it. There is no valid
+   > v1-scope shortcut here, unlike ADR-0003a's atomicity/isolation split.
+
+   This ADR mandates that the mechanism is `GenericXLog` on the index relation,
+   never a sidecar, **and** that abort isolation uses xid stamping + a scan-time
+   visibility filter mirroring `gph_xmin_visible()`.
 
 4. **`amvacuumcleanup` / `ambulkdelete`** route `markDelete` through the same
    `GenericXLog` page path so tombstones are durable and redo-able.
@@ -98,10 +109,14 @@ used for the graph store. Concretely:
   + wiring sketch + verification plan. No build.
 - **Phase B (GX10, follow-on):** implement the `GenericXLog` page layer for the
   index relation; make `aminsert` WAL-logged; reconstruct the in-memory graph
-  from recovered pages. Land crash/abort tests (below) GREEN in Docker on GX10.
-- **Phase C (GX10, follow-on):** per-node xmin visibility for full abort
-  isolation if Phase B used the deferred sub-option; remove the abort budget cap
-  from the SM-5 loop (ADR-0003a Test C2).
+  from recovered pages. This closes the **crash-redo** gap only — land the
+  crash-recovery tests (below) GREEN in Docker on GX10.
+- **Phase C (GX10, follow-on) — NOT optional:** per-node xid stamping + scan-time
+  `xmin` visibility filter, and rebuild the in-memory `HierarchicalNSW` to honor
+  it, so an aborted insert is invisible and uncorrupting. Only this closes the
+  **abort-corruption** gap; only then can the abort budget cap be removed from
+  the SM-5 loop (ADR-0003a Test C2) and KNOWN-LIMITATION #3 retired. Phase B
+  alone does **not** suffice (see Decision §3 correction).
 
 ## Consequences
 

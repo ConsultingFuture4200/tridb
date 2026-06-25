@@ -20,6 +20,19 @@ Reference implementation to mirror: src/graph_store/graph_am.c in THIS repo
 (GenericXLogStart / GenericXLogRegisterBuffer / GenericXLogFinish on the relation
 relation's own forks; gph_xmin_visible for abort visibility).
 
+CAVEATS for the Phase-B implementer (Linus review):
+  1. This DRAFT only adds a commented skeleton at the Insert (addPoint) call site.
+     The markDelete / BulkDelete path (hnswindex_scan.cpp markDelete, see the
+     bug-analysis table) needs a PARALLEL commented skeleton + the same
+     hnsw_wal_log_delete hook before handoff; the seam declares the function but
+     the patch leaves its call site without an anchor. Add it.
+  2. The CMakeLists.txt hunk is a no-op (@@ -0,0 +0,0 @@) — `git apply` will NOT
+     wire the new translation unit into the build. Regenerate that hunk against
+     the live vectordb source list on the GX10 tree before applying.
+  3. Per ADR-0009 §3 (corrected): WAL-logging here closes the crash-redo gap ONLY.
+     Abort-corruption needs the xmin visibility filter + in-memory rebuild
+     (ADR-0009 Phase C) — it is mandatory, not deferrable.
+
 --------------------------------------------------------------------------------
  src/tridb_hnsw_wal.hpp |  new — WAL-durability seam (DRAFT)
  src/tridb_hnsw_wal.cpp |  new — GenericXLog page mutations (DRAFT/STUB)
