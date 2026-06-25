@@ -94,6 +94,18 @@ scan provably early-terminates rather than blocking.
   executor via SPI and reads live graph state.
 - **BM25 / a fourth leg** remains a future predicate-or-stream decision; the predicates-on-one-stream
   pattern generalizes to any additional *filter* leg without an order-merge.
+- **Inherited fork SPI limitation (known issue).** `tjs()` forks the `topk`/`multicol_topk`
+  SPI-driven-executor lifecycle, and inherits a PRE-EXISTING MSVBASE fork bug: issuing another query
+  against the operator's own target table in the **same plpgsql block** as the operator call (e.g.
+  `SELECT count(*) FROM entities;` alongside `tjs('entities', …)`) segfaults the backend. It is
+  reproducible with **unmodified `multicol_topk` alone** (no TJS, no graph), so it is the fork's, not
+  TJS's. Top-level (non-plpgsql) calls and back-to-back calls are unaffected — only a sibling scan of
+  the same table within one plpgsql block. The fix belongs to the fork's executor-driving lifecycle
+  (a separate hardening task, GX10-adjacent); the canonical e2e test sidesteps it by not co-issuing a
+  second `entities` scan in the early-termination block. See DEV-1169 report.
+- **HNSW incremental-insert limitation (known fork issue).** Inserting into an already-indexed table
+  crashes the fork's HNSW AM (reproducible with `vectordb` alone). Tests build the full corpus before
+  `CREATE INDEX`. Also outside DEV-1169's scope.
 
 ## Alternatives rejected
 

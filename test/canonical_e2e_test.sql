@@ -27,12 +27,19 @@ CREATE TABLE entities (
     embedding float8[8]
 );
 
+-- The full corpus is built BEFORE the HNSW index (the assertion-3 early-termination corpus is
+-- 2000 rows; assertions 1/1b/2 only reference reachable {10,20,30,40} and q near 19/40, all id<=50,
+-- so the extra rows 51..2000 do not change those answers — src=1 only reaches {10,20,30,40}).
+-- NOTE: all INSERTs precede CREATE INDEX deliberately — the MSVBASE fork's HNSW access method does
+-- not support incremental inserts into an already-built index (it crashes the backend; reproducible
+-- with vectordb alone, no TJS/graph involved). Same build-corpus-first discipline as
+-- test/trimodal_early_term.sql. This is an upstream-fork limitation, outside DEV-1169's scope.
 INSERT INTO entities
 SELECT k,
        'chunk ' || k,
        CASE WHEN k = 40 THEN 999 ELSE 100 END,
        ARRAY[k,0,0,0,0,0,0,0]::float8[]
-FROM generate_series(1, 50) AS k;
+FROM generate_series(1, 2000) AS k;
 
 CREATE INDEX entities_hnsw ON entities USING hnsw(embedding)
     WITH (dimension = 8, distmethod = l2_distance);
@@ -51,7 +58,7 @@ SET enable_seqscan = off;
 -- distances among reachable {10,20,30,40} to q=[19,...]: |10-19|=9, |20-19|=1, |30-19|=11,
 -- |40-19|=21. With ts<500 dropping 40 (which is far anyway here), the closest 2 are {20,10}.
 -- The result {20,10} is only reachable if ALL THREE legs engage: graph membership (restricts to
--- {10,20,30,40}), the ts filter, AND the vector order. A vector-only run over all 50 entities, or
+-- {10,20,30,40}), the ts filter, AND the vector order. A vector-only run over all 2000 entities, or
 -- a no-graph run, returns a different set.
 -- ===========================================================================
 DO $$
@@ -119,14 +126,19 @@ END $$;
 -- before draining all rows. This is the no-blocking property: top-k settles via early termination,
 -- not full materialization.
 -- ===========================================================================
-INSERT INTO entities
-SELECT k, 'chunk ' || k, 100, ARRAY[k,0,0,0,0,0,0,0]::float8[]
-FROM generate_series(51, 2000) AS k;
-
+-- (corpus is already 2000 rows, built before the index — see the top-of-file note.)
 -- src 1 reaches only {10,20,30,40}; rank by distance to q=[19]. The scan should terminate well
 -- before examining all 2000 rows once the top-5 is settled (consecutive_drops default 50).
+-- IMPORTANT (fork limitation): this block must NOT issue any OTHER query against `entities` (e.g.
+-- SELECT count(*) FROM entities) in the same plpgsql block as the tjs() call. Combining a second
+-- scan of the operator's own target table with the SPI-driven IndexScan inside one plpgsql block
+-- segfaults the backend — a PRE-EXISTING MSVBASE fork bug in the topk/multicol_topk Fagin-merge
+-- lifecycle (reproducible with multicol_topk alone, no TJS/graph), which tjs() inherits by forking
+-- the same execFagins pattern (the mandated v1 architecture). So `corpus` is the known constant 2000
+-- (the literal generate_series bound above), not a live SELECT count(*). The operator itself is
+-- correct; this is purely a test-harness accommodation. See the DEV-1169 report / ADR-0007.
 DO $$
-DECLARE got bigint[]; examined bigint; corpus bigint;
+DECLARE got bigint[]; examined bigint; corpus bigint := 2000;  -- = the generate_series(1,2000) bound.
 BEGIN
     SELECT array_agg(id) INTO got FROM (
         SELECT t.id
@@ -134,7 +146,6 @@ BEGIN
                  'embedding <-> ''{19,0,0,0,0,0,0,0}''') AS t(id bigint)
     ) q;
     examined := tjs_candidates_examined();
-    SELECT count(*) INTO corpus FROM entities;
 
     -- Graph restricts to {10,20,30,40} (40 stale -> dropped); the top-5 reachable survivors are
     -- {10,20,30} ordered by distance. The exact set is {20,10,30} (only 3 reachable+fresh exist).

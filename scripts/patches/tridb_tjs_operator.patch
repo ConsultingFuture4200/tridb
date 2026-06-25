@@ -39,10 +39,10 @@ index 8bd02e7..53d041d 100644
 +	AS 'MODULE_PATHNAME' LANGUAGE C;
 diff --git a/src/tjs_operator.cpp b/src/tjs_operator.cpp
 new file mode 100644
-index 0000000..401e354
+index 0000000..9d4b51a
 --- /dev/null
 +++ b/src/tjs_operator.cpp
-@@ -0,0 +1,637 @@
+@@ -0,0 +1,702 @@
 +// Copyright (c) TriDB. Licensed under the MIT License.
 +//
 +// tjs_operator.cpp — TriDB Traversal-Join-Similarity (TJS) operator (DEV-1169 / FR-4).
@@ -294,6 +294,28 @@ index 0000000..401e354
 +	return ExecCopySlotHeapTuple(slot);
 +}
 +
++// Copy a tuple descriptor, optionally dropping the last attribute. The vector leg's IndexScan plan
++// for `select <attr_exp> from <t> order by <orderby>` carries the ORDER BY expression as a trailing
++// (resjunk) attribute in its result desc, so the child slot has natts = (attr_exp cols) + 1. We drop
++// that trailing orderby column so TJS's visible output is exactly `attr_exp`. Forked from
++// multicol_topk.cpp's copyAndDropLastAttrM.
++TupleDesc copyAndDropLastAttrT(TupleDesc tupdesc, bool doDrop){
++	TupleDesc desc = CreateTemplateTupleDesc(doDrop ? std::max(tupdesc->natts - 1, 0) : tupdesc->natts);
++	memcpy(TupleDescAttr(desc, 0), TupleDescAttr(tupdesc, 0),
++		   desc->natts * sizeof(FormData_pg_attribute));
++	for (int i = 0; i < desc->natts; i++) {
++		Form_pg_attribute att = TupleDescAttr(desc, i);
++		att->attnotnull   = false;
++		att->atthasdef    = false;
++		att->atthasmissing = false;
++		att->attidentity  = '\0';
++		att->attgenerated = '\0';
++	}
++	desc->tdtypeid = tupdesc->tdtypeid;
++	desc->tdtypmod = tupdesc->tdtypmod;
++	return desc;
++}
++
 +// ---------------------------------------------------------------------------
 +// The graph reachability predicate.
 +//
@@ -307,27 +329,32 @@ index 0000000..401e354
 +// This honors golden rule 3 (graph is native traversal, NOT a relational join): we call the graph
 +// store's own iterator, not a join over an edge table.
 +// ---------------------------------------------------------------------------
++// Probe the graph store for src's reachable set. MUST be called while ALREADY inside an SPI
++// connection the caller opened (we do NOT SPI_connect/finish here): graph_store.neighbors is itself
++// an SRF that does its own nested SPI_connect/finish, and bracketing THAT with a second, sibling
++// SPI_connect/finish in the same C call left the SPI stack in a state that crashed the *next* tjs()
++// in the session. Running this probe inside the SRF's single, already-open SPI connection keeps the
++// SPI nesting strictly hierarchical (graph_neighbors' SPI nests cleanly under ours) and balanced.
 +static std::unordered_set<int64> graphReachableT(int64 src){
 +	std::unordered_set<int64> reachable;
 +	char cmd[256];
 +	snprintf(cmd, sizeof(cmd),
 +			 "SELECT dst FROM graph_store.neighbors(%lld) AS dst", (long long) src);
 +
-+	SPI_connect();
-+	int ret = SPI_exec(cmd, 0);
++	int ret = SPI_execute(cmd, true /* read_only */, 0);
 +	if (ret != SPI_OK_SELECT)
 +		elog(ERROR, "TJS graph predicate: graph_store.neighbors(%lld) probe failed (%d)",
 +			 (long long) src, ret);
 +
 +	uint64 proc = SPI_processed;
-+	TupleDesc tupdesc = SPI_tuptable->tupdesc;
++	SPITupleTable *tt = SPI_tuptable;
++	TupleDesc tupdesc = tt->tupdesc;
 +	for (uint64 i = 0; i < proc; i++) {
 +		bool isnull;
-+		Datum d = SPI_getbinval(SPI_tuptable->vals[i], tupdesc, 1, &isnull);
++		Datum d = SPI_getbinval(tt->vals[i], tupdesc, 1, &isnull);
 +		if (!isnull)
 +			reachable.insert(DatumGetInt64(d));
 +	}
-+	SPI_finish();
 +	return reachable;
 +}
 +
@@ -357,8 +384,17 @@ index 0000000..401e354
 +	std::vector<IndexScanState*> *children;
 +	std::vector<QueryDesc*>* qDescs;
 +
++	// The SRF's multi-call memory context. Result heap tuples are copied here (NOT into the child
++	// executor's per-query context, which EndTJSState frees), so they survive after the children are
++	// closed and SPI is finished — both of which happen inside the SRF's FIRST call (see tjs()).
++	MemoryContext result_cxt;
++
 +	// Instrumentation (increment 3 / SM-3): candidates pulled from the ANN stream this scan.
 +	int64 examined;
++
++	// Set true once the children/executor/relation have been closed (EndTJSChildren). Guards the SRF
++	// from touching freed executor state on later per-call invocations.
++	bool children_closed;
 +} TJSState;
 +
 +// Process-global examined counter for the last TJS scan in this backend (TR-1 probe, SM-3). Mirrors
@@ -440,7 +476,12 @@ index 0000000..401e354
 +				if ( graph_ok && ( proc_pq->size() < k || proc_pq->top().first > rank_score ) ){
 +					if ( proc_pq->size() == k )
 +						proc_pq->pop();
++					// Copy the surviving tuple into the SRF's multi-call context (result_cxt), NOT the
++					// child's es_query_cxt which EndTJSState frees at teardown — so the tuple outlives
++					// the children and stays valid across the SRF's per-call pops.
++					auto resctx = MemoryContextSwitchTo(estate->result_cxt);
 +					proc_pq->push(std::make_pair(rank_score, copyItemT(slot)));
++					MemoryContextSwitchTo(resctx);
 +					consecutive_drops = 0;
 +				}
 +
@@ -481,9 +522,10 @@ index 0000000..401e354
 +	TJSState* state = (TJSState*)malloc(sizeof(TJSState));
 +	memset(&(state->ps), 0, sizeof(PlanState));
 +
-+	// Single-leg: the result tuple desc is the child's verbatim (no rank column to drop, unlike the
-+	// multi-orderby multicol_topk path).
-+	state->ps.ps_ResultTupleDesc = scans[0]->ss.ps.ps_ResultTupleDesc;
++	// Drop the trailing ORDER BY (resjunk) attribute the IndexScan plan appends, so TJS's visible
++	// result is exactly `attr_exp`. The stored heap tuple may still carry the extra column; a slot
++	// desc with fewer attributes simply ignores the trailing source attrs on store.
++	state->ps.ps_ResultTupleDesc = copyAndDropLastAttrT(scans[0]->ss.ps.ps_ResultTupleDesc, true);
 +	state->ps.ps_ResultTupleSlot = MakeTupleTableSlot(state->ps.ps_ResultTupleDesc,
 +													  scans[0]->ss.ps.ps_ResultTupleSlot->tts_ops);
 +	state->ps.ExecProcNode = execTJS;
@@ -504,29 +546,43 @@ index 0000000..401e354
 +	state->reachable        = new std::unordered_set<int64>(std::move(reachable));
 +	state->idAttno          = 1; // attr_exp's first column is the candidate id by contract.
 +	state->examined         = 0;
++	state->result_cxt       = CurrentMemoryContext; // the SRF's multi_call_memory_ctx (caller switched).
++	state->children_closed  = false;
 +
 +	return state;
 +}
 +
-+void EndTJSState(TJSState *state){
-+	if (!state) return;
++// Close the executor-driven children + the SPI-driven scan + the relation. Called from EndTJSState
++// at the SRF's FINAL invocation (the finish label), exactly like multicol_topk's EndFaginsStateM —
++// NOT mid-iteration. Tearing the executor down while the SRF is still returning rows segfaults on a
++// repeated same-query call (the second tjs() over the same HNSW index). The result tuples live in
++// result_cxt (the multi_call context), so they outlive this teardown. Idempotent via children_closed.
++void EndTJSChildren(TJSState *state){
++	if (!state || state->children_closed) return;
 +	table_index_fetch_end(state->result_heap_scan);
 +	table_close(state->relation, AccessShareLock);
-+	ExecDropSingleTupleTableSlot(state->ps.ps_ResultTupleSlot);
 +
 +	for (QueryDesc* queryDesc: *(state->qDescs)) {
 +		ExecutorFinish(queryDesc);
 +		ExecutorEnd(queryDesc);
 +		FreeQueryDesc(queryDesc);
 +	}
++	state->children_closed = true;
++}
++
++void EndTJSState(TJSState *state){
++	if (!state) return;
++	EndTJSChildren(state); // idempotent — no-op if already closed in the first call.
++	ExecDropSingleTupleTableSlot(state->ps.ps_ResultTupleSlot);
 +	delete(state->proc_pq);
 +	delete(state->seenSet);
 +	delete(state->result_stack);
 +	delete(state->reachable);
 +	auto qDescs = state->qDescs;
++	auto children = state->children;
 +	free(state);
 +	delete(qDescs);
-+	return;
++	delete(children);
 +}
 +
 +void parseVectorConstantT(std::string &src) {
@@ -590,14 +646,16 @@ index 0000000..401e354
 +					text_to_cstring(attr_exp_text), text_to_cstring(filter_exp_text),
 +					text_to_cstring(orderby_text));
 +
-+		// GRAPH leg: resolve the reachable set ONCE (before driving the SPI IndexScan).
-+		std::unordered_set<int64> reachable;
-+		if (graphEnabled)
-+			reachable = graphReachableT(src);
-+
 +		std::vector<IndexScanState*> scannodes;
 +		std::vector<QueryDesc*> qDescs;
 +		SPI_connect();
++
++		// GRAPH leg: resolve the reachable set ONCE, INSIDE the SRF's single SPI connection (opened
++		// just above) and BEFORE building/driving the SPI IndexScan. graph_store.neighbors' own SPI
++		// then nests cleanly under ours. (graphReachableT must NOT open its own sibling connection.)
++		std::unordered_set<int64> reachable;
++		if (graphEnabled)
++			reachable = graphReachableT(src);
 +
 +		// Build the vector leg: a single index-scan SQL with the relational filter in WHERE.
 +		std::string orderby(text_to_cstring(orderby_text));
@@ -650,6 +708,11 @@ index 0000000..401e354
 +	TJSState* top_execNode = (TJSState*)funcctx->user_fctx;
 +
 +	if (call_cntr < max_calls) {
++		// First per-call invocation: execTJS drains the whole early-terminating merge into
++		// result_stack (children driven once, surviving tuples copied into result_cxt) and returns
++		// the first row. Later invocations just pop result_stack. The executor children and the SPI
++		// connection stay open until the SRF's final invocation (the finish label) — teardown mid-
++		// iteration segfaults on a repeated same-query call, exactly as multicol_topk avoids.
 +		TupleTableSlot *slot = execTJS((PlanState*) top_execNode);
 +		if ( TupIsNull(slot) )
 +			goto finish;
@@ -661,6 +724,8 @@ index 0000000..401e354
 +	}
 +
 + finish:
++	// Final invocation: close children + the relation, free the durable containers, then SPI_finish.
++	// Order matches multicol_topk's EndFaginsStateM + trailing SPI_finish (the validated lifecycle).
 +	EndTJSState(top_execNode);
 +	SPI_finish();
 +	DEBUG_PRINT("TJS done, processed = %u", call_cntr);
