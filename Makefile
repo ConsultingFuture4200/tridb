@@ -1,4 +1,4 @@
-.PHONY: test lint graph-test smoke-test test-all baseline-up baseline-down seed clean
+.PHONY: test lint graph-test smoke-test test-all baseline-up baseline-down seed bench clean
 
 IMAGE ?= tridb/msvbase:dev
 ENGINE_TESTS := test/graph_store_test.sql test/trimodal_compose.sql \
@@ -38,6 +38,16 @@ test-all: test lint smoke-test graph-test
 
 seed:
 	python3 tools/seed_corpus.py --entities 1000 --dim 768 --out data/seed/
+
+# TriDB benchmark (DEV-1172 harness + DEV-1173 report), deterministic STUB engine
+# (runs anywhere). Seeds a small corpus if data/seed is missing, then drives the
+# canonical query vs the in-process baseline and renders bench/out/report.html.
+# The live engine run (--engine live) is GX10/engine-gated; do not run off-target.
+bench:
+	@test -f data/seed/entities.csv || \
+	  python3 tools/seed_corpus.py --entities 200 --dim 32 --out data/seed/
+	python3 -m bench.harness --seed-dir data/seed --k 5 --engine stub \
+	  --out bench/out/bench_metrics.json --html bench/out/report.html
 
 baseline-up:
 	docker compose -f baseline/docker-compose.yml up -d
