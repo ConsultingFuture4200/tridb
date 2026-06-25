@@ -35,13 +35,22 @@ Hardware-independent layer (works on any x86_64/ARM64 dev box):
 python3 -m venv .venv && . .venv/bin/activate && pip install -r requirements.txt
 
 # Tests (buildable-anywhere suite: seed corpus, harness, planner design checks)
-make test                    # -> pytest tests/
+make test                    # -> pytest tests/   (Python only, fast, no Docker)
 
 # Lint/format
 make lint                    # -> ruff check . && ruff format --check .
 
 # Generate a seed corpus
 python3 tools/seed_corpus.py --entities 1000 --dim 768 --out data/seed/
+```
+
+Engine layer (the graph store + tri-modal SQL suites) — needs the `tridb/msvbase:dev`
+image from `scripts/x86build.sh --docker`:
+
+```bash
+make smoke-test              # -> test/smoke.sql (vector + relational) in the image
+make graph-test              # -> all four test/*.sql engine suites, fail-fast
+make test-all                # -> test + lint + smoke-test + graph-test (full verify)
 
 # Stand up the multi-system baseline (DEV-1171)
 make baseline-up             # -> docker compose -f baseline/docker-compose.yml up -d

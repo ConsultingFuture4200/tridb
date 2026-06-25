@@ -83,8 +83,16 @@ src/         graph_store/ + planner/ — native store + join-order (gated on GX1
 See `CLAUDE.md` for the canonical commands. Quick start for the
 hardware-independent layer:
 
+Two layers:
+
+- `make test` / `make lint` — Python + lint only. Fast, no Docker, runs anywhere.
+- `make smoke-test` / `make graph-test` / `make test-all` — the engine SQL suites.
+  These need the `tridb/msvbase:dev` image from `scripts/x86build.sh --docker`;
+  `make test-all` runs test + lint + smoke + graph.
+
 ```bash
 python3 -m venv .venv && . .venv/bin/activate
 pip install -r requirements.txt
-make test          # runs the buildable-anywhere test suite
+make test          # Python + lint layer (buildable anywhere)
+make test-all      # full engine verification (requires the tridb/msvbase:dev image)
 ```
