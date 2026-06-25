@@ -1,34 +1,25 @@
 /*
  * graphstore.h — Native adjacency-list graph store: access-method surface.
  *
- * // GX10-GATED: not built off-target.
+ * Shared types + the traversal-iterator contract for TriDB's native graph store. As of
+ * DEV-1164/DEV-1165 this IS compiled: graph_am.c includes it and implements the v1 core
+ * (page store, vertex/edge insert, and the Open/Next/Close traversal engine). The store builds
+ * and its suites pass on the x86 standin (it is architecture-independent PG 13.4 access-method C
+ * over 32KB pages); only the live GX10 ARM64 build + the 128GB benchmark remain hardware-gated.
  *
- * This header declares the C surface for TriDB's native graph store. It is an
- * INTERFACE SKELETON only — there is NO implementation in this file or this
- * directory. The implementing C lives behind the GX10 build gate (ARM64+CUDA,
- * 128GB), because it must compile against a live MSVBASE / PostgreSQL 13.4 fork
- * built with --with-blocksize=32 (32KB pages). It cannot be built on the dev box.
+ * Implementing issues: DEV-1164 (adjacency-list access method, merged), DEV-1165 (traversal
+ * iterator — this file's gs_* contract + the gph_traverse SRF), DEV-1166 (verify shared txn mgr).
+ * Authoritative layout contract: docs/graph_store_layout_v0.1.0.md (DEV-1163). See also
+ * docs/decisions/0003 (AM core), 0005 (traversal iterator), and src/graph_store/README.md.
  *
- * Implementing issues: DEV-1164 (adjacency-list access method),
- * DEV-1165 (graph traversal iterator), DEV-1166 (verify shared txn manager).
- *
- * Authoritative layout contract: docs/graph_store_layout_v0.1.0.md (DEV-1163).
- * Build/gating status: docs/STATUS.md. See also src/graph_store/README.md.
- *
- * NON-NEGOTIABLE INVARIANTS this surface must uphold:
- *   - TR-1: traversal is a Volcano iterator (Open/Next/Close) with EARLY
- *     TERMINATION. gs_getnext() yields exactly ONE vertex-or-edge per call.
- *     No blocking / no full-materialization operators.
- *   - Never leave the Postgres process: this access method runs inside the
- *     forked Postgres backend and shares the ONE existing transaction manager
- *     and the ONE WAL. No second WAL, no cross-system transaction.
- *   - Graph topology is a native adjacency-list ACCESS METHOD backed by a
- *     B-tree over 32KB pages — never relational join tables.
+ * NON-NEGOTIABLE INVARIANTS this surface upholds:
+ *   - TR-1: traversal is a Volcano iterator (Open/Next/Close) with EARLY TERMINATION.
+ *     gs_getnext() yields exactly ONE edge per call, reading at most one adjacency page, so a
+ *     LIMIT above stops before later chain pages are read. No blocking / full-materialization.
+ *   - Never leave the Postgres process: runs inside the forked Postgres backend, sharing the ONE
+ *     transaction manager and the ONE WAL. No second WAL, no cross-system transaction.
+ *   - Graph topology is a native adjacency-list store over 32KB pages — never relational joins.
  *   - v1 supports a SINGLE edge label: :related_to (entity -> entity).
- *
- * The header is kept compilable-shaped (include guards, typedefs, opaque
- * handles) so the GX10 implementer drops in C against a known surface rather
- * than designing one from zero. It is intentionally NOT compiled here.
  */
 
 #ifndef TRIDB_GRAPH_STORE_GRAPHSTORE_H
@@ -79,28 +70,17 @@ extern "C" {
 #define GRAPHSTORE_EDGE_LABEL       "related_to"
 
 /* -------------------------------------------------------------------------
- * Opaque handle types.
+ * Opaque scan descriptor.
  *
- * Callers hold these by pointer only. Their layouts are private to the
- * implementation (defined in the .c behind the GX10 gate); this header
- * forward-declares them so the surface compiles without exposing internals.
+ * GraphScanDesc — the Volcano traversal-iterator cursor (TR-1). Its body
+ * (struct GraphScanDescData) is private to graph_am.c; this header forward-
+ * declares it so callers hold it by pointer. Created by gs_open(), advanced one
+ * EDGE per gs_getnext(), released by gs_close(). Never materializes the frontier.
+ * (The deferred cross-extension GraphStore handle API has no v1 consumer, so its
+ * typedefs are intentionally absent — see the implementation-surface note below.)
  * ------------------------------------------------------------------------- */
 
-/*
- * GraphStore — a single native adjacency-list graph store instance, bound to
- * a host Postgres Relation and the current transaction's resource owner.
- * Opaque: lifecycle is graphstore_open() ... graphstore_close().
- */
-typedef struct GraphStoreData GraphStore;
-typedef GraphStore *GraphStoreHandle;
-
-/*
- * GraphScanDesc — the Volcano traversal-iterator descriptor (TR-1).
- * Opaque: created by gs_open(), advanced one element per gs_getnext(),
- * released by gs_close(). Never materializes the full traversal frontier.
- */
 typedef struct GraphScanDescData GraphScanDesc;
-typedef GraphScanDesc *GraphScanDescHandle;
 
 /* -------------------------------------------------------------------------
  * Stable identifiers.
@@ -178,130 +158,34 @@ typedef struct GraphElement
 } GraphElement;
 
 /* -------------------------------------------------------------------------
- * Adjacency-list store lifecycle and mutation.
+ * v1 implementation surface (graph_am.c).
  *
- * All functions run inside a host Postgres backend and participate in the
- * current transaction. They emit WAL through the host's shared WAL only;
- * there is no private log. They raise via the host's elog/ereport on error
- * (no error return codes) — consistent with the PG 13.4 access-method API.
+ * Mutation is exposed as SQL-callable functions, not a C handle API: gph_insert_vertex(),
+ * gph_insert_edge(src, dst) (registered in graph_store_am--0.1.0.sql). They run inside the host
+ * backend, emit WAL through the host's shared WAL only (GenericXLog), and commit/abort atomically
+ * with the surrounding transaction (the FR-7 substrate, DEV-1166). The GraphStore* handle
+ * lifecycle (graphstore_open/close/insert_*) sketched in earlier drafts is DEFERRED — v1 has no
+ * cross-extension C consumer, so it is not needed.
+ *
+ * Traversal (TR-1 Open/Next/Close) is implemented internally in graph_am.c as a static engine
+ * over GraphScanDescData:
+ *
+ *     bool gs_open (GraphScanDesc *scan, Relation rel, GraphVertexId start, GraphScanDirection);
+ *     bool gs_getnext(Relation rel, GraphScanDesc *scan, GraphElement *out);  // one EDGE per call
+ *     void gs_close(GraphScanDesc *scan);
+ *
+ * The Relation is caller-managed (not retained by the scan) and no buffer pin is held across
+ * Next() calls, so the iterator is leak-free under early abandon (LIMIT). It is surfaced to SQL /
+ * SPI consumers as two SRFs: gph_neighbors(src) -> SETOF bigint (out-neighbor vids) and
+ * gph_traverse(src) -> TABLE(src, dst) (one :related_to edge per Next()). Cross-extension
+ * consumers (e.g. the TJS operator in vectordb, DEV-1169) drive the traversal through these SRFs
+ * via SPI rather than C-linking the static engine across shared-object boundaries.
+ *
+ * EARLY TERMINATION is the load-bearing contract: gs_getnext() reads at most one adjacency page
+ * per call, so an enclosing LIMIT stops before later chain pages are read — never "collect all
+ * then return". The gph_traverse SRF MUST be used in a target-list / ProjectSet position, not a
+ * FROM-clause FunctionScan (which materializes to a tuplestore and forfeits early termination).
  * ------------------------------------------------------------------------- */
-
-/*
- * graphstore_open — bind a graph store instance to an already-open host
- * Relation (the adjacency-list access-method index relation) for the current
- * transaction.
- *
- * Contract:
- *   - `index_relation` is a PostgreSQL Relation* for the graph access method,
- *     opened by the caller with the appropriate lock mode (typed as void* in
- *     this skeleton to avoid the off-target PG header dependency).
- *   - Returns a handle valid until graphstore_close(); the handle does NOT own
- *     the Relation and must not outlive the transaction.
- *   - Does not start a transaction and does not open a WAL: it joins the
- *     current backend's transaction and shared WAL.
- *   - Raises (ereport ERROR) if the relation is not a graph access method or
- *     was built under a block size other than GRAPHSTORE_BLOCKSZ.
- */
-extern GraphStoreHandle graphstore_open(void *index_relation);
-
-/*
- * graphstore_close — release a graph store handle.
- *
- * Contract:
- *   - Releases per-handle scan/buffer state; does NOT close the underlying
- *     Relation (the caller owns it) and does NOT commit or abort — durability
- *     is the host transaction manager's responsibility.
- *   - Idempotent on a NULL handle (no-op).
- */
-extern void graphstore_close(GraphStoreHandle store);
-
-/*
- * graphstore_insert_vertex — insert a vertex into the adjacency-list store.
- *
- * Contract:
- *   - `payload`/`payload_len` carry the vertex's stored columns (opaque here;
- *     layout per the spec). May be NULL/0 for a topology-only vertex.
- *   - Returns the assigned GraphVertexId (never GRAPHSTORE_INVALID_ID on
- *     success).
- *   - WAL-logged via the host shared WAL; visible/durable under the current
- *     transaction's commit. Raises on duplicate id or page-allocation failure.
- */
-extern GraphVertexId graphstore_insert_vertex(GraphStoreHandle store,
-                                              const void *payload,
-                                              size_t payload_len);
-
-/*
- * graphstore_insert_edge — insert one directed :related_to edge (src -> dst).
- *
- * Contract:
- *   - v1 edge label is fixed to GRAPHSTORE_EDGE_LABEL; this function inserts an
- *     edge of that label only.
- *   - Both `src` and `dst` must already exist (raises otherwise).
- *   - Appends `dst` to `src`'s adjacency list on its 32KB page, splitting via
- *     the B-tree when the list overflows the page. WAL-logged via shared WAL.
- *   - Returns the assigned GraphEdgeId (never GRAPHSTORE_INVALID_ID on
- *     success).
- */
-extern GraphEdgeId graphstore_insert_edge(GraphStoreHandle store,
-                                          GraphVertexId src,
-                                          GraphVertexId dst);
-
-/* -------------------------------------------------------------------------
- * Volcano traversal iterator (TR-1): Open / Next / Close.
- *
- * gs_getnext() yields EXACTLY ONE vertex-or-edge per call so an enclosing
- * operator can stop early (e.g. ORDER BY <-> ... LIMIT 5) without ever
- * materializing the traversal frontier. This is the load-bearing contract for
- * the efficiency thesis — it MUST NOT be implemented as
- * "collect all then return".
- * ------------------------------------------------------------------------- */
-
-/*
- * gs_open — begin a traversal scan from a starting vertex.
- *
- * Contract:
- *   - `start` is the source vertex; for the v1 canonical query this is the
- *     `src:entity` bound by the GRAPH_TABLE MATCH pattern.
- *   - `direction` selects which adjacency to walk (v1: GRAPH_SCAN_OUTGOING).
- *   - Returns a scan descriptor positioned BEFORE the first element; the first
- *     gs_getnext() returns the first element.
- *   - Raises (ereport ERROR) if `start` does not exist — consistent with the
- *     "no error return codes" contract in the lifecycle section above. Never
- *     returns NULL; the caller must not NULL-check the return value.
- *   - Allocates lazily: opening a scan must NOT read the whole adjacency list.
- *   - The scan pins buffers from the host shared buffer pool; gs_close()
- *     releases them.
- */
-extern GraphScanDescHandle gs_open(GraphStoreHandle store,
-                                   GraphVertexId start,
-                                   GraphScanDirection direction);
-
-/*
- * gs_getnext — advance the scan by ONE element (the Next() of Open/Next/Close).
- *
- * Contract:
- *   - Produces exactly one vertex-or-edge per call into `*out` and returns
- *     true; returns false when the scan is exhausted (and sets out->kind =
- *     GRAPH_ELEM_NONE).
- *   - `*out` (and any payload it points to) is owned by the scan and valid
- *     only until the next gs_getnext()/gs_close(); the caller copies out what
- *     it must retain.
- *   - MUST be incremental: each call advances at most one adjacency step. No
- *     blocking, no look-ahead materialization. This is what enables early
- *     termination by the enclosing LIMIT operator.
- */
-extern bool gs_getnext(GraphScanDescHandle scan, GraphElement *out);
-
-/*
- * gs_close — end a traversal scan (the Close() of Open/Next/Close).
- *
- * Contract:
- *   - Releases the scan descriptor and unpins any buffers it held. Does NOT
- *     affect the owning GraphStore handle or the transaction.
- *   - Idempotent on a NULL handle (no-op). Safe to call after early
- *     termination (before the scan is exhausted).
- */
-extern void gs_close(GraphScanDescHandle scan);
 
 #ifdef __cplusplus
 }

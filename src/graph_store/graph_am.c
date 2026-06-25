@@ -45,6 +45,7 @@
 #include "utils/rel.h"
 
 #include "gph_page.h"
+#include "graphstore.h"
 
 PG_MODULE_MAGIC;
 
@@ -483,56 +484,63 @@ gph_insert_edge(PG_FUNCTION_ARGS)
 /* Traversal: Open / Next / Close incremental iterator                 */
 /* ------------------------------------------------------------------ */
 
-typedef struct GphScanState
+/*
+ * GraphScanDescData — the concrete body of the opaque GraphScanDesc declared in graphstore.h.
+ * Holds only the cursor (current adjacency page + next slot) plus the source/direction; it does
+ * NOT retain the container Relation or a buffer pin, so the iterator is leak-free under early
+ * abandon (LIMIT) and the caller manages the Relation lifetime (passed to gs_getnext).
+ */
+struct GraphScanDescData
 {
-	BlockNumber	cur_blk;		/* current adjacency page; Invalid = exhausted */
-	uint32		cur_slot;		/* next EdgeSlot index on cur_blk */
-} GphScanState;
-
-PG_FUNCTION_INFO_V1(gph_neighbors);
+	GraphVertexId		src;		/* source vertex of this traversal */
+	GraphScanDirection	direction;	/* v1: GRAPH_SCAN_OUTGOING only */
+	BlockNumber			cur_blk;	/* current adjacency page; Invalid = exhausted */
+	uint32				cur_slot;	/* next EdgeSlot index on cur_blk */
+};
 
 /*
- * gph_neighbors(src bigint) RETURNS SETOF bigint — yield src's out-neighbors one per Next(),
- * reading at most one adjacency page at a time so a LIMIT above stops before later chain pages
- * are read (TR-1 storage-level early termination). The relation is opened/closed per call and
- * no buffer pin is held across calls, so abandoning the scan early (LIMIT) leaks nothing.
+ * gs_open — position a traversal scan before src's first out-edge (the Open of Open/Next/Close).
+ * `rel` is BORROWED (used only to locate the vertex; not retained). Returns true if `src` exists
+ * (scan positioned, possibly over an empty adjacency list); false if `src` is absent. Policy is
+ * the caller's: the SQL SRFs treat an absent source as an empty result, while a direct C consumer
+ * (e.g. the TJS operator) may raise. v1 supports GRAPH_SCAN_OUTGOING only.
  */
-Datum
-gph_neighbors(PG_FUNCTION_ARGS)
+static bool
+gs_open(GraphScanDesc *scan, Relation rel, GraphVertexId start, GraphScanDirection direction)
 {
-	FuncCallContext *funcctx;
-	GphScanState   *st;
-	Relation		rel;
+	GphVertexRecord src_rec;
+	BlockNumber		vblk;
+	uint32			vslot;
 
-	if (SRF_IS_FIRSTCALL())		/* === Open === */
-	{
-		MemoryContext oldctx;
-		uint64		src = (uint64) PG_GETARG_INT64(0);
-		BlockNumber	vblk;
-		uint32		vslot;
-		GphVertexRecord src_rec;
+	if (direction != GRAPH_SCAN_OUTGOING)
+		ereport(ERROR,
+				(errmsg("graph_store: only GRAPH_SCAN_OUTGOING is supported in v1 (got %d)",
+						(int) direction)));
 
-		funcctx = SRF_FIRSTCALL_INIT();
-		oldctx = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
+	scan->src = start;
+	scan->direction = direction;
+	scan->cur_blk = InvalidBlockNumber;
+	scan->cur_slot = 0;
 
-		st = (GphScanState *) palloc0(sizeof(GphScanState));
-		st->cur_blk = InvalidBlockNumber;
-		st->cur_slot = 0;
+	if (!gph_locate_vertex(rel, start, &vblk, &vslot, &src_rec))
+		return false;			/* absent => caller decides (empty scan vs raise) */
+	scan->cur_blk = src_rec.vr_adj_head;	/* Invalid if src has no edges => empty scan */
+	return true;
+}
 
-		rel = gph_open_store(AccessShareLock);
-		if (gph_locate_vertex(rel, src, &vblk, &vslot, &src_rec))
-			st->cur_blk = src_rec.vr_adj_head;
-		relation_close(rel, AccessShareLock);
+/*
+ * gs_getnext — advance the scan by ONE visible :related_to edge (the Next of Open/Next/Close).
+ * Reads at most one adjacency page per call from `rel` and holds no buffer pin across calls, so a
+ * LIMIT above stops before later chain pages are ever read (TR-1 storage-level early termination)
+ * and abandoning the scan early leaks nothing. Fills *out and returns true; on exhaustion sets
+ * out->kind = GRAPH_ELEM_NONE and returns false.
+ */
+static bool
+gs_getnext(Relation rel, GraphScanDesc *scan, GraphElement *out)
+{
+	out->kind = GRAPH_ELEM_NONE;
 
-		funcctx->user_fctx = st;
-		MemoryContextSwitchTo(oldctx);
-	}
-
-	funcctx = SRF_PERCALL_SETUP();	/* === Next === */
-	st = (GphScanState *) funcctx->user_fctx;
-
-	rel = gph_open_store(AccessShareLock);
-	while (st->cur_blk != InvalidBlockNumber)
+	while (scan->cur_blk != InvalidBlockNumber)
 	{
 		Buffer		buf;
 		Page		page;
@@ -541,22 +549,22 @@ gph_neighbors(PG_FUNCTION_ARGS)
 		bool		have_edge = false;
 
 		CHECK_FOR_INTERRUPTS();
-		buf = ReadBufferExtended(rel, MAIN_FORKNUM, st->cur_blk, RBM_NORMAL, NULL);
+		buf = ReadBufferExtended(rel, MAIN_FORKNUM, scan->cur_blk, RBM_NORMAL, NULL);
 		LockBuffer(buf, BUFFER_LOCK_SHARE);
 		page = BufferGetPage(buf);
 		count = GphPageRecordCount(page, sizeof(GphEdgeSlot));
 
-		if (st->cur_slot < count)
+		if (scan->cur_slot < count)
 		{
-			memcpy(&slot, GphPageGetRecord(page, st->cur_slot, sizeof(GphEdgeSlot)),
+			memcpy(&slot, GphPageGetRecord(page, scan->cur_slot, sizeof(GphEdgeSlot)),
 				   sizeof(GphEdgeSlot));
-			st->cur_slot++;
+			scan->cur_slot++;
 			have_edge = true;
 		}
 		else
 		{
-			st->cur_blk = GphPageSpecialPtr(page)->gph_next_pageno;
-			st->cur_slot = 0;
+			scan->cur_blk = GphPageSpecialPtr(page)->gph_next_pageno;
+			scan->cur_slot = 0;
 		}
 		UnlockReleaseBuffer(buf);
 
@@ -568,14 +576,141 @@ gph_neighbors(PG_FUNCTION_ARGS)
 				continue;
 			if (!gph_xmin_visible(slot.es_xmin))
 				continue;		/* edge from an aborted/uncommitted txn */
-			relation_close(rel, AccessShareLock);
+
+			out->kind = GRAPH_ELEM_EDGE;
+			out->edge_id = GRAPHSTORE_INVALID_ID;	/* v1 edge slots carry no stored id */
+			out->edge_src = slot.es_src_vid;
+			out->edge_dst = slot.es_dst_vid;
+			out->vertex_id = slot.es_dst_vid;		/* convenience: the reached neighbor */
+			out->payload = NULL;
+			out->payload_len = 0;
 			gph_visit_counter++;	/* one unit of traversal work, per edge emitted */
-			SRF_RETURN_NEXT(funcctx, Int64GetDatum((int64) slot.es_dst_vid));
+			return true;
 		}
 		/* else: advanced to next chain page (or exhausted); loop again */
 	}
-	relation_close(rel, AccessShareLock);	/* === Close === */
+	return false;
+}
 
+/* gs_close — release a traversal scan (the Close of Open/Next/Close). The scan holds no buffer
+ * pin or Relation, so this only resets the cursor; idempotent on NULL. */
+static void
+gs_close(GraphScanDesc *scan)
+{
+	if (scan == NULL)
+		return;
+	scan->cur_blk = InvalidBlockNumber;
+	scan->cur_slot = 0;
+}
+
+PG_FUNCTION_INFO_V1(gph_neighbors);
+
+/*
+ * gph_neighbors(src bigint) RETURNS SETOF bigint — yield src's out-neighbor vids one per Next(),
+ * over the shared gs_open/gs_getnext/gs_close engine. The relation is opened/closed per call and
+ * no buffer pin is held across calls, so abandoning the scan early (LIMIT) leaks nothing.
+ */
+Datum
+gph_neighbors(PG_FUNCTION_ARGS)
+{
+	FuncCallContext *funcctx;
+	GraphScanDesc  *scan;
+	Relation		rel;
+	GraphElement	elem;
+
+	if (SRF_IS_FIRSTCALL())		/* === Open === */
+	{
+		MemoryContext oldctx;
+		GraphVertexId src = (GraphVertexId) PG_GETARG_INT64(0);
+
+		funcctx = SRF_FIRSTCALL_INIT();
+		oldctx = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
+
+		scan = (GraphScanDesc *) palloc0(sizeof(GraphScanDesc));
+		rel = gph_open_store(AccessShareLock);
+		(void) gs_open(scan, rel, src, GRAPH_SCAN_OUTGOING);	/* absent src => empty (lenient SRF) */
+		relation_close(rel, AccessShareLock);
+
+		funcctx->user_fctx = scan;
+		MemoryContextSwitchTo(oldctx);
+	}
+
+	funcctx = SRF_PERCALL_SETUP();	/* === Next === */
+	scan = (GraphScanDesc *) funcctx->user_fctx;
+
+	rel = gph_open_store(AccessShareLock);
+	if (gs_getnext(rel, scan, &elem))
+	{
+		relation_close(rel, AccessShareLock);
+		SRF_RETURN_NEXT(funcctx, Int64GetDatum((int64) elem.edge_dst));
+	}
+	relation_close(rel, AccessShareLock);	/* === Close === */
+	gs_close(scan);
+	SRF_RETURN_DONE(funcctx);
+}
+
+PG_FUNCTION_INFO_V1(gph_traverse);
+
+/*
+ * gph_traverse(src bigint) RETURNS TABLE(src bigint, dst bigint) — the edge-emitting traversal:
+ * one :related_to edge per Next() (not just the bare neighbor vid), so a caller can surface the
+ * edge endpoints and join dst back to its relational/vector payload (the canonical query's
+ * COLUMNS projection). Same shared engine and early-termination property as gph_neighbors.
+ *
+ * MUST be used as a target-list / ProjectSet SRF (not a FROM-clause FunctionScan): a FROM-clause
+ * SRF is materialized to a tuplestore before LIMIT applies, which forfeits early termination.
+ * v1 edge slots carry no stored edge id, so only (src, dst) are surfaced.
+ */
+Datum
+gph_traverse(PG_FUNCTION_ARGS)
+{
+	FuncCallContext *funcctx;
+	GraphScanDesc  *scan;
+	Relation		rel;
+	GraphElement	elem;
+
+	if (SRF_IS_FIRSTCALL())		/* === Open === */
+	{
+		MemoryContext oldctx;
+		TupleDesc	tupdesc;
+		GraphVertexId src = (GraphVertexId) PG_GETARG_INT64(0);
+
+		funcctx = SRF_FIRSTCALL_INIT();
+		oldctx = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
+
+		if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("gph_traverse must be called in a context that expects a record")));
+		funcctx->tuple_desc = BlessTupleDesc(tupdesc);
+
+		scan = (GraphScanDesc *) palloc0(sizeof(GraphScanDesc));
+		rel = gph_open_store(AccessShareLock);
+		(void) gs_open(scan, rel, src, GRAPH_SCAN_OUTGOING);	/* absent src => empty (lenient SRF) */
+		relation_close(rel, AccessShareLock);
+
+		funcctx->user_fctx = scan;
+		MemoryContextSwitchTo(oldctx);
+	}
+
+	funcctx = SRF_PERCALL_SETUP();	/* === Next === */
+	scan = (GraphScanDesc *) funcctx->user_fctx;
+
+	rel = gph_open_store(AccessShareLock);
+	if (gs_getnext(rel, scan, &elem))
+	{
+		Datum		values[2];
+		bool		nulls[2] = {false, false};
+		HeapTuple	tup;
+
+		relation_close(rel, AccessShareLock);
+		values[0] = Int64GetDatum((int64) elem.edge_src);
+		values[1] = Int64GetDatum((int64) elem.edge_dst);
+		tup = heap_form_tuple(funcctx->tuple_desc, values, nulls);
+		SRF_RETURN_NEXT(funcctx, HeapTupleGetDatum(tup));
+	}
+	relation_close(rel, AccessShareLock);	/* === Close === */
+	gs_close(scan);
 	SRF_RETURN_DONE(funcctx);
 }
 

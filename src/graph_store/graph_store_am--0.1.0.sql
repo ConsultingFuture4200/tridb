@@ -20,6 +20,14 @@ CREATE FUNCTION gph_insert_edge(bigint, bigint) RETURNS void
 CREATE FUNCTION gph_neighbors(bigint) RETURNS SETOF bigint
   AS 'MODULE_PATHNAME' LANGUAGE C VOLATILE STRICT;
 
+-- Edge-emitting traversal (DEV-1165): one :related_to edge per Next(), so callers can surface the
+-- edge endpoints and join dst back to its relational/vector payload (the canonical query's COLUMNS
+-- projection). Use in a target-list / ProjectSet position (SELECT gph_traverse(x)), NOT a
+-- FROM-clause FunctionScan, or early termination under LIMIT is lost. v1 edge slots carry no
+-- stored edge id, so only (src, dst) are surfaced.
+CREATE FUNCTION gph_traverse(bigint, OUT src bigint, OUT dst bigint) RETURNS SETOF record
+  AS 'MODULE_PATHNAME' LANGUAGE C VOLATILE STRICT;
+
 CREATE FUNCTION gph_visits() RETURNS bigint
   AS 'MODULE_PATHNAME' LANGUAGE C VOLATILE;
 

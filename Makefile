@@ -14,6 +14,8 @@ lint:
 graph-test:
 	@docker image inspect $(IMAGE) >/dev/null 2>&1 || \
 	  { echo "image $(IMAGE) not built — run scripts/x86build.sh --docker"; exit 1; }
+	@echo "=== graph_store_am suite (DEV-1164 core + DEV-1165 traversal) ==="
+	@bash scripts/graph_am_test.sh $(IMAGE)
 	@for t in $(ENGINE_TESTS); do \
 	  echo "=== $$t ==="; bash scripts/graph_test.sh $(IMAGE) $$t || exit 1; done
 
