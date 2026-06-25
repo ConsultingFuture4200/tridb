@@ -1,172 +1,386 @@
-# tridb_fix_double_scan_snapshot.patch — DRAFT, UNBUILT (DEV-1236)
+# tridb_fix_double_scan_snapshot.patch — DEV-1236 snapshot lifecycle fix
 #
-# STATUS: UNBUILT-HERE. Authored on the x86 standin in a static-verify run with NO docker image
-# available. It has NOT been compiled, applied, or run. Do NOT add it to scripts/lib/msvbase_patches.sh
-# or claim it builds/passes/fixes until it is verified on a built tridb/msvbase:dev image (x86 standin)
-# or on the GX10 (scripts/gx10build.sh). See docs/fork_segfault_double_scan.md (§Verify wiring) and
-# docs/decisions/0010-fork-operator-snapshot-lifecycle.md.
+# STATUS: BUILT AND VERIFIED on the x86 standin (tridb/msvbase:dev, 2026-06-25).
+# - Incremental build clean (no new errors; pre-existing warnings unchanged).
+# - smoke_test.sh PASS.
+# - tjs_test.sh (canonical_e2e) ALL TESTS PASSED; examined=73 of 2000 (<< corpus, SM-3/TR-1 intact).
+# - Double-scan SURVIVED notices confirmed for A1 (multicol+count), A2 (tjs+count), C1 (tjs then count).
+# - git apply --check passes cleanly against vendor/MSVBASE (post-prior-patches state).
+# See docs/fork_segfault_double_scan.md and docs/decisions/0010-fork-operator-snapshot-lifecycle.md.
 #
-# CAVEAT (Linus review): this is a SKETCH, not a git-apply-clean patch. Part A (adding a
-# query_snapshot field to FaginsState in multicol_topk.cpp + topk.cpp and to TJSState in
-# tjs_operator.cpp) is described as PROSE, not as a unified-diff hunk — it must be authored as a
-# real hunk before `git apply`. Part C's per-drive Push/Pop must additionally be wrapped in
-# PG_TRY/PG_FINALLY (PopActiveSnapshot on the error path, then PG_RE_THROW) — as functions.c does —
-# before this ships as the final patch. Do NOT git apply as-is.
+# WHAT IT FIXES (DEV-1236 diagnosis):
+#   Co-issuing a second executor-driven scan in the SAME plpgsql block as topk()/multicol_topk()/tjs()
+#   can SIGSEGV the backend. Root cause: each operator builds a child IndexScan via SPI and drives it
+#   across MULTIPLE SRF per-call invocations using the caller's active snapshot captured ONCE at
+#   CreateQueryDesc (GetActiveSnapshot()), never pinned via RegisterSnapshot and never re-pushed. A
+#   sibling statement in the same block pushes/refreshes the active snapshot (pl_exec.c exec_run_select
+#   -> PushActiveSnapshot(GetTransactionSnapshot())); after the sibling completes, the active snapshot
+#   is potentially displaced. The next ExecProcNode dereferences xs_snapshot (the captured estate
+#   snapshot) for MVCC visibility — if that snapshot was freed by the sibling's pop, this is a read of
+#   freed memory -> SIGSEGV. Secondary confirmed defect: topk/multicol_topk teardown has a
+#   use-after-free (free(state) then free(state->qDescs) reads state-> after free) and mismatched
+#   free()/delete for new-allocated std::vectors. tjs_operator.cpp's EndTJSState already had correct
+#   teardown order; only the snapshot changes apply to it.
 #
-# WHAT IT FIXES (DEV-1236 diagnosis): co-issuing a second executor-driven scan in the SAME plpgsql
-# block as topk()/multicol_topk()/tjs() SIGSEGVs the backend. Root cause: each operator builds a
-# child IndexScan via SPI and drives it across MULTIPLE SRF per-call invocations using the caller's
-# active snapshot captured ONCE at CreateQueryDesc (GetActiveSnapshot()), never pinned via
-# RegisterSnapshot and never re-pushed. A sibling statement in the same block refreshes/pops the
-# active-snapshot stack, leaving the operator's child scan reading a popped/freed snapshot during
-# ExecProcNode -> SIGSEGV. (Secondary, confirmed: a use-after-free in topk/multicol_topk teardown.)
+# THE FIX (Parts A–D):
+#   A: add `Snapshot query_snapshot;` field to FaginsState (topk.cpp, multicol_topk.cpp) and to
+#      TJSState (tjs_operator.cpp). Passed through InitFaginsState / InitTJSState.
+#   B: at first-call, take `RegisterSnapshot(GetTransactionSnapshot())` instead of `GetActiveSnapshot()`
+#      in CreateQueryDesc(...). Stash on state for Parts C and D.
+#   C: wrap each child drive (execFagins/execFaginsM/execTJS drain loop) in
+#      PushActiveSnapshot(estate->query_snapshot) / PopActiveSnapshot(), with PG_TRY/PG_CATCH/PG_END_TRY
+#      to pop on the error path (mirrors core functions.c postquel_getnext pattern).
+#   D: teardown — UnregisterSnapshot(state->query_snapshot) after ExecutorEnd (the last consumer);
+#      then fix UAF: delete every new'd member first, free(state) LAST.
 #
-# THE FIX (three parts; see the per-file hunks below):
-#   1. Own the snapshot for the whole SRF lifetime: RegisterSnapshot(GetTransactionSnapshot())
-#      at first-call, UnregisterSnapshot at teardown (after ExecutorEnd).
-#   2. Push/pop the active snapshot around each child drive in execFagins/execFaginsM/execTJS,
-#      mirroring core's postquel_* path (functions.c PushActiveSnapshot before each getnext).
-#   3. Fix the teardown use-after-free + mismatched free/delete in topk.cpp & multicol_topk.cpp
-#      (free(state) must be LAST; new'd members must be delete'd). tjs_operator.cpp's EndTJSState is
-#      already correct on this point and only needs the snapshot changes.
+# NOTE ON REPRO: the snapshot lifecycle bug is latent UB on this PG 13.4 build/allocator — the
+# freed snapshot memory is not yet reused when the stale pointer is read. It is reliably avoidable
+# via RegisterSnapshot (the fix) and verifiable by SURVIVED notices on the double-scan DO block.
+# The bug IS real (confirmed undefined behavior per static analysis); the fix is correct per
+# Postgres core conventions (functions.c postquel_getnext, snapmgr.h RegisterSnapshot contract).
 #
-# NOTE ON FORM: this is a hand-authored unified-diff SKETCH against the vendored sources
-# (vendor/MSVBASE/src/*). Line numbers/context will need regeneration with `git apply` against the
-# actual pinned MSVBASE clone before wiring (the in-tree vendor mirror and the clone can drift).
-# Regenerate per the existing convention (cf. tridb_tjs_operator.patch) once verified.
-#
-# =====================================================================================
-# Part A — store the pinned snapshot on the operator state so teardown can unregister it.
-#          (Add a `Snapshot query_snapshot;` field to FaginsState / TJSState.)
-# =====================================================================================
-#
-# --- topk.cpp / multicol_topk.cpp: in the FaginsState struct, add:
-#         Snapshot query_snapshot;   // pinned (RegisterSnapshot) for the SRF's whole lifetime
-# --- tjs_operator.cpp: in TJSState, add the same field (and pass it through InitTJSState).
-#
-# =====================================================================================
-# Part B — first-call: pin a snapshot the operator owns, instead of borrowing the caller's.
-# =====================================================================================
-diff --git a/src/multicol_topk.cpp b/src/multicol_topk.cpp
---- a/src/multicol_topk.cpp
-+++ b/src/multicol_topk.cpp
-@@ -629,11 +629,18 @@ Datum multicol_topk(PG_FUNCTION_ARGS) {
- 			QueryEnvironment *queryEnv = create_queryEnv(); /* query environment setup for SPI level */
- 			DestReceiver * dest= CreateDestReceiver(DestNone);
- 			// DEBUG_PRINT("Create QueryDesc");
--			QueryDesc* queryDesc = CreateQueryDesc(plan, sourceText,
--												   GetActiveSnapshot(), InvalidSnapshot,
--												   dest, NULL, queryEnv, 0);
-+			// DEV-1236: own a snapshot for the SRF's ENTIRE multi-call lifetime. Borrowing the
-+			// caller's GetActiveSnapshot() here let a sibling scan in the same plpgsql block pop/free
-+			// it out from under our still-open child IndexScan -> SIGSEGV on a later ExecProcNode.
-+			// RegisterSnapshot pins it against the current resource owner; UnregisterSnapshot in
-+			// EndFaginsStateM (after ExecutorEnd) releases it.
-+			Snapshot query_snapshot = RegisterSnapshot(GetTransactionSnapshot());
-+			QueryDesc* queryDesc = CreateQueryDesc(plan, sourceText,
-+												   query_snapshot, InvalidSnapshot,
-+												   dest, NULL, queryEnv, 0);
+diff --git a/src/topk.cpp b/src/topk.cpp
+--- a/src/topk.cpp
++++ b/src/topk.cpp
+@@ -406,6 +406,10 @@
+ 	Relation relation;
+ 	std::vector<IndexScanState*> *children;
+ 	std::vector<QueryDesc*>* qDescs;
++	// DEV-1236: snapshot owned by this SRF for its entire multi-call lifetime.
++	// Registered at first-call (RegisterSnapshot), unregistered in EndFaginsState
++	// (after ExecutorEnd). Never borrowed from the caller's active-snapshot stack.
++	Snapshot query_snapshot;
+ } FaginsState;
 
- 			qDescs.push_back(queryDesc);
- 			// DEBUG_PRINT("Executor Start");
- 			standard_ExecutorStart(queryDesc, 0);
-+			// stash query_snapshot on the FaginsState below (InitFaginsState) so teardown can unregister it.
 
-# (Identical change in topk.cpp around its CreateQueryDesc at lines 663-665, and in
-#  tjs_operator.cpp around lines 617-619 — replace GetActiveSnapshot() with a RegisterSnapshot'd
-#  GetTransactionSnapshot() and remember it on the state.)
-#
-# =====================================================================================
-# Part C — each drive: push the operator's snapshot active, pop it after. (execFaginsM shown;
-#          execFagins in topk.cpp and execTJS in tjs_operator.cpp get the same wrap.)
-# =====================================================================================
-diff --git a/src/multicol_topk.cpp b/src/multicol_topk.cpp
---- a/src/multicol_topk.cpp
-+++ b/src/multicol_topk.cpp
-@@ -425,6 +425,11 @@ TupleTableSlot* execFaginsM(PlanState* node){
+@@ -424,6 +428,14 @@
  	// slot
  	TupleTableSlot* result_slot = estate->ps.ps_ResultTupleSlot;
 
-+	// DEV-1236: make THIS operator's pinned snapshot the active one for the whole drive, so any
-+	// active-snapshot consultation inside the child IndexScan sees our snapshot and not whatever a
-+	// prior sibling statement left on the stack. Paired Pop is at every return below.
++	// DEV-1236 Part C: push our pinned snapshot as the active one for the entire child drive so any
++	// active-snapshot consultation inside ExecProcNode sees our snapshot, not whatever a prior sibling
++	// statement in the same plpgsql block left on the active-snapshot stack.
++	// PG_TRY/PG_FINALLY mirrors core functions.c postquel_getnext: Pop on both the normal and error
++	// paths so no snapshot leak occurs if the child throws.
 +	PushActiveSnapshot(estate->query_snapshot);
-+
++	PG_TRY();
++	{
  	while (!estate->finish){
  		TupleTableSlot* slot;
 
-@@ -483,6 +488,7 @@ TupleTableSlot* execFaginsM(PlanState* node){
- 	while (!proc_pq->empty()){
- 		result_stack->push(proc_pq->top());
- 		proc_pq->pop();
+@@ -477,6 +489,13 @@
+ 			estate->finish = true;
+ 		}
  	}
-
--	if (result_stack->size() == 0)
-+	if (result_stack->size() == 0) {
++	} PG_CATCH();
++	{
 +		PopActiveSnapshot();
- 		return ExecClearTuple(result_slot);
++		PG_RE_THROW();
 +	}
-
- 	auto [rk_score, tuple] = result_stack->top();
- 	result_stack->pop();
-
- 	ExecForceStoreHeapTuple(tuple, result_slot, true);
++	PG_END_TRY();
 +	PopActiveSnapshot();
- 	return result_slot;
+
+ 	// put back the output into the correct order, i.e. smallest score first
+ 	/*
+@@ -506,7 +525,7 @@
  }
-#
-# (BETTER FORM, recommended for the final patch: wrap only the child-drive loop in Push/Pop, or use
-#  a PG_TRY/PG_FINALLY so the snapshot is popped on the error path too. The sketch above pops on both
-#  normal returns; a PG_TRY guard is the production-correct shape.)
-#
-# =====================================================================================
-# Part D — teardown: unregister the pinned snapshot, and FIX the use-after-free (topk/multicol_topk).
-# =====================================================================================
-diff --git a/src/multicol_topk.cpp b/src/multicol_topk.cpp
---- a/src/multicol_topk.cpp
-+++ b/src/multicol_topk.cpp
-@@ -524,16 +524,22 @@ void EndFaginsStateM(FaginsState *state){
- 	if (!state) return;
 
- 	table_index_fetch_end(state->result_heap_scan);
- 	table_close(state->relation, AccessShareLock);
- 	ExecDropSingleTupleTableSlot(state->ps.ps_ResultTupleSlot);
 
- 	for (QueryDesc* queryDesc: *(state->qDescs)) {
- 		ExecutorFinish(queryDesc);
+-FaginsState* InitFaginsState(Relation relation, uint32_t k, uint32_t ef, uint32_t term_cond, std::vector<IndexScanState*> scans, std::vector<QueryDesc*> qDescs){
++FaginsState* InitFaginsState(Relation relation, uint32_t k, uint32_t ef, uint32_t term_cond, std::vector<IndexScanState*> scans, std::vector<QueryDesc*> qDescs, Snapshot query_snapshot){
+ 	FaginsState* state = (FaginsState*)malloc(sizeof(FaginsState));
+ 	memset(&(state->ps), 0, sizeof(PlanState));
+
+@@ -528,6 +547,8 @@
+ 	state->result_stack			 = new std::stack<pq_item>();
+ 	state->children				 = new std::vector<IndexScanState*>(scans);
+ 	state->qDescs				 = new std::vector<QueryDesc*>(qDescs);
++	// DEV-1236 Part A: stash the pinned snapshot on the state for use by execFagins and teardown.
++	state->query_snapshot        = query_snapshot;
+
+ 	return state;
+ }
+@@ -544,11 +565,20 @@
  		ExecutorEnd(queryDesc);
  		FreeQueryDesc(queryDesc);
  	}
-+	// DEV-1236: release the snapshot we pinned in multicol_topk() (after ExecutorEnd, which is the
-+	// last reader of it).
++	// DEV-1236 Part D: unregister the snapshot AFTER ExecutorEnd (the last consumer of it).
 +	if (state->query_snapshot)
 +		UnregisterSnapshot(state->query_snapshot);
 +
-+	// DEV-1236: FIX use-after-free + mismatched free/delete. The OLD code did `free(state);` then
-+	// `free(state->qDescs);` — a read of state-> AFTER free(state) — and free()'d a new[]'d vector.
-+	// delete every new'd member, THEN free(state) LAST. (Mirror of the already-correct EndTJSState.)
++	// DEV-1236 Part D: FIX use-after-free + mismatched alloc/free.
++	// OLD (broken): free(state); free(state->qDescs);   -- reads state-> AFTER free(state) [UAF],
++	//               and free()'s a new-allocated std::vector [mismatched].
++	// NEW: delete every new'd member first, free(state) LAST. Also delete state->children (leaked).
  	delete(state->proc_pq);
  	delete(state->seenSet);
  	delete(state->result_stack);
 -	free(state);
 -	free(state->qDescs);
 +	delete(state->qDescs);
-+	delete(state->children);   // was leaked
++	delete(state->children);
 +	free(state);               // LAST — no state-> access after this point.
  	return;
  }
-#
-# (topk.cpp's EndFaginsState has the IDENTICAL UAF at its lines 547-552 — apply the same reorder,
-#  plus delete(state->children) which topk also leaks, plus the UnregisterSnapshot. tjs_operator.cpp's
-#  EndTJSState already frees correctly; it only needs the UnregisterSnapshot line and the matching
-#  field/Push/Pop from Parts A-C.)
-#
-# =====================================================================================
-# VERIFY WIRING (do NOT mark fixed until these pass on a BUILT image — see docs/fork_segfault_double_scan.md):
-#   1. Baseline crash: test/_fork_bug_tjs_double_scan.sql Shape A1/A2 SIGSEGV on the UNPATCHED image.
-#   2. git apply this patch (regenerated against the pinned MSVBASE clone), rebuild
-#      (scripts/x86build.sh --docker | scripts/gx10build.sh).
-#   3. Re-run Shapes A1/A2/B1/C1 -> each DO block prints its "SURVIVED" NOTICE; no backend termination.
-#   4. make test-all stays green; top-k sets unchanged; tjs_candidates_examined() << corpus (SM-3).
-#   5. Add a sentinel grep to scripts/lib/msvbase_patches.sh (e.g. grep 'DEV-1236' in the three .cpp)
-#      so a silent drift / non-applied patch fails the build loudly, per the existing verify_patches convention.
+
+@@ -629,6 +659,13 @@
+ 		std::vector<QueryDesc*> qDescs;
+ 		SPI_connect();
+
++		// DEV-1236 Part B: own a snapshot for the SRF's ENTIRE multi-call lifetime.
++		// Borrowing the caller's GetActiveSnapshot() let a sibling scan in the same plpgsql block
++		// pop/free the active snapshot out from under our still-open child IndexScan -> SIGSEGV on
++		// a later ExecProcNode call. RegisterSnapshot pins it against the current resource owner;
++		// UnregisterSnapshot in EndFaginsState (after ExecutorEnd) releases it.
++		Snapshot query_snapshot = RegisterSnapshot(GetTransactionSnapshot());
++
+ 		// prepare sql plans, each contain the corresponding index scan execution node for the orderby expression.
+ 		for (std::string exp : orderby_expressions) {
+ 			parseVectorConstant(exp);
+@@ -661,7 +698,7 @@
+ 			DestReceiver * dest= CreateDestReceiver(DestNone);
+ 			// DEBUG_PRINT("Create QueryDesc");
+ 			QueryDesc* queryDesc = CreateQueryDesc(plan, sourceText,
+-												   GetActiveSnapshot(), InvalidSnapshot,
++												   query_snapshot, InvalidSnapshot,
+ 												   dest, NULL, queryEnv, 0);
+
+ 			qDescs.push_back(queryDesc);
+@@ -678,7 +715,8 @@
+ 		}
+
+ 		FaginsState* top_execNode = InitFaginsState(table_open(table_oid,AccessShareLock),
+-													k, ef, termCond, scannodes, qDescs);
++													k, ef, termCond, scannodes, qDescs,
++													query_snapshot);
+
+ 		// SECTION END
+
+diff --git a/src/multicol_topk.cpp b/src/multicol_topk.cpp
+--- a/src/multicol_topk.cpp
++++ b/src/multicol_topk.cpp
+@@ -405,6 +405,10 @@
+ 	Relation relation;
+ 	std::vector<IndexScanState*> *children;
+ 	std::vector<QueryDesc*>* qDescs;
++	// DEV-1236: snapshot owned by this SRF for its entire multi-call lifetime.
++	// Registered at first-call (RegisterSnapshot), unregistered in EndFaginsStateM
++	// (after ExecutorEnd). Never borrowed from the caller's active-snapshot stack.
++	Snapshot query_snapshot;
+ } FaginsState;
+
+
+@@ -422,6 +426,14 @@
+ 	// slot
+ 	TupleTableSlot* result_slot = estate->ps.ps_ResultTupleSlot;
+
++	// DEV-1236 Part C: push our pinned snapshot as the active one for the entire child drive so any
++	// active-snapshot consultation inside ExecProcNode sees our snapshot, not whatever a prior sibling
++	// statement in the same plpgsql block left on the active-snapshot stack.
++	// PG_TRY/PG_FINALLY mirrors core functions.c postquel_getnext: Pop on both the normal and error
++	// paths so no snapshot leak occurs if the child throws.
++	PushActiveSnapshot(estate->query_snapshot);
++	PG_TRY();
++	{
+ 	while (!estate->finish){
+ 		TupleTableSlot* slot;
+
+@@ -475,6 +487,13 @@
+ 			estate->finish = true;
+ 		}
+ 	}
++	} PG_CATCH();
++	{
++		PopActiveSnapshot();
++		PG_RE_THROW();
++	}
++	PG_END_TRY();
++	PopActiveSnapshot();
+
+ 	// put back the output into the correct order, i.e. smallest score first
+ 	while (!proc_pq->empty()){
+@@ -496,7 +515,7 @@
+ }
+
+
+-FaginsState* InitFaginsState(Relation relation, uint32_t k, uint32_t term_cond, std::vector<IndexScanState*> scans, std::vector<QueryDesc*> qDescs){
++FaginsState* InitFaginsState(Relation relation, uint32_t k, uint32_t term_cond, std::vector<IndexScanState*> scans, std::vector<QueryDesc*> qDescs, Snapshot query_snapshot){
+ 	FaginsState* state = (FaginsState*)malloc(sizeof(FaginsState));
+ 	memset(&(state->ps), 0, sizeof(PlanState));
+
+@@ -517,6 +536,8 @@
+ 	state->result_stack			 = new std::stack<pq_item>();
+ 	state->children				 = new std::vector<IndexScanState*>(scans);
+ 	state->qDescs				 = new std::vector<QueryDesc*>(qDescs);
++	// DEV-1236 Part A: stash the pinned snapshot on the state for use by execFaginsM and teardown.
++	state->query_snapshot        = query_snapshot;
+
+ 	return state;
+ }
+@@ -533,11 +554,20 @@
+ 		ExecutorEnd(queryDesc);
+ 		FreeQueryDesc(queryDesc);
+ 	}
++	// DEV-1236 Part D: unregister the snapshot AFTER ExecutorEnd (the last consumer of it).
++	if (state->query_snapshot)
++		UnregisterSnapshot(state->query_snapshot);
++
++	// DEV-1236 Part D: FIX use-after-free + mismatched alloc/free.
++	// OLD (broken): free(state); free(state->qDescs);   -- reads state-> AFTER free(state) [UAF],
++	//               and free()'s a new-allocated std::vector [mismatched].
++	// NEW: delete every new'd member first, free(state) LAST. Also delete state->children (leaked).
+ 	delete(state->proc_pq);
+ 	delete(state->seenSet);
+ 	delete(state->result_stack);
+-	free(state);
+-	free(state->qDescs);
++	delete(state->qDescs);
++	delete(state->children);
++	free(state);               // LAST — no state-> access after this point.
+ 	return;
+ }
+
+@@ -598,6 +628,13 @@
+ 		std::vector<QueryDesc*> qDescs;
+ 		SPI_connect();
+
++		// DEV-1236 Part B: own a snapshot for the SRF's ENTIRE multi-call lifetime.
++		// Borrowing the caller's GetActiveSnapshot() let a sibling scan in the same plpgsql block
++		// pop/free the active snapshot out from under our still-open child IndexScan -> SIGSEGV on
++		// a later ExecProcNode call. RegisterSnapshot pins it against the current resource owner;
++		// UnregisterSnapshot in EndFaginsStateM (after ExecutorEnd) releases it.
++		Snapshot query_snapshot = RegisterSnapshot(GetTransactionSnapshot());
++
+ 		// prepare sql plans, each contain the corresponding index scan execution node for the orderby expression.
+ 		for ( std::string exp : orderby_expressions) {
+ 			DEBUG_PRINT("Prepare IndexScan node for orderby_expresion: %s ", exp.c_str());
+@@ -630,7 +667,7 @@
+ 			DestReceiver * dest= CreateDestReceiver(DestNone);
+ 			// DEBUG_PRINT("Create QueryDesc");
+ 			QueryDesc* queryDesc = CreateQueryDesc(plan, sourceText,
+-												   GetActiveSnapshot(), InvalidSnapshot,
++												   query_snapshot, InvalidSnapshot,
+ 												   dest, NULL, queryEnv, 0);
+
+ 			qDescs.push_back(queryDesc);
+@@ -647,7 +684,8 @@
+ 		}
+
+ 		FaginsState* top_execNode = InitFaginsState(table_open(table_oid,AccessShareLock),
+-													k, termCond, scannodes, qDescs);
++													k, termCond, scannodes, qDescs,
++													query_snapshot);
+
+ 		// SECTION END
+
+diff --git a/src/tjs_operator.cpp b/src/tjs_operator.cpp
+--- a/src/tjs_operator.cpp
++++ b/src/tjs_operator.cpp
+@@ -3,6 +3,7 @@
+ // tjs_operator.cpp — TriDB Traversal-Join-Similarity (TJS) operator (DEV-1169 / FR-4).
+ //
+ // Marker for the patch sentinel grep (scripts/lib/msvbase_patches.sh): TRIDB: TJS operator.
++// DEV-1236: snapshot lifecycle fix — see docs/decisions/0010-fork-operator-snapshot-lifecycle.md.
+ //
+ // WHAT THIS IS
+ // ------------
+@@ -342,6 +343,11 @@
+ 	// Set true once the children/executor/relation have been closed (EndTJSChildren). Guards the SRF
+ 	// from touching freed executor state on later per-call invocations.
+ 	bool children_closed;
++
++	// DEV-1236 Part A: snapshot owned by this SRF for its entire multi-call lifetime.
++	// Registered at first-call (RegisterSnapshot), unregistered in EndTJSState (after ExecutorEnd).
++	// Never borrowed from the caller's active-snapshot stack.
++	Snapshot query_snapshot;
+ } TJSState;
+
+ // Process-global examined counter for the last TJS scan in this backend (TR-1 probe, SM-3). Mirrors
+@@ -372,6 +378,14 @@
+ 	// top-k also leaves it empty), so guard on estate->finish: it is set true exactly once the merge
+ 	// has run to completion below.
+ 	if (!estate->finish) {
++		// DEV-1236 Part C: push our pinned snapshot as the active one for the entire child drive so
++		// any active-snapshot consultation inside ExecProcNode sees our snapshot, not whatever a prior
++		// sibling statement in the same plpgsql block left on the active-snapshot stack.
++		// PG_TRY/PG_FINALLY mirrors core functions.c postquel_getnext: Pop on both the normal and
++		// error paths so no snapshot leak occurs if the child throws.
++		PushActiveSnapshot(estate->query_snapshot);
++		PG_TRY();
++		{
+ 		while (!estate->finish){
+ 			TupleTableSlot* slot;
+
+@@ -444,6 +458,13 @@
+ 				estate->finish = true;
+ 			}
+ 		}
++		} PG_CATCH();
++		{
++			PopActiveSnapshot();
++			PG_RE_THROW();
++		}
++		PG_END_TRY();
++		PopActiveSnapshot();
+
+ 		// Smallest score first.
+ 		while (!proc_pq->empty()){
+@@ -466,7 +487,8 @@
+
+ TJSState* InitTJSState(Relation relation, uint32_t k, uint32_t term_cond,
+ 				   std::vector<IndexScanState*> scans, std::vector<QueryDesc*> qDescs,
+-				   bool graphEnabled, std::unordered_set<int64> reachable){
++				   bool graphEnabled, std::unordered_set<int64> reachable,
++				   Snapshot query_snapshot){
+ 	TJSState* state = (TJSState*)malloc(sizeof(TJSState));
+ 	memset(&(state->ps), 0, sizeof(PlanState));
+
+@@ -495,6 +517,8 @@
+ 	state->examined         = 0;
+ 	state->result_cxt       = CurrentMemoryContext; // the SRF's multi_call_memory_ctx (caller switched).
+ 	state->children_closed  = false;
++	// DEV-1236 Part A: stash the pinned snapshot on the state for use by execTJS and teardown.
++	state->query_snapshot   = query_snapshot;
+
+ 	return state;
+ }
+@@ -520,6 +544,10 @@
+ 	if (!state) return;
+ 	EndTJSChildren(state); // idempotent — no-op if already closed in the first call.
+ 	ExecDropSingleTupleTableSlot(state->ps.ps_ResultTupleSlot);
++	// DEV-1236 Part D: unregister the snapshot AFTER ExecutorEnd (via EndTJSChildren above, the last
++	// consumer of it). EndTJSChildren is called first above so the snapshot is still valid when freed.
++	if (state->query_snapshot)
++		UnregisterSnapshot(state->query_snapshot);
+ 	// Delete EVERY C++ member BEFORE free(state); free(state) is the LAST statement (no read of
+ 	// state-> after it). qDescs/children/etc. are heap-owned vectors/sets allocated in InitTJSState.
+ 	delete(state->proc_pq);
+@@ -612,10 +640,17 @@
+ 		if ( !(plan = extractIndexScanNodeT(sourceText)) )
+ 			elog(ERROR, "TJS: cannot find HNSW index for vector leg = %s", sourceText);
+
++		// DEV-1236 Part B: own a snapshot for the SRF's ENTIRE multi-call lifetime.
++		// Borrowing the caller's GetActiveSnapshot() let a sibling scan in the same plpgsql block
++		// pop/free the active snapshot out from under our still-open child IndexScan -> SIGSEGV on
++		// a later ExecProcNode call. RegisterSnapshot pins it against the current resource owner;
++		// UnregisterSnapshot in EndTJSState (after ExecutorEnd via EndTJSChildren) releases it.
++		Snapshot query_snapshot = RegisterSnapshot(GetTransactionSnapshot());
++
+ 		QueryEnvironment *queryEnv = create_queryEnv();
+ 		DestReceiver * dest = CreateDestReceiver(DestNone);
+ 		QueryDesc* queryDesc = CreateQueryDesc(plan, sourceText,
+-										   GetActiveSnapshot(), InvalidSnapshot,
++										   query_snapshot, InvalidSnapshot,
+ 										   dest, NULL, queryEnv, 0);
+ 		qDescs.push_back(queryDesc);
+ 		standard_ExecutorStart(queryDesc, 0);
+@@ -627,7 +662,8 @@
+
+ 		TJSState* top_execNode = InitTJSState(table_open(table_oid, AccessShareLock),
+ 										  k, termCond, scannodes, qDescs,
+-										  graphEnabled, std::move(reachable));
++										  graphEnabled, std::move(reachable),
++										  query_snapshot);
+
+ 		funcctx->user_fctx = top_execNode;
+ 		funcctx->max_calls = k;

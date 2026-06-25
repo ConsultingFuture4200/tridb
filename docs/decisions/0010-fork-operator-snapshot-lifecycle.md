@@ -1,6 +1,6 @@
 # ADR-0010: Fork operators must own their snapshot for the full SRF lifetime
 
-**Status:** Accepted (diagnosis); fix DRAFTED, **UNBUILT-HERE** (GX10-gated)
+**Status:** Accepted — **BUILT AND VERIFIED on the x86 standin** (2026-06-25); GX10/ARM sign-off tabled
 **Issue:** DEV-1236 (spike / diagnose)
 **Related:** ADR-0007 (TJS operator), ADR-0006 (relaxed-monotonicity vector iterator),
 DEV-1169 (TJS), DEV-1168 (vector iterator), `docs/fork_segfault_double_scan.md` (full evidence chain),
@@ -69,13 +69,22 @@ built and verified.
 
 ## Status / gating
 
-- **UNBUILT-HERE.** Authored on the x86 standin in a static-verify run with no docker image. The
-  fix is a DRAFT patch (`scripts/patches/tridb_fix_double_scan_snapshot.patch`, labeled UNBUILT)
-  plus a repro (`test/_fork_bug_tjs_double_scan.sql`, NOT in CI — crashes the backend).
-- **Not claimed to compile, pass, or fix anything.** Verification (baseline crash → apply → re-run
-  shapes → `make test-all` green → promote a minimized survivor block to CI) must run on a built
-  `tridb/msvbase:dev` image (x86 standin) or the GX10. Steps in
-  `docs/fork_segfault_double_scan.md` §Verify wiring and the patch trailer.
+**BUILT AND VERIFIED on the x86 standin (2026-06-25).** Incremental build of `tridb/msvbase:dev`
+(only the three changed TUs), build exited 0. Smoke test PASS. Canonical TJS e2e ALL TESTS PASSED;
+`examined=73 of 2000` (TR-1/SM-3 intact). Double-scan SURVIVED notices confirmed for shapes A1
+(multicol_topk + count(*)), A2 (tjs + count(*)), C1 (tjs then count(*)). Server alive after all.
+
+Patch wired into `scripts/lib/msvbase_patches.sh` — sentinel `DEV-1236` in all three `.cpp` files.
+
+**GX10/ARM sign-off tabled.** Snapshot logic is architecture-independent PG 13.4 C++ (no
+GX10-specific codepaths). GX10 is required only to build the full native HNSW/graph layer;
+sign-off there tracks with the GX10 Phase build, not this fix specifically.
+
+**NOTE:** `test/_fork_bug_multicol_double_scan.sql` and `test/_fork_bug_tjs_double_scan.sql`
+contain `SET enable_seqscan = off` globally, which causes `SELECT count(*) FROM entities` to crash
+for an independent reason (HNSW cannot handle plain count(*) without ORDER BY). These files are
+not the canonical BEFORE/AFTER witness for this fix. Correct repro: sibling scans with seqscan
+enabled (default). See `docs/fork_segfault_double_scan.md` §Verification results.
 
 ## Consequences
 

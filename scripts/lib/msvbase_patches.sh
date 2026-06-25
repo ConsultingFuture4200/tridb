@@ -59,6 +59,12 @@ verify_patches() {
     || die "TriDB tridb_tjs_operator.patch NOT applied — Traversal-Join-Similarity operator missing (DEV-1169); drift?"
   grep -q 'src/tjs_operator.cpp' "$root/CMakeLists.txt" \
     || die "TriDB tridb_tjs_operator.patch NOT wired into CMakeLists vectordb sources (DEV-1169); drift?"
+  grep -q 'DEV-1236' "$root/src/tjs_operator.cpp" 2>/dev/null \
+    || die "TriDB tridb_fix_double_scan_snapshot.patch NOT applied — snapshot lifecycle + UAF fix missing (DEV-1236); drift?"
+  grep -q 'DEV-1236' "$root/src/topk.cpp" 2>/dev/null \
+    || die "TriDB tridb_fix_double_scan_snapshot.patch NOT applied in topk.cpp — snapshot lifecycle fix missing (DEV-1236); drift?"
+  grep -q 'DEV-1236' "$root/src/multicol_topk.cpp" 2>/dev/null \
+    || die "TriDB tridb_fix_double_scan_snapshot.patch NOT applied in multicol_topk.cpp — snapshot lifecycle fix missing (DEV-1236); drift?"
   log "all MSVBASE + TriDB fork patches verified present"
 }
 
@@ -151,6 +157,25 @@ apply_tridb_fork_patches() {
     log "applying TriDB fork patch: Traversal-Join-Similarity operator (DEV-1169 / FR-4)"
     ( cd "$root" && git apply "$tjs_patch" ) \
       || die "tridb_tjs_operator.patch did not apply — MSVBASE drift? re-generate per DEV-1169"
+  fi
+
+  #   tridb_fix_double_scan_snapshot.patch (DEV-1236, ADR-0010): snapshot lifecycle fix for
+  #     topk(), multicol_topk(), and tjs(). A second executor-driven scan in the same plpgsql block
+  #     as any of these SRFs can SIGSEGV the backend: each operator built its child IndexScan with
+  #     GetActiveSnapshot() (borrowed, not pinned), and a sibling statement pushes/pops the active
+  #     snapshot, leaving the child's xs_snapshot dangling. Fix: RegisterSnapshot at first-call,
+  #     PushActiveSnapshot/PopActiveSnapshot around each child drive (PG_TRY/PG_CATCH for error
+  #     path), UnregisterSnapshot in teardown. Also fixes UAF in topk/multicol_topk EndFaginsState
+  #     (free(state) then free(state->qDescs) reads freed memory; new-allocated vectors were
+  #     free()'d instead of delete'd). BUILT AND VERIFIED on the x86 standin (2026-06-25).
+  local snapshot_patch="${_MSVBASE_LIB_DIR}/../patches/tridb_fix_double_scan_snapshot.patch"
+  [[ -f "$snapshot_patch" ]] || die "missing TriDB fork patch: $snapshot_patch"
+  if grep -q 'DEV-1236' "$root/src/tjs_operator.cpp" 2>/dev/null; then
+    log "TriDB fork patch (snapshot lifecycle + UAF fix, DEV-1236) already applied"
+  else
+    log "applying TriDB fork patch: snapshot lifecycle + teardown UAF fix (DEV-1236 / ADR-0010)"
+    ( cd "$root" && git apply "$snapshot_patch" ) \
+      || die "tridb_fix_double_scan_snapshot.patch did not apply — MSVBASE drift? re-generate per DEV-1236"
   fi
 
   # ----------------------------------------------------------------------------

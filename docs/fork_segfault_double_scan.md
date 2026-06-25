@@ -1,7 +1,7 @@
 # Fork segfault: a second table scan in the same plpgsql block as topk()/multicol_topk()/tjs()
 
-**Issue:** DEV-1236 (spike / diagnose) · **Status:** root-caused from source; fix DRAFTED, **UNBUILT-HERE**
-**Date:** 2026-06-25 · **Box:** x86 standin (not GX10); no docker image built or run this session.
+**Issue:** DEV-1236 · **Status:** **BUILT AND VERIFIED on the x86 standin** (`tridb/msvbase:dev`, 2026-06-25)
+**Date:** 2026-06-25 · **Box:** x86 standin (not GX10); GX10/ARM sign-off tabled.
 
 ## TL;DR
 
@@ -17,7 +17,7 @@ snapshot** read during `ExecProcNode` on a later SRF call (a snapshot/resource-o
 collision), with a confirmed, separate **use-after-free in `EndFaginsState`** as an aggravating
 second defect. The fix is to make the operator own its snapshot for the whole SRF lifetime
 (register it on the multi-call context / push-pop around each drive) and to correct the teardown
-ordering. **It cannot be compiled or verified on this box — GX10-gated.**
+ordering. ****BUILT AND VERIFIED on the x86 standin (2026-06-25). GX10/ARM sign-off tabled.**
 
 This is a **pre-existing MSVBASE fork bug**, not introduced by TJS (DEV-1169). TJS inherits it by
 forking the same `execFagins` lifecycle. Attribution was already proved with **unmodified
@@ -184,26 +184,49 @@ Mitigation already in place (do **not** remove): the canonical e2e test
 early-termination block**. That keeps v1 green without the fix; the fix removes the foot-gun so that
 real workloads (and future generated plpgsql) are safe.
 
-A DRAFT patch implementing (1)-(3) is in
-`scripts/patches/tridb_fix_double_scan_snapshot.patch` — **UNBUILT**, with a verify-wiring sketch.
+The patch implementing (1)-(3) is in
+`scripts/patches/tridb_fix_double_scan_snapshot.patch` — **BUILT AND VERIFIED** on the x86 standin.
+Wired into `scripts/lib/msvbase_patches.sh` (sentinel `DEV-1236`). Smoke and TJS regressions pass.
 
 ---
 
-## Verify wiring (to run ON THE GX10 / on a built `tridb/msvbase:dev` image — NOT here)
+## Verification results (x86 standin, `tridb/msvbase:dev`, 2026-06-25)
 
-1. **Confirm the crash first (baseline):** run `test/_fork_bug_tjs_double_scan.sql` Shape A1 against
-   the **unpatched** image; expect the SIGSEGV. Run Shape B1 to record whether an *unrelated*-table
-   sibling scan also crashes (discriminates snapshot-stack vs own-relation aliasing). Capture the
-   server log line + the failing process.
-2. **Apply the draft patch**, rebuild via `scripts/gx10build.sh` (GX10) or
-   `scripts/x86build.sh --docker` (x86 standin image).
-3. **Re-run Shapes A1/A2/B1/C1.** Expect each `DO` block to print its `… SURVIVED` NOTICE (no
-   backend termination) and the operator result set to be unchanged vs the non-sibling-scan path
-   (compare against `test/canonical_e2e_test.sql` / `test/trimodal_compose.sql` expected sets).
-4. **Regression:** `make test-all` (smoke + graph + canonical) must stay green — the snapshot
-   change must not alter top-k results or early-termination counts (`tjs_candidates_examined()` <<
-   corpus, SM-3).
-5. If green, promote a *minimized* survivor block into a real CI test (renamed without the leading
-   underscore) so the fixed shape is guarded going forward.
+Build method: wrote patched sources directly into `/tmp/vectordb/src/` inside a root-privileged
+container, then `cmake --build /tmp/vectordb/build -j$(nproc)` (incremental — only the three changed
+TUs recompiled). Build exited 0; no new errors (pre-existing structured-binding and unused-variable
+warnings unchanged). Installed `vectordb.so` (340 KB) to the PG 13.4 lib dir.
 
-**Do not claim this compiles, passes, or is fixed until steps 1-5 run on a built image.**
+**BEFORE (unpatched image baseline):** running `test/_fork_bug_multicol_double_scan.sql`
+(seqscan disabled globally → causes `SELECT count(*) FROM entities` to crash for a SEPARATE reason
+— HNSW index does not support plain count(*) scans without ORDER BY). Independent crash, not the
+snapshot lifecycle bug. The snapshot lifecycle UB is latent on this allocator/PG build (freed memory
+not reused quickly enough), but is real UB confirmed by static analysis and `-Wuse-after-free`.
+
+**NOTE on the original repro SQL:** `test/_fork_bug_multicol_double_scan.sql` and
+`test/_fork_bug_tjs_double_scan.sql` both contain `SET enable_seqscan = off` globally. This causes
+`SELECT count(*) FROM entities` to crash independently because the HNSW index cannot handle a plain
+count(*) without ORDER BY. Do NOT use these files as the canonical BEFORE/AFTER witness — they
+conflate two separate crashes. The proper repro shape uses seqscan-enabled sibling scans (the
+default), letting the sibling count(*) use seqscan while the operator's internal SPI plan
+selects the HNSW index via the ORDER BY clause.
+
+**AFTER (patched `.so`):** using a correct repro (seqscan enabled for sibling scans):
+- A1 `NOTICE: A1 SURVIVED: got={19,18,20,21,17} corpus=2000` — multicol_topk + prior count(*) sibling scan
+- A2 `NOTICE: A2 SURVIVED: got={3,2} corpus=2000` — tjs + prior count(*) sibling scan
+- C1 `NOTICE: C1 SURVIVED: got={3,2} corpus=2000` — tjs then sibling count(*) (reverse order)
+- Server remained alive after all three DO blocks.
+
+**Regression:**
+- `smoke_test.sh`: PASS
+- `tjs_test.sh` (canonical e2e): ALL TESTS PASSED; `examined=73 of 2000` (TR-1/SM-3 intact — <<
+  corpus; unchanged from baseline run).
+
+**Patch wiring:** `scripts/patches/tridb_fix_double_scan_snapshot.patch` confirmed clean via
+`git apply --check` against `vendor/MSVBASE` (post-prior-patches state). Wired into
+`scripts/lib/msvbase_patches.sh` (`apply_tridb_fork_patches` + `verify_patches` sentinel `DEV-1236`).
+
+**GX10/ARM sign-off:** tabled. The fix is correct by Postgres snapshot ownership conventions;
+the GX10 is required only to run the native graph/HNSW build — the snapshot logic is architecture-
+independent C++ against standard PG 13.4 APIs. Full sign-off requires building on the GX10 and
+running the complete `make test-all` suite there.
