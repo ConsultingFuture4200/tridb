@@ -138,3 +138,82 @@ used for the graph store. Concretely:
 - It does not change the query surface or add a query language. (Rule #4.)
 - It does not claim the patch compiles or passes — that is GX10+Docker-gated and
   explicitly out of scope for this x86 standin spike.
+
+---
+
+## Addendum A — DEV-1235 Defect A: rebuild-from-heap (v1 interim fix, 2026-06-25)
+
+**Status:** IMPLEMENTED — built, all four oracles pass on `tridb/msvbase:dev` (x86 Docker).
+**Patch:** `scripts/patches/tridb_hnsw_rebuild_on_recovery.patch`
+**Issue:** DEV-1235 Defect A (crash/cross-session/abort-exclusion/no-dup).
+
+### What shipped
+
+Instead of implementing the full GenericXLog page-store described above (Phase B/C,
+GX10-gated), v1 adopts a simpler mechanism that achieves crash-redo correctness and
+abort exclusion without touching the WAL-write path:
+
+**`LoadIndex` now rebuilds the in-RAM `HierarchicalNSW` from the WAL-durable HEAP
+on cache-miss, via `table_index_build_scan`**, instead of loading the stale flat file.
+
+The heap is the source of truth — it always was, since the relational heap is
+WAL-logged and MVCC-managed by PostgreSQL. The flat file is no longer in the load
+path (it remains on disk as a dead artifact but is not read by `LoadIndex`).
+
+### Mechanism
+
+1. Cache guard: `vector_index_map.find(p_path)` short-circuits to avoid re-scanning.
+2. `IndexGetRelation(RelationGetRelid(index), false)` → heap OID.
+3. `table_open(heapOid, AccessShareLock)` → heap `Relation`.
+4. `table_index_build_scan(heap, index, indexInfo, false, false, HNSWRebuildCallback, &state, NULL)`:
+   - `scan=NULL` → heap AM creates its own `HeapScanDesc` with `SnapshotAny`.
+   - `SnapshotAny` + `HeapTupleSatisfiesVacuum`: `HEAPTUPLE_DEAD` → `tupleIsAlive=false`
+     → callback returns early → aborted rows excluded (Oracle C).
+   - `HEAPTUPLE_LIVE`, `HEAPTUPLE_RECENTLY_DEAD`-with-alive-check, and
+     `HEAPTUPLE_INSERT_IN_PROGRESS` (own-xact) → `tupleIsAlive=true` → `addPoint`.
+5. `HNSWRebuildCallback` encodes each TID as `(blockId << 32) | offset` — identical
+   to `hnsw_insert` — and calls `vector_index->addPoint`.
+6. `table_close(heap, AccessShareLock)`.
+7. Both `distanceFunction_map` and `vector_index_map` populated together so
+   `hnswlib`'s raw pointer to the space object remains valid.
+
+### Double-add policy (aminsert / own-transaction in-progress)
+
+On the first insert in a fresh backend, `LoadIndex` runs before `aminsert`'s
+`addPoint`. With `SnapshotAny` + `ii_Concurrent=false`, the in-progress row from
+the current transaction is visible (`HEAPTUPLE_INSERT_IN_PROGRESS` → `tupleIsAlive=true`).
+`HNSWRebuildCallback` calls `addPoint` for it; `aminsert` then calls `addPoint` again
+with the same label.
+
+Policy chosen: **(b) idempotency** — `hnswlib::HierarchicalNSW::addPoint` detects a
+duplicate label in `label_lookup_` and calls `updatePoint` with the identical vector
+data. No duplicate node is inserted; no corruption occurs. Verified by Oracle D.
+
+### Oracle results (x86 Docker, `tridb/msvbase:dev`)
+
+| Oracle | Scenario | Result |
+|--------|----------|--------|
+| A | Crash-immediate (no shutdown checkpoint), WAL-redo, HNSW scan must find post-checkpoint committed row | PASS — returns 9001 |
+| B | Cross-session: row committed by session 1, HNSW scan in fresh session 2 must find it | PASS — returns 75 |
+| C | Abort exclusion: rolled-back insert must NOT appear in HNSW scan results | PASS — 9999 absent |
+| D | Recall / no-dup: 7 nearest-neighbour queries with pre-crash data return correct results | PASS — all 7 correct |
+
+### Performance tradeoff
+
+O(heap) rebuild at first access per backend per index. Subsequent accesses in the
+same backend are O(1) from `vector_index_map` cache. The cost is proportional to table
+size; for workloads with many small indexes and many backend restarts this is a regression
+over the (broken) flat-file load. Accepted as the v1 tradeoff. Documented here so Phase B
+(GenericXLog page store, GX10) can be prioritized when this cost becomes observable.
+
+### What this addendum does NOT change
+
+- The GenericXLog Phase B/C plan (Decision §§1-4) remains the long-term target.
+  Addendum A is a correctness fix that closes the crash-redo and abort-exclusion gaps
+  without GX10 work; it does NOT retire ADR-0003a KNOWN-LIMITATION #3 (that requires
+  Phase C's xid-stamped scan-time visibility filter — abort durability in the WAL-write
+  path, not just at rebuild time).
+- The flat file produced by `ambuild` (`SaveIndex`) still exists; it is not deleted
+  by this patch. It is simply no longer trusted or read during `LoadIndex`.
+- The full GenericXLog route (WAL-log mutations at `aminsert` time) eliminates the
+  per-backend O(heap) rebuild cost and is the correct v2 target.

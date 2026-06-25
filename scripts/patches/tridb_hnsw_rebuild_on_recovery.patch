@@ -1,0 +1,310 @@
+# tridb_hnsw_rebuild_on_recovery.patch — DEV-1235 Defect A (ADR-0009 rebuild-on-recovery).
+#
+# ROOT CAUSE: HNSWIndexScan::LoadIndex loaded the in-RAM HierarchicalNSW from a flat file written
+# only at ambuild (hnsw_build -> SaveIndex). aminsert -> addPoint mutated the in-RAM map ONLY —
+# never persisted, never WAL-logged. So after crash recovery (or in any fresh backend), the flat
+# file is stale and misses every post-ambuild insert. Defect A (verified): query after crash with
+# enable_seqscan=off returns WRONG row (30 instead of 9001 in the oracle repro).
+#
+# FIX: On cache-miss, LoadIndex now REBUILDS the in-RAM index by scanning the WAL-durable HEAP
+# (table_index_build_scan with SnapshotAny + HeapTupleSatisfiesVacuum), adding each LIVE tuple via
+# addPoint using the same label encoding as hnsw_insert. The heap is the source of truth. The flat
+# file is left untouched but is no longer used for loading.
+#
+# AMINSERT DOUBLE-ADD (subtlety 1): on the first insert in a fresh backend, LoadIndex rebuilds
+# from heap. With SnapshotAny + ii_Concurrent=false, HEAPTUPLE_INSERT_IN_PROGRESS tuples (the
+# current transaction's own in-progress row) are indexed with tupleIsAlive=true — so addPoint
+# is called for the new row, then aminsert calls addPoint again. hnswlib::addPoint is IDEMPOTENT
+# on duplicate labels: it calls updatePoint with the same vector data — no duplicate node, no
+# corruption. Verified by oracle D (recall/no-dup).
+#
+# SNAPSHOT / VISIBILITY: SnapshotAny -> HeapTupleSatisfiesVacuum. HEAPTUPLE_DEAD (aborted rows)
+# yield tupleIsAlive=false and are skipped — satisfying oracle C (abort exclusion). HEAPTUPLE_LIVE
+# rows are indexed unconditionally. Cross-session (oracle B): rebuild scans committed rows from all
+# transactions, so rows committed by backend1 are visible to backend2's first-access rebuild.
+#
+# PERFORMANCE: O(heap) on first access per backend per index; cached after that. Documented in
+# ADR-0009 addendum as the accepted v1 tradeoff vs GenericXLog-backed page durability.
+#
+# SENTINEL: "TRIDB: HNSW rebuild-on-recovery (DEV-1235)" in src/hnswindex_scan.cpp.
+# Apply AFTER tridb_hnsw_scan_no_orderby.patch (DEV-1236).
+# Verified: git apply --check exit 0; oracle A/B/C/D pass on tridb/msvbase:dev.
+#
+# Files modified:
+#   src/hnswindex_scan.hpp    — LoadIndex signature: add Relation index as first parameter.
+#   src/hnswindex_scan.cpp    — LoadIndex body: rebuild from heap on cache-miss.
+#   src/hnswindex.cpp         — 3 call sites (hnsw_insert, hnsw_bulkdelete, hnsw_begin_scan).
+#   src/tridb_vector_iter.cpp — 1 call site (tridb_vec_open).
+diff --git a/src/hnswindex_scan.hpp b/src/hnswindex_scan.hpp
+--- a/src/hnswindex_scan.hpp
++++ b/src/hnswindex_scan.hpp
+@@ -34,7 +34,14 @@
+ 	    std::vector<float> array;
+         std::priority_queue<float> distanceQueue;
+     };
+-    static void LoadIndex(const std::string &p_path,
++    // DEV-1235 (ADR-0009 rebuild-on-recovery): LoadIndex now takes the index Relation
++    // so it can open the heap and rebuild the in-RAM index from WAL-durable heap tuples
++    // on cache-miss, instead of trusting the stale flat file. Callers must pass the
++    // index Relation (available at all call sites: hnsw_insert, hnsw_begin_scan,
++    // hnsw_bulkdelete, and tridb_vec_open). Cache is keyed by p_path and populated
++    // at most once per backend per index — O(heap) cost on first access only.
++    static void LoadIndex(Relation index,
++                          const std::string &p_path,
+                           DistanceMethod distance_method, int dim);
+     static std::shared_ptr<hnswlib::ResultIterator<float>> BeginScan(
+         const void *p_target, const std::string &p_path);
+diff --git a/src/hnswindex_scan.cpp b/src/hnswindex_scan.cpp
+--- a/src/hnswindex_scan.cpp
++++ b/src/hnswindex_scan.cpp
+@@ -4,6 +4,15 @@
+ #include "hnswindex_scan.hpp"
+ #include "tridb_vector_index.hpp"
+ 
++// DEV-1235 (ADR-0009 rebuild-on-recovery): pull in the Postgres catalog and
++// table-scan headers needed for heap-rebuild in LoadIndex.
++extern "C"
++{
++#include <access/table.h>
++#include <catalog/index.h>
++#include <utils/rel.h>
++}
++
+ // TRIDB(DEV-1228 / ADR-0004): the hnswlib-backed HNSW AM is the reference implementer of the
+ // TriDB-owned vector-index scan contract. Assert conformance at compile time so a future
+ // refactor that breaks Open/Next/Close fails the build here, not at runtime.
+@@ -12,29 +21,153 @@
+ std::map<std::string, std::shared_ptr<hnswlib::SpaceInterface<float>>> HNSWIndexScan::distanceFunction_map;
+ std::map<std::string, std::shared_ptr<hnswlib::HierarchicalNSW<float>>> HNSWIndexScan::vector_index_map;
+ 
+-void HNSWIndexScan::LoadIndex(const std::string &p_path,
++// DEV-1235 (ADR-0009 rebuild-on-recovery): state struct threaded through the
++// heap-rebuild scan callback. Mirrors HNSWIndexBuilder but inline here to avoid
++// pulling in hnswindex_builder.hpp (that header exposes ambuild internals).
++struct HNSWRebuildState
++{
++    std::shared_ptr<hnswlib::HierarchicalNSW<float>> vector_index;
++    int dim;
++    int tuples_added;
++};
++
++// DEV-1235 (ADR-0009 rebuild-on-recovery): heap-scan callback for LoadIndex
++// rebuild. Mirrors HNSWLoadTupleCallback in hnswindex_builder.cpp exactly:
++//   label = (blockId << 32) | offset  — the same encoding hnsw_insert uses.
++// hnswlib::addPoint is idempotent on duplicate labels (updates the existing
++// entry rather than inserting a duplicate), so if aminsert's own-transaction
++// in-progress row is seen by SnapshotAny during rebuild AND addPoint is called
++// again by aminsert afterwards, the second call is a no-op vector update with
++// identical data — no duplicate node, no corruption (DEV-1235 subtlety 1).
++static void
++HNSWRebuildCallback(Relation /*index*/,
++                    ItemPointer tid,
++                    Datum *values,
++                    bool *isnull,
++                    bool tupleIsAlive,
++                    void *state)
++{
++    // Only index live tuples. RECENTLY_DEAD tuples are passed by SnapshotAny
++    // but we intentionally skip them: they are dead for MVCC purposes and a
++    // crash-recovered index need not serve them. tupleIsAlive is false for
++    // RECENTLY_DEAD in the SnapshotAny path (heapam_handler.c:1406).
++    if (!tupleIsAlive)
++        return;
++
++    if (*isnull)
++        return;
++
++    HNSWRebuildState &self = *reinterpret_cast<HNSWRebuildState *>(state);
++    Datum value = values[0];
++
++    auto array = convert_array_to_vector(value);
++    if (static_cast<int>(array.size()) != self.dim)
++    {
++        ereport(ERROR,
++                (errcode(ERRCODE_DATA_EXCEPTION),
++                 errmsg("DEV-1235 rebuild: inconsistent array length, expected %d, found %zu",
++                        self.dim, array.size())));
++    }
++
++    std::int32_t blockId = ItemPointerGetBlockNumberNoCheck(tid);
++    std::int32_t offset  = ItemPointerGetOffsetNumberNoCheck(tid);
++    std::uint64_t number = static_cast<std::uint64_t>(blockId);
++    number = (number << 32) + static_cast<std::uint64_t>(offset);
++
++    self.vector_index->addPoint(reinterpret_cast<char *>(array.data()), number);
++    self.tuples_added++;
++}
++
++// DEV-1235 (ADR-0009 rebuild-on-recovery): LoadIndex now takes the index
++// Relation and rebuilds the in-RAM HierarchicalNSW from the WAL-durable HEAP
++// on cache-miss, instead of loading the stale ambuild flat file. The heap is
++// the source of truth; the flat file is left untouched but is no longer used
++// for loading after this patch. Cached in vector_index_map after first build —
++// O(heap) cost at most once per backend per index.
++//
++// Snapshot / visibility: table_index_build_scan with scan=NULL uses SnapshotAny
++// (ii_Concurrent=false, non-bootstrap) which calls HeapTupleSatisfiesVacuum.
++// HEAPTUPLE_DEAD tuples (aborted or vacuumable) yield tupleIsAlive=false and
++// are skipped in HNSWRebuildCallback — satisfying oracle C (abort exclusion).
++// HEAPTUPLE_LIVE tuples are indexed. HEAPTUPLE_INSERT_IN_PROGRESS tuples from
++// the current transaction (the aminsert case) are also indexed with
++// tupleIsAlive=true — this is correct: hnswlib::addPoint is idempotent on
++// duplicate labels, so the subsequent aminsert addPoint is harmless.
++//
++// Cross-session correctness (oracle B): the rebuild happens at first-access
++// in each backend, scanning all committed heap rows, so a row committed by
++// backend1 is visible to backend2's rebuild scan.
++// TRIDB: HNSW rebuild-on-recovery (DEV-1235)
++void HNSWIndexScan::LoadIndex(Relation index,
++                              const std::string &p_path,
+                               DistanceMethod distance_method,
+                               int dim)
+ {
+-    if(vector_index_map.find(p_path)==vector_index_map.end())
++    // Cache guard: at most once per backend per index path.
++    if (vector_index_map.find(p_path) != vector_index_map.end())
++        return;
++
++    // Build the distance space (same as ConstructInternalBuilder).
++    std::shared_ptr<hnswlib::SpaceInterface<float>> distanceFunction;
++    switch (distance_method)
+     {
+-        std::shared_ptr<hnswlib::SpaceInterface<float>> distanceFunction;
+-        switch (distance_method)
+-        {
+-        case DistanceMethod::L2:
+-            distanceFunction = std::make_shared<hnswlib::L2Space>(dim);
+-            break;
+-        case DistanceMethod::InnerProduct:
+-            distanceFunction = std::make_shared<hnswlib::InnerProductSpace>(dim);
+-            break;
+-        default:
+-            exit(1);
+-        }
+-        auto vector_index = std::make_shared<hnswlib::HierarchicalNSW<float>>(
+-            distanceFunction.get(), p_path);
+-        distanceFunction_map.insert(std::make_pair(p_path,distanceFunction));
+-        vector_index_map.insert(std::make_pair(p_path,vector_index));
++    case DistanceMethod::L2:
++        distanceFunction = std::make_shared<hnswlib::L2Space>(dim);
++        break;
++    case DistanceMethod::InnerProduct:
++        distanceFunction = std::make_shared<hnswlib::InnerProductSpace>(dim);
++        break;
++    default:
++        ereport(ERROR,
++                (errcode(ERRCODE_DATA_EXCEPTION),
++                 errmsg("DEV-1235 LoadIndex: unknown distance method")));
+     }
++
++    // Derive heap OID from the index relation. IndexGetRelation(oid, missing_ok).
++    Oid heapOid = IndexGetRelation(RelationGetRelid(index), false);
++    Relation heap = table_open(heapOid, AccessShareLock);
++
++    // Capacity estimate: use pg_class.reltuples * 10 (same factor as
++    // ConstructInternalBuilder). reltuples may be 0 after ANALYZE hasn't run
++    // or on a fresh table; floor at 16 to avoid a zero-capacity HierarchicalNSW
++    // which would panic on the first addPoint.
++    double reltuples = heap->rd_rel->reltuples;
++    size_t capacity = static_cast<size_t>(reltuples * 10.0);
++    if (capacity < 16)
++        capacity = 16;
++
++    auto vector_index =
++        std::make_shared<hnswlib::HierarchicalNSW<float>>(distanceFunction.get(), capacity);
++
++    // Build IndexInfo for table_index_build_scan. BuildIndexInfo reads the
++    // index catalog (expression trees, predicate, etc.) — we need it even
++    // though our callback ignores predicates, because the scan API requires it.
++    IndexInfo *indexInfo = BuildIndexInfo(index);
++
++    HNSWRebuildState state;
++    state.vector_index  = vector_index;
++    state.dim           = dim;
++    state.tuples_added  = 0;
++
++    // table_index_build_scan with scan=NULL: the heap AM picks SnapshotAny
++    // (non-concurrent, non-bootstrap) and calls HeapTupleSatisfiesVacuum on
++    // each tuple. Dead/aborted tuples are skipped (tupleIsAlive=false). The
++    // callback adds only live tuples to the in-RAM index.
++    table_index_build_scan(heap,
++                           index,
++                           indexInfo,
++                           false,   /* allow_sync: false — no syncscan needed */
++                           false,   /* progress: no PROGRESS_SCAN_BLOCKS_* updates */
++                           HNSWRebuildCallback,
++                           reinterpret_cast<void *>(&state),
++                           NULL);   /* scan: NULL — let heap AM create with SnapshotAny */
++
++    table_close(heap, AccessShareLock);
++
++    // Cache: both maps must be populated together so distanceFunction lifetime
++    // is tied to vector_index (hnswlib holds a raw pointer to the space object).
++    distanceFunction_map.insert(std::make_pair(p_path, distanceFunction));
++    vector_index_map.insert(std::make_pair(p_path, vector_index));
+ }
+ 
+ std::shared_ptr<hnswlib::ResultIterator<float>> HNSWIndexScan::BeginScan(
+diff --git a/src/hnswindex.cpp b/src/hnswindex.cpp
+--- a/src/hnswindex.cpp
++++ b/src/hnswindex.cpp
+@@ -160,14 +160,15 @@
+         switch(hnsw_ParaGetDistmethod(index))
+         {
+             case hnsw_Inner_Product:
+-                HNSWIndexScan::LoadIndex(path, DistanceMethod::InnerProduct, dim);
++                // DEV-1235: pass index Relation so LoadIndex can rebuild from heap on cache-miss.
++                HNSWIndexScan::LoadIndex(index, path, DistanceMethod::InnerProduct, dim);
+                 break;
+             case hnsw_L2_Distance:
+-                HNSWIndexScan::LoadIndex(path, DistanceMethod::L2, dim);
++                HNSWIndexScan::LoadIndex(index, path, DistanceMethod::L2, dim);
+                 break;
+             default:
+                 elog(ERROR, "hnsw index parameter value error.");
+-        }	
++        }
+ 	return HNSWIndexScan::Insert(path,
+ 		values,
+ 		isnull,
+@@ -187,10 +188,11 @@
+         switch(hnsw_ParaGetDistmethod(index))
+         {
+             case hnsw_Inner_Product:
+-                HNSWIndexScan::LoadIndex(path, DistanceMethod::InnerProduct, dim);
++                // DEV-1235: pass index Relation so LoadIndex can rebuild from heap on cache-miss.
++                HNSWIndexScan::LoadIndex(index, path, DistanceMethod::InnerProduct, dim);
+                 break;
+             case hnsw_L2_Distance:
+-                HNSWIndexScan::LoadIndex(path, DistanceMethod::L2, dim);
++                HNSWIndexScan::LoadIndex(index, path, DistanceMethod::L2, dim);
+                 break;
+             default:
+                 elog(ERROR, "hnsw index parameter value error.");
+@@ -212,10 +214,11 @@
+     switch(hnsw_ParaGetDistmethod(index))
+     {
+         case hnsw_Inner_Product:
+-            HNSWIndexScan::LoadIndex(path, DistanceMethod::InnerProduct, hnsw_ParaGetDimension(index));
++            // DEV-1235: pass index Relation so LoadIndex can rebuild from heap on cache-miss.
++            HNSWIndexScan::LoadIndex(index, path, DistanceMethod::InnerProduct, hnsw_ParaGetDimension(index));
+             break;
+         case hnsw_L2_Distance:
+-            HNSWIndexScan::LoadIndex(path, DistanceMethod::L2, hnsw_ParaGetDimension(index));
++            HNSWIndexScan::LoadIndex(index, path, DistanceMethod::L2, hnsw_ParaGetDimension(index));
+             break;
+         default:
+             elog(ERROR, "hnsw index parameter value error.");
+diff --git a/src/tridb_vector_iter.cpp b/src/tridb_vector_iter.cpp
+--- a/src/tridb_vector_iter.cpp
++++ b/src/tridb_vector_iter.cpp
+@@ -119,7 +119,8 @@
+     // any failure return nullptr after the unique_ptr cleans up; release() only on success.
+     try
+     {
+-        HNSWIndexScan::LoadIndex(path, distance, index_dim);
++        // DEV-1235: pass index Relation so LoadIndex can rebuild from heap on cache-miss.
++        HNSWIndexScan::LoadIndex(index, path, distance, index_dim);
+ 
+         auto it = std::make_unique<TridbVectorIter>();
+         it->k = k;
