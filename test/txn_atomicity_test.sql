@@ -233,6 +233,10 @@ BEGIN
 
         -- one relational+graph insert as ONE atomic subtransaction (EXCEPTION block = SAVEPOINT);
         -- we deliberately raise to roll the subtxn back when do_commit is false.
+        -- NOTE: inside this block gph_insert_vertex's GetCurrentTransactionId() returns the SUB-xid
+        -- (the SAVEPOINT's xid). On sub-abort TransactionIdDidCommit(sub_xid)=false, so gph_xmin_visible
+        -- correctly hides the rolled-back vertex/edge from the next reader — atomicity holds at the
+        -- subtransaction level exactly as it does at the top level.
         BEGIN
             INSERT INTO rand_rel VALUES (k);
             new_vid := gph_insert_vertex();

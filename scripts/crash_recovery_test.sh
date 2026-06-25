@@ -97,14 +97,22 @@ COMMIT;
 SQL
   ) &
   BGPID=$!
-  # give the background session time to issue the writes (poll for the doomed vertex being
-  # self-visible to ITS OWN txn is not observable cross-session; poll a sentinel instead).
-  for i in $(seq 1 50); do
-    # the doomed INSERT holds a lock on entities pk 6000; once present in pg_locks the writes are in.
+  # Sentinel: poll pg_stat_activity for the doomed session FINAL statement (the pg_sleep call) being
+  # active. Because the three tri-store writes precede pg_sleep in the same BEGIN block, observing
+  # pg_sleep active proves all three uncommitted writes have already executed and the txn is open.
+  sentinel=0
+  for i in $(seq 1 200); do
     n=$($PSQL -tA -c "SELECT count(*) FROM pg_stat_activity WHERE query LIKE '"'"'%pg_sleep(60)%'"'"' AND state='"'"'active'"'"';" 2>/dev/null || echo 0)
-    [ "$n" = "1" ] && break
+    if [ "$n" = "1" ]; then sentinel=1; break; fi
     sleep 0.2
   done
+  # FAIL LOUD on poll timeout BEFORE crashing: if the sentinel never went active, the doomed writes
+  # never ran, so crashing now would trivially "pass" scenario 2 with no in-flight tri-store state.
+  if [ "$sentinel" != "1" ]; then
+    echo "FAIL (uncommitted): doomed txn never reached its in-flight state (pg_sleep sentinel not observed) — poll timeout"
+    kill $BGPID >/dev/null 2>&1 || true; $B/pg_ctl -D $D2 -m immediate -w stop >/dev/null 2>&1 || true
+    exit 1
+  fi
   # CRASH while the txn is open and uncommitted.
   $B/pg_ctl -D $D2 -m immediate -w stop >/dev/null 2>&1 || true
   kill $BGPID >/dev/null 2>&1 || true; wait $BGPID 2>/dev/null || true

@@ -85,10 +85,17 @@ SQL
   ##########################################################################
   echo "=== (a) uncommitted-invisible / (b) commit-then-visible ==="
   ( $P -f /tmp/holder.sql >/dev/null 2>&1 ) & HOLDER=$!
-  for i in $(seq 1 100); do [ "$(Q holder_has)" -ge 1 ] 2>/dev/null && break; sleep 0.1; done
+  for i in $(seq 1 300); do [ "$(Q holder_has)" -ge 1 ] 2>/dev/null && break; sleep 0.1; done
+  # FAIL LOUD on poll timeout: if the holder never acquired lock 42 the rest of the test is
+  # meaningless (T1 would not block, so "uncommitted-invisible" would be vacuous).
+  [ "$(Q holder_has)" -ge 1 ] || { echo "FAIL: holder never acquired lock 42 — poll timeout"; exit 1; }
 
   ( $P -f /tmp/t1.sql >/dev/null 2>&1 ) & T1=$!
-  for i in $(seq 1 100); do [ "$(Q waiter_has)" -ge 1 ] 2>/dev/null && break; sleep 0.1; done
+  for i in $(seq 1 300); do [ "$(Q waiter_has)" -ge 1 ] 2>/dev/null && break; sleep 0.1; done
+  # CRITICAL guard: without confirming T1 is actually BLOCKED in the lock queue, t2a=$(Q count)
+  # could run before T1 inserted anything, turning "uncommitted-invisible" into the vacuous
+  # "did-not-exist-yet-invisible". A timeout here means T1 never reached its blocking insert.
+  [ "$(Q waiter_has)" -ge 1 ] || { echo "FAIL: T1 never blocked on lock 42 (no uncommitted insert in flight) — poll timeout"; exit 1; }
 
   # T2: T1 holds an OPEN uncommitted insert -> must still see baseline 5.
   t2a=$(Q count)

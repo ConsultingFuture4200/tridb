@@ -70,19 +70,15 @@ BEGIN
 
     RAISE NOTICE 'PASS crash/committed: relational + vector-heap + native graph all REDONE from WAL after immediate-stop crash (HNSW index-redo gap is a vendor KNOWN-LIMITATION)';
 END $$;
-\endif
-
-\if :is_committed
 \else
 -- --------------------------------------------------------------------------
 -- UNCOMMITTED scenario: a tri-store txn was left open (never COMMIT) when the crash hit.
 -- Its xid never committed, so after recovery NONE of the three writes are visible.
--- The harness used entity id 6000 / vertex 6000 for the doomed writes; baseline before the
--- doomed txn had exactly 6 visible graph vertices (5 seed + 1 committed in the committed pass
--- is a SEPARATE data dir; here the uncommitted pass starts from its own 6-vertex baseline).
+-- The harness used entity id 6000 / vertex vid 6 / edge 0->6 for the doomed writes; baseline
+-- before the doomed txn had exactly 6 visible graph vertices (vids 0..5 seeded this data dir).
 -- --------------------------------------------------------------------------
 DO $$
-DECLARE rel_n bigint; gc bigint;
+DECLARE rel_n bigint; gc bigint; nbrs bigint[];
 BEGIN
     -- (i) relational/vector heap row NOT visible (its inserting xid is crash-aborted). We read via
     -- a heap path (seqscan) so the assertion does not depend on the vendored HNSW index at all.
@@ -94,13 +90,20 @@ BEGIN
         RAISE EXCEPTION 'CRASH/uncommitted: relational/vector row 6000 visible after recovery (uncommitted write leaked)';
     END IF;
 
-    -- (ii) native graph: the doomed vertex must be hidden by gph_xmin_visible
+    -- (ii) native graph vertex: the doomed vertex must be hidden by gph_xmin_visible
     --       (TransactionIdDidCommit is false for the crash-aborted xid). Baseline is 6.
     gc := gph_vertex_count();
     IF gc <> 6 THEN
         RAISE EXCEPTION 'CRASH/uncommitted: gph_vertex_count = % (expected baseline 6 — uncommitted graph vertex visible)', gc;
     END IF;
 
-    RAISE NOTICE 'PASS crash/uncommitted: relational/vector heap + native graph all HIDE the crash-aborted xid after recovery';
+    -- (iii) native graph edge: the doomed edge 0->6 must NOT be in neighbors (symmetry with the
+    --       committed scenario, which checks both vertex AND edge survived redo).
+    SELECT array_agg(x ORDER BY x) INTO nbrs FROM gph_neighbors(0) x;
+    IF nbrs IS NOT NULL AND 6 = ANY(nbrs) THEN
+        RAISE EXCEPTION 'CRASH/uncommitted: doomed edge 0->6 visible after recovery (neighbors=%)', nbrs;
+    END IF;
+
+    RAISE NOTICE 'PASS crash/uncommitted: relational/vector heap + native graph vertex AND edge all HIDE the crash-aborted xid after recovery';
 END $$;
 \endif
