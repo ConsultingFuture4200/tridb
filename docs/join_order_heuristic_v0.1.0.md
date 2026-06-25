@@ -1,9 +1,20 @@
 # Cross-Modal Join-Order Heuristic (FR-6)
 
-**Version:** 0.1.0
-**Date:** 2026-06-23
+**Version:** 0.1.1
+**Date:** 2026-06-25
 **Issue:** DEV-1170
-**Status:** Design complete; implementation deferred to GX10 (`src/planner/join_order.c`)
+**Status:** Design complete; interface FROZEN (§10). Python reference model +
+test suite landed (`src/planner/join_order_ref.py`, `tests/test_join_order.py`).
+C port deferred to GX10 (`src/planner/join_order.c`, engine/GX10-gated — NOT
+built or run off-target).
+
+**Changelog**
+- 0.1.1 (2026-06-25, DEV-1170 close-out): froze the C-port interface (§10);
+  pinned the boundary (`<=`), degenerate-input, and threshold-clamp contracts so
+  the C port cannot silently diverge from the reference; corrected the reference
+  test path to `tests/test_join_order.py`; expanded that suite to cover decision
+  boundaries and edge cases.
+- 0.1.0 (2026-06-23): initial design.
 
 ---
 
@@ -86,6 +97,12 @@ else:
 ```
 
 The threshold is **10%** (hardcoded for v1, configurable in v2 via a GUC).
+
+**Boundary semantics (FROZEN):** the comparison is `<=`. A selectivity exactly
+equal to the threshold chooses `filter_first`. The C port
+(`tridb_choose_join_order`) MUST use the same inclusive comparison; an exclusive
+`<` would flip the decision at the boundary and break parity with the reference
+model and the boundary tests in `tests/test_join_order.py`.
 
 **Rationale for 10%:** At 10% selectivity the relational filter passes 10% of
 the table. The graph traversal then fans out by `avg_out_degree` from that 10%.
@@ -231,8 +248,14 @@ The test must assert both the ordering choice and that the filter-first
 intermediate count is materially smaller than the vector-first intermediate
 count when selectivity is low — directly verifying SM-1 (≥5× reduction).
 
-A reference test using these corpora is located at
-`src/planner/tests/test_join_order_ref.py` (to be authored as part of DEV-1170).
+The reference test suite using these corpora lives at
+`tests/test_join_order.py` (`test_doc_section8_acceptance_corpora`,
+`test_sm1_reduction_is_at_least_5x`). It runs under `make test` with no database.
+Beyond the §8 acceptance corpora it also pins the decision boundaries
+(selectivity exactly at / just above / just below the threshold), the
+selectivity extremes (0% → filter_first, 100% → vector_first), the degenerate
+inputs (empty table, zero `vector_topk`, stale stats with matches > table_size),
+and the GUC threshold range/clamp behavior (§10.3).
 
 ---
 
@@ -252,9 +275,88 @@ three legs regardless of ordering. TR-1 is preserved.
 
 ---
 
-## 10. Cross-References
+## 10. FROZEN C-Port Contract (`src/planner/join_order.c`)
+
+> **Status:** This interface is FROZEN as of v0.1.1. A GX10 implementer ports
+> against this section and `src/planner/join_order_ref.py` without further
+> design input. The C file is **engine/GX10-gated**: it compiles only inside the
+> MSVBASE fork on the GX10 and is NOT built or run on the x86 standin. Do not
+> claim it "builds" or "passes" off-target. The Python reference model is the
+> executable specification; the C port must produce bit-identical decisions for
+> every case the test suite pins.
+
+### 10.1 Struct (frozen)
+
+```c
+typedef struct LegStats {
+    int64  rel_filter_matches;   /* from pg_statistic / restriction selectivity */
+    int64  table_size;           /* from pg_class.reltuples                      */
+    float8 avg_out_degree;       /* from graph access method metapage            */
+    int32  vector_topk;          /* from LIMIT clause                            */
+} LegStats;
+```
+
+`avg_out_degree` is carried for `tridb_estimate_intermediate()` (EXPLAIN graph
+fan-out, v2); it is NOT an input to the driver-selection decision in v1.
+
+### 10.2 Functions (frozen signatures + semantics)
+
+| C function | Python ref | Contract |
+|---|---|---|
+| `float8 tridb_rel_selectivity(const LegStats *s)` | `relational_selectivity` | `s->table_size == 0` → return `1.0`. Else `(float8) s->rel_filter_matches / s->table_size`. Do **not** clamp `rel_filter_matches` to `table_size` — a stale-stats value > 1.0 is allowed and resolves to `vector_first`. |
+| `TriJoinOrder tridb_choose_join_order(const LegStats *s, float8 threshold)` | `choose_order` | Clamp `threshold` to `[0.0, 1.0]`. Return `FILTER_FIRST` iff `tridb_rel_selectivity(s) <= threshold` (inclusive), else `VECTOR_FIRST`. |
+| `int64 tridb_estimate_intermediate(const LegStats *s, TriJoinOrder order)` | `estimated_intermediate_rows` | `FILTER_FIRST` → `min(s->rel_filter_matches, s->vector_topk)`. `VECTOR_FIRST` → `s->vector_topk * 50`. Any other enum value → `ereport(ERROR)`. (The 50× over-fetch is the v1 placeholder; see §5 — validate `ef_search` on GX10.) |
+
+```c
+typedef enum TriJoinOrder {
+    FILTER_FIRST,
+    VECTOR_FIRST
+} TriJoinOrder;
+```
+
+The string returns of the Python reference (`"filter_first"` / `"vector_first"`)
+map one-to-one onto the enum; EXPLAIN text rendering reuses the lowercase forms.
+
+### 10.3 Frozen behavioral invariants (the test contract)
+
+These are asserted in `tests/test_join_order.py`; the C port must match each:
+
+1. **Boundary is inclusive.** selectivity == threshold → `FILTER_FIRST`.
+2. **Empty/unknown table → `VECTOR_FIRST`.** `table_size == 0` yields selectivity
+   `1.0` (the safe default — never fan the graph out from an unbounded filter).
+3. **Selectivity extremes.** 0% → `FILTER_FIRST`; 100% → `VECTOR_FIRST`.
+4. **Stale stats tolerated.** `rel_filter_matches > table_size` → selectivity
+   > 1.0 → `VECTOR_FIRST`; no clamping of the numerator.
+5. **Threshold clamp.** thresholds outside `[0.0, 1.0]` clamp to the range; the
+   reference model and the C planner hook must agree on a misconfigured GUC.
+6. **Degenerate intermediate estimates.** `vector_topk == 0` → both orders
+   estimate `0`; `rel_filter_matches == 0` → `FILTER_FIRST` estimates `0`.
+7. **EXPLAIN parity.** the order reported by EXPLAIN equals the standalone
+   `tridb_choose_join_order` decision under the same (clamped) threshold.
+
+### 10.4 GUC
+
+`tridb.join_order_selectivity_threshold` — `float8`, default `0.10`, declared
+range `[0.0, 1.0]`. Postgres's GUC machinery rejects out-of-range `SET`s; the
+explicit clamp in `tridb_choose_join_order` is defense-in-depth so a value
+injected by any non-GUC path (tests, direct calls) still matches the reference.
+
+### 10.5 Planner hook integration (unchanged from §7)
+
+`src/planner/join_order.c` registers a `planner_hook` that intercepts
+`PlannedStmt` nodes whose `rtable` contains all three store types, builds a
+`LegStats` from the catalog + graph metapage, calls `tridb_choose_join_order()`,
+and sets the TJS node's driving-child slot accordingly before returning to the
+executor. The TJS node is built join-order-agnostic (DEV-1169); this hook only
+selects which child drives. No blocking operator is introduced — TR-1 (§9) holds.
+
+---
+
+## 11. Cross-References
 
 - `src/planner/join_order_ref.py` — reference model (read before editing this doc)
+- `tests/test_join_order.py` — executable contract: FR-6 acceptance + boundary/
+  edge-case matrix (§10.3)
 - `docs/sqlpgq_logical_plan_v0.1.0.md` — where the TJS operator sits in the
   logical plan; join-order heuristic feeds into TJS construction
 - `docs/graph_store_layout_v0.1.0.md` — `avg_out_degree` storage on metapage

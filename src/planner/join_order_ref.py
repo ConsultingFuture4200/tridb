@@ -27,7 +27,14 @@ def relational_selectivity(stats: LegStats) -> float:
     """
     Compute the selectivity of the relational filter.
 
-    Returns rel_filter_matches / table_size, with guard against division by zero.
+    Returns rel_filter_matches / table_size.
+
+    Degenerate-input contract (FROZEN — the C port tridb_rel_selectivity()
+    MUST replicate):
+      - table_size == 0 (no statistics / empty relation): return 1.0. Treating
+        an unknown/empty table as fully unselective steers the planner to
+        vector_first, which is the safe default — it never fans the graph out
+        from a filter we cannot bound.
     """
     if stats.table_size == 0:
         return 1.0
@@ -40,11 +47,22 @@ def choose_order(stats: LegStats, threshold: float = 0.10) -> str:
 
     Args:
         stats: Statistics for the query leg
-        threshold: Selectivity threshold to decide order (default 0.10)
+        threshold: Selectivity threshold to decide order (default 0.10).
+            Clamped to the GUC range [0.0, 1.0] (see doc §7,
+            tridb.join_order_selectivity_threshold). The C port
+            (tridb_choose_join_order) MUST clamp identically.
 
     Returns:
-        "filter_first" if selectivity <= threshold, else "vector_first"
+        "filter_first" if selectivity <= threshold, else "vector_first".
+
+    Boundary semantics (FROZEN): the comparison is ``<=`` — a selectivity
+    exactly equal to the threshold chooses filter_first. The C port must use
+    the same inclusive comparison so the two implementations never diverge on
+    the boundary case.
     """
+    # Clamp to the documented GUC range so the reference model and the C planner
+    # hook agree even if a caller passes an out-of-range threshold.
+    threshold = min(1.0, max(0.0, threshold))
     selectivity = relational_selectivity(stats)
     return "filter_first" if selectivity <= threshold else "vector_first"
 
@@ -84,6 +102,9 @@ def explain(stats: LegStats, threshold: float = 0.10) -> dict:
     Returns:
         Dictionary with order, selectivity, intermediate rows, and rationale
     """
+    # Clamp identically to choose_order so the rationale string never reports a
+    # threshold that disagrees with the decision actually made.
+    threshold = min(1.0, max(0.0, threshold))
     selectivity = relational_selectivity(stats)
     order = choose_order(stats, threshold)
     intermediate_rows = estimated_intermediate_rows(stats, order)

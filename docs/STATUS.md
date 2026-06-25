@@ -43,7 +43,7 @@ build on GX10) · 🔴 GX10-gated (needs live MSVBASE build).
 | DEV-1167 | SQL/PGQ surface → logical plan | 2 | 🟡 | `docs/sqlpgq_logical_plan_v0.1.0.md` design |
 | DEV-1168 | HNSW relaxed-monotonicity iterator | 2 | 🔴 GX10 | Contract documented; wraps MSVBASE code |
 | DEV-1169 | TJS operator | 2 | 🔴 GX10 | Design in plan-mapping doc; stub |
-| DEV-1170 | Cross-modal join-order heuristic | 2 | 🟡 | `docs/join_order_heuristic_v0.1.0.md` + py reference model + unit test |
+| DEV-1170 | Cross-modal join-order heuristic | 2 | 🟡 | **Hardware-independent layer complete + tested here**: `docs/join_order_heuristic_v0.1.0.md` (v0.1.1, C-port interface FROZEN §10) + `src/planner/join_order_ref.py` reference model + `tests/test_join_order.py` (FR-6 acceptance + boundary/edge-case matrix, 21 cases). C port `src/planner/join_order.c` is GX10-gated (not built here) |
 | DEV-1171 | Multi-system baseline harness | 3 | 🟢 | `baseline/` docker-compose + harness |
 | DEV-1172 | TriDB benchmark harness | 3 | 🟡 | `bench/` harness skeleton; corpus + metric capture buildable, run needs TriDB |
 | DEV-1173 | Benchmark results report | 3 | 🟡 | `bench/report.py` template + metric schema |
