@@ -182,5 +182,3 @@ index, PASS after Phase B:
 
 Until items 1-4 pass GREEN in Docker on the GX10, the fix is **UNBUILT** and no
 "passes"/"durable"/"fixed" claim may be made.
-</content>
-</invoke>

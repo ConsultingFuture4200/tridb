@@ -235,4 +235,3 @@ diff --git a/CMakeLists.txt b/CMakeLists.txt
 +# vectordb source-list line in this file (it drifts with upstream), the same way
 +# tridb_vector_iter.patch / tridb_tjs_operator.patch do. Do NOT apply blind.
 +#     src/tridb_hnsw_wal.cpp
-</content>

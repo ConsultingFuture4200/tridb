@@ -123,4 +123,3 @@ used for the graph store. Concretely:
 - It does not change the query surface or add a query language. (Rule #4.)
 - It does not claim the patch compiles or passes — that is GX10+Docker-gated and
   explicitly out of scope for this x86 standin spike.
-</content>
