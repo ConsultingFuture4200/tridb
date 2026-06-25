@@ -10,6 +10,13 @@ test:
 lint:
 	ruff check . && ruff format --check .
 
+# Native-AM harnesses (DEV-1164/1165/1166) — each PGXS-builds src/graph_store in the image and
+# FAILS LOUD on any error (build output -> log, nonzero make aborts; no piping to tail).
+AM_TESTS := scripts/graph_am_test.sh \
+            scripts/txn_atomicity_test.sh \
+            scripts/crash_recovery_test.sh \
+            test/graph_concurrency_test.sh
+
 # Engine test suites — require the tridb/msvbase:dev image (scripts/x86build.sh --docker).
 graph-test:
 	@docker image inspect $(IMAGE) >/dev/null 2>&1 || \
@@ -18,6 +25,8 @@ graph-test:
 	@bash scripts/graph_am_test.sh $(IMAGE)
 	@for t in $(ENGINE_TESTS); do \
 	  echo "=== $$t ==="; bash scripts/graph_test.sh $(IMAGE) $$t || exit 1; done
+	@for h in $(AM_TESTS); do \
+	  echo "=== $$h ==="; bash $$h $(IMAGE) || exit 1; done
 
 smoke-test:
 	@docker image inspect $(IMAGE) >/dev/null 2>&1 || \
