@@ -43,6 +43,8 @@ verify_patches() {
     || die "spann.patch NOT applied (no MultiIndexScan) — upstream drift?"
   grep -q 'TRIDB: real scalar L2 distance' "$root/src/operator.cpp" \
     || die "TriDB l2_distance_scalar.patch NOT applied — scalar distance still broken; drift?"
+  grep -q 'WITH_SPTAG' "$root/CMakeLists.txt" \
+    || die "TriDB sptag_optional_build.patch NOT applied — WITH_SPTAG gate missing (DEV-1228); drift?"
   log "all MSVBASE + TriDB fork patches verified present"
 }
 
@@ -66,17 +68,30 @@ apply_msvbase_patches() {
 #   l2_distance_scalar.patch (plan 005): scalar l2_distance returned 0 for any dim < 16 (static
 #     L2Space built with dim=0 -> hnswlib L2SqrSIMD16Ext sums only full 16-float blocks). Fixed
 #     to compute the Euclidean distance directly; unblocks SQL exact re-rank / DEV-1168 tests.
+#   sptag_optional_build.patch (DEV-1228, ADR-0004): WITH_SPTAG CMake option (default OFF) gating
+#     the SPTAG build/link, the sptag/spann sources, the lib.cpp registration, and the SQL DDL.
+#     Default build is hnswlib-only (no SPTAG) — unblocks the GX10 ARM port. Opt in: -DWITH_SPTAG=ON.
 apply_tridb_fork_patches() {
   local root="$1"
   local patch="${_MSVBASE_LIB_DIR}/../patches/l2_distance_scalar.patch"
   [[ -f "$patch" ]] || die "missing TriDB fork patch: $patch"
   if grep -q 'TRIDB: real scalar L2 distance' "$root/src/operator.cpp" 2>/dev/null; then
     log "TriDB fork patch (scalar l2_distance) already applied"
-    return 0
+  else
+    log "applying TriDB fork patch: real scalar l2_distance (plan 005)"
+    ( cd "$root" && git apply "$patch" ) \
+      || die "l2_distance_scalar.patch did not apply — MSVBASE drift? re-generate from src/operator.cpp"
   fi
-  log "applying TriDB fork patch: real scalar l2_distance (plan 005)"
-  ( cd "$root" && git apply "$patch" ) \
-    || die "l2_distance_scalar.patch did not apply — MSVBASE drift? re-generate from src/operator.cpp"
+
+  local sptag_patch="${_MSVBASE_LIB_DIR}/../patches/sptag_optional_build.patch"
+  [[ -f "$sptag_patch" ]] || die "missing TriDB fork patch: $sptag_patch"
+  if grep -q 'WITH_SPTAG' "$root/CMakeLists.txt" 2>/dev/null; then
+    log "TriDB fork patch (WITH_SPTAG decouple, DEV-1228) already applied"
+  else
+    log "applying TriDB fork patch: WITH_SPTAG vector-index decouple (DEV-1228 / ADR-0004)"
+    ( cd "$root" && git apply "$sptag_patch" ) \
+      || die "sptag_optional_build.patch did not apply — MSVBASE drift? re-generate per ADR-0004"
+  fi
 }
 
 # Patch known-dead upstream URLs / build-breakers in the MSVBASE Dockerfile. Arch-independent
