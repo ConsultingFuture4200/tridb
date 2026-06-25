@@ -67,7 +67,7 @@ verify_patches() {
     || die "TriDB tridb_fix_double_scan_snapshot.patch NOT applied in multicol_topk.cpp — snapshot lifecycle fix missing (DEV-1236); drift?"
   grep -q 'hnsw index scan requires an ORDER BY' "$root/src/hnswindex.cpp" 2>/dev/null \
     || die "TriDB tridb_hnsw_scan_no_orderby.patch NOT applied in hnswindex.cpp — no-ORDER-BY scan guard missing (DEV-1236); drift?"
-  grep -q 'DEV-1236' "$root/src/hnswindex_scan.cpp" 2>/dev/null \
+  grep -q 'null-safe teardown' "$root/src/hnswindex_scan.cpp" 2>/dev/null \
     || die "TriDB tridb_hnsw_scan_no_orderby.patch NOT applied in hnswindex_scan.cpp — null-safe EndScan missing (DEV-1236); drift?"
   log "all MSVBASE + TriDB fork patches verified present"
 }

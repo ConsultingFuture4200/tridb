@@ -23,8 +23,10 @@
 # This is the REPRODUCIBLE DEV-1236 crash. The snapshot-lifetime change in
 # tridb_fix_double_scan_snapshot.patch is separate, latent-UB hardening (no reproducible crash).
 # Sentinel for verify_patches: "DEV-1236" in hnswindex.cpp and hnswindex_scan.cpp.
+#
+# Depends-on: tridb_vector_index_seam.patch (DEV-1228) — apply after it (hnswindex_scan.cpp context).
 diff --git a/src/hnswindex.cpp b/src/hnswindex.cpp
-index ecc1bcc..cee4b00 100644
+index ecc1bcc..da98789 100644
 --- a/src/hnswindex.cpp
 +++ b/src/hnswindex.cpp
 @@ -279,7 +279,16 @@ bool hnsw_gettuple(IndexScanDesc scan, ScanDirection dir)
@@ -41,10 +43,30 @@ index ecc1bcc..cee4b00 100644
 +                        (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 +                         errmsg("hnsw index scan requires an ORDER BY <-> distance clause"),
 +                         errdetail("The HNSW vector index cannot serve an unordered scan such as count(*) or a SELECT without ORDER BY; it was chosen because enable_seqscan is off."),
-+                         errhint("Re-enable enable_seqscan, or add ORDER BY embedding <-> :query to the scan.")));
++                         errhint("Re-enable enable_seqscan, or add ORDER BY embedding <-> '<query vector>' to the scan.")));
              if (scan->keyData->sk_flags & SK_ISNULL)
                  return false;
  
+@@ -394,9 +403,16 @@ bool hnsw_gettuple(IndexScanDesc scan, ScanDirection dir)
+ void hnsw_endscan(IndexScanDesc scan)
+ {
+     HNSWScanOpaque scanState = (HNSWScanOpaque) scan->opaque;
+-    HNSWIndexScan::EndScan(scanState->workSpace->resultIterator);
+-    scanState->workSpace->resultIterator = nullptr;
+-    delete scanState->workSpace;
++    // DEV-1236: guard workSpace, mirroring hnsw_rescan. workSpace is null between
++    // beginscan and the first gettuple, so a beginscan->endscan with no tuple
++    // fetch (or any error before first fetch) would otherwise deref null here.
++    if (scanState->workSpace != nullptr)
++    {
++        HNSWIndexScan::EndScan(scanState->workSpace->resultIterator);
++        scanState->workSpace->resultIterator = nullptr;
++        delete scanState->workSpace;
++        scanState->workSpace = nullptr;
++    }
+     pfree(scanState);
+     scan->opaque = NULL;
+ }
 diff --git a/src/hnswindex_scan.cpp b/src/hnswindex_scan.cpp
 index 9f79e99..3b66350 100644
 --- a/src/hnswindex_scan.cpp
