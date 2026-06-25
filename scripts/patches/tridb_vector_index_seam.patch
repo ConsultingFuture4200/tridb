@@ -1,0 +1,107 @@
+diff --git a/src/hnswindex_scan.cpp b/src/hnswindex_scan.cpp
+index 9f79e99..bb4db46 100644
+--- a/src/hnswindex_scan.cpp
++++ b/src/hnswindex_scan.cpp
+@@ -2,6 +2,12 @@
+ // Licensed under the MIT License.
+ 
+ #include "hnswindex_scan.hpp"
++#include "tridb_vector_index.hpp"
++
++// TRIDB(DEV-1228 / ADR-0004): the hnswlib-backed HNSW AM is the reference implementer of the
++// TriDB-owned vector-index scan contract. Assert conformance at compile time so a future
++// refactor that breaks Open/Next/Close fails the build here, not at runtime.
++TRIDB_ASSERT_VECTOR_BACKEND(HNSWIndexScan);
+ 
+ std::map<std::string, std::shared_ptr<hnswlib::SpaceInterface<float>>> HNSWIndexScan::distanceFunction_map;
+ std::map<std::string, std::shared_ptr<hnswlib::HierarchicalNSW<float>>> HNSWIndexScan::vector_index_map;
+diff --git a/src/tridb_vector_index.hpp b/src/tridb_vector_index.hpp
+new file mode 100644
+index 0000000..a558f85
+--- /dev/null
++++ b/src/tridb_vector_index.hpp
+@@ -0,0 +1,84 @@
++// Copyright (c) TriDB. Licensed under the MIT License.
++//
++// tridb_vector_index.hpp — TriDB-owned vector-index seam (DEV-1228 / ADR-0004).
++//
++// This header names the *minimal contract the executor actually needs* from a vector index,
++// independent of any third-party library type. It is a SEAM, not an abstraction layer: the
++// hnswlib-backed `HNSWIndexScan` / `HNSWIndexBuilder` already satisfy this contract directly,
++// so v1 introduces no virtual dispatch and does not wrap the validated hnswlib types. The
++// header exists to (a) document the contract in TriDB's own vocabulary, (b) give a future
++// non-hnswlib / non-SPTAG backend a single place to conform to, and (c) compile-time assert
++// that the shipping HNSW backend honors it (see TRIDB_ASSERT_VECTOR_BACKEND below).
++//
++// The contract is the TR-1 iterator shape (CLAUDE.md golden rule 1): Open / Next / Close with
++// early termination — no blocking operator, no full materialization.
++//
++//   Distance     : L2 or inner-product (tridb::DistanceKind, == src/util.hpp DistanceMethod).
++//   Open  (build): Insert(path, values, isnull, heap_tid, uniqueCheck, dim) -> bool
++//                  LoadIndex(path, distance, dim)                              (open/cache for scan)
++//   Open  (scan) : BeginScan(target, path) -> Iterator
++//   Next         : GetNet(Iterator&)       -> Result*    (nullptr => stream exhausted)
++//   Close        : EndScan(Iterator&)
++//   Maintain     : BulkDelete(path, info, stats, cb, cb_state)
++//
++// A conforming backend exposes these as static members keyed by the on-disk index path (the
++// `hnsw` AM's pattern). The Iterator/Result types are the backend's own; TriDB only relies on
++// the open/next/close *shape* and the nullptr-terminates-the-stream convention.
++
++#ifndef TRIDB_VECTOR_INDEX_HPP
++#define TRIDB_VECTOR_INDEX_HPP
++
++#include <type_traits>
++#include "util.hpp"   // DistanceMethod
++
++namespace tridb
++{
++    // TriDB-owned distance vocabulary. Kept layout-compatible with src/util.hpp DistanceMethod
++    // so a backend can use either name without conversion.
++    enum class DistanceKind : std::uint8_t
++    {
++        L2 = 0,
++        InnerProduct = 1,
++    };
++
++    static_assert(static_cast<std::uint8_t>(DistanceKind::L2) ==
++                      static_cast<std::uint8_t>(DistanceMethod::L2),
++                  "tridb::DistanceKind must stay layout-compatible with DistanceMethod (util.hpp)");
++    static_assert(static_cast<std::uint8_t>(DistanceKind::InnerProduct) ==
++                      static_cast<std::uint8_t>(DistanceMethod::InnerProduct),
++                  "tridb::DistanceKind must stay layout-compatible with DistanceMethod (util.hpp)");
++
++    // Compile-time conformance check (C++14 SFINAE). A backend conforms when it exposes the
++    // scan trio as static members: BeginScan(const void*, const std::string&) -> Iterator,
++    // GetNet(Iterator&) -> Result* (pointer => nullptr-terminates), EndScan(Iterator&). This
++    // is deliberately the *scan* core (the TR-1 Open/Next/Close hot path); build/insert vary
++    // more by backend and are documented above rather than statically enforced.
++    template <typename B, typename = void>
++    struct is_vector_backend : std::false_type
++    {
++    };
++
++    template <typename B>
++    struct is_vector_backend<
++        B,
++        decltype(
++            // B::WorkSpace exists; BeginScan(Open) yields an iterator handle that GetNet(Next)
++            // and EndScan(Close) both accept by reference. Duck-typed — no backend type named.
++            (void)std::declval<typename B::WorkSpace>(),
++            (void)B::GetNet(std::declval<decltype(B::BeginScan(
++                std::declval<const void *>(), std::declval<const std::string &>())) &>()),
++            (void)B::EndScan(std::declval<decltype(B::BeginScan(
++                std::declval<const void *>(), std::declval<const std::string &>())) &>()),
++            void())> : std::true_type
++    {
++    };
++}  // namespace tridb
++
++// Assert a concrete backend honors the TriDB vector-index scan contract. Place in the backend's
++// .cpp after its class is fully defined.
++#define TRIDB_ASSERT_VECTOR_BACKEND(B)                                            \
++    static_assert(::tridb::is_vector_backend<B>::value,                           \
++                  #B " does not satisfy the TriDB vector-index scan contract "    \
++                     "(BeginScan/GetNet/EndScan) — see tridb_vector_index.hpp")
++
++#endif  // TRIDB_VECTOR_INDEX_HPP

@@ -45,6 +45,8 @@ verify_patches() {
     || die "TriDB l2_distance_scalar.patch NOT applied — scalar distance still broken; drift?"
   grep -q 'WITH_SPTAG' "$root/CMakeLists.txt" \
     || die "TriDB sptag_optional_build.patch NOT applied — WITH_SPTAG gate missing (DEV-1228); drift?"
+  grep -q 'TRIDB_ASSERT_VECTOR_BACKEND' "$root/src/hnswindex_scan.cpp" \
+    || die "TriDB tridb_vector_index_seam.patch NOT applied — vector-index seam missing (DEV-1228); drift?"
   log "all MSVBASE + TriDB fork patches verified present"
 }
 
@@ -91,6 +93,16 @@ apply_tridb_fork_patches() {
     log "applying TriDB fork patch: WITH_SPTAG vector-index decouple (DEV-1228 / ADR-0004)"
     ( cd "$root" && git apply "$sptag_patch" ) \
       || die "sptag_optional_build.patch did not apply — MSVBASE drift? re-generate per ADR-0004"
+  fi
+
+  local seam_patch="${_MSVBASE_LIB_DIR}/../patches/tridb_vector_index_seam.patch"
+  [[ -f "$seam_patch" ]] || die "missing TriDB fork patch: $seam_patch"
+  if grep -q 'TRIDB_ASSERT_VECTOR_BACKEND' "$root/src/hnswindex_scan.cpp" 2>/dev/null; then
+    log "TriDB fork patch (vector-index seam, DEV-1228) already applied"
+  else
+    log "applying TriDB fork patch: TriDB-owned vector-index seam (DEV-1228 / ADR-0004)"
+    ( cd "$root" && git apply "$seam_patch" ) \
+      || die "tridb_vector_index_seam.patch did not apply — MSVBASE drift? re-generate per ADR-0004"
   fi
 }
 
