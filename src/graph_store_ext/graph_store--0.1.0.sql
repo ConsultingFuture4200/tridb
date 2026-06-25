@@ -81,7 +81,6 @@ DECLARE
     k_val        int;
     ts_filter    text;
     query_vec    text;
-    rec          record;
 BEGIN
     -- Normalize: collapse whitespace runs to single spaces, trim. Keeps the matcher a single
     -- fixed template regardless of how the caller line-wrapped the canonical query.
@@ -101,8 +100,8 @@ BEGIN
         ||     'dst\.chunk\s+AS\s+chunk\s*,\s*'
         ||     'dst\.timestamp\s+AS\s+timestamp\s*'
         ||   '\)\s*\)\s+'
-        || 'WHERE\s+src\.id\s*=\s*(-?\d+)\s+AND\s+timestamp\s+IN\s*\(([^)]+)\)\s+'
-        || 'ORDER\s+BY\s+src_embedding\s*<->\s*''(\{[^'']*\})''\s+'
+        || 'WHERE\s+src\.id\s*=\s*(-?\d+)\s+AND\s+timestamp\s+IN\s*\((\d+(?:\s*,\s*\d+)*)\)\s+'
+        || 'ORDER\s+BY\s+src_embedding\s*<->\s*''(\{[^'']+\})''\s+'
         || 'LIMIT\s+(\d+)\s*;?\s*$',
         'i'
     );
@@ -117,29 +116,31 @@ BEGIN
     END IF;
 
     src_id    := m[1]::bigint;
-    ts_filter := 'timestamp IN (' || m[2] || ')';
+    -- Build the filter against the PHYSICAL column directly (the canonical `timestamp` is aliased
+    -- from dst.timestamp; the backing relation column is `ts`). m[2] is integers-and-commas only
+    -- (the scope-guard regex), so this is a closed value set, not an injection surface.
+    ts_filter := 'ts IN (' || m[2] || ')';
     query_vec := m[3];
     k_val     := m[4]::int;
+
+    -- Bound k too (the guard validates params, not just shape): tjs's top-k heap is sized by k.
+    IF k_val < 1 OR k_val > 10000 THEN
+        RAISE EXCEPTION 'graph_query: LIMIT out of range (got %, allowed 1..10000)', k_val;
+    END IF;
 
     -- LOWERING: one tjs(...) call. The vector leg (dst HNSW scan) is the sole rank authority;
     -- the timestamp predicate is pushed into its WHERE; the graph leg is the reachability
     -- predicate on src. attr_exp's first column is `id` (the candidate graph id tjs probes);
-    -- chunk is the second projected column we return. The canonical column name is `timestamp`;
-    -- the backing relation column is `ts` (COLUMNS aliases dst.timestamp AS timestamp), so the
-    -- canonical predicate is mapped onto the physical `ts` column here.
-    FOR rec IN
-        EXECUTE format(
-            'SELECT t.chunk FROM tjs(%L, %s, 0, %s::bigint, %L, %L, %L) AS t(id bigint, chunk text)',
-            'entities',                                   -- table_name
-            k_val,                                        -- k
-            src_id,                                       -- src
-            'id, chunk',                                  -- attr_exp (1st col = candidate id)
-            replace(ts_filter, 'timestamp', 'ts'),        -- filter_exp (canonical->physical col)
-            'embedding <-> ''' || query_vec || ''''       -- orderby_exp (dst embedding)
-        )
-    LOOP
-        RETURN NEXT rec.chunk;
-    END LOOP;
+    -- chunk is the second projected column we return.
+    RETURN QUERY EXECUTE format(
+        'SELECT t.chunk FROM tjs(%L, %s, 0, %s::bigint, %L, %L, %L) AS t(id bigint, chunk text)',
+        'entities',                                   -- table_name
+        k_val,                                        -- k
+        src_id,                                       -- src
+        'id, chunk',                                  -- attr_exp (1st col = candidate id)
+        ts_filter,                                    -- filter_exp (physical ts column)
+        'embedding <-> ''' || query_vec || ''''       -- orderby_exp (dst embedding)
+    );
     RETURN;
 END;
 $fn$;

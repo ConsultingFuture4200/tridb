@@ -132,10 +132,15 @@ DECLARE
         -- (e) missing LIMIT (no top-k bound)
         $v$SELECT chunk FROM GRAPH_TABLE ( MATCH (src:entity)-[:related_to]->(dst:entity)
              COLUMNS ( src.embedding AS src_embedding, dst.chunk AS chunk, dst.timestamp AS timestamp ) )
-           WHERE src.id = 1 AND timestamp IN (100) ORDER BY src_embedding <-> '{19,0,0,0,0,0,0,0}'$v$
+           WHERE src.id = 1 AND timestamp IN (100) ORDER BY src_embedding <-> '{19,0,0,0,0,0,0,0}'$v$,
+        -- (f) INJECTION: a crafted non-numeric IN-list. The scope-guard regex admits the
+        --     timestamp window as integers-and-commas ONLY, so `100 OR 1=1` never reaches the
+        --     filter_exp fragment tjs() interpolates into SPI SQL. Must be REJECTED (no rows).
+        $v$SELECT chunk FROM GRAPH_TABLE ( MATCH (src:entity)-[:related_to]->(dst:entity)
+             COLUMNS ( src.embedding AS src_embedding, dst.chunk AS chunk, dst.timestamp AS timestamp ) )
+           WHERE src.id = 1 AND timestamp IN (100 OR 1=1) ORDER BY src_embedding <-> '{19,0,0,0,0,0,0,0}' LIMIT 2$v$
     ];
     v       text;
-    n       int;
     raised  boolean;
 BEGIN
     FOREACH v IN ARRAY variants LOOP
