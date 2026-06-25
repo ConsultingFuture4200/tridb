@@ -1,0 +1,521 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 1842d2f..bc2e875 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -111,6 +111,10 @@ set(VECTORDB_SOURCES
+     src/model_mng.cpp
+     src/topk.cpp
+     src/multicol_topk.cpp
++    # TRIDB(DEV-1168 / FR-3): relaxed-monotonicity vector iterator + its test-only SQL probe.
++    # UNCONDITIONAL (hnswlib-backed) — must NOT sit inside the if(WITH_SPTAG) block (ADR-0004).
++    src/tridb_vector_iter.cpp
++    src/tridb_vector_probe.cpp
+ )
+ if(WITH_SPTAG)
+     list(APPEND VECTORDB_SOURCES
+diff --git a/sql/vectordb.sql b/sql/vectordb.sql
+index 77331de..8bd02e7 100644
+--- a/sql/vectordb.sql
++++ b/sql/vectordb.sql
+@@ -113,3 +113,11 @@ CREATE FUNCTION topk(table_name text, k integer, ef integer, term_cond integer,
+ 	AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
+ CREATE FUNCTION multicol_topk(table_name text, k integer, term_cond integer, attr_exp text, filter_exp text, rank_exp text, VARIADIC arr text[]) RETURNS SETOF record
+ 	AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
++
++-- TRIDB(DEV-1168 / FR-3): test-only probe over the relaxed-monotonicity vector iterator. Drains
++-- tridb_vec_open/next/close and dumps (tid, distance, examined). `stop`=false drains the whole
++-- ANN stream (the no-stop oracle for top-k parity). NOT for production use — the TJS operator
++-- (DEV-1169) calls the C iterator directly. See test/vector_relaxed_mono_test.sql.
++CREATE FUNCTION tridb_vec_probe(index regclass, query float8[], k integer, stop boolean)
++	RETURNS TABLE(tid text, distance float8, examined integer)
++	AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+diff --git a/src/tridb_vector_iter.hpp b/src/tridb_vector_iter.hpp
+new file mode 100644
+index 0000000..657585d
+--- /dev/null
++++ b/src/tridb_vector_iter.hpp
+@@ -0,0 +1,89 @@
++// Copyright (c) TriDB. Licensed under the MIT License.
++//
++// tridb_vector_iter.hpp — TriDB-owned relaxed-monotonicity vector iterator (DEV-1168 / FR-3).
++//
++// The HNSW access method (src/hnswindex.cpp, hnsw_gettuple) already implements a full
++// relaxed-monotonicity Open/Next/Close ANN scan with early termination — but it is welded to
++// Postgres's IndexScanDesc plumbing and its stopping condition is hardcoded (queueThreshold=50,
++// distanceThreshold=3). The TJS join operator (DEV-1169) needs to drive the *same* relaxed-mono
++// stream WITHOUT an IndexScanDesc, with a caller-controlled stop bound, and with the per-candidate
++// internal distance surfaced on every Next().
++//
++// HARD CONSTRAINT (fork finding, docs/fork_findings.md): the fork's scalar `<->` / l2_distance()
++// returns a real value only *inside* an index scan; outside it returns 0. So the only authoritative
++// per-candidate distance is hnswlib::QueryResult::GetDistance() obtained while draining the scan.
++// This iterator surfaces exactly that distance; callers MUST NOT re-rank in SQL.
++//
++// TR-1 (CLAUDE.md golden rule 1): this is an Open/Next/Close iterator with early termination — no
++// blocking, no full materialization. tridb_vec_next() pulls exactly one candidate per call from the
++// underlying hnswlib::ResultIterator and applies the relaxed-monotonicity stop in O(1).
++//
++// This is an extern "C" surface (callable from the C TJS operator and C SRF wrappers) backed by a
++// C++ implementation over HNSWIndexScan. It introduces no virtual dispatch and does not wrap the
++// validated hnswlib types beyond what HNSWIndexScan already exposes.
++
++#ifndef TRIDB_VECTOR_ITER_HPP
++#define TRIDB_VECTOR_ITER_HPP
++
++#include <stdint.h>
++
++extern "C"
++{
++#include <postgres.h>
++#include <storage/itemptr.h>
++#include <utils/relcache.h>
++}
++
++#ifdef __cplusplus
++extern "C"
++{
++#endif
++
++// Opaque iterator handle. Lifetime: tridb_vec_open .. tridb_vec_close.
++typedef struct TridbVectorIter TridbVectorIter;
++
++// One emitted candidate: a heap TID and its authoritative internal ANN distance.
++typedef struct TridbVectorCand
++{
++    ItemPointerData heap_tid;
++    float distance;
++} TridbVectorCand;
++
++// Open a relaxed-monotonicity scan over an HNSW index `index` for `query_vec` (`dim` floats),
++// targeting the top-`k` nearest. Derives the on-disk index path + distance method from `index`
++// exactly as hnsw_begin_scan does, loads/caches the index (HNSWIndexScan::LoadIndex), and begins
++// an hnswlib::ResultIterator scan. Returns NULL on error (e.g. dim mismatch).
++//   k  — top-k target; sizes the internal stop priority-queue (the fallback stop when no caller
++//        bound is set). Must be > 0.
++TridbVectorIter *tridb_vec_open(Relation index, const float *query_vec, int dim, int k);
++
++// Pull the next candidate. Returns true and fills *out when a candidate is emitted; returns false
++// when the stream is exhausted OR the relaxed-monotonicity stop fired (early termination). After a
++// false return the iterator yields no further candidates.
++bool tridb_vec_next(TridbVectorIter *it, TridbVectorCand *out);
++
++// DEV-1169 seam: the upstream TJS priority-queue feeds its current k-th-best *surviving* distance
++// here. The iterator stops once the (relaxed-monotone) ANN stream provably can no longer beat it
++// — i.e. once candidates exceed this bound beyond the inversion tolerance. Tighter than the
++// internal k-queue fallback; call repeatedly as the upstream bound improves. A bound <= 0 means
++// "unset" (fall back to the internal k-queue stop).
++void tridb_vec_set_kth_bound(TridbVectorIter *it, float kth_best_distance);
++
++// Optional: override the relaxed-monotonicity inversion tolerance (default 3). This many
++// consecutive over-bound candidates are tolerated before the stop fires — relaxed monotonicity is
++// NOT strict ascending, so a single inversion must not terminate the scan.
++void tridb_vec_set_tolerance(TridbVectorIter *it, int distance_threshold);
++
++// Diagnostic: number of candidates pulled from the underlying ANN stream so far (the "examined"
++// count). int32 to match the SQL probe's `examined integer` column. Used by tests to assert early
++// termination (examined << corpus).
++int32_t tridb_vec_examined(const TridbVectorIter *it);
++
++// Close the scan and free the iterator. NULL-safe.
++void tridb_vec_close(TridbVectorIter *it);
++
++#ifdef __cplusplus
++}  // extern "C"
++#endif
++
++#endif  // TRIDB_VECTOR_ITER_HPP
+diff --git a/src/tridb_vector_iter.cpp b/src/tridb_vector_iter.cpp
+new file mode 100644
+index 0000000..3a55810
+--- /dev/null
++++ b/src/tridb_vector_iter.cpp
+@@ -0,0 +1,242 @@
++// Copyright (c) TriDB. Licensed under the MIT License.
++//
++// tridb_vector_iter.cpp — implementation of the TriDB relaxed-monotonicity vector iterator
++// (DEV-1168 / FR-3). See tridb_vector_iter.hpp for the contract and the fork distance constraint.
++//
++// Marker for the patch sentinel grep (scripts/lib/msvbase_patches.sh): tridb_vec_open.
++
++#include "tridb_vector_iter.hpp"
++#include "hnswindex_scan.hpp"
++#include "hnswindex.hpp"
++#include "util.hpp"
++
++#include <cstdint>
++#include <memory>
++#include <queue>
++#include <string>
++#include <vector>
++
++extern "C"
++{
++#include <miscadmin.h>
++#include <utils/elog.h>
++#include <utils/rel.h>
++}
++
++// hnsw_ParaGetDimension / hnsw_ParaGetDistmethod are defined in hnswindex.cpp with C++ linkage but
++// have no header declaration there. Forward-declare them here matching those definitions.
++int hnsw_ParaGetDimension(Relation index);
++hnsw_DistCalcMethod hnsw_ParaGetDistmethod(Relation index);
++
++namespace
++{
++constexpr int kDefaultInversionTolerance = 3;  // lifted from hnsw_gettuple's distanceThreshold.
++}
++
++// The iterator state. Mirrors HNSWScanOpaque + the hnsw_gettuple stop logic, but the stop
++// constants (k, inversion tolerance) are parameters and the k-th-best bound is caller-settable.
++struct TridbVectorIter
++{
++    std::shared_ptr<hnswlib::ResultIterator<float>> resultIterator;
++    std::vector<float> query;  // owns the query copy the iterator points into.
++
++    int k = 1;
++    int inversionTolerance = kDefaultInversionTolerance;
++
++    // Internal fallback stop: max-heap of the best-k distances seen so far. Its top is the current
++    // k-th-best distance once the heap is full (size == k). Maintained UNCONDITIONALLY (every call)
++    // so the fallback bound stays valid even after a caller bound is later unset (set to <= 0).
++    std::priority_queue<float> kQueue;
++
++    // DEV-1169 seam: caller-supplied k-th-best surviving distance. <= 0 => unset.
++    float kthBound = 0.0f;
++
++    // Consecutive candidates seen worse than the active stop bound (relaxed-mono inversion run).
++    int overBoundRun = 0;
++
++    // Candidates pulled from the ANN stream. int32 to match the SQL probe's `examined integer`
++    // (int4) column; the count is corpus-bounded so it fits comfortably.
++    std::int32_t examined = 0;
++    bool stopped = false;  // sticky: once the stream exhausts or the stop fires, stay done.
++};
++
++// Active stop bound: the caller bound if set, else the internal k-queue's k-th best (only once the
++// queue is full — before that there is no meaningful bound and we never stop on it).
++static bool tridb_vec_active_bound(const TridbVectorIter *it, float *bound_out)
++{
++    if (it->kthBound > 0.0f)
++    {
++        *bound_out = it->kthBound;
++        return true;
++    }
++    if (static_cast<int>(it->kQueue.size()) >= it->k)
++    {
++        *bound_out = it->kQueue.top();
++        return true;
++    }
++    return false;
++}
++
++TridbVectorIter *tridb_vec_open(Relation index, const float *query_vec, int dim, int k)
++{
++    if (index == nullptr || query_vec == nullptr || dim <= 0 || k <= 0)
++        return nullptr;
++
++    // Derive the on-disk index path exactly as hnsw_begin_scan / hnsw_gettuple do.
++    std::string path = std::string(DataDir) + std::string("/") +
++                       std::string(DatabasePath) + std::string("/") +
++                       std::string(RelationGetRelationName(index));
++
++    // Dim mismatch and unknown distance method are hard configuration errors — a TJS caller
++    // (DEV-1169) must NOT silently get zero results. These checks run BEFORE any C++ heap object
++    // (the iterator) is constructed on the stack, so the ereport(ERROR) longjmp skips no C++
++    // destructor and leaks nothing. (Resolve the distance method here, before construction, so a
++    // bad method also fails loudly rather than after `it` exists.)
++    int index_dim = hnsw_ParaGetDimension(index);
++    if (index_dim != dim)
++        ereport(ERROR,
++                (errcode(ERRCODE_DATA_EXCEPTION),
++                 errmsg("tridb_vec_open: query dim %d != index dim %d", dim, index_dim)));
++
++    DistanceMethod distance;
++    switch (hnsw_ParaGetDistmethod(index))
++    {
++    case hnsw_Inner_Product:
++        distance = DistanceMethod::InnerProduct;
++        break;
++    case hnsw_L2_Distance:
++        distance = DistanceMethod::L2;
++        break;
++    default:
++        ereport(ERROR,
++                (errcode(ERRCODE_DATA_EXCEPTION),
++                 errmsg("tridb_vec_open: unknown hnsw distance method on index \"%s\"",
++                        RelationGetRelationName(index))));
++    }
++
++    // From here on a C++ heap object (the iterator, via unique_ptr) is live on the stack. NEVER
++    // ereport(ERROR) below — longjmp would skip ~TridbVectorIter (and its hnswlib WorkSpace). On
++    // any failure return nullptr after the unique_ptr cleans up; release() only on success.
++    try
++    {
++        HNSWIndexScan::LoadIndex(path, distance, index_dim);
++
++        auto it = std::make_unique<TridbVectorIter>();
++        it->k = k;
++        it->query.assign(query_vec, query_vec + dim);
++        // BeginScan points the hnswlib iterator at our owned copy of the query vector. If it
++        // throws (workspace alloc / OOM), the unique_ptr destructs `it` — returning its hnswlib
++        // WorkSpace to the visited_list_pool_ — and we leak nothing.
++        it->resultIterator = HNSWIndexScan::BeginScan(
++            static_cast<const void *>(it->query.data()), path);
++        return it.release();
++    }
++    catch (std::exception &ex)
++    {
++        ereport(WARNING, (errmsg("tridb_vec_open: %s", ex.what())));
++        return nullptr;
++    }
++    catch (...)
++    {
++        ereport(WARNING, (errmsg("tridb_vec_open: unknown C++ exception")));
++        return nullptr;
++    }
++}
++
++bool tridb_vec_next(TridbVectorIter *it, TridbVectorCand *out)
++{
++    if (it == nullptr || out == nullptr || it->stopped)
++        return false;
++
++    // One candidate per call (TR-1: no internal loop — every pulled result is either emitted or
++    // terminates the stream).
++    hnswlib::QueryResult<float> *result = HNSWIndexScan::GetNet(it->resultIterator);
++    if (!result->HasResult())
++    {
++        it->stopped = true;  // stream exhausted.
++        return false;
++    }
++    it->examined++;
++
++    float dist = result->GetDistance();
++
++    // Relaxed-monotonicity stop (lifted from hnsw_gettuple's orderby path, parametrized).
++    // The iterator EMITS every candidate in the ANN stream's (relaxed-monotone) discovery
++    // order — like hnsw_gettuple, it does not drop candidates — because the caller (DEV-1169
++    // TJS) must see each one to expand the graph + apply the relational filter. The bound only
++    // governs WHEN to STOP: once a run of candidates exceeds the current k-th-best bound beyond
++    // the inversion tolerance, the stream provably can no longer beat the top-k, so terminate.
++    // A single over-bound candidate is a tolerated inversion (the stream is approximately, not
++    // strictly, non-decreasing); the run must reach inversionTolerance to fire the stop.
++    float bound;
++    if (tridb_vec_active_bound(it, &bound))
++    {
++        if (dist > bound)
++        {
++            it->overBoundRun++;
++            if (it->overBoundRun >= it->inversionTolerance)
++            {
++                it->stopped = true;
++                return false;  // early termination.
++            }
++        }
++        else
++        {
++            it->overBoundRun = 0;  // back within the bound — the inversion run is broken.
++        }
++    }
++
++    // Maintain the internal best-k max-heap UNCONDITIONALLY (even while a caller bound is set), so
++    // the fallback bound stays current and valid the moment the caller bound is unset (set <= 0).
++    // Tracks the k smallest distances seen, so its top is the k-th best once full.
++    if (static_cast<int>(it->kQueue.size()) < it->k)
++    {
++        it->kQueue.push(dist);
++    }
++    else if (dist < it->kQueue.top())
++    {
++        it->kQueue.pop();
++        it->kQueue.push(dist);
++    }
++
++    // Decode the heap TID from the hnswlib label using the SAME shift logic as hnsw_gettuple /
++    // HNSWIndexScan::Insert: blkno = label >> 32, offset = low 32 bits.
++    std::uint64_t number = result->GetLabel();
++    BlockNumber blkno = static_cast<std::uint32_t>(number >> 32);
++    OffsetNumber offset = static_cast<std::uint32_t>(number);
++    ItemPointerSet(&out->heap_tid, blkno, offset);
++    out->distance = dist;
++    return true;
++}
++
++void tridb_vec_set_kth_bound(TridbVectorIter *it, float kth_best_distance)
++{
++    if (it == nullptr)
++        return;
++    it->kthBound = kth_best_distance;
++    it->overBoundRun = 0;  // a fresh bound restarts the inversion accounting.
++}
++
++void tridb_vec_set_tolerance(TridbVectorIter *it, int distance_threshold)
++{
++    if (it == nullptr || distance_threshold < 1)
++        return;
++    it->inversionTolerance = distance_threshold;
++}
++
++std::int32_t tridb_vec_examined(const TridbVectorIter *it)
++{
++    return it == nullptr ? 0 : it->examined;
++}
++
++void tridb_vec_close(TridbVectorIter *it)
++{
++    if (it == nullptr)
++        return;
++    if (it->resultIterator)
++    {
++        HNSWIndexScan::EndScan(it->resultIterator);
++        it->resultIterator = nullptr;
++    }
++    delete it;
++}
+diff --git a/src/tridb_vector_probe.cpp b/src/tridb_vector_probe.cpp
+new file mode 100644
+index 0000000..0a57f62
+--- /dev/null
++++ b/src/tridb_vector_probe.cpp
+@@ -0,0 +1,141 @@
++// Copyright (c) TriDB. Licensed under the MIT License.
++//
++// tridb_vector_probe.cpp — TEST-ONLY SQL probe for the relaxed-monotonicity vector iterator
++// (DEV-1168 / FR-3). Exposes the iterator's (tid, distance) stream + examined-counter to SQL so
++// test/vector_relaxed_mono_test.sql can assert the three acceptance properties:
++//   (1) distances approx-non-decreasing (relaxed, bounded inversions),
++//   (2) early termination (candidates examined << corpus),
++//   (3) top-k set parity vs a full-drain (no-stop) oracle.
++//
++// This wrapper exists ONLY for verification; the production caller is the C TJS operator
++// (DEV-1169), which calls tridb_vec_open/next/close directly. It deliberately surfaces the
++// iterator's internal GetDistance() — never a scalar `<->` (which returns 0 outside a scan).
++
++#include "tridb_vector_iter.hpp"
++#include "util.hpp"
++
++#include <cstdint>
++#include <vector>
++
++extern "C"
++{
++#include <postgres.h>
++#include <fmgr.h>
++#include <funcapi.h>
++#include <access/relation.h>
++#include <utils/array.h>
++#include <utils/builtins.h>
++#include <utils/rel.h>
++}
++
++// Materialized probe result: the bounded candidate stream plus the examined count (constant across
++// rows, echoed per row so a single-query test can read it).
++struct TridbProbeResult
++{
++    std::vector<TridbVectorCand> cands;
++    std::int32_t examined;  // matches the SQL `examined integer` (int4) column.
++};
++
++CPP_PG_FUNCTION_INFO_V1(tridb_vec_probe);
++
++// tridb_vec_probe(index regclass, query float8[], k int, stop bool)
++//   RETURNS TABLE(tid text, distance float8, examined int)
++// Drives tridb_vec_open/next/close to completion (early stop honored when `stop`), collecting
++// every emitted (tid, distance). When stop=false the inversion tolerance is raised so high the
++// iterator drains the whole stream — the no-stop ORACLE for the parity assertion.
++extern "C" Datum tridb_vec_probe(PG_FUNCTION_ARGS)
++{
++    FuncCallContext *funcctx;
++
++    if (SRF_IS_FIRSTCALL())
++    {
++        funcctx = SRF_FIRSTCALL_INIT();
++        MemoryContext oldcontext = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
++
++        Oid index_oid = PG_GETARG_OID(0);
++        ArrayType *query_arr = PG_GETARG_ARRAYTYPE_P(1);
++        int k = PG_GETARG_INT32(2);
++        bool stop = PG_GETARG_BOOL(3);
++
++        // INVARIANT (Linus DEV-1168 review): never ereport(ERROR) — a longjmp — while a live,
++        // un-destructed C++ heap-owning object (the result, or even a stack std::vector) is on the
++        // stack, because longjmp skips C++ destructors. So do EVERY operation that can ereport here
++        // (the result-type resolution) FIRST, against only POD/Postgres objects, before any C++
++        // container is constructed. relation_open / tridb_vec_open can also ERROR, so they too run
++        // before `res` exists; the query vector is the last thing destructed in this block and
++        // nothing that can longjmp runs after it is built and the scan begins.
++        TupleDesc tupdesc;
++        if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
++            ereport(ERROR,
++                    (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
++                     errmsg("tridb_vec_probe: function returning record called in context that "
++                            "cannot accept type record")));
++        funcctx->tuple_desc = BlessTupleDesc(tupdesc);
++        funcctx->attinmeta = TupleDescGetAttInMetadata(funcctx->tuple_desc);
++
++        // relation_open / tridb_vec_open may ereport(ERROR) (bad regclass, dim mismatch, unknown
++        // distmethod). These run before `res` is allocated, so an ERROR here leaks no C++ heap.
++        Relation index = relation_open(index_oid, AccessShareLock);
++
++        std::vector<float> query = convert_array_to_vector(PointerGetDatum(query_arr));
++        int dim = static_cast<int>(query.size());
++
++        TridbVectorIter *it = tridb_vec_open(index, query.data(), dim, k);
++
++        // From here on `res` (a C++ heap object) is live: no ereport(ERROR) below.
++        TridbProbeResult *res = new TridbProbeResult();
++        res->examined = 0;
++
++        if (it != nullptr)
++        {
++            if (!stop)
++            {
++                // No-stop oracle: raise the inversion tolerance so the relaxed-mono stop never
++                // fires; the iterator drains the entire ANN stream.
++                tridb_vec_set_tolerance(it, INT32_MAX);
++            }
++            TridbVectorCand cand;
++            while (tridb_vec_next(it, &cand))
++            {
++                res->cands.push_back(cand);
++            }
++            res->examined = tridb_vec_examined(it);
++            tridb_vec_close(it);
++        }
++
++        relation_close(index, AccessShareLock);
++
++        funcctx->user_fctx = res;
++        funcctx->max_calls = static_cast<uint32>(res->cands.size());
++
++        MemoryContextSwitchTo(oldcontext);
++    }
++
++    funcctx = SRF_PERCALL_SETUP();
++    TridbProbeResult *res = static_cast<TridbProbeResult *>(funcctx->user_fctx);
++
++    if (funcctx->call_cntr < funcctx->max_calls)
++    {
++        const TridbVectorCand &cand = res->cands[funcctx->call_cntr];
++
++        char tid_buf[64];
++        snprintf(tid_buf, sizeof(tid_buf), "(%u,%u)",
++                 ItemPointerGetBlockNumberNoCheck(&cand.heap_tid),
++                 ItemPointerGetOffsetNumberNoCheck(&cand.heap_tid));
++        char dist_buf[64];
++        snprintf(dist_buf, sizeof(dist_buf), "%.9g", static_cast<double>(cand.distance));
++        char exam_buf[16];
++        snprintf(exam_buf, sizeof(exam_buf), "%d", res->examined);
++
++        char *cstrs[3] = {tid_buf, dist_buf, exam_buf};
++        HeapTuple tuple = BuildTupleFromCStrings(funcctx->attinmeta, cstrs);
++        Datum result = HeapTupleGetDatum(tuple);
++        SRF_RETURN_NEXT(funcctx, result);
++    }
++    else
++    {
++        delete res;
++        funcctx->user_fctx = nullptr;
++        SRF_RETURN_DONE(funcctx);
++    }
++}
