@@ -37,7 +37,7 @@ build on GX10) · 🔴 GX10-gated (needs live MSVBASE build).
 | DEV-1161 | Reproducible GX10 build script | 0 | 🟡 | `scripts/gx10build.sh` authored from spike deltas (runs on GX10) |
 | DEV-1162 | Seed corpus + rel/vec smoke test | 0 | 🟡 | `tools/seed_corpus.py` (runs anywhere); SQL smoke test needs the build |
 | DEV-1163 | Design adjacency-list layout | 1 | 🟢 | `docs/graph_store_layout_v0.1.0.md` + ADR-0002 |
-| DEV-1164 | Adjacency-list access method | 1 | 🔴 GX10 | `src/graph_store/` interface skeleton + header stubs |
+| DEV-1164 | Adjacency-list access method | 1 | 🟡 | **v1 core built + tested on the x86 standin** (`src/graph_store/graph_am.c`, `scripts/graph_am_test.sh`): 32KB pages via shared buffer mgr + GenericXLog, incremental iterator, FR-7 abort + restart-persistence. Full TableAM vtable / secondary indexes / GX10 benchmark deferred (ADR-0003) |
 | DEV-1165 | Graph traversal iterator | 1 | 🔴 GX10 | Iterator contract documented in layout spec; stub |
 | DEV-1166 | Verify shared txn manager (FR-7) | 1 | 🔴 GX10 | Test plan in layout spec; runs on the build |
 | DEV-1167 | SQL/PGQ surface → logical plan | 2 | 🟡 | `docs/sqlpgq_logical_plan_v0.1.0.md` design |
