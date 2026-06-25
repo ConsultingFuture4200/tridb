@@ -39,8 +39,12 @@ verify_patches() {
     || die "Postgres.patch NOT applied (no amcanrelaxedorderbyop) — relaxed monotonicity missing; upstream drift?"
   grep -rq 'ResultIterator' "$root/thirdparty/hnsw/hnswlib/" \
     || die "hnsw.patch NOT applied (no ResultIterator) — VBASE iterator missing; upstream drift?"
-  grep -rq 'MultiIndexScan' "$root/thirdparty/SPTAG/" \
-    || die "spann.patch NOT applied (no MultiIndexScan) — upstream drift?"
+  # SPTAG is opt-in (WITH_SPTAG, DEV-1228); a lean build may skip the submodule entirely, so only
+  # verify the spann patch when the SPTAG tree is actually present.
+  if [[ -d "$root/thirdparty/SPTAG" ]]; then
+    grep -rq 'MultiIndexScan' "$root/thirdparty/SPTAG/" \
+      || die "spann.patch NOT applied (no MultiIndexScan) — upstream drift?"
+  fi
   grep -q 'TRIDB: real scalar L2 distance' "$root/src/operator.cpp" \
     || die "TriDB l2_distance_scalar.patch NOT applied — scalar distance still broken; drift?"
   grep -q 'WITH_SPTAG' "$root/CMakeLists.txt" \

@@ -1,5 +1,5 @@
 diff --git a/CMakeLists.txt b/CMakeLists.txt
-index 4cddda9..38f2a41 100644
+index 4cddda9..1842d2f 100644
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
 @@ -4,6 +4,18 @@
@@ -21,13 +21,15 @@ index 4cddda9..38f2a41 100644
  # Find Dependency
  
  set(PostgreSQL_ADDITIONAL_VERSIONS "13")
-@@ -21,6 +33,17 @@ set(EXT_SQL_FILES
+@@ -21,6 +33,19 @@ set(EXT_SQL_FILES
  list (GET EXT_SQL_FILES 0 EXT_SQL_MAIN)
  configure_file(${EXT_CONTROL_FILE}.in ${EXT_CONTROL_FILE})
  
 +# TRIDB(DEV-1228): assemble the installed extension SQL = base (hnswlib AMs) plus the SPTAG
 +# fragment only when WITH_SPTAG. The default build emits no sptag/spann DDL, so CREATE EXTENSION
 +# resolves no SPTAG handler symbols. See ADR-0004.
++# NOTE: this runs at configure (cmake) time, not build (make) time — toggling WITH_SPTAG requires
++# re-running cmake to regenerate the .sql, not just `make`.
 +set(EXT_SQL_INSTALLED "${CMAKE_CURRENT_BINARY_DIR}/${PROJECT_NAME}--${PROJECT_VERSION}.sql")
 +file(READ "${CMAKE_CURRENT_SOURCE_DIR}/${EXT_SQL_MAIN}" _tridb_sql_base)
 +file(WRITE "${EXT_SQL_INSTALLED}" "${_tridb_sql_base}")
@@ -39,7 +41,7 @@ index 4cddda9..38f2a41 100644
  # Add Dependency
  
  #Include(FetchContent)
-@@ -71,11 +94,10 @@ endif()
+@@ -71,11 +96,10 @@ endif()
  
  # Add Extension Library
  
@@ -54,7 +56,7 @@ index 4cddda9..38f2a41 100644
      src/hnswindex.cpp
      src/hnswindex_builder.cpp
      src/hnswindex_scan.cpp
-@@ -87,9 +109,18 @@ add_library(${PROJECT_NAME} SHARED
+@@ -87,9 +111,18 @@ add_library(${PROJECT_NAME} SHARED
      src/model_mng.cpp
      src/topk.cpp
      src/multicol_topk.cpp
@@ -75,11 +77,18 @@ index 4cddda9..38f2a41 100644
  
  target_compile_features(${PROJECT_NAME} PUBLIC cxx_std_14)
  target_compile_options(${PROJECT_NAME} PRIVATE -Wall -mavx2)
-@@ -163,10 +194,10 @@ foreach(EXT_SQL_FILE ${EXT_SQL_FILES})
-         FILES ${CMAKE_CURRENT_SOURCE_DIR}/${EXT_SQL_FILE}
-         DESTINATION "${PostgreSQL_SHAREDIR}/extension")
- endforeach(EXT_SQL_FILE)
-+# TRIDB(DEV-1228): install the assembled SQL (already named ${PROJECT_NAME}--${PROJECT_VERSION}.sql).
+@@ -158,15 +191,12 @@ execute_process(
+ install(
+     FILES ${CMAKE_CURRENT_BINARY_DIR}/${EXT_CONTROL_FILE}
+     DESTINATION "${PostgreSQL_SHAREDIR}/extension")
+-foreach(EXT_SQL_FILE ${EXT_SQL_FILES})
+-    install(
+-        FILES ${CMAKE_CURRENT_SOURCE_DIR}/${EXT_SQL_FILE}
+-        DESTINATION "${PostgreSQL_SHAREDIR}/extension")
+-endforeach(EXT_SQL_FILE)
++# TRIDB(DEV-1228): install ONLY the assembled SQL (already named ${PROJECT_NAME}--${PROJECT_VERSION}.sql,
++# = base + optional SPTAG fragment). The old per-file foreach loop dropped an unversioned, incomplete
++# sql/vectordb.sql that PostgreSQL's loader never reads (it uses extname--version.sql); removed.
  install(
 -    FILES ${CMAKE_CURRENT_SOURCE_DIR}/${EXT_SQL_MAIN}
 -    DESTINATION "${PostgreSQL_SHAREDIR}/extension"
@@ -159,7 +168,7 @@ index 91f49ab..77331de 100644
  -- term_cond is the number of consecutive drops of table row after a priority queue is stable
 diff --git a/sql/vectordb_sptag.sql b/sql/vectordb_sptag.sql
 new file mode 100644
-index 0000000..039aee3
+index 0000000..a81981a
 --- /dev/null
 +++ b/sql/vectordb_sptag.sql
 @@ -0,0 +1,44 @@
@@ -184,7 +193,7 @@ index 0000000..039aee3
 +
 +CREATE ACCESS METHOD spann TYPE INDEX HANDLER spann_handler;
 +
-+COMMENT ON ACCESS METHOD spann IS 'spann index access method';
++COMMENT ON ACCESS METHOD spann IS 'spann index access method';  -- TRIDB(DEV-1228): was mislabeled 'sptag' upstream
 +
 +-- opclasses
 +

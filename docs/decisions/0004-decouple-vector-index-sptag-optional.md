@@ -106,6 +106,12 @@ hnswlib as peer implementers and *no third-party types in the core*. Rejected fo
 - A future `gx10build.sh` run should pass `-DWITH_SPTAG=OFF` explicitly (it is also the default)
   and may skip the SPTAG submodule init to save clone time — tracked as a GX10 follow-up, not
   part of this x86 work.
+- **The next GX10 blocker after SPTAG is already in the tree:** the `vectordb` CMake hardcodes
+  x86 SIMD flags (`-mavx2`/`-msse4.2`/`-maes`/`-mmwaitx`) with no arch guard, which fail the
+  aarch64 compile of the vectordb sources themselves. "Needs only an hnswlib port" means exactly
+  this — filed as **DEV-1234** (blocks DEV-1160). hnswlib's portable scalar fallback covers the
+  functionality; the work is purely to stop emitting x86 `-m*` flags on ARM. Surfaced by the
+  DEV-1228 Linus review.
 
 ## Migration plan (bounded increments, each rebuilt + smoke-tested, Linus-reviewed before merge)
 
