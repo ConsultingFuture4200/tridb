@@ -4,7 +4,14 @@
 # available. It has NOT been compiled, applied, or run. Do NOT add it to scripts/lib/msvbase_patches.sh
 # or claim it builds/passes/fixes until it is verified on a built tridb/msvbase:dev image (x86 standin)
 # or on the GX10 (scripts/gx10build.sh). See docs/fork_segfault_double_scan.md (§Verify wiring) and
-# docs/decisions/0009-fork-operator-snapshot-lifecycle.md.
+# docs/decisions/0010-fork-operator-snapshot-lifecycle.md.
+#
+# CAVEAT (Linus review): this is a SKETCH, not a git-apply-clean patch. Part A (adding a
+# query_snapshot field to FaginsState in multicol_topk.cpp + topk.cpp and to TJSState in
+# tjs_operator.cpp) is described as PROSE, not as a unified-diff hunk — it must be authored as a
+# real hunk before `git apply`. Part C's per-drive Push/Pop must additionally be wrapped in
+# PG_TRY/PG_FINALLY (PopActiveSnapshot on the error path, then PG_RE_THROW) — as functions.c does —
+# before this ships as the final patch. Do NOT git apply as-is.
 #
 # WHAT IT FIXES (DEV-1236 diagnosis): co-issuing a second executor-driven scan in the SAME plpgsql
 # block as topk()/multicol_topk()/tjs() SIGSEGVs the backend. Root cause: each operator builds a

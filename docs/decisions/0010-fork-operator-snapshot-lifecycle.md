@@ -1,4 +1,4 @@
-# ADR-0009: Fork operators must own their snapshot for the full SRF lifetime
+# ADR-0010: Fork operators must own their snapshot for the full SRF lifetime
 
 **Status:** Accepted (diagnosis); fix DRAFTED, **UNBUILT-HERE** (GX10-gated)
 **Issue:** DEV-1236 (spike / diagnose)

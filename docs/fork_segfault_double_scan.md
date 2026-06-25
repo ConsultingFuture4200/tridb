@@ -126,7 +126,7 @@ statement's boundary.
 Independent of the snapshot issue, `topk.cpp`'s teardown reads `state` **after** freeing it:
 
 ```c
-// vendor/MSVBASE/src/topk.cpp  EndFaginsState(), lines 547-552
+// vendor/MSVBASE/src/topk.cpp  EndFaginsState(), lines 547-551
     delete(state->proc_pq);
     delete(state->seenSet);
     delete(state->result_stack);
