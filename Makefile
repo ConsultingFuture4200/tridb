@@ -3,7 +3,7 @@
 IMAGE ?= tridb/msvbase:dev
 ENGINE_TESTS := test/graph_store_test.sql test/trimodal_compose.sql \
                 test/trimodal_early_term.sql test/fork_distance_probe.sql \
-                test/vector_relaxed_mono_test.sql
+                test/vector_relaxed_mono_test.sql test/canonical_e2e_test.sql
 
 test:
 	pytest tests/ -q
