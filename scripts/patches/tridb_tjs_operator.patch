@@ -14,10 +14,10 @@ index bc2e875..25ff54a 100644
  if(WITH_SPTAG)
      list(APPEND VECTORDB_SOURCES
 diff --git a/sql/vectordb.sql b/sql/vectordb.sql
-index 8bd02e7..53d041d 100644
+index 8bd02e7..c605522 100644
 --- a/sql/vectordb.sql
 +++ b/sql/vectordb.sql
-@@ -121,3 +121,19 @@ CREATE FUNCTION multicol_topk(table_name text, k integer, term_cond integer, att
+@@ -121,3 +121,36 @@ CREATE FUNCTION multicol_topk(table_name text, k integer, term_cond integer, att
  CREATE FUNCTION tridb_vec_probe(index regclass, query float8[], k integer, stop boolean)
  	RETURNS TABLE(tid text, distance float8, examined integer)
  	AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
@@ -28,10 +28,27 @@ index 8bd02e7..53d041d 100644
 +-- authority; the RELATIONAL filter is pushed into its WHERE; the GRAPH leg is a reachability
 +-- predicate probing graph_store.neighbors(src). attr_exp's FIRST column must be the candidate's
 +-- graph id. src < 0 disables the graph leg. NOT IMMUTABLE/PARALLEL SAFE: it drives the executor
-+-- via SPI and reads live graph state. See docs/decisions/0007-tjs-operator.md.
++-- via SPI and reads live graph state.
++--
++-- SEMANTIC NOTE (term_cond): the early-termination bound counts EVERY candidate that fails to
++-- improve the top-k as a "drop" — INCLUDING candidates rejected by the GRAPH reachability predicate,
++-- not only ANN-distance losers. So a restrictive graph predicate (most candidates unreachable) fires
++-- early termination SOONER. term_cond is therefore "consecutive non-improving candidates", not
++-- "consecutive ANN-distance drops". Tune it with the graph selectivity in mind.
++--
++-- WARNING: attr_exp / filter_exp / orderby_exp are raw SQL fragments (like topk's) and CANNOT be
++-- quoted; do not pass untrusted input. v1 feeds them from the controlled DEV-1167 lowering of the
++-- single canonical query, not end users. table_name is resolved via the catalog (no SQL injection).
++-- See docs/decisions/0007-tjs-operator.md.
 +CREATE FUNCTION tjs(table_name text, k integer, term_cond integer, src bigint,
 +                    attr_exp text, filter_exp text, orderby_exp text) RETURNS SETOF record
 +	AS 'MODULE_PATHNAME' LANGUAGE C STABLE;
++
++COMMENT ON FUNCTION tjs(text, integer, integer, bigint, text, text, text) IS
++	'TriDB Traversal-Join-Similarity operator (DEV-1169). One Volcano plan composing graph traversal '
++	'+ relational filter + vector similarity under a single early-terminating top-k. term_cond counts '
++	'ALL non-improving candidates (graph-rejected included), so a restrictive graph predicate '
++	'terminates sooner. attr_exp/filter_exp/orderby_exp are raw SQL fragments — trusted input only.';
 +
 +-- TR-1 / SM-3 probe: ANN candidates pulled by the last TJS scan in this backend. Asserting this
 +-- << corpus proves early termination (no blocking full scan). Mirrors graph_store.visits().
@@ -39,10 +56,10 @@ index 8bd02e7..53d041d 100644
 +	AS 'MODULE_PATHNAME' LANGUAGE C;
 diff --git a/src/tjs_operator.cpp b/src/tjs_operator.cpp
 new file mode 100644
-index 0000000..9d4b51a
+index 0000000..86e9ad2
 --- /dev/null
 +++ b/src/tjs_operator.cpp
-@@ -0,0 +1,702 @@
+@@ -0,0 +1,685 @@
 +// Copyright (c) TriDB. Licensed under the MIT License.
 +//
 +// tjs_operator.cpp — TriDB Traversal-Join-Similarity (TJS) operator (DEV-1169 / FR-4).
@@ -132,6 +149,9 @@ index 0000000..9d4b51a
 +#include <utils/rel.h>
 +#include <utils/selfuncs.h>
 +
++#include <nodes/makefuncs.h>     // makeRangeVar — for the SPI-free table-name -> OID resolution.
++#include <catalog/namespace.h>   // RangeVarGetRelid — search-path-aware syscache lookup.
++
 +#include "libpq/pqformat.h"
 +#include <utils/builtins.h>
 +}
@@ -204,37 +224,16 @@ index 0000000..9d4b51a
 +	return false;
 +}
 +
++// Resolve a table name to its OID via the catalog cache — NOT SPI. The previous SPI version
++// (forked from multicol_topk) leaked its SPI connection on every ereport(ERROR) path (SPI_finish
++// was unreachable after a longjmp), which left SPI open and corrupted the NEXT operator call — the
++// fork's signature SPI-corruption failure mode. RangeVarGetRelid does a search-path-aware syscache
++// lookup with no SPI connection and no error-path gap, and (bonus) keeps the table name out of an
++// interpolated SQL string, closing the SQL-injection vector that the SELECT ... WHERE relname='%s'
++// form opened. missing_ok=true so a bad name yields InvalidOid for a clean caller-side error.
 +inline Oid getrelidT(const std::string relname){
-+	char cmd[256];
-+	int cmd_len = snprintf(cmd, sizeof(cmd), "SELECT oid FROM pg_catalog.pg_class WHERE relname = '%s';", relname.c_str());
-+	if ( cmd_len < 0 ) {
-+		elog(ERROR, "getrelidT:: relname '%s' is too long", relname.c_str());
-+		return InvalidOid;
-+	}
-+	SPI_connect();
-+	int ret = SPI_exec(cmd, 1);
-+	uint64 proc = SPI_processed;
-+	Oid retval = InvalidOid;
-+	if ( ret > 0 && SPI_tuptable != NULL ){
-+		TupleDesc tupdesc = SPI_tuptable->tupdesc;
-+		SPITupleTable *tuptable = SPI_tuptable;
-+		if ( proc > 1 )
-+			ereport(ERROR, (errcode(ERRCODE_DATA_EXCEPTION), errmsg("only a single relname should be returned")));
-+		if ( tupdesc->natts != 1 )
-+			ereport(ERROR, (errcode(ERRCODE_DATA_EXCEPTION), errmsg("only a single attribute should be returned")));
-+		if ( proc == 1 ) {
-+			HeapTuple tuple = tuptable->vals[0];
-+			bool isnull;
-+			Datum value = SPI_getbinval(tuple, tupdesc, 1, &isnull);
-+			if ( isnull )
-+				ereport(ERROR, (errcode(ERRCODE_DATA_EXCEPTION), errmsg("Non-null value should be returned")));
-+			retval = DatumGetObjectId(value);
-+		} else {
-+			elog(ERROR, "getrelidT:: cannot find relid for relname (%s)", relname.c_str());
-+		}
-+	}
-+	SPI_finish();
-+	return retval;
++	RangeVar *rv = makeRangeVar(NULL, pstrdup(relname.c_str()), -1);
++	return RangeVarGetRelid(rv, NoLock, true /* missing_ok */);
 +}
 +
 +// DFS for the IndexScanState / IndexScan nodes — identical to multicol_topk's, renamed.
@@ -259,17 +258,28 @@ index 0000000..9d4b51a
 +	bool old_enable_seqscan = enable_seqscan;
 +	enable_seqscan = false;
 +	PlannedStmt* plan = NULL;
-+	SPIPlanPtr planptr = SPI_prepare(query, 0, NULL);
-+	cplan = SPI_plan_get_cached_plan(planptr);
-+	List* stmt_list = cplan->stmt_list;
-+	ListCell* lc;
-+	IndexScan* node = NULL;
-+	foreach(lc, stmt_list){
-+		PlannedStmt *stmt = lfirst_node(PlannedStmt, lc);
-+		if ( (node = findIndexScanNodeT(stmt->planTree)) != NULL ){
-+			plan = stmt;
++	// PG_TRY so a throw inside SPI_prepare/planning still restores enable_seqscan (the upstream
++	// multicol_topk version leaks the override on error). PG_RE_THROW preserves the original error.
++	PG_TRY();
++	{
++		SPIPlanPtr planptr = SPI_prepare(query, 0, NULL);
++		cplan = SPI_plan_get_cached_plan(planptr);
++		List* stmt_list = cplan->stmt_list;
++		ListCell* lc;
++		IndexScan* node = NULL;
++		foreach(lc, stmt_list){
++			PlannedStmt *stmt = lfirst_node(PlannedStmt, lc);
++			if ( (node = findIndexScanNodeT(stmt->planTree)) != NULL ){
++				plan = stmt;
++			}
 +		}
 +	}
++	PG_CATCH();
++	{
++		enable_seqscan = old_enable_seqscan;
++		PG_RE_THROW();
++	}
++	PG_END_TRY();
 +	enable_seqscan = old_enable_seqscan;
 +	return plan;
 +}
@@ -379,7 +389,6 @@ index 0000000..9d4b51a
 +	std::unordered_set<int64> *reachable;
 +	int idAttno; // 1-based attribute of the candidate's graph id in the result slot (the first attr).
 +
-+	IndexFetchTableData *result_heap_scan;
 +	Relation relation;
 +	std::vector<IndexScanState*> *children;
 +	std::vector<QueryDesc*>* qDescs;
@@ -476,12 +485,13 @@ index 0000000..9d4b51a
 +				if ( graph_ok && ( proc_pq->size() < k || proc_pq->top().first > rank_score ) ){
 +					if ( proc_pq->size() == k )
 +						proc_pq->pop();
-+					// Copy the surviving tuple into the SRF's multi-call context (result_cxt), NOT the
-+					// child's es_query_cxt which EndTJSState frees at teardown — so the tuple outlives
-+					// the children and stays valid across the SRF's per-call pops.
-+					auto resctx = MemoryContextSwitchTo(estate->result_cxt);
++					// Copy the surviving tuple into the SRF's multi-call context (result_cxt ==
++					// multi_call_memory_ctx), NOT the child's es_query_cxt which EndTJSState frees at
++					// teardown — so the tuple outlives the children and stays valid across the SRF's
++					// per-call pops. The MemoryContextSwitchTo(oldcontext) below restores the context,
++					// so no explicit switch-back is needed here.
++					MemoryContextSwitchTo(estate->result_cxt);
 +					proc_pq->push(std::make_pair(rank_score, copyItemT(slot)));
-+					MemoryContextSwitchTo(resctx);
 +					consecutive_drops = 0;
 +				}
 +
@@ -535,7 +545,6 @@ index 0000000..9d4b51a
 +	state->topk            = k;
 +	state->term_cond       = term_cond;
 +
-+	state->result_heap_scan = table_index_fetch_begin(relation);
 +	state->proc_pq          = new std::priority_queue<pq_item_t, std::vector<pq_item_t>, pq_item_compare_lt_t>();
 +	state->seenSet          = new std::unordered_set<uint64_t>();
 +	state->result_stack     = new std::stack<pq_item_t>();
@@ -559,7 +568,6 @@ index 0000000..9d4b51a
 +// result_cxt (the multi_call context), so they outlive this teardown. Idempotent via children_closed.
 +void EndTJSChildren(TJSState *state){
 +	if (!state || state->children_closed) return;
-+	table_index_fetch_end(state->result_heap_scan);
 +	table_close(state->relation, AccessShareLock);
 +
 +	for (QueryDesc* queryDesc: *(state->qDescs)) {
@@ -574,29 +582,17 @@ index 0000000..9d4b51a
 +	if (!state) return;
 +	EndTJSChildren(state); // idempotent — no-op if already closed in the first call.
 +	ExecDropSingleTupleTableSlot(state->ps.ps_ResultTupleSlot);
++	// Delete EVERY C++ member BEFORE free(state); free(state) is the LAST statement (no read of
++	// state-> after it). qDescs/children/etc. are heap-owned vectors/sets allocated in InitTJSState.
 +	delete(state->proc_pq);
 +	delete(state->seenSet);
 +	delete(state->result_stack);
 +	delete(state->reachable);
-+	auto qDescs = state->qDescs;
-+	auto children = state->children;
++	delete(state->qDescs);
++	delete(state->children);
 +	free(state);
-+	delete(qDescs);
-+	delete(children);
 +}
 +
-+void parseVectorConstantT(std::string &src) {
-+	std::size_t pos = 0;
-+	while ((pos = src.find("{", pos)) != std::string::npos) {
-+		src.replace(pos, 1, "\'{");
-+		pos += 2;
-+	}
-+	pos = 0;
-+	while ((pos = src.find("}", pos)) != std::string::npos) {
-+		src.replace(pos, 1, "}\'");
-+		++pos;
-+	}
-+}
 +
 +// ---------------------------------------------------------------------------
 +// tjs(table_name, k, term_cond, src, attr_exp, filter_exp, orderby_exp) RETURNS SETOF record
@@ -629,6 +625,10 @@ index 0000000..9d4b51a
 +		text *tablename = PG_GETARG_TEXT_PP(argc++);
 +		uint32 k = PG_GETARG_UINT32(argc++);
 +		Oid table_oid = getrelidT(std::string(text_to_cstring(tablename)));
++		if (!OidIsValid(table_oid))
++			ereport(ERROR,
++					(errcode(ERRCODE_UNDEFINED_TABLE),
++					 errmsg("TJS: relation \"%s\" does not exist", text_to_cstring(tablename))));
 +
 +		uint32 termCond = PG_GETARG_UINT32(argc++);
 +		if (termCond == 0)

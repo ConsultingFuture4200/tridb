@@ -94,18 +94,51 @@ scan provably early-terminates rather than blocking.
   executor via SPI and reads live graph state.
 - **BM25 / a fourth leg** remains a future predicate-or-stream decision; the predicates-on-one-stream
   pattern generalizes to any additional *filter* leg without an order-merge.
-- **Inherited fork SPI limitation (known issue).** `tjs()` forks the `topk`/`multicol_topk`
-  SPI-driven-executor lifecycle, and inherits a PRE-EXISTING MSVBASE fork bug: issuing another query
-  against the operator's own target table in the **same plpgsql block** as the operator call (e.g.
-  `SELECT count(*) FROM entities;` alongside `tjs('entities', …)`) segfaults the backend. It is
-  reproducible with **unmodified `multicol_topk` alone** (no TJS, no graph), so it is the fork's, not
-  TJS's. Top-level (non-plpgsql) calls and back-to-back calls are unaffected — only a sibling scan of
-  the same table within one plpgsql block. The fix belongs to the fork's executor-driving lifecycle
-  (a separate hardening task, GX10-adjacent); the canonical e2e test sidesteps it by not co-issuing a
-  second `entities` scan in the early-termination block. See DEV-1169 report.
+- **Inherited fork SPI limitation (known issue — verified pre-existing).** `tjs()` forks the
+  `topk`/`multicol_topk` SPI-driven-executor lifecycle, and inherits a PRE-EXISTING MSVBASE fork bug:
+  issuing another query against the operator's own target table in the **same plpgsql block** as the
+  operator call (e.g. `SELECT count(*) FROM entities;` alongside `tjs('entities', …)`) segfaults the
+  backend. Top-level (non-plpgsql) calls and back-to-back calls are unaffected — only a sibling scan
+  of the same table within one plpgsql block.
+
+  **Attribution proof (Linus review #9, verified 2026-06-25 on `tridb/msvbase:dev`).** Reproduced
+  with **UNMODIFIED `multicol_topk` alone** — no `tjs()`, no `graph_store` extension, no graph leg:
+
+  ```sql
+  -- vectordb only; see test/_fork_bug_multicol_double_scan.sql (NOT in CI — it crashes the backend)
+  DO $$ DECLARE got bigint[]; corpus bigint;
+  BEGIN
+      SELECT count(*) INTO corpus FROM entities;                 -- sibling scan of the same table
+      SELECT array_agg(id) INTO got FROM (
+          SELECT t.id FROM multicol_topk('entities',5,0,'id','','',
+                         'embedding <-> ''{19,0,0,0,0,0,0,0}''') AS t(id bigint, d float8)) q;
+  END $$;
+  ```
+
+  Server log: `server process (PID 34) was terminated by signal 11: Segmentation fault`, failed
+  process = the DO block above. **Verdict: genuinely the fork's bug, not TJS's** — TJS only inherits
+  it by forking the same `execFagins` lifecycle (the mandated v1 architecture). The fix belongs to
+  the fork's executor-driving lifecycle (a separate hardening task, GX10-adjacent); the canonical
+  e2e test sidesteps it by not co-issuing a second `entities` scan in the early-termination block.
 - **HNSW incremental-insert limitation (known fork issue).** Inserting into an already-indexed table
   crashes the fork's HNSW AM (reproducible with `vectordb` alone). Tests build the full corpus before
   `CREATE INDEX`. Also outside DEV-1169's scope.
+- **`term_cond` counts graph-rejected candidates (user-facing semantic).** The early-termination
+  bound is "consecutive candidates that did not improve the top-k", which **includes** candidates the
+  graph reachability predicate rejected — NOT only ANN-distance losers. So a restrictive graph
+  predicate (most candidates unreachable from `src`) makes `consecutive_drops` climb faster and fires
+  early termination **sooner**. This is correct (an unreachable candidate genuinely cannot enter the
+  result), but it means `term_cond` interacts with graph selectivity: tune it accordingly. Documented
+  in the `tjs(...)` SQL `COMMENT` as well.
+- **SQL-fragment injection surface (known v1 limitation, mitigated).** `attr_exp` / `filter_exp` /
+  `orderby_exp` are raw SQL fragments interpolated into the vector-leg query (the same design as
+  `topk`/`multicol_topk` — they are expressions, so they cannot be parameter-bound or quoted). They
+  are therefore a SQL-injection surface IF fed untrusted input. **Mitigated** because v1 feeds them
+  exclusively from the controlled DEV-1167 lowering of the *single canonical query*, not from end
+  users. The `table_name` argument is NOT part of this surface: it is resolved via the catalog
+  (`RangeVarGetRelid`), not string-interpolated (Linus review #1 — this also removed an SPI
+  connection leak on the resolver's error paths). A future multi-query surface must validate/bind
+  these fragments before exposing TJS to untrusted callers.
 
 ## Alternatives rejected
 
