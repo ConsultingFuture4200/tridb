@@ -1,60 +1,56 @@
-# src/graph_store/ — native adjacency-list graph store (GX10-gated C surface)
+# src/graph_store/ — native adjacency-list graph store (v1 core)
 
-This directory holds the **interface skeleton** for TriDB's native graph store:
-the adjacency-list access method plus its Volcano traversal iterator, declared
-against the PostgreSQL 13.4 access-method API.
+TriDB's native graph store: an adjacency-list topology store over 32KB pages, managed directly
+through PostgreSQL's shared buffer manager and shared WAL (GenericXLog) — **not** relational join
+tables, and **not** a sidecar (one process, one transaction manager, one WAL).
 
-> **Not to be confused with `src/graph_store_ext/`.** That is the *working* v0
-> heap-backed extension (built and tested on the x86 standin, `scripts/graph_test.sh`
-> green). **This** directory is the GX10-gated C *contract/skeleton* for the v1 custom
-> 32KB-page access method (DEV-1164) — a known shape to implement against, never compiled here.
+This is **real, compiled code**, built and tested on the x86 standin via `scripts/graph_am_test.sh`
+(PGXS against the `tridb/msvbase:dev` image). It is architecture-independent PostgreSQL 13.4
+access-method C; only the live GX10 ARM64 build and the 128GB benchmark remain hardware-gated.
 
-> **GX10-GATED: not built off-target.**
-> Nothing here is compiled on the dev box. The implementing C must build against
-> a live MSVBASE / PostgreSQL 13.4 fork built with `--with-blocksize=32` (32KB
-> pages), which exists only on the GX10 target (ARM64 + CUDA, 128GB). On this
-> repo the directory is a documented surface — opaque handles, typedefs, and
-> per-function contracts — so the GX10 implementer drops in C against a known
-> shape rather than designing from zero.
+> **Not to be confused with `src/graph_store_ext/`** — that is the superseded v0 heap-backed
+> extension. **This** directory is the v1 custom 32KB-page store (DEV-1164 core + DEV-1165
+> traversal). See ADR-0003 (AM core) and ADR-0005 (traversal iterator).
 
 ## Contents
 
 | File | What it is |
 | ---- | ---------- |
-| `graphstore.h` | The access-method surface: opaque `GraphStore` / `GraphScanDesc` handles, `graphstore_open` / `graphstore_insert_vertex` / `graphstore_insert_edge`, and the `gs_open` / `gs_getnext` / `gs_close` traversal-iterator contract. Kept compilable-shaped (include guards, typedefs) but not built here. |
+| `graph_am.c` | The implementation: page store, `gph_insert_vertex` / `gph_insert_edge` (WAL-logged via GenericXLog, MVCC-visibility-filtered reads), the shared `gs_open`/`gs_getnext`/`gs_close` traversal engine, and the `gph_neighbors` / `gph_traverse` SRFs + `gph_visits` / `gph_vertex_count` probes. |
+| `gph_page.h` | On-disk 32KB page format (metapage, vertex pages, packed adjacency `GphEdgeSlot`s, chain pointers); static-asserts `BLCKSZ == 32768`. |
+| `graphstore.h` | Shared types (`GraphVertexId`, `GraphElement`, kind/direction enums, constants) + the documented traversal contract. Compiled (included by `graph_am.c`). |
+| `graph_store_am--0.1.0.sql` / `.control` | The `graph_store_am` extension: the `gstore` page container + the `gph_*` functions. |
 
-## Invariants this surface upholds
+## Invariants this store upholds
 
-- **TR-1 — Volcano + early termination.** Traversal is `gs_open` / `gs_getnext`
-  / `gs_close`; `gs_getnext` yields exactly **one** vertex-or-edge per call so
-  the enclosing `ORDER BY <-> ... LIMIT 5` can stop early. No blocking, no
-  frontier materialization.
-- **One process, one txn manager, one WAL.** The access method runs inside the
-  forked Postgres backend, joins the current transaction, and logs through the
-  host's shared WAL. No second WAL, no cross-system transaction.
-- **Native adjacency list, not join tables.** Topology is a B-tree access method
-  over **32KB** pages — never relational join tables.
+- **TR-1 — Volcano + early termination.** Traversal is `gs_open` / `gs_getnext` / `gs_close`;
+  `gs_getnext` yields exactly **one** edge per call, reading at most one adjacency page, so an
+  enclosing `LIMIT` stops before later chain pages are read. No blocking, no frontier
+  materialization. (`gph_traverse` must be used in a target-list / `ProjectSet` position, not a
+  FROM-clause `FunctionScan`, or `LIMIT` materializes and forfeits early termination.)
+- **One process, one txn manager, one WAL.** Runs inside the forked Postgres backend, joins the
+  current transaction, logs through the host's shared WAL. No second WAL, no cross-system txn.
+- **Native adjacency list, not join tables.** Topology is a page-level store over **32KB** pages.
 - **Single edge label for v1:** `:related_to` (entity → entity).
+
+## Build & test
+
+```bash
+scripts/x86build.sh --docker     # produce tridb/msvbase:dev (once)
+make graph-test                  # runs this store's suite (DEV-1164 core + DEV-1165 traversal)
+                                 #   via scripts/graph_am_test.sh, then the tri-modal suites
+```
 
 ## Specs and status
 
-- **Layout contract (authoritative):** `docs/graph_store_layout_v0.1.0.md`
-  (32KB page layout, shared-WAL behavior, single `:related_to` edge). The
-  constants in `graphstore.h` (`GRAPHSTORE_BLOCKSZ`, `GRAPHSTORE_EDGE_LABEL`)
-  mirror that spec — keep them in sync.
-- **Build / gating status:** `docs/STATUS.md`.
+- **Layout contract (authoritative):** `docs/graph_store_layout_v0.1.0.md` (DEV-1163).
+- **Decisions:** ADR-0002 (layout), ADR-0003 (v1 core AM), ADR-0005 (traversal iterator).
+- **Build / gating status:** `docs/STATUS.md`. GX10 owns only ARM64 sign-off + the benchmark.
 
 ## Implementing issues
 
-| Issue | Scope |
-| ----- | ----- |
-| **DEV-1164** | Adjacency-list access method (`graphstore_open` / `insert_vertex` / `insert_edge`, B-tree over 32KB pages). |
-| **DEV-1165** | Graph traversal iterator (`gs_open` / `gs_getnext` / `gs_close`, one element per Next, early termination). |
-| **DEV-1166** | Verify shared transaction manager (FR-7): no second WAL, atomicity under the host txn. |
-
-## Handoff to GX10
-
-1. Build the fork on GX10 via `scripts/gx10build.sh`.
-2. Implement against `docs/graph_store_layout_v0.1.0.md`, binding `graphstore.h`
-   to the PG 13.4 access-method headers listed in its include block.
-3. Static-assert `GRAPHSTORE_BLOCKSZ` against the live `BLCKSZ`.
+| Issue | Scope | Status |
+| ----- | ----- | ------ |
+| **DEV-1164** | Adjacency-list access method (page store over 32KB pages, WAL-backed). | core merged |
+| **DEV-1165** | Graph traversal iterator (`gs_*` engine + `gph_traverse` edge SRF, one edge per Next, early termination). | this work |
+| **DEV-1166** | Verify shared transaction manager (FR-7): atomicity under the host txn + concurrency audit. | pending |

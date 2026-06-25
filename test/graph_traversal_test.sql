@@ -13,6 +13,10 @@ SELECT gph_insert_edge(0, 2);
 SELECT gph_insert_edge(0, 3);
 SELECT gph_insert_edge(1, 4);
 
+-- NB: the correctness checks below call gph_traverse in a FROM-clause position — fine here
+-- because they are full scans (no LIMIT). TR-1 early termination is asserted ONLY via the
+-- target-list position at the LIMIT 5 check further down; a FROM-clause SRF would materialize.
+
 -- Edge emission: gph_traverse(0) yields (src=0, dst in {1,2,3}) — the edge, not just dst.
 DO $$
 DECLARE d bigint[]; s bigint[];

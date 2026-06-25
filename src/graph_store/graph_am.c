@@ -626,7 +626,7 @@ gph_neighbors(PG_FUNCTION_ARGS)
 		funcctx = SRF_FIRSTCALL_INIT();
 		oldctx = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
 
-		scan = (GraphScanDesc *) palloc0(sizeof(struct GraphScanDescData));
+		scan = (GraphScanDesc *) palloc0(sizeof(GraphScanDesc));
 		rel = gph_open_store(AccessShareLock);
 		(void) gs_open(scan, rel, src, GRAPH_SCAN_OUTGOING);	/* absent src => empty (lenient SRF) */
 		relation_close(rel, AccessShareLock);
@@ -684,7 +684,7 @@ gph_traverse(PG_FUNCTION_ARGS)
 					 errmsg("gph_traverse must be called in a context that expects a record")));
 		funcctx->tuple_desc = BlessTupleDesc(tupdesc);
 
-		scan = (GraphScanDesc *) palloc0(sizeof(struct GraphScanDescData));
+		scan = (GraphScanDesc *) palloc0(sizeof(GraphScanDesc));
 		rel = gph_open_store(AccessShareLock);
 		(void) gs_open(scan, rel, src, GRAPH_SCAN_OUTGOING);	/* absent src => empty (lenient SRF) */
 		relation_close(rel, AccessShareLock);

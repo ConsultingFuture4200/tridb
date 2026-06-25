@@ -70,28 +70,17 @@ extern "C" {
 #define GRAPHSTORE_EDGE_LABEL       "related_to"
 
 /* -------------------------------------------------------------------------
- * Opaque handle types.
+ * Opaque scan descriptor.
  *
- * Callers hold these by pointer only. Their layouts are private to the
- * implementation (defined in the .c behind the GX10 gate); this header
- * forward-declares them so the surface compiles without exposing internals.
+ * GraphScanDesc — the Volcano traversal-iterator cursor (TR-1). Its body
+ * (struct GraphScanDescData) is private to graph_am.c; this header forward-
+ * declares it so callers hold it by pointer. Created by gs_open(), advanced one
+ * EDGE per gs_getnext(), released by gs_close(). Never materializes the frontier.
+ * (The deferred cross-extension GraphStore handle API has no v1 consumer, so its
+ * typedefs are intentionally absent — see the implementation-surface note below.)
  * ------------------------------------------------------------------------- */
 
-/*
- * GraphStore — a single native adjacency-list graph store instance, bound to
- * a host Postgres Relation and the current transaction's resource owner.
- * Opaque: lifecycle is graphstore_open() ... graphstore_close().
- */
-typedef struct GraphStoreData GraphStore;
-typedef GraphStore *GraphStoreHandle;
-
-/*
- * GraphScanDesc — the Volcano traversal-iterator descriptor (TR-1).
- * Opaque: created by gs_open(), advanced one element per gs_getnext(),
- * released by gs_close(). Never materializes the full traversal frontier.
- */
 typedef struct GraphScanDescData GraphScanDesc;
-typedef GraphScanDesc *GraphScanDescHandle;
 
 /* -------------------------------------------------------------------------
  * Stable identifiers.
