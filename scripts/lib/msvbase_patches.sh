@@ -51,6 +51,10 @@ verify_patches() {
     || die "TriDB sptag_optional_build.patch NOT applied — WITH_SPTAG gate missing (DEV-1228); drift?"
   grep -q 'TRIDB_ASSERT_VECTOR_BACKEND' "$root/src/hnswindex_scan.cpp" \
     || die "TriDB tridb_vector_index_seam.patch NOT applied — vector-index seam missing (DEV-1228); drift?"
+  grep -q 'tridb_vec_open' "$root/src/tridb_vector_iter.cpp" 2>/dev/null \
+    || die "TriDB tridb_vector_iter.patch NOT applied — relaxed-mono vector iterator missing (DEV-1168); drift?"
+  grep -q 'src/tridb_vector_iter.cpp' "$root/CMakeLists.txt" \
+    || die "TriDB tridb_vector_iter.patch NOT wired into CMakeLists vectordb sources (DEV-1168); drift?"
   log "all MSVBASE + TriDB fork patches verified present"
 }
 
@@ -107,6 +111,23 @@ apply_tridb_fork_patches() {
     log "applying TriDB fork patch: TriDB-owned vector-index seam (DEV-1228 / ADR-0004)"
     ( cd "$root" && git apply "$seam_patch" ) \
       || die "tridb_vector_index_seam.patch did not apply — MSVBASE drift? re-generate per ADR-0004"
+  fi
+
+  #   tridb_vector_iter.patch (DEV-1168, FR-3): the relaxed-monotonicity vector iterator the TJS
+  #     operator (DEV-1169) drives WITHOUT an IndexScanDesc. Adds src/tridb_vector_iter.{hpp,cpp}
+  #     (extern "C" Open/Next/Close lifting hnsw_gettuple's stop into a caller-controlled bound,
+  #     surfacing hnswlib's internal GetDistance() per Next) + src/tridb_vector_probe.cpp (a
+  #     test-only SQL SRF), wires both into the UNCONDITIONAL vectordb source list, and declares
+  #     tridb_vec_probe() in sql/vectordb.sql. Must apply AFTER the seam patch (it relies on
+  #     HNSWIndexScan + the seam contract). hnswlib-only — no SPTAG.
+  local iter_patch="${_MSVBASE_LIB_DIR}/../patches/tridb_vector_iter.patch"
+  [[ -f "$iter_patch" ]] || die "missing TriDB fork patch: $iter_patch"
+  if grep -q 'tridb_vec_open' "$root/src/tridb_vector_iter.cpp" 2>/dev/null; then
+    log "TriDB fork patch (relaxed-mono vector iterator, DEV-1168) already applied"
+  else
+    log "applying TriDB fork patch: relaxed-monotonicity vector iterator (DEV-1168 / FR-3)"
+    ( cd "$root" && git apply "$iter_patch" ) \
+      || die "tridb_vector_iter.patch did not apply — MSVBASE drift? re-generate per DEV-1168"
   fi
 }
 
