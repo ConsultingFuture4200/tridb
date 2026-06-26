@@ -103,6 +103,49 @@ The TriDB side emits the same per-query intermediate sizes; SM-1 is the ratio
 of baseline `merged_candidates` (and friends) to TriDB's fused intermediate
 sets.
 
+## 6. FAIR SM-2 head-to-head (`make sm2`) — DEV-1171 completion
+
+`make sm2` runs the **like-for-like** latency comparison: LIVE TriDB vs this LIVE
+multi-system stack, on the IDENTICAL corpus, measured the SAME way on both sides.
+
+```bash
+make baseline-up                      # this stack, healthy
+scripts/x86build.sh --docker          # the tridb/msvbase:dev engine image
+PGPORT=5432 make sm2                  # set PGPORT if Postgres isn't on the default 5432
+```
+
+What it does (`scripts/bench_sm2.sh`):
+
+1. `tools/bench_sm2_corpus.py` builds ONE corpus from the shared deterministic
+   generator (`tools/bench_corpus_shared.py`, same seed/params the TriDB live
+   bench uses) and writes the SQL + a public manifest. The TriDB side and the
+   baseline are both driven from that single corpus — identical entity ids,
+   embeddings, edges, timestamps, and the 12 query vectors/windows/k.
+2. **TriDB side**: inside the engine image, loads the corpus + HNSW index ONCE
+   (untimed), then times the canonical `tjs()` query over a warm psql connection
+   — `\timing` round-trip, median of N runs after a warm-up.
+3. **Baseline side** (`baseline/sm2.py`): loads all three systems ONCE (untimed),
+   then times the *realized* canonical query (pinned-src 1-hop graph reach,
+   ANN over-fetch k×32 ranked by dst distance, timestamp filter, app-side merge)
+   over warm clients — Python `perf_counter`, median of N runs after a warm-up.
+4. `bench/sm2_compare.py` computes SM-2 = fraction of queries where TriDB
+   end-to-end median < baseline end-to-end median (target ≥ 80%), the latency
+   ratios, the baseline intermediate sizes (SM-1 cross-check), and TriDB-vs-
+   baseline answer parity.
+
+Artifacts: `bench/results/sm2_metrics.json`, `bench/results/sm2_tridb_raw.txt`,
+`bench/results/sm2_baseline.json`, and `docs/benchmark_sm2_v0.1.0.md`.
+
+> **Methodology honesty.** Both sides report client-side end-to-end wall-clock
+> over warm connections (load/index excluded) — NOT TriDB's EXPLAIN-ANALYZE-only
+> time (which DEV-1173 correctly left GATED). The baseline's three cross-system
+> round-trips are inherent to out-of-DB integration, which is the architectural
+> cost this benchmark measures.
+
+> **Postgres note.** `baseline/sm2.py` loads via batched multi-row `INSERT`
+> (not `COPY FROM STDIN`) so it works against PGlite-style PG shims as well as
+> stock Postgres 16. Point it at a non-5432 port with `PGPORT`.
+
 ## Connection params
 
 All clients read env vars with localhost defaults — override to point at a

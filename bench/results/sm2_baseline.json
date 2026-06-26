@@ -1,0 +1,383 @@
+{
+  "baseline": "akasicdb-scenario-2-live-multisystem",
+  "methodology": "end-to-end client wall-clock per query over WARM connections (one warm-up discarded); MEDIAN of N measured runs; one-time load+index build EXCLUDED; realized canonical semantics (pinned src, 1-hop graph reach, ANN over-fetch k*32 ranked by dst distance, timestamp-window filter, app-side merge top-k)",
+  "k": 5,
+  "seed": 42,
+  "runs": 7,
+  "num_queries": 12,
+  "ann_overfetch": 32,
+  "queries": [
+    {
+      "qid": 0,
+      "src": 0,
+      "k": 5,
+      "latency_total_ms": 20.680473011452705,
+      "latency_samples_ms": [
+        19.5529,
+        21.326,
+        20.6365,
+        21.3911,
+        19.1022,
+        20.6805,
+        21.2052
+      ],
+      "latency_graph_ms": 11.4369,
+      "latency_vector_ms": 6.8718,
+      "latency_relational_ms": 3.069,
+      "latency_merge_ms": 0.0276,
+      "graph_reached_dst": 150,
+      "vector_candidates": 160,
+      "relational_filtered": 95,
+      "merged_candidates": 19,
+      "final_results": 5,
+      "result_ids": [
+        849,
+        627,
+        197,
+        47,
+        1408
+      ]
+    },
+    {
+      "qid": 1,
+      "src": 1,
+      "k": 5,
+      "latency_total_ms": 18.262144993059337,
+      "latency_samples_ms": [
+        17.3837,
+        21.9988,
+        16.717,
+        18.9175,
+        18.2621,
+        21.0857,
+        15.8095
+      ],
+      "latency_graph_ms": 8.369,
+      "latency_vector_ms": 6.1182,
+      "latency_relational_ms": 3.0566,
+      "latency_merge_ms": 0.0398,
+      "graph_reached_dst": 150,
+      "vector_candidates": 160,
+      "relational_filtered": 87,
+      "merged_candidates": 21,
+      "final_results": 5,
+      "result_ids": [
+        573,
+        1909,
+        1024,
+        278,
+        882
+      ]
+    },
+    {
+      "qid": 2,
+      "src": 2,
+      "k": 5,
+      "latency_total_ms": 18.75584595836699,
+      "latency_samples_ms": [
+        22.1053,
+        18.724,
+        20.5573,
+        18.7558,
+        17.4625,
+        18.8873,
+        17.961
+      ],
+      "latency_graph_ms": 9.5127,
+      "latency_vector_ms": 6.2285,
+      "latency_relational_ms": 2.6707,
+      "latency_merge_ms": 0.0208,
+      "graph_reached_dst": 150,
+      "vector_candidates": 160,
+      "relational_filtered": 90,
+      "merged_candidates": 7,
+      "final_results": 5,
+      "result_ids": [
+        1013,
+        1209,
+        905,
+        1347,
+        1754
+      ]
+    },
+    {
+      "qid": 3,
+      "src": 3,
+      "k": 5,
+      "latency_total_ms": 21.853970014490187,
+      "latency_samples_ms": [
+        22.3348,
+        22.7758,
+        20.8,
+        21.854,
+        21.023,
+        24.4573,
+        19.1872
+      ],
+      "latency_graph_ms": 10.0068,
+      "latency_vector_ms": 6.6243,
+      "latency_relational_ms": 4.6203,
+      "latency_merge_ms": 0.0378,
+      "graph_reached_dst": 150,
+      "vector_candidates": 160,
+      "relational_filtered": 92,
+      "merged_candidates": 8,
+      "final_results": 5,
+      "result_ids": [
+        524,
+        1105,
+        1343,
+        1938,
+        1777
+      ]
+    },
+    {
+      "qid": 4,
+      "src": 4,
+      "k": 5,
+      "latency_total_ms": 28.069377993233502,
+      "latency_samples_ms": [
+        26.2326,
+        28.0694,
+        24.3197,
+        19.735,
+        28.8675,
+        33.3745,
+        32.3492
+      ],
+      "latency_graph_ms": 11.0585,
+      "latency_vector_ms": 9.7198,
+      "latency_relational_ms": 4.0628,
+      "latency_merge_ms": 0.031,
+      "graph_reached_dst": 149,
+      "vector_candidates": 160,
+      "relational_filtered": 82,
+      "merged_candidates": 11,
+      "final_results": 5,
+      "result_ids": [
+        508,
+        1133,
+        637,
+        795,
+        703
+      ]
+    },
+    {
+      "qid": 5,
+      "src": 5,
+      "k": 5,
+      "latency_total_ms": 21.273125952575356,
+      "latency_samples_ms": [
+        23.8602,
+        22.7192,
+        20.7961,
+        22.3965,
+        21.2731,
+        17.8198,
+        19.8202
+      ],
+      "latency_graph_ms": 9.7393,
+      "latency_vector_ms": 6.3123,
+      "latency_relational_ms": 4.7748,
+      "latency_merge_ms": 0.0378,
+      "graph_reached_dst": 150,
+      "vector_candidates": 160,
+      "relational_filtered": 97,
+      "merged_candidates": 13,
+      "final_results": 5,
+      "result_ids": [
+        1609,
+        1905,
+        889,
+        1098,
+        1087
+      ]
+    },
+    {
+      "qid": 6,
+      "src": 6,
+      "k": 5,
+      "latency_total_ms": 18.584192963317037,
+      "latency_samples_ms": [
+        18.5842,
+        18.5405,
+        17.2987,
+        22.849,
+        18.6651,
+        17.1486,
+        19.3331
+      ],
+      "latency_graph_ms": 8.4508,
+      "latency_vector_ms": 6.4584,
+      "latency_relational_ms": 4.3655,
+      "latency_merge_ms": 0.0285,
+      "graph_reached_dst": 150,
+      "vector_candidates": 160,
+      "relational_filtered": 82,
+      "merged_candidates": 21,
+      "final_results": 5,
+      "result_ids": [
+        1946,
+        669,
+        339,
+        280,
+        1599
+      ]
+    },
+    {
+      "qid": 7,
+      "src": 7,
+      "k": 5,
+      "latency_total_ms": 17.511473037302494,
+      "latency_samples_ms": [
+        20.6336,
+        19.6546,
+        17.5115,
+        18.0967,
+        16.2672,
+        16.8922,
+        16.1999
+      ],
+      "latency_graph_ms": 7.5235,
+      "latency_vector_ms": 6.4599,
+      "latency_relational_ms": 3.1341,
+      "latency_merge_ms": 0.0335,
+      "graph_reached_dst": 150,
+      "vector_candidates": 160,
+      "relational_filtered": 85,
+      "merged_candidates": 20,
+      "final_results": 5,
+      "result_ids": [
+        164,
+        1719,
+        282,
+        1339,
+        1690
+      ]
+    },
+    {
+      "qid": 8,
+      "src": 8,
+      "k": 5,
+      "latency_total_ms": 18.33845500368625,
+      "latency_samples_ms": [
+        19.1647,
+        18.1214,
+        20.9916,
+        18.3385,
+        22.7738,
+        17.9212,
+        18.296
+      ],
+      "latency_graph_ms": 8.9748,
+      "latency_vector_ms": 6.3015,
+      "latency_relational_ms": 3.9902,
+      "latency_merge_ms": 0.0378,
+      "graph_reached_dst": 150,
+      "vector_candidates": 160,
+      "relational_filtered": 87,
+      "merged_candidates": 23,
+      "final_results": 5,
+      "result_ids": [
+        701,
+        460,
+        1579,
+        1840,
+        53
+      ]
+    },
+    {
+      "qid": 9,
+      "src": 9,
+      "k": 5,
+      "latency_total_ms": 17.929992987774312,
+      "latency_samples_ms": [
+        17.93,
+        16.5891,
+        20.2657,
+        19.6404,
+        17.3403,
+        18.4219,
+        17.5473
+      ],
+      "latency_graph_ms": 8.1949,
+      "latency_vector_ms": 6.2954,
+      "latency_relational_ms": 2.8341,
+      "latency_merge_ms": 0.0224,
+      "graph_reached_dst": 150,
+      "vector_candidates": 160,
+      "relational_filtered": 86,
+      "merged_candidates": 13,
+      "final_results": 5,
+      "result_ids": [
+        1238,
+        1140,
+        1829,
+        1047,
+        1142
+      ]
+    },
+    {
+      "qid": 10,
+      "src": 10,
+      "k": 5,
+      "latency_total_ms": 19.210301979910582,
+      "latency_samples_ms": [
+        19.2103,
+        20.35,
+        17.4898,
+        20.2773,
+        20.9283,
+        17.4915,
+        18.4664
+      ],
+      "latency_graph_ms": 8.9796,
+      "latency_vector_ms": 6.2762,
+      "latency_relational_ms": 3.4137,
+      "latency_merge_ms": 0.0267,
+      "graph_reached_dst": 150,
+      "vector_candidates": 160,
+      "relational_filtered": 97,
+      "merged_candidates": 21,
+      "final_results": 5,
+      "result_ids": [
+        290,
+        941,
+        985,
+        702,
+        849
+      ]
+    },
+    {
+      "qid": 11,
+      "src": 11,
+      "k": 5,
+      "latency_total_ms": 18.155551981180906,
+      "latency_samples_ms": [
+        17.0917,
+        18.1556,
+        15.6744,
+        21.0529,
+        15.942,
+        20.5059,
+        19.7934
+      ],
+      "latency_graph_ms": 8.3882,
+      "latency_vector_ms": 6.495,
+      "latency_relational_ms": 3.0408,
+      "latency_merge_ms": 0.0301,
+      "graph_reached_dst": 150,
+      "vector_candidates": 160,
+      "relational_filtered": 89,
+      "merged_candidates": 18,
+      "final_results": 5,
+      "result_ids": [
+        727,
+        1743,
+        1095,
+        745,
+        1320
+      ]
+    }
+  ]
+}
