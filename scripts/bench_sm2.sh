@@ -44,6 +44,7 @@ K="${BENCH_K:-5}"
 WINDOW="${BENCH_WINDOW:-600}"
 SEED="${BENCH_SEED:-42}"
 RUNS="${SM2_RUNS:-7}"
+TERMCOND="${BENCH_TERMCOND:-0}"   # tjs() operating point (0 -> engine default 50); pin it for a fair SM-2
 
 OUTDIR="$ROOT/bench/results"
 WORK="$(mktemp -d)"
@@ -59,10 +60,11 @@ docker image inspect "$IMAGE" >/dev/null 2>&1 || {
 PY="python3"
 [ -x "$ROOT/.venv/bin/python" ] && PY="$ROOT/.venv/bin/python"
 
-echo "[sm2] generating identical corpus (entities=$ENTITIES dim=$DIM hubs=$HUBS fanout=$FANOUT queries=$QUERIES k=$K seed=$SEED runs=$RUNS)"
+echo "[sm2] generating identical corpus (entities=$ENTITIES dim=$DIM hubs=$HUBS fanout=$FANOUT queries=$QUERIES k=$K seed=$SEED runs=$RUNS term_cond=$TERMCOND)"
 "$PY" "$ROOT/tools/bench_sm2_corpus.py" \
   --entities "$ENTITIES" --dim "$DIM" --hubs "$HUBS" --fanout "$FANOUT" \
   --queries "$QUERIES" --k "$K" --window "$WINDOW" --seed "$SEED" --runs "$RUNS" \
+  --term-cond "$TERMCOND" \
   --sql-out "$SQL" --manifest-out "$MANIFEST"
 
 # ----- TriDB side: live tjs() client wall-clock inside the engine image --------

@@ -42,7 +42,7 @@ import json
 from bench_corpus_shared import build_corpus, vec_literal
 
 
-def build_sql(manifest: dict, runs: int) -> str:
+def build_sql(manifest: dict, runs: int, term_cond: int = 0) -> str:
     n = manifest["entities"]
     dim = manifest["dim"]
     k = manifest["k"]
@@ -58,7 +58,7 @@ def build_sql(manifest: dict, runs: int) -> str:
     w("-- Do not edit by hand; regenerate via scripts/bench_sm2.sh.")
     w(
         f"-- corpus={n} dim={dim} hubs={manifest['hubs']} fanout={manifest['fanout']} "
-        f"queries={len(queries)} edges={len(edges)} k={k} runs={runs}"
+        f"queries={len(queries)} edges={len(edges)} k={k} runs={runs} term_cond={term_cond}"
     )
     w("\\set ON_ERROR_STOP on")
 
@@ -97,7 +97,7 @@ def build_sql(manifest: dict, runs: int) -> str:
         win = ",".join(str(t) for t in q["window"])
         qvec = vec_literal(q["embedding"])
         w(
-            f"SELECT count(*) FROM tjs('entities', {k}, 0, {src}::bigint, 'id, chunk', "
+            f"SELECT count(*) FROM tjs('entities', {k}, {term_cond}, {src}::bigint, 'id, chunk',"
             f"'ts IN ({win})', 'embedding <-> ''{qvec}''') AS t(id bigint, chunk text);"
         )
 
@@ -112,7 +112,7 @@ def build_sql(manifest: dict, runs: int) -> str:
             # each run: a single top-level tjs() statement (fork-safe). psql prints
             # a `Time: <ms> ms` line after each — the client-side wall-clock.
             w(
-                f"SELECT t.id FROM tjs('entities', {k}, 0, {src}::bigint, 'id, chunk', "
+                f"SELECT t.id FROM tjs('entities', {k}, {term_cond}, {src}::bigint, 'id, chunk',"
                 f"'ts IN ({win})', 'embedding <-> ''{qvec}''') AS t(id bigint, chunk text);"
             )
         # capture the answer ids once (for SM-4 parity vs the baseline).
@@ -122,7 +122,7 @@ def build_sql(manifest: dict, runs: int) -> str:
             "COALESCE(array_to_string(array_agg(id), ','), '') AS line FROM ("
         )
         w(
-            f"  SELECT t.id FROM tjs('entities', {k}, 0, {src}::bigint, 'id, chunk', "
+            f"  SELECT t.id FROM tjs('entities', {k}, {term_cond}, {src}::bigint, 'id, chunk',"
             f"'ts IN ({win})', 'embedding <-> ''{qvec}''') AS t(id bigint, chunk text)"
         )
         w(") s;")
@@ -147,12 +147,22 @@ def main(argv=None) -> int:
     p.add_argument("--query-jitter", type=float, default=0.35)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--runs", type=int, default=7, help="measured tjs() runs per query")
+    p.add_argument(
+        "--term-cond",
+        type=int,
+        default=0,
+        help="tjs() early-termination depth (0 -> engine default 50). The recall/latency "
+        "operating point; pin the SAME value for the SM-2 latency and recall claims.",
+    )
     p.add_argument("--sql-out", required=True)
     p.add_argument("--manifest-out", required=True)
     args = p.parse_args(argv)
 
     manifest = build_corpus(args)
-    sql = build_sql(manifest, args.runs)
+    manifest["term_cond"] = (
+        args.term_cond
+    )  # recorded in the public manifest for sm2_compare
+    sql = build_sql(manifest, args.runs, term_cond=args.term_cond)
 
     # strip the bulky inline corpus arrays before writing the public manifest:
     # the baseline rebuilds them deterministically from the seed (same as the
@@ -166,7 +176,7 @@ def main(argv=None) -> int:
     print(
         f"[bench_sm2_corpus] wrote {args.sql_out} + manifest {args.manifest_out} "
         f"(corpus={args.entities} dim={args.dim} queries={args.queries} k={args.k} "
-        f"runs={args.runs})"
+        f"runs={args.runs} term_cond={args.term_cond})"
     )
     return 0
 

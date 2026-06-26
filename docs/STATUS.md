@@ -1,7 +1,106 @@
 # TriDB Build Status — per-issue gating
 
-Updated: 2026-06-23. Legend: 🟢 unblocked here · 🟡 partial (design here,
+Updated: 2026-06-26. Legend: 🟢 unblocked here · 🟡 partial (design here,
 build on GX10) · 🔴 GX10-gated (needs live MSVBASE build).
+
+> **🟡 ARM NEON L2 KERNEL ADDED 2026-06-26 (DEV-1234) — un-sandbags ANN/TJS latency on the GX10.**
+> On aarch64 the build strips MSVBASE's hardcoded x86 ISA flags (`scripts/lib/msvbase_patches.sh`
+> `patch_cmake_arm_isa_flags`), so hnswlib's `USE_SSE/AVX` SIMD paths are all dead and `L2Space` fell
+> back to the **scalar `L2Sqr`** for EVERY distance — the hottest loop in ANN search and the TJS
+> re-rank — making every ARM latency number wrong-low. Added a native NEON `L2Sqr` kernel to
+> `thirdparty/hnsw/hnswlib/space_l2.h` (`scripts/patches/tridb_neon_l2_distance.patch`, wired into
+> the patch chain + `verify_patches`; gated on `__ARM_NEON`, inert on x86 — no build-flag change).
+> Validated ON THE GX10 (aarch64): `tools/neon_l2_bench.c` shows the kernel equals scalar within
+> **1e-4 rel err** across dims (incl. residual paths 31/100) and is **3.6× (dim 32) / 6.1× (dim 128)
+> / 7.8× (dim 768)** faster per distance call; the patched header also compiles in-context and
+> `L2Space` returns correct distances at dims 16/32/100/128/768. ENGINE A/B ON THE GX10: rebuilding
+> `vectordb.so` through the real MSVBASE `make` (so the patch is proven to build AND run in the
+> engine), the HNSW **index-build time on a 20k×128 corpus drops 4.2× — 47.8 s (scalar) → 11.3 s
+> (NEON)** on the same cluster, consistent with the per-call kernel speedup (distance is the dominant
+> cost of HNSW construction). REMAINING (GX10): roll this into the 128 GB headline benchmark and
+> report the end-to-end query-latency delta at the operating point.
+
+> **🟡 HNSW RELOPTIONS + RECALL/LATENCY SWEEP 2026-06-26 (DEV-1286) — index quality unblocked by NEON.**
+> Exposed per-index `m` / `ef_construction` as HNSW reloptions (`WITH (m=.., ef_construction=..)`,
+> `scripts/patches/tridb_hnsw_reloptions.patch`, wired + verified; default 0 -> hnswlib defaults, so
+> existing indexes are unchanged). Swept index-quality × `term_cond` on the **NEON+reloptions engine
+> rebuilt through the real MSVBASE `make`** on the GX10 (20k×128, 8 queries, k=10; `tools/sweep_corpus.py`).
+> Live result: at the recall@10 = **100%** operating point (`term_cond=20`, default index) the canonical
+> `tjs()` query runs in **~1.8 ms median at 2.18% examined** — the first real latency on the target ISA
+> (closes the GTM R1 latency gate at moderate scale). High-quality `m=32/ef_construction=400` now builds
+> in **5.4 s** (impractical on the scalar fallback — the reason DEV-1286 was gated). At 20k×128 recall is
+> saturated, so quality/`term_cond` trade latency not recall; the recall *curve* (where they move recall)
+> is the **100k/768** headline ([[DEV-1169]] measured the recall side). Full table + repro:
+> `docs/benchmark_neon_sweep_v0.1.0.md`; artifacts in `bench/results/neon_sweep_*`.
+
+> **🟡 TJS JOIN-ORDER INTEGRATION DESIGN 2026-06-26 (DEV-1285) — ADR + safe draft, operator change GX10-gated.**
+> The DEV-1170 decision core is shipped; integrating it is NOT a wiring task — `tjs()` is a C SRF (not a
+> CustomScan), and it is hardwired vector-first, so "filter-first" is a new physical path. ADR-0011
+> (`docs/decisions/0011-tjs-join-order-integration.md`) analyzes the two options and recommends **Option B**
+> (pass the chosen order into `tjs()` as a parameter; keeps the validated vector-first body + its
+> early-termination bound untouched, preserving TR-1). Delivered: the ADR, a safe additive
+> `src/planner/join_order_legstats.{c,h}` catalog helper (UNBUILT-HERE), and a GX10-gated FR-6 stub test.
+> Surfaced a real gap: the graph metapage has no `avg_out_degree` (needs `gm_edge_count`, graph-store
+> follow-up). The risky operator change (filter-first body) is deliberately NOT started — GX10-gated.
+
+> **🟢 REAL-DATASET BENCH HARNESS 2026-06-26 (DEV-1284) — recall measurable on real vectors today.**
+> `tools/real_corpus.py`: loads real embeddings (`.npy/.fvecs/.ivecs/.hdf5`, h5py lazy-imported),
+> synthesizes the same topical hub graph the synthetic harness uses, computes the EXACT numpy top-k
+> oracle, and emits the IDENTICAL `#BENCH` SQL + manifest the live harness consumes. The SQL emitter
+> is now shared (`tools/bench_corpus.py:build_sql`, single source of truth) so the format cannot drift
+> between the synthetic and real paths. Recall@k / SM-4 is gradeable on the x86 standin WITHOUT the
+> engine; latency (SM-2) / live candidates-examined (SM-3) stay GX10-gated and are never claimed.
+> 110 Python tests pass, lint clean. Seam to wire engine recall into `bench/live_report.py` documented.
+
+> **🟢 CRASH-RECOVERY SUITE-ORDERING FLAKE FIXED 2026-06-26 (DEV-1234 P1b).** `scripts/crash_recovery_test.sh`
+> scenario 2 (uncommitted tri-store txn) raced host load when it ran LAST in `make graph-test`: the
+> 40s sentinel poll could time out before the doomed txn went active, and a self-expiring `pg_sleep(60)`
+> could ELAPSE and COMMIT the "doomed" txn, breaking the post-recovery "nothing visible" assert. Fixed
+> by holding the txn open with `pg_sleep(3600)` (always killed by the crash; never self-commits) + a
+> generous, liveness-checked ~180s readiness budget. Both scenarios PASS against `tridb/msvbase:dev`.
+
+> **🟢 TJS SCALE-DEFECT FIXED 2026-06-26 (DEV-1169) — the defining feature is now correct at scale.**
+> The first 100k/dim-768 GX10 benchmark exposed a predicate-blind early-termination bug in the TJS
+> operator: graph/relational predicate rejections were counted as VBASE "drops", so a selective
+> predicate tripped `term_cond` before the top-k filled → empty/partial answers (SM-4 = 5%, invisible
+> at the 2k/dim-32 standin where it read 100%). Fixed in `tridb_tjs_predicate_termination.patch` (a
+> "drop" now means past-frontier only: PQ full AND distance ≥ k-th). It is a **correctness fix, not a
+> speed win** — and the honest result is a recall/effort curve, not a single number:
+>
+> | `term_cond` | SM-4 exact-parity | SM-3 examined | |
+> |---|---|---|---|
+> | 50 (default) | 58.5% | 3.6% | approximate, fast |
+> | 5000 | 97.2% | 10.9% | |
+> | 10000 | 100% | 20.1% | exact; < 25% TR-1 ceiling |
+>
+> Linus-reviewed (logic + packaging; SHIP). Clean-room verified: fresh MSVBASE clone + full patch
+> chain builds, smoke + SM-1..SM-5 pass, SM-4=100% reproduced. Still open before any public claim:
+> latency-in-ms at the operating point vs a full-scan-filter baseline; `term_cond` exposed as the
+> recall knob (`BENCH_TERMCOND`), default left at 50. The crash_recovery scenario-2 timeout seen in
+> the full `graph-test` sequence is a pre-existing suite-ordering flake (tjs-independent; passes in
+> isolation), tracked separately.
+
+> **🟢 ON-TARGET SIGN-OFF 2026-06-25 — the fork now builds and runs on the real GX10.**
+> Ran `scripts/gx10build.sh` on the DGX Spark (`gx10-4210`, GB10, aarch64, 128 GB, 20 cores,
+> Docker 29.2.1, reachable over Tailscale as host `spark`). Results:
+> - **Build:** `[100%] Built target vectordb` → image `tridb/msvbase:gx10`. **DEV-1160/1161 signed off.**
+> - **Smoke** (`scripts/smoke_test.sh`): PASS — vectordb extension loads, 100k-row HNSW index
+>   builds, early-terminating ANN Index Scan path (TR-1) confirmed in EXPLAIN.
+> - **Engine suite** (`make graph-test IMAGE=tridb/msvbase:gx10`): exit 0, **47 PASS / 7
+>   "ALL TESTS PASSED"**, zero real failures. Validates on ARM64: graph traversal iterator
+>   (DEV-1165), FR-7 tri-store atomicity + SM-5 randomized (DEV-1166), crash/WAL recovery, and
+>   txn concurrency. The only non-PASS is the pre-documented logical-single-writer first-edge
+>   race (ADR-0003 KNOWN-LIMITATION), unchanged from x86.
+>
+> The first live run surfaced **two genuine ARM-only build deltas** the x86 standin could never
+> exercise — both fixed in `scripts/lib/msvbase_patches.sh` / `gx10build.sh` (branch
+> `dustin/dev-1161`): (1) `patch_cmake_arm_isa_flags` strips MSVBASE's hardcoded x86 ISA flags
+> (`-msse4.2 -maes -mavx2 -mmwaitx`) that aarch64 GCC rejects (failed every cmake probe as a
+> bogus "Could NOT find OpenMP_C"; hnswlib falls back to scalar L2Sqr); (2) a CWD-relative
+> smoke-test path in `gx10build.sh` (latent — that line had never run before).
+>
+> **Only remaining GX10 item: the 128 GB headline benchmark** (at-scale run; the functional
+> port is complete). Off-target benches stay x86-standin numbers.
 
 > **RE-GATED 2026-06-23:** the dev workstation was proven a viable **x86_64 standin** —
 > `scripts/x86build.sh --docker` builds the MSVBASE fork and `scripts/smoke_test.sh`

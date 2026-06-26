@@ -159,7 +159,7 @@ tests/       Python unit tests (harness, planner, corpus)
 
 ## Status
 
-Active development, tracked in Linear project **TriDB**. The tri-modal engine — native graph store, TJS operator, SQL/PGQ surface, HNSW vector durability, and cross-modal join ordering — is feature-complete and benchmarked on the x86_64 standin. Remaining on-target work: the GX10 ARM64 build sign-off and the 128 GB headline benchmark. See [`docs/STATUS.md`](docs/STATUS.md) for the per-issue breakdown.
+Active development, tracked in Linear project **TriDB**. The tri-modal engine — native graph store, TJS operator, SQL/PGQ surface, HNSW vector durability, and cross-modal join ordering — is feature-complete. The **GX10 ARM64 build + engine suite are signed off** (the fork builds and the full suite passes on the DGX Spark; the first at-scale run found and fixed a TJS early-termination scale defect — SM-4 restored to 100%). Remaining on-target work: the **128 GB headline benchmark**, plus the honest SM-2 latency re-measurement at the corrected operating point (DEV-1284). See [`docs/STATUS.md`](docs/STATUS.md) for the per-issue breakdown.
 
 ## License
 

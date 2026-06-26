@@ -16,6 +16,11 @@
 _MSVBASE_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Validated upstream base (plan 002). Honors a prior assignment (e.g. from --commit).
+# RE-PIN DISCIPLINE: this pin is the contract the entire fork-patch chain below is diffed against
+# (esp. the stacked tjs_operator -> DEV-1236 snapshot -> DEV-1169 termination patches, which target
+# the SAME file in sequence). Bumping PIN_COMMIT requires a FULL clean-room rebuild + `make test-all`
+# (NOT just smoke) to re-validate every patch applies and the SM-1..SM-5 suite still passes — a
+# newer upstream may have touched the executor-lifecycle code these patches assume. (Linus review.)
 PIN_COMMIT="${PIN_COMMIT:-1a548db14d7a3f6f64808c99b9bc1aa01a25b71f}"   # MSVBASE "Fix vector constant parsing (#20)"
 
 # Official checksums for build-time downloads (supply-chain integrity, plan 007). Update these
@@ -71,6 +76,12 @@ verify_patches() {
     || die "TriDB tridb_hnsw_scan_no_orderby.patch NOT applied in hnswindex_scan.cpp — null-safe EndScan missing (DEV-1236); drift?"
   grep -q 'TRIDB: HNSW rebuild-on-recovery (DEV-1235)' "$root/src/hnswindex_scan.cpp" 2>/dev/null \
     || die "TriDB tridb_hnsw_rebuild_on_recovery.patch NOT applied — heap-rebuild-on-load missing (DEV-1235); drift?"
+  grep -q 'rank_score >= kth' "$root/src/tjs_operator.cpp" 2>/dev/null \
+    || die "TriDB tridb_tjs_predicate_termination.patch NOT applied — predicate-blind early termination (DEV-1169 scale defect); drift?"
+  grep -q 'L2SqrSIMD16ExtNEON' "$root/thirdparty/hnsw/hnswlib/space_l2.h" 2>/dev/null \
+    || die "TriDB tridb_neon_l2_distance.patch NOT applied — ARM NEON L2 kernel missing, scalar fallback sandbags latency (DEV-1234); drift?"
+  grep -q 'offsetof(hnsw_ParaOptions, ef_construction)' "$root/src/hnswindex.cpp" 2>/dev/null \
+    || die "TriDB tridb_hnsw_reloptions.patch NOT applied — HNSW m/ef_construction reloptions missing (DEV-1286); drift?"
   log "all MSVBASE + TriDB fork patches verified present"
 }
 
@@ -222,6 +233,65 @@ apply_tridb_fork_patches() {
       || die "tridb_hnsw_rebuild_on_recovery.patch did not apply — MSVBASE drift? re-generate per DEV-1235"
   fi
 
+  #   tridb_tjs_predicate_termination.patch (DEV-1169 scale defect, found on the first live GX10 run):
+  #     the TJS early-termination counted EVERY non-inserted candidate — INCLUDING graph/relational
+  #     predicate rejections — as a VBASE consecutive_drop, so a selective predicate tripped term_cond
+  #     BEFORE the top-k priority queue filled and tjs() returned an EMPTY/partial result. Confirmed at
+  #     100k/dim-768: examined==term_cond, SM-4 = 5% (0/12 exact). Invisible at toy scale (2k/dim-32:
+  #     qualifying rows sat in the top-50, SM-4 = 100%). Fix: a "drop" now means ONLY past-frontier
+  #     (PQ full AND distance >= k-th); predicate rejections and sub-threshold candidates do not advance
+  #     the counter, and termination cannot fire before the PQ fills (a selective predicate drains the
+  #     ANN stream to exhaustion, which is correct). Restores SM-4 to 100% at term_cond=10000 / SM-3
+  #     20.1% (still < 25%, TR-1 preserved). Diffed against the post-DEV-1236 tjs_operator.cpp, so it
+  #     MUST apply AFTER tridb_fix_double_scan_snapshot.patch (it does — this is last in the chain).
+  # Sentinel anchors on a LOAD-BEARING CODE token (the past-frontier drop test), NOT a comment
+  # phrase: a comment reformat must not silently let verify pass on an unapplied patch (Linus review).
+  local tjs_term_patch="${_MSVBASE_LIB_DIR}/../patches/tridb_tjs_predicate_termination.patch"
+  [[ -f "$tjs_term_patch" ]] || die "missing TriDB fork patch: $tjs_term_patch"
+  if grep -q 'rank_score >= kth' "$root/src/tjs_operator.cpp" 2>/dev/null; then
+    log "TriDB fork patch (predicate-correct TJS termination, DEV-1169 scale fix) already applied"
+  else
+    log "applying TriDB fork patch: predicate-correct TJS early termination (DEV-1169 scale fix)"
+    ( cd "$root" && git apply "$tjs_term_patch" ) \
+      || die "tridb_tjs_predicate_termination.patch did not apply — MSVBASE/DEV-1236 drift? re-generate per DEV-1169"
+  fi
+
+  # tridb_neon_l2_distance.patch (DEV-1234): native AArch64 NEON L2-squared kernel in hnswlib's
+  #   space_l2.h. On aarch64 the build strips x86 ISA flags (patch_cmake_arm_isa_flags below), so
+  #   USE_SSE/AVX are undefined and L2Space falls back to the scalar L2Sqr for EVERY distance — the
+  #   hottest loop in ANN search and the TJS re-rank — sandbagging all latency numbers. Adds a NEON
+  #   path gated on __ARM_NEON (no build-flag change needed; inert on x86). Validated equal to scalar
+  #   within 1e-4 rel err and 3.6x-7.8x faster (dim 32..768) on the GX10 via tools/neon_l2_bench.c.
+  #   Applies INSIDE the hnsw submodule (paths a/hnswlib/...), like upstream scripts/patch.sh, and
+  #   AFTER hnsw.patch (which only makes L2SqrSIMD16Ext static — disjoint from these hunks).
+  local neon_patch="${_MSVBASE_LIB_DIR}/../patches/tridb_neon_l2_distance.patch"
+  [[ -f "$neon_patch" ]] || die "missing TriDB fork patch: $neon_patch"
+  if grep -q 'L2SqrSIMD16ExtNEON' "$root/thirdparty/hnsw/hnswlib/space_l2.h" 2>/dev/null; then
+    log "TriDB fork patch (NEON L2 kernel, DEV-1234) already applied"
+  else
+    log "applying TriDB fork patch: AArch64 NEON L2 distance kernel (DEV-1234)"
+    ( cd "$root/thirdparty/hnsw" && git apply "$neon_patch" ) \
+      || die "tridb_neon_l2_distance.patch did not apply — hnswlib drift? re-generate from thirdparty/hnsw/hnswlib/space_l2.h"
+  fi
+
+  # tridb_hnsw_reloptions.patch (DEV-1286): expose per-index HNSW build quality as reloptions
+  #   WITH (m=..., ef_construction=...) on the vectordb HNSW AM (the relopt table previously exposed
+  #   only dimension/distmethod). Default 0 -> hnswlib defaults (M=16 / ef_construction=200), so
+  #   existing indexes are unchanged; opt-in per index. Threads the values into the FRESH-build
+  #   constructor (hnswindex_builder.cpp). NOTE: the DEV-1235 rebuild-on-recovery path
+  #   (hnswindex_scan.cpp LoadIndex) still rebuilds at hnswlib defaults — a tuned index recovers at
+  #   default quality until reindexed; documented follow-up, not wired here. Unblocked by NEON
+  #   (DEV-1234): higher build quality is only affordable to build once the distance kernel is SIMD.
+  local relopt_patch="${_MSVBASE_LIB_DIR}/../patches/tridb_hnsw_reloptions.patch"
+  [[ -f "$relopt_patch" ]] || die "missing TriDB fork patch: $relopt_patch"
+  if grep -q 'offsetof(hnsw_ParaOptions, ef_construction)' "$root/src/hnswindex.cpp" 2>/dev/null; then
+    log "TriDB fork patch (HNSW m/ef_construction reloptions, DEV-1286) already applied"
+  else
+    log "applying TriDB fork patch: HNSW m/ef_construction reloptions (DEV-1286)"
+    ( cd "$root" && git apply "$relopt_patch" ) \
+      || die "tridb_hnsw_reloptions.patch did not apply — MSVBASE drift? re-generate from src/{hnswindex.hpp,hnswindex.cpp,lib.cpp,hnswindex_builder.cpp}"
+  fi
+
   # ----------------------------------------------------------------------------
   # SUPERSEDED / DO NOT ENABLE (DEV-1235 / ADR-0009): original GenericXLog draft.
   # ----------------------------------------------------------------------------
@@ -337,5 +407,33 @@ patch_cmake_aarch64() {
     # If harden_dockerfile_downloads already injected the x86_64 checksum, swap it to the
     # aarch64 one too (no-op if hardening has not run). Keeps URL and hash consistent on ARM.
     sed -i "s#${CMAKE_3_14_4_X86_64_SHA256}#${CMAKE_3_27_9_AARCH64_SHA256}#g" "$df"
+  fi
+}
+
+# GX10/ARM-only delta #2: MSVBASE's CMakeLists.txt hardcodes x86-only ISA flags
+# (-msse4.2 -maes -mavx2 -mmwaitx) into the global CMAKE_C/CXX_FLAGS and two
+# target_compile_options(-mavx2). On aarch64 GCC these flags are UNRECOGNIZED, so
+# every cmake compile probe fails — the first visible casualty is the OpenMP probe
+# ("Could NOT find OpenMP_C (missing: OpenMP_C_FLAGS OpenMP_C_LIB_NAMES)"), NOT
+# OpenMP itself. Strip them on ARM. hnswlib's SIMD kernels are all gated on
+# __SSE__/__AVX__ (hnswlib.h: `#ifdef __SSE__` -> `#define USE_SSE`), which GCC
+# only predefines under -msse/-mavx; with the flags gone they compile via the
+# scalar L2Sqr/InnerProduct fallback (fstdistfunc_ = L2Sqr). Idempotent
+# (grep-guarded), with a post-condition assert that no x86 ISA flag survives.
+# Call ONLY on ARM, after patch_cmake_aarch64. (Performance tuning — Neoverse
+# -mcpu=native — is deferred; this is correctness-first to clear the ARM build.)
+patch_cmake_arm_isa_flags() {
+  local root="$1"
+  local top="$root/CMakeLists.txt"
+  local tp="$root/thirdparty/CMakeLists.txt"
+  [[ -f "$top" ]] || die "patch_cmake_arm_isa_flags: missing $top"
+  if grep -qE 'msse4\.2|maes|mavx2|mmwaitx' "$top" "$tp" 2>/dev/null; then
+    log "stripping hardcoded x86 ISA flags (-msse4.2 -maes -mavx2 -mmwaitx) for aarch64 (GX10 delta #2; hnswlib -> scalar path)"
+    sed -i -E -e 's/ -msse4\.2 -maes -mavx2//g' -e 's/ -mmwaitx//g' -e 's/ -mavx2//g' "$top"
+    [[ -f "$tp" ]] && sed -i -E -e 's/ -mavx2//g' "$tp"
+  fi
+  # post-condition: NO x86 ISA flag may remain on ARM (else the cmake probes re-fail)
+  if grep -qE 'msse4\.2|maes|mavx2|mmwaitx' "$top" "$tp" 2>/dev/null; then
+    die "patch_cmake_arm_isa_flags: x86 ISA flag still present after patch (upstream drift?) — inspect $top and $tp"
   fi
 }

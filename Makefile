@@ -17,7 +17,8 @@ lint:
 AM_TESTS := scripts/graph_am_test.sh \
             scripts/txn_atomicity_test.sh \
             scripts/crash_recovery_test.sh \
-            scripts/graph_concurrency_test.sh
+            scripts/graph_concurrency_test.sh \
+            scripts/join_order_test.sh
 
 # Engine test suites — require the tridb/msvbase:dev image (scripts/x86build.sh --docker).
 graph-test:

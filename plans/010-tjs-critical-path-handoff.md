@@ -169,3 +169,21 @@ duplicate execFagins); C graph leg LATERAL-under-driver, assert early-terminatio
 ## Status snapshot (2026-06-25)
 - DEV-1228 ✅ merged (PR #4) · DEV-1165 ✅ PR #5 (Linus ACCEPT) · DEV-1234 filed (ARM SIMD, deferred).
 - DEV-1168 / 1166 / 1169 / 1167 → scoped above, not yet executed.
+
+## RECONCILED 2026-06-26 — all four DONE
+All four critical-path issues have shipped; this plan is **closed**:
+- **DEV-1168** ✅ `scripts/patches/tridb_vector_iter.patch` (sentinel `tridb_vec_open`), ADR-0006.
+- **DEV-1166** ✅ `test/txn_atomicity_test.sql` + `scripts/{crash_recovery,graph_concurrency}_test.sh`,
+  ADR-0003a. Verified on the GX10 (FR-7 atomicity green in the engine suite).
+- **DEV-1169** ✅ `scripts/patches/tridb_tjs_operator.patch`, ADR-0007. Plus the **predicate-correct
+  early-termination scale fix** (`tridb_tjs_predicate_termination.patch`, DEV-1169 follow-on) found on
+  the first 100k/dim-768 GX10 run — SM-4 restored to 100% (see `docs/STATUS.md`).
+- **DEV-1167** ✅ implemented as ADR-0008's SQL-function front door `graph_store.graph_query(text)`
+  (NOT the `src/parser/graph_table.c` C parser this plan sketched — the ADR chose the lower-risk
+  whole-statement text surface). `test/parse_canonical.sql`, merged **PR #10**.
+
+Remaining TriDB work is NOT in this (completed) backlog — it now lives in: the **128 GB headline
+benchmark**, **DEV-1284** (SM-2 latency re-measurement at the correct TJS operating point), **DEV-1170**
+join-order C port (`src/planner/join_order.c`, GX10-gated, Python ref model done), HNSW index-quality
+tuning (widen the 20%-examined margin), and the `crash_recovery` suite-ordering flake. Run a fresh
+`/improve` audit to re-plan these against current reality rather than executing this stale set.

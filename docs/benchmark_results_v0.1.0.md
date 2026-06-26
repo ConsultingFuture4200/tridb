@@ -31,8 +31,9 @@ Artifacts (committed): `bench/results/bench_live_metrics.json` (full `BenchmarkR
   prune model (`bench/live_report.py:baseline_query_canonical`) on the **same corpus**.
   It over-fetches `k×32` on the ANN leg (no graph/time pushdown), materializes the full
   reachable pair set, and merges app-side — the intermediate blowup SM-1 measures
-  (peak 160 rows/query vs TriDB's bounded top-k heap of 5). The model's answer set is
-  the realized-canonical ground truth, so SM-4 parity is meaningful.
+  (peak 160 rows/query vs TriDB's peak of **max(k, reached)**: the bounded top-k heap PLUS
+  the reachable-id set the current SRF TJS precomputes once at Open, `graphReachableT`). The
+  model's answer set is the realized-canonical ground truth, so SM-4 parity is meaningful.
 - **Gated (NOT run here):**
   - **SM-2 head-to-head.** Comparing the live TriDB latency against a zero-runtime
     model is not fair, so no SM-2 win is claimed. A real SM-2 needs the multi-system
@@ -56,18 +57,22 @@ Result: **12/12 exact match** across all three. SM-4 = 100%.
 
 - **Early termination is the efficiency thesis in action.** SM-3 worst case is 6.4%
   of the corpus — the `tjs` operator settles the top-5 after streaming 64–128 HNSW
-  candidates of 2000, never materializing the reachable/filtered set. SM-1's 32× is
-  the same property: TriDB holds a bounded top-k heap (5) where the out-of-DB baseline
-  ships 160 intermediate rows/query.
-- **Corpus realism matters for recall (SM-4).** Early termination uses a
-  `consecutive_drops` bound that counts graph-rejected candidates (ADR-0007). On a
-  pathologically sparse graph (qualifying answers scattered uniformly through 2000
-  rows) the scan can stop before collecting all k — an earlier draft saw 85% parity.
-  The benchmark therefore models realistic Omni-RAG **topical locality**: a hub's
-  graph neighbours are embedding-clustered and queries target the hub's neighbourhood,
-  so qualifying answers are dense in the similarity stream. On that corpus the engine
-  returns exact ground truth (100%). This is a documented property of the v1
-  early-termination design, not a workaround.
+  candidates of 2000, without materializing the full *filtered* candidate stream or a
+  cross product. It is NOT a pure no-materialization graph predicate, though: the SRF
+  TJS precomputes the source's reachable-id set once at Open (bounded by out-degree), so
+  TriDB's peak intermediate is `max(k, reached)`, not `k`. SM-1 compares that against the
+  out-of-DB baseline's fully-materialized pair set (160 rows/query). > [!NOTE] The committed
+  SM-1 figure predates this corrected accounting (peak was recorded as `k`); regenerate with
+  `make bench-live` (live_report.py now reports `max(k, reached)`) before quoting a number.
+- **Recall is now predicate-correct, not corpus-dependent (DEV-1169 scale fix).** The original
+  `consecutive_drops` bound counted graph-rejected candidates (ADR-0007), so on a sparse graph the
+  scan could stop before collecting all k and return a partial/empty set — an earlier standin draft
+  saw 85% parity, and the first 100k/dim-768 GX10 run saw SM-4 = 5%. That is **fixed**: a drop now
+  means only past-frontier (PQ full AND distance ≥ the k-th), so graph/relational rejections no
+  longer trip early termination. Recall is a function of scan depth (`term_cond`) and HNSW index
+  quality, **not** of whether the corpus has topical locality. The benchmark still models realistic
+  Omni-RAG **topical locality** (a hub's neighbours are embedding-clustered and queries target the
+  neighbourhood) for fidelity, but the engine no longer *depends* on it for correctness.
 - **Two fork bugs were hit and worked around in the harness (not the engine):**
   1. a `tjs` scan corrupts a subsequent plain scan of the same table in one session
      (`docs/fork_segfault_double_scan.md`) — so all oracles run FIRST, before any

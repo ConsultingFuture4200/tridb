@@ -73,6 +73,7 @@ def _manifest():
     return {
         "k": 5,
         "seed": 42,
+        "term_cond": 10000,
         "entities": 2000,
         "edges": 1799,
         "queries": [{"qid": 0, "src": 3}, {"qid": 1, "src": 7}],
@@ -93,6 +94,8 @@ def test_sm2_fraction_and_ratios():
     # exact answer parity both queries
     assert res["answer_parity_exact_set"] == "2/2"
     assert res["answer_mean_jaccard"] == 1.0
+    # plan 012: the operating point is recorded in the result (and the JSON it serializes to)
+    assert res["term_cond"] == 10000
 
 
 def test_sm2_fraction_partial_and_parity_divergence():
@@ -119,3 +122,5 @@ def test_render_md_contains_headline_and_tables():
     assert "SM-2" in md
     assert "Per-query latency" in md
     assert "intermediate-result sizes" in md
+    # plan 012: the markdown names the operating point so latency/recall claims are tied to it
+    assert "term_cond=10000" in md

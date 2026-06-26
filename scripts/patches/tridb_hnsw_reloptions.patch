@@ -1,0 +1,97 @@
+diff --git a/src/hnswindex.hpp b/src/hnswindex.hpp
+--- a/src/hnswindex.hpp
++++ b/src/hnswindex.hpp
+@@ -26,6 +26,8 @@
+         int32 vl_len_;
+         int dimension;
+         hnsw_DistCalcMethod distmethod;
++        int m;                // TRIDB DEV-1286: HNSW max neighbours per node (0 -> hnswlib default 16)
++        int ef_construction;  // TRIDB DEV-1286: build candidate list size (0 -> hnswlib default 200)
+     } hnsw_ParaOptions;
+ 
+     typedef struct HNSWScanOpaqueData
+diff --git a/src/hnswindex.cpp b/src/hnswindex.cpp
+--- a/src/hnswindex.cpp
++++ b/src/hnswindex.cpp
+@@ -25,7 +25,9 @@
+ 
+   static const relopt_parse_elt tab[] = {
+       {"dimension", RELOPT_TYPE_INT, offsetof(hnsw_ParaOptions, dimension)},
+-      {"distmethod", RELOPT_TYPE_ENUM, offsetof(hnsw_ParaOptions, distmethod)}
++      {"distmethod", RELOPT_TYPE_ENUM, offsetof(hnsw_ParaOptions, distmethod)},
++      {"m", RELOPT_TYPE_INT, offsetof(hnsw_ParaOptions, m)},                             // TRIDB DEV-1286
++      {"ef_construction", RELOPT_TYPE_INT, offsetof(hnsw_ParaOptions, ef_construction)}  // TRIDB DEV-1286
+   };
+ 
+   return (bytea *)build_reloptions(reloptions, validate, hnsw_para_relopt_kind, sizeof(hnsw_ParaOptions), tab, lengthof(tab));
+@@ -49,6 +51,22 @@
+   return hnsw_Inner_Product;
+ }
+ 
++// TRIDB DEV-1286: per-index HNSW build quality. Return 0 when unset so the builder falls back to
++// hnswlib defaults (M=16 / ef_construction=200) and existing indexes are unchanged.
++int hnsw_ParaGetM(Relation index) {
++  hnsw_ParaOptions *opts = (hnsw_ParaOptions *)index->rd_options;
++  if (opts)
++    return opts->m;
++  return 0;
++}
++
++int hnsw_ParaGetEfConstruction(Relation index) {
++  hnsw_ParaOptions *opts = (hnsw_ParaOptions *)index->rd_options;
++  if (opts)
++    return opts->ef_construction;
++  return 0;
++}
++
+ CPP_PG_FUNCTION_INFO_V1(hnsw_handler);
+ Datum hnsw_handler(PG_FUNCTION_ARGS)
+ {
+diff --git a/src/lib.cpp b/src/lib.cpp
+--- a/src/lib.cpp
++++ b/src/lib.cpp
+@@ -67,6 +67,13 @@
+                         hnsw_DistCalcMethodValues, hnsw_Inner_Product,
+                         "Valid values are \"inner_product\" and \"l2_distance\".",
+                         AccessExclusiveLock);
++    // TRIDB DEV-1286: per-index HNSW build-quality reloptions (default 0 -> hnswlib defaults
++    // M=16 / ef_construction=200, so existing indexes are unchanged). NEON (DEV-1234) makes
++    // higher index quality affordable to build on aarch64.
++    add_int_reloption(hnsw_para_relopt_kind, "m", "HNSW max neighbours per node (M)",
++                      0, 0, 512, AccessExclusiveLock);
++    add_int_reloption(hnsw_para_relopt_kind, "ef_construction", "HNSW build candidate list size",
++                      0, 0, 4096, AccessExclusiveLock);
+ 
+     pase_hnsw_para_relopt_kind = add_reloption_kind();
+     add_int_reloption(pase_hnsw_para_relopt_kind, "dimension", "Vector Dimension",
+diff --git a/src/hnswindex_builder.cpp b/src/hnswindex_builder.cpp
+--- a/src/hnswindex_builder.cpp
++++ b/src/hnswindex_builder.cpp
+@@ -17,6 +17,11 @@
+ #include <utils/relcache.h>
+ }
+ 
++// TRIDB DEV-1286: defined in hnswindex.cpp (C++ linkage). Read per-index HNSW build-quality
++// reloptions; both return 0 when unset so ConstructInternalBuilder keeps hnswlib's defaults.
++int hnsw_ParaGetM(Relation index);
++int hnsw_ParaGetEfConstruction(Relation index);
++
+ HNSWIndexBuilder::HNSWIndexBuilder(Relation p_heap,
+                            Relation p_index,
+                            IndexInfo *p_indexInfo)
+@@ -41,8 +46,14 @@
+     default:
+         exit(1);
+     }
++    // TRIDB DEV-1286: honour per-index M / ef_construction reloptions (0 -> hnswlib defaults
++    // 16 / 200). Higher build quality is affordable on aarch64 thanks to the NEON kernel (DEV-1234).
++    int relM = hnsw_ParaGetM(m_index);
++    int relEfc = hnsw_ParaGetEfConstruction(m_index);
++    size_t hnsw_M = (relM > 0) ? static_cast<size_t>(relM) : 16;
++    size_t hnsw_efc = (relEfc > 0) ? static_cast<size_t>(relEfc) : 200;
+     vector_index = std::make_shared<hnswlib::HierarchicalNSW<float>>(
+-        distance.get(), m_indtuples * 10);
++        distance.get(), m_indtuples * 10, hnsw_M, hnsw_efc);
+ }
+ 
+ void HNSWComputeElementsCallback(Relation index,
