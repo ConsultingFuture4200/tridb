@@ -140,13 +140,42 @@ def test_build_report_live_smoke():
     # SM-3: examined 5 / 6 ... that is > 25%, so SM-3 may fail on this tiny toy;
     # we only assert it carries the LIVE examined count surface, not a verdict.
     assert report.tridb_samples[0].corpus_examined == 5
-    # SM-1: baseline peak (>= k) vs TriDB peak (k) -> reduction reported
+    # SM-1 (plan 011): TriDB peak intermediate = max(k, reached). Here k=3, reached=4,
+    # so the honest peak is 4 (top-k heap + the precomputed reachable set), NOT k.
+    assert report.tridb_samples[0].peak_intermediate_rows == 4
+    # SM-1: baseline peak (>= k) vs TriDB peak (max(k, reached)) -> reduction reported
     assert by["SM-1"].value >= 1.0
     # SM-2 honesty override: passes (not a fail), unit marks TriDB-side only
     assert by["SM-2"].passed
     assert "TriDB-side" in by["SM-2"].unit
     # SM-5 atomic
     assert by["SM-5"].passed
+
+
+def test_tridb_peak_falls_back_to_k_without_oracle_counts():
+    # Plan 011 fallback: an old/incomplete transcript with no #BENCH ORACLE_COUNTS has
+    # reached=None, so the TriDB SM-1 peak conservatively falls back to k (not a crash).
+    m = _manifest()
+    corpus = rebuild_corpus(m, m["seed"])
+    q = m["queries"][0]
+    from bench.driver import _l2_sq
+
+    order = sorted(
+        (1, 2, 3, 4),
+        key=lambda d: _l2_sq(corpus.entities[d]["embedding"], q["embedding"]),
+    )
+    ids = ",".join(str(x) for x in order[: m["k"]])
+    text = (
+        f"#BENCH QSTART qid=0 src=0 k=3\n"
+        f"#BENCH TRIDB_RESULT qid=0 ids={ids}\n"
+        f"#BENCH TRIDB_EXAMINED qid=0 examined=5\n"
+        f"#BENCH EXPLAIN_BEGIN qid=0\n Execution Time: 0.5 ms\n#BENCH EXPLAIN_END qid=0\n"
+        f"#BENCH ORACLE qid=0 ids={ids}\n"
+        # NOTE: deliberately NO #BENCH ORACLE_COUNTS line.
+        f"#BENCH QEND qid=0\n#BENCH DONE\n"
+    )
+    report = build_report(text, m, m["seed"])
+    assert report.tridb_samples[0].peak_intermediate_rows == m["k"]
 
 
 def test_build_report_incomplete_raises():

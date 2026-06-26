@@ -230,14 +230,20 @@ def build_report(text: str, manifest: dict, seed: int) -> BenchmarkReport:
         tridb_chunks = [f"chunk {i}" for i in o["tridb_ids"]]
         # Peak in-flight intermediate of the early-terminating fused plan (TR-1,
         # golden rule #1): the operator streams dst candidates from the HNSW scan
-        # in distance order, applies the graph-reachability + timestamp predicates
-        # inline, and keeps ONLY the bounded top-k heap. It never materializes the
-        # full reachable/filtered set or any cross product (the no-blocking
-        # property). So the peak intermediate the plan holds is the top-k heap of
-        # size k. (The number of HNSW candidates streamed before early termination
-        # is the SEPARATE SM-3 surface: corpus_examined below = the LIVE
-        # tjs_candidates_examined().)
-        peak = k
+        # in distance order, applies the timestamp predicate inline, and keeps the
+        # bounded top-k heap (size k) — it never builds a cross product or
+        # materializes the full filtered candidate stream. BUT the current SRF TJS
+        # precomputes the source's reachable-id set ONCE at Open (graphReachableT,
+        # tjs_operator.cpp) and caches it for the scan; that set is a real
+        # in-process intermediate bounded by the source's out-degree and can exceed
+        # k. So the HONEST peak is max(k, reached): the top-k heap PLUS the
+        # precomputed reachable set — not just k. (A future streaming graph predicate
+        # would drop the reachable-set term; that is a separate redesign, not here.)
+        # Falls back to k only for old transcripts that predate #BENCH ORACLE_COUNTS.
+        # The HNSW candidates streamed before early termination remain the SEPARATE
+        # SM-3 surface: corpus_examined below = the LIVE tjs_candidates_examined().
+        reachable_peak = o["reached"] if o.get("reached") is not None else k
+        peak = max(k, reachable_peak)
         tridb_samples.append(
             QuerySample(
                 qid=qid,

@@ -31,8 +31,9 @@ Artifacts (committed): `bench/results/bench_live_metrics.json` (full `BenchmarkR
   prune model (`bench/live_report.py:baseline_query_canonical`) on the **same corpus**.
   It over-fetches `k×32` on the ANN leg (no graph/time pushdown), materializes the full
   reachable pair set, and merges app-side — the intermediate blowup SM-1 measures
-  (peak 160 rows/query vs TriDB's bounded top-k heap of 5). The model's answer set is
-  the realized-canonical ground truth, so SM-4 parity is meaningful.
+  (peak 160 rows/query vs TriDB's peak of **max(k, reached)**: the bounded top-k heap PLUS
+  the reachable-id set the current SRF TJS precomputes once at Open, `graphReachableT`). The
+  model's answer set is the realized-canonical ground truth, so SM-4 parity is meaningful.
 - **Gated (NOT run here):**
   - **SM-2 head-to-head.** Comparing the live TriDB latency against a zero-runtime
     model is not fair, so no SM-2 win is claimed. A real SM-2 needs the multi-system
@@ -56,9 +57,13 @@ Result: **12/12 exact match** across all three. SM-4 = 100%.
 
 - **Early termination is the efficiency thesis in action.** SM-3 worst case is 6.4%
   of the corpus — the `tjs` operator settles the top-5 after streaming 64–128 HNSW
-  candidates of 2000, never materializing the reachable/filtered set. SM-1's 32× is
-  the same property: TriDB holds a bounded top-k heap (5) where the out-of-DB baseline
-  ships 160 intermediate rows/query.
+  candidates of 2000, without materializing the full *filtered* candidate stream or a
+  cross product. It is NOT a pure no-materialization graph predicate, though: the SRF
+  TJS precomputes the source's reachable-id set once at Open (bounded by out-degree), so
+  TriDB's peak intermediate is `max(k, reached)`, not `k`. SM-1 compares that against the
+  out-of-DB baseline's fully-materialized pair set (160 rows/query). > [!NOTE] The committed
+  SM-1 figure predates this corrected accounting (peak was recorded as `k`); regenerate with
+  `make bench-live` (live_report.py now reports `max(k, reached)`) before quoting a number.
 - **Corpus realism matters for recall (SM-4).** Early termination uses a
   `consecutive_drops` bound that counts graph-rejected candidates (ADR-0007). On a
   pathologically sparse graph (qualifying answers scattered uniformly through 2000
