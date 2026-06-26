@@ -123,13 +123,18 @@ scan provably early-terminates rather than blocking.
 - **HNSW incremental-insert limitation (known fork issue).** Inserting into an already-indexed table
   crashes the fork's HNSW AM (reproducible with `vectordb` alone). Tests build the full corpus before
   `CREATE INDEX`. Also outside DEV-1169's scope.
-- **`term_cond` counts graph-rejected candidates (user-facing semantic).** The early-termination
-  bound is "consecutive candidates that did not improve the top-k", which **includes** candidates the
-  graph reachability predicate rejected — NOT only ANN-distance losers. So a restrictive graph
-  predicate (most candidates unreachable from `src`) makes `consecutive_drops` climb faster and fires
-  early termination **sooner**. This is correct (an unreachable candidate genuinely cannot enter the
-  result), but it means `term_cond` interacts with graph selectivity: tune it accordingly. Documented
-  in the `tjs(...)` SQL `COMMENT` as well.
+- **`term_cond` = consecutive PAST-FRONTIER candidates (corrected — DEV-1169 scale fix).**
+  Originally the bound counted EVERY non-improving candidate, *including graph-rejected ones*, and
+  this ADR documented that as "correct". It was a **scale defect**: with a selective predicate the
+  qualifying rows rank deeper than `term_cond`, so `consecutive_drops` hit the bound before the
+  top-k priority queue ever filled and `tjs()` returned **empty** results (measured SM-4 = 5% at
+  100k/dim-768; invisible at the 2k/dim-32 standin where the rows sat in the top-50). Fixed in
+  `tridb_tjs_predicate_termination.patch`: a "drop" now means **only past-frontier** — the PQ is
+  full (a valid k-th distance exists) AND the candidate's distance ≥ that k-th. Predicate rejections
+  do NOT advance the counter, and termination cannot fire before the PQ fills (a selective predicate
+  drains the ANN stream instead, which is correct). `term_cond` remains the recall/effort knob; see
+  the operating-point curve in `docs/STATUS.md`. (The live `tjs(...)` SQL `COMMENT` still carries the
+  original wording — correcting it in the catalog is a follow-up folded into the termination patch.)
 - **SQL-fragment injection surface (known v1 limitation, mitigated).** `attr_exp` / `filter_exp` /
   `orderby_exp` are raw SQL fragments interpolated into the vector-leg query (the same design as
   `topk`/`multicol_topk` — they are expressions, so they cannot be parameter-bound or quoted). They

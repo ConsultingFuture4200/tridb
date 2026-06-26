@@ -64,15 +64,15 @@ Result: **12/12 exact match** across all three. SM-4 = 100%.
   out-of-DB baseline's fully-materialized pair set (160 rows/query). > [!NOTE] The committed
   SM-1 figure predates this corrected accounting (peak was recorded as `k`); regenerate with
   `make bench-live` (live_report.py now reports `max(k, reached)`) before quoting a number.
-- **Corpus realism matters for recall (SM-4).** Early termination uses a
-  `consecutive_drops` bound that counts graph-rejected candidates (ADR-0007). On a
-  pathologically sparse graph (qualifying answers scattered uniformly through 2000
-  rows) the scan can stop before collecting all k — an earlier draft saw 85% parity.
-  The benchmark therefore models realistic Omni-RAG **topical locality**: a hub's
-  graph neighbours are embedding-clustered and queries target the hub's neighbourhood,
-  so qualifying answers are dense in the similarity stream. On that corpus the engine
-  returns exact ground truth (100%). This is a documented property of the v1
-  early-termination design, not a workaround.
+- **Recall is now predicate-correct, not corpus-dependent (DEV-1169 scale fix).** The original
+  `consecutive_drops` bound counted graph-rejected candidates (ADR-0007), so on a sparse graph the
+  scan could stop before collecting all k and return a partial/empty set — an earlier standin draft
+  saw 85% parity, and the first 100k/dim-768 GX10 run saw SM-4 = 5%. That is **fixed**: a drop now
+  means only past-frontier (PQ full AND distance ≥ the k-th), so graph/relational rejections no
+  longer trip early termination. Recall is a function of scan depth (`term_cond`) and HNSW index
+  quality, **not** of whether the corpus has topical locality. The benchmark still models realistic
+  Omni-RAG **topical locality** (a hub's neighbours are embedding-clustered and queries target the
+  neighbourhood) for fidelity, but the engine no longer *depends* on it for correctness.
 - **Two fork bugs were hit and worked around in the harness (not the engine):**
   1. a `tjs` scan corrupts a subsequent plain scan of the same table in one session
      (`docs/fork_segfault_double_scan.md`) — so all oracles run FIRST, before any
