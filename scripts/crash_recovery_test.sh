@@ -92,7 +92,7 @@ BEGIN;
   INSERT INTO entities VALUES (6000, '"'"'doomed'"'"', ARRAY[6000,0,0,0,0,0,0,0]::float8[]);
   SELECT gph_insert_vertex();   -- vid 6 (doomed)
   SELECT gph_insert_edge(0, 6);
-  SELECT pg_sleep(60);          -- hold the txn open; the crash below interrupts this
+  SELECT pg_sleep(3600);        -- hold the txn open indefinitely; the crash below interrupts it
 COMMIT;
 SQL
   ) &
@@ -100,16 +100,32 @@ SQL
   # Sentinel: poll pg_stat_activity for the doomed session FINAL statement (the pg_sleep call) being
   # active. Because the three tri-store writes precede pg_sleep in the same BEGIN block, observing
   # pg_sleep active proves all three uncommitted writes have already executed and the txn is open.
+  #
+  # ROBUST TO SUITE ORDERING / HOST LOAD (DEV-1234 P1b flake fix): this harness can run LAST in the
+  # full `make graph-test` sequence, where a loaded box makes connect + 3 writes + HNSW work take far
+  # longer than a standalone run. The old 40s (200 x 0.2s) budget + a self-expiring pg_sleep(60)
+  # raced that load two ways: (1) the poll could time out before the doomed txn went active (the
+  # observed "scenario-2 timeout"), and (2) pg_sleep(60) could ELAPSE and COMMIT the "doomed" txn,
+  # making its writes durable and breaking the post-recovery "nothing visible" assert. Fixed by
+  # holding the txn open for pg_sleep(3600) (always killed by the crash; never self-commits) and a
+  # generous, liveness-checked ~180s budget.
   sentinel=0
-  for i in $(seq 1 200); do
-    n=$($PSQL -tA -c "SELECT count(*) FROM pg_stat_activity WHERE query LIKE '"'"'%pg_sleep(60)%'"'"' AND state='"'"'active'"'"';" 2>/dev/null || echo 0)
+  for i in $(seq 1 360); do
+    # Bail loud if the doomed session died before reaching pg_sleep (e.g. a tri-store write errored)
+    # instead of silently polling to timeout.
+    if ! kill -0 $BGPID 2>/dev/null; then
+      echo "FAIL (uncommitted): doomed background session exited before reaching its in-flight state (a tri-store write errored before pg_sleep?)"
+      $B/pg_ctl -D $D2 -m immediate -w stop >/dev/null 2>&1 || true
+      exit 1
+    fi
+    n=$($PSQL -tA -c "SELECT count(*) FROM pg_stat_activity WHERE query LIKE '"'"'%pg_sleep%'"'"' AND state='"'"'active'"'"';" 2>/dev/null || echo 0)
     if [ "$n" = "1" ]; then sentinel=1; break; fi
-    sleep 0.2
+    sleep 0.5
   done
   # FAIL LOUD on poll timeout BEFORE crashing: if the sentinel never went active, the doomed writes
   # never ran, so crashing now would trivially "pass" scenario 2 with no in-flight tri-store state.
   if [ "$sentinel" != "1" ]; then
-    echo "FAIL (uncommitted): doomed txn never reached its in-flight state (pg_sleep sentinel not observed) — poll timeout"
+    echo "FAIL (uncommitted): doomed txn never reached its in-flight state (pg_sleep sentinel not observed after ~180s) — poll timeout"
     kill $BGPID >/dev/null 2>&1 || true; $B/pg_ctl -D $D2 -m immediate -w stop >/dev/null 2>&1 || true
     exit 1
   fi

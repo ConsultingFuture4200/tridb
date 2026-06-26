@@ -20,6 +20,13 @@ build on GX10) · 🔴 GX10-gated (needs live MSVBASE build).
 > cost of HNSW construction). REMAINING (GX10): roll this into the 128 GB headline benchmark and
 > report the end-to-end query-latency delta at the operating point.
 
+> **🟢 CRASH-RECOVERY SUITE-ORDERING FLAKE FIXED 2026-06-26 (DEV-1234 P1b).** `scripts/crash_recovery_test.sh`
+> scenario 2 (uncommitted tri-store txn) raced host load when it ran LAST in `make graph-test`: the
+> 40s sentinel poll could time out before the doomed txn went active, and a self-expiring `pg_sleep(60)`
+> could ELAPSE and COMMIT the "doomed" txn, breaking the post-recovery "nothing visible" assert. Fixed
+> by holding the txn open with `pg_sleep(3600)` (always killed by the crash; never self-commits) + a
+> generous, liveness-checked ~180s readiness budget. Both scenarios PASS against `tridb/msvbase:dev`.
+
 > **🟢 TJS SCALE-DEFECT FIXED 2026-06-26 (DEV-1169) — the defining feature is now correct at scale.**
 > The first 100k/dim-768 GX10 benchmark exposed a predicate-blind early-termination bug in the TJS
 > operator: graph/relational predicate rejections were counted as VBASE "drops", so a selective
