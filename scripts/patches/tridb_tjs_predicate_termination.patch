@@ -1,0 +1,122 @@
+--- a/src/tjs_operator.cpp
++++ b/src/tjs_operator.cpp
+@@ -31,9 +31,12 @@
+ //                  finite, so caching it is exact, not an approximation.
+ //
+ // Because graph + relational are PREDICATES on the single ordered (vector) stream — not a second
+-// ordered stream to merge — there is no order-merge to reconcile, and the VBASE consecutive_drops
+-// early-termination stays correct: a candidate that fails the graph or relational predicate simply
+-// is not inserted into the result priority queue, exactly like a candidate that loses on distance.
++// ordered stream to merge — there is no order-merge to reconcile. A predicate-rejected candidate is
++// simply not inserted into the result priority queue. CRUCIAL: a predicate rejection is NOT the same
++// early-termination signal as a distance loss. The VBASE consecutive_drops bound counts ONLY
++// past-frontier candidates (distance >= the k-th best, with a FULL top-k); predicate rejections and
++// sub-threshold candidates do not advance it — otherwise a selective predicate terminates the scan
++// before the qualifying top-k is assembled (the DEV-1169 scale defect). See execTJS drop accounting.
+ //
+ // TR-1 (CLAUDE.md golden rule 1): Open/Next/Close + EARLY TERMINATION, no blocking operator. The
+ // bounded priority queue is size k; the merge stops once consecutive_drops >= term_cond and then
+@@ -55,6 +58,7 @@
+ #include <utility> // std::pair
+ #include <algorithm> // std::min, std::max
+ #include <string>
++#include <limits>    // std::numeric_limits — +inf k-th-distance sentinel (empty/partial top-k)
+ 
+ extern "C"
+ {
+@@ -364,6 +368,10 @@
+ 	TJSState* estate = (TJSState*) node;
+ 	uint32_t k = estate->topk;
+ 	uint32_t term_cond = estate->term_cond;
++	// Local by design: execTJS drains the ENTIRE ANN stream in this one call (the SRF
++	// first-call-drains-all model), so resetting to 0 on entry is correct. If this is ever adapted
++	// to a coroutine / per-row pull model (the "future CustomScan" reuse noted above), move this to
++	// TJSState so the run survives across calls — otherwise termination could never fire.
+ 	uint32_t consecutive_drops = 0;
+ 
+ 	auto proc_pq = estate->proc_pq;
+@@ -397,6 +405,14 @@
+ 
+ 				slot = ExecProcNode((PlanState*) child);
+ 
++				// ANN stream exhausted (the VBASE incremental-search iterator ran its candidate queue
++				// dry). This is the correct (and guaranteed) terminator when a predicate is selective
++				// enough that the PQ never fills k: with no distance frontier to early-terminate on, we
++				// drain the stream and return the < k rows that qualify. Cost scales with predicate
++				// selectivity, NOT a fixed cap: a non-selective query fills k and stops early (the
++				// common case); a maximally-selective one (≈0 qualifying) must examine deep to PROVE
++				// fewer than k exist — inherent, not a regression. Still Open/Next/Close with no full
++				// intermediate materialization, so TR-1 holds; SM-3 then measures the real selectivity.
+ 				if ( TupIsNull(slot) ) {
+ 					estate->finish = true;
+ 					MemoryContextSwitchTo(oldcontext);
+@@ -429,12 +445,35 @@
+ 						graph_ok = false; // NULL id is never reachable.
+ 				}
+ 
+-				consecutive_drops++;
+-				// RELATIONAL leg already applied in the WHERE clause; here only graph + distance can
+-				// drop a survivor. Insert into the bounded top-k PQ iff reachable AND it beats the
+-				// current k-th best (or the PQ is not yet full).
+-				if ( graph_ok && ( proc_pq->size() < k || proc_pq->top().first > rank_score ) ){
+-					if ( proc_pq->size() == k )
++				// EARLY-TERMINATION DROP ACCOUNTING — predicate-correct VBASE relaxed monotonicity.
++				//
++				// A "drop" must mean exactly ONE thing: evidence that the ANN stream has moved PAST
++				// the distance frontier of the current top-k. That holds ONLY when the result PQ is
++				// full (a valid k-th distance D_k exists) AND this candidate's distance >= D_k. The
++				// original code incremented on EVERY non-inserted candidate — INCLUDING graph /
++				// relational predicate rejections — so a selective predicate tripped term_cond before
++				// the PQ ever filled and returned an EMPTY top-k (DEV-1169 scale defect: examined ==
++				// term_cond, 0/12 oracle parity at 100k/dim-768). Two cases must NOT advance the run:
++				//   (1) PQ not yet full      -> no threshold exists; keep scanning (to ANN-stream
++				//       exhaustion if the predicate is that selective — that is what makes a selective
++				//       graph/relational predicate CORRECT, not a premature empty result).
++				//   (2) predicate-rejected candidate still INSIDE the frontier (distance < D_k) -> we
++				//       are not past the top-k region; a closer qualifying candidate may still be
++				//       unseen. Skip it: neither advance nor reset the drop run.
++				// Only a candidate at distance >= D_k WHILE the PQ is full is past-frontier evidence.
++				bool pq_full = ( proc_pq->size() == k );
++				// The k-th best qualifying distance D_k — the frontier. With < k results in hand there
++				// is no frontier yet, so D_k is +inf: every qualifying candidate improves the top-k and
++				// nothing can be "past" it. (Not a magic 0.0 — an honest "no threshold" sentinel.)
++				float kth    = pq_full ? proc_pq->top().first : std::numeric_limits<float>::infinity();
++
++				// STRICT '>' on insert: a candidate at EXACTLY D_k does not displace the k-th (it cannot
++				// improve a bounded top-k), and is counted as a past-frontier drop below (>= D_k). HNSW
++				// gives no distance-uniqueness at the boundary, so treating ties as drops is the correct
++				// conservative choice and keeps insert/drop mutually exclusive and exhaustive.
++				if ( graph_ok && kth > rank_score ){
++					// Qualifying AND improves the top-k -> insert, and reset the drop run.
++					if ( pq_full )
+ 						proc_pq->pop();
+ 					// Copy the surviving tuple into the SRF's multi-call context (result_cxt ==
+ 					// multi_call_memory_ctx), NOT the child's es_query_cxt which EndTJSState frees at
+@@ -444,15 +483,23 @@
+ 					MemoryContextSwitchTo(estate->result_cxt);
+ 					proc_pq->push(std::make_pair(rank_score, copyItemT(slot)));
+ 					consecutive_drops = 0;
++				} else if ( pq_full && rank_score >= kth ){
++					// Past the top-k distance frontier (predicate pass/fail is irrelevant here): the
++					// ONLY legitimate early-termination signal. term_cond consecutive such -> stop.
++					consecutive_drops++;
+ 				}
++				// else: PQ not full, OR predicate-rejected while still inside the frontier ->
++				// leave consecutive_drops untouched and keep scanning.
+ 
+ 				MemoryContextSwitchTo(oldcontext);
+ 			}
+ 
+-			// EARLY TERMINATION (TR-1): reuse VBASE's consecutive_drops bound verbatim — do NOT
+-			// invent a new stop. Once `term_cond` consecutive candidates fail to improve the top-k,
+-			// the ANN stream provably cannot beat the current k-th best, so finish (which then
+-			// Close()s the child below, propagating the stop into the HNSW beam).
++			// EARLY TERMINATION (TR-1): VBASE relaxed-monotonicity bound. Once `term_cond` consecutive
++			// PAST-FRONTIER candidates (distance >= D_k, PQ full — see the drop accounting above) have
++			// been seen, the approximately-distance-ordered ANN stream provably cannot beat the current
++			// k-th best, so finish (which then Close()s the child below, propagating the stop into the
++			// HNSW beam). NB: this can ONLY fire with a full top-k; a selective predicate that never
++			// fills k instead runs to ANN-stream exhaustion above (TupIsNull), which is correct.
+ 			if ( consecutive_drops >= term_cond ) {
+ 				estate->finish = true;
+ 			}

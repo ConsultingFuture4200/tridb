@@ -16,6 +16,11 @@
 _MSVBASE_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Validated upstream base (plan 002). Honors a prior assignment (e.g. from --commit).
+# RE-PIN DISCIPLINE: this pin is the contract the entire fork-patch chain below is diffed against
+# (esp. the stacked tjs_operator -> DEV-1236 snapshot -> DEV-1169 termination patches, which target
+# the SAME file in sequence). Bumping PIN_COMMIT requires a FULL clean-room rebuild + `make test-all`
+# (NOT just smoke) to re-validate every patch applies and the SM-1..SM-5 suite still passes — a
+# newer upstream may have touched the executor-lifecycle code these patches assume. (Linus review.)
 PIN_COMMIT="${PIN_COMMIT:-1a548db14d7a3f6f64808c99b9bc1aa01a25b71f}"   # MSVBASE "Fix vector constant parsing (#20)"
 
 # Official checksums for build-time downloads (supply-chain integrity, plan 007). Update these
@@ -71,6 +76,8 @@ verify_patches() {
     || die "TriDB tridb_hnsw_scan_no_orderby.patch NOT applied in hnswindex_scan.cpp — null-safe EndScan missing (DEV-1236); drift?"
   grep -q 'TRIDB: HNSW rebuild-on-recovery (DEV-1235)' "$root/src/hnswindex_scan.cpp" 2>/dev/null \
     || die "TriDB tridb_hnsw_rebuild_on_recovery.patch NOT applied — heap-rebuild-on-load missing (DEV-1235); drift?"
+  grep -q 'rank_score >= kth' "$root/src/tjs_operator.cpp" 2>/dev/null \
+    || die "TriDB tridb_tjs_predicate_termination.patch NOT applied — predicate-blind early termination (DEV-1169 scale defect); drift?"
   log "all MSVBASE + TriDB fork patches verified present"
 }
 
@@ -220,6 +227,29 @@ apply_tridb_fork_patches() {
     log "applying TriDB fork patch: HNSW rebuild-on-recovery — heap as source of truth (DEV-1235 / ADR-0009)"
     ( cd "$root" && git apply "$rebuild_patch" ) \
       || die "tridb_hnsw_rebuild_on_recovery.patch did not apply — MSVBASE drift? re-generate per DEV-1235"
+  fi
+
+  #   tridb_tjs_predicate_termination.patch (DEV-1169 scale defect, found on the first live GX10 run):
+  #     the TJS early-termination counted EVERY non-inserted candidate — INCLUDING graph/relational
+  #     predicate rejections — as a VBASE consecutive_drop, so a selective predicate tripped term_cond
+  #     BEFORE the top-k priority queue filled and tjs() returned an EMPTY/partial result. Confirmed at
+  #     100k/dim-768: examined==term_cond, SM-4 = 5% (0/12 exact). Invisible at toy scale (2k/dim-32:
+  #     qualifying rows sat in the top-50, SM-4 = 100%). Fix: a "drop" now means ONLY past-frontier
+  #     (PQ full AND distance >= k-th); predicate rejections and sub-threshold candidates do not advance
+  #     the counter, and termination cannot fire before the PQ fills (a selective predicate drains the
+  #     ANN stream to exhaustion, which is correct). Restores SM-4 to 100% at term_cond=10000 / SM-3
+  #     20.1% (still < 25%, TR-1 preserved). Diffed against the post-DEV-1236 tjs_operator.cpp, so it
+  #     MUST apply AFTER tridb_fix_double_scan_snapshot.patch (it does — this is last in the chain).
+  # Sentinel anchors on a LOAD-BEARING CODE token (the past-frontier drop test), NOT a comment
+  # phrase: a comment reformat must not silently let verify pass on an unapplied patch (Linus review).
+  local tjs_term_patch="${_MSVBASE_LIB_DIR}/../patches/tridb_tjs_predicate_termination.patch"
+  [[ -f "$tjs_term_patch" ]] || die "missing TriDB fork patch: $tjs_term_patch"
+  if grep -q 'rank_score >= kth' "$root/src/tjs_operator.cpp" 2>/dev/null; then
+    log "TriDB fork patch (predicate-correct TJS termination, DEV-1169 scale fix) already applied"
+  else
+    log "applying TriDB fork patch: predicate-correct TJS early termination (DEV-1169 scale fix)"
+    ( cd "$root" && git apply "$tjs_term_patch" ) \
+      || die "tridb_tjs_predicate_termination.patch did not apply — MSVBASE/DEV-1236 drift? re-generate per DEV-1169"
   fi
 
   # ----------------------------------------------------------------------------

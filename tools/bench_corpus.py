@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 
 import numpy as np
 
@@ -231,6 +232,11 @@ def build(args) -> tuple[str, dict]:
     w(
         "SET enable_seqscan = off;   -- force the HNSW ANN index scan for tjs's vector leg"
     )
+    # tjs() early-termination depth (VBASE consecutive past-frontier drops). 0 -> the operator's
+    # built-in default (50). This is the recall/latency knob (the ANN-bench ef_search analogue):
+    # at high dim / large corpus a wider window is needed for high recall@k. BENCH_TERMCOND lets the
+    # harness sweep it without rebuilding the engine.
+    termcond = int(os.environ.get("BENCH_TERMCOND", "0") or "0")
     for q in queries:
         qid = q["qid"]
         src = q["src"]
@@ -248,7 +254,7 @@ def build(args) -> tuple[str, dict]:
             "COALESCE(array_to_string(array_agg(id), ','), '') AS line FROM (" % qid
         )
         w(
-            f"  SELECT t.id FROM tjs('entities', {k}, 0, {src}::bigint, 'id, chunk', "
+            f"  SELECT t.id FROM tjs('entities', {k}, {termcond}, {src}::bigint, 'id, chunk', "
             f"'ts IN ({win})', 'embedding <-> ''{qvec}''') AS t(id bigint, chunk text)"
         )
         w(") s;")
@@ -263,7 +269,7 @@ def build(args) -> tuple[str, dict]:
         #     A fresh statement; EXPLAIN runs the plan once and reports the wall time.
         w(f"\\echo #BENCH EXPLAIN_BEGIN qid={qid}")
         w(
-            f"EXPLAIN (ANALYZE, TIMING ON) SELECT t.id FROM tjs('entities', {k}, 0, "
+            f"EXPLAIN (ANALYZE, TIMING ON) SELECT t.id FROM tjs('entities', {k}, {termcond}, "
             f"{src}::bigint, 'id, chunk', 'ts IN ({win})', "
             f"'embedding <-> ''{qvec}''') AS t(id bigint, chunk text);"
         )
