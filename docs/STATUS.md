@@ -1,7 +1,28 @@
 # TriDB Build Status — per-issue gating
 
-Updated: 2026-06-25. Legend: 🟢 unblocked here · 🟡 partial (design here,
+Updated: 2026-06-26. Legend: 🟢 unblocked here · 🟡 partial (design here,
 build on GX10) · 🔴 GX10-gated (needs live MSVBASE build).
+
+> **🟢 TJS SCALE-DEFECT FIXED 2026-06-26 (DEV-1169) — the defining feature is now correct at scale.**
+> The first 100k/dim-768 GX10 benchmark exposed a predicate-blind early-termination bug in the TJS
+> operator: graph/relational predicate rejections were counted as VBASE "drops", so a selective
+> predicate tripped `term_cond` before the top-k filled → empty/partial answers (SM-4 = 5%, invisible
+> at the 2k/dim-32 standin where it read 100%). Fixed in `tridb_tjs_predicate_termination.patch` (a
+> "drop" now means past-frontier only: PQ full AND distance ≥ k-th). It is a **correctness fix, not a
+> speed win** — and the honest result is a recall/effort curve, not a single number:
+>
+> | `term_cond` | SM-4 exact-parity | SM-3 examined | |
+> |---|---|---|---|
+> | 50 (default) | 58.5% | 3.6% | approximate, fast |
+> | 5000 | 97.2% | 10.9% | |
+> | 10000 | 100% | 20.1% | exact; < 25% TR-1 ceiling |
+>
+> Linus-reviewed (logic + packaging; SHIP). Clean-room verified: fresh MSVBASE clone + full patch
+> chain builds, smoke + SM-1..SM-5 pass, SM-4=100% reproduced. Still open before any public claim:
+> latency-in-ms at the operating point vs a full-scan-filter baseline; `term_cond` exposed as the
+> recall knob (`BENCH_TERMCOND`), default left at 50. The crash_recovery scenario-2 timeout seen in
+> the full `graph-test` sequence is a pre-existing suite-ordering flake (tjs-independent; passes in
+> isolation), tracked separately.
 
 > **🟢 ON-TARGET SIGN-OFF 2026-06-25 — the fork now builds and runs on the real GX10.**
 > Ran `scripts/gx10build.sh` on the DGX Spark (`gx10-4210`, GB10, aarch64, 128 GB, 20 cores,
