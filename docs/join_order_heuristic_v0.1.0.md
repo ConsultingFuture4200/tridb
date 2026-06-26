@@ -1,14 +1,20 @@
 # Cross-Modal Join-Order Heuristic (FR-6)
 
-**Version:** 0.1.1
-**Date:** 2026-06-25
+**Version:** 0.1.2
+**Date:** 2026-06-26
 **Issue:** DEV-1170
-**Status:** Design complete; interface FROZEN (§10). Python reference model +
-test suite landed (`src/planner/join_order_ref.py`, `tests/test_join_order.py`).
-C port deferred to GX10 (`src/planner/join_order.c`, engine/GX10-gated — NOT
-built or run off-target).
+**Status:** Decision core SHIPPED. The C port (`src/planner/join_order.c`) of the
+three frozen functions + the GUC is implemented as an in-tree PGXS extension and
+makes **bit-identical decisions** to the Python reference across the full pinned
+matrix — built and tested on the GX10 (`scripts/join_order_test.sh`, wired into
+`make graph-test`). The `planner_hook` integration (§10.5) is DEFERRED: `tjs()` is
+a C SRF, not a CustomScan plan node, so "rewrite the driving child" does not map
+onto it yet — tracked as a separate follow-on issue.
 
 **Changelog**
+- 0.1.2 (2026-06-26): ported the frozen decision core to C (`join_order.c`,
+  PGXS), parity test (`test/join_order_test.sql`) green on the GX10; Linus review
+  (NULL-arg guard, -ffast-math strip, 0.10-literal identity documented). Hook deferred.
 - 0.1.1 (2026-06-25, DEV-1170 close-out): froze the C-port interface (§10);
   pinned the boundary (`<=`), degenerate-input, and threshold-clamp contracts so
   the C port cannot silently diverge from the reference; corrected the reference

@@ -1,0 +1,4 @@
+comment = 'TriDB cross-modal join-order heuristic (FR-6 / DEV-1170): filter-first vs vector-first'
+default_version = '0.1.0'
+module_pathname = '$libdir/join_order'
+relocatable = false
