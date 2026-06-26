@@ -1,0 +1,66 @@
+"""Pins the fairness invariant: the shared corpus generator produces the EXACT
+same corpus as tools/bench_corpus.py (the TriDB live side) so both the live SM-2
+SQL and the multi-system baseline run on one identical corpus.
+
+If this drifts, the SM-2 head-to-head stops being like-for-like.
+"""
+
+import sys
+from pathlib import Path
+
+import pytest
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT / "tools"))
+
+pytest.importorskip("numpy")
+
+from bench_corpus_shared import build_corpus  # noqa: E402
+from bench.live_report import rebuild_corpus  # noqa: E402
+from tools.bench_corpus import build  # noqa: E402
+
+
+class _Args:
+    entities = 200
+    dim = 8
+    hubs = 4
+    fanout = 20
+    queries = 6
+    k = 5
+    window = 60
+    time_min = 19000
+    time_max = 20000
+    query_jitter = 0.35
+    seed = 42
+
+
+def test_shared_corpus_matches_bench_corpus():
+    _, man_orig = build(_Args())
+    man_shared = build_corpus(_Args())
+    # public structural fields identical
+    assert man_orig["edges"] == man_shared["edges"]
+    assert man_orig["hub_dsts"] == man_shared["hub_dsts"]
+    assert man_orig["queries"] == man_shared["queries"]
+    assert man_orig["num_queries"] == man_shared["num_queries"]
+
+
+def test_shared_entities_match_live_rebuild():
+    """The private _entities (ts + embedding the SM-2 SQL inserts) must equal what
+    bench/live_report.rebuild_corpus derives from the same manifest — i.e. exactly
+    what the TriDB live side computes against."""
+    man = build_corpus(_Args())
+    corpus = rebuild_corpus(man, _Args.seed)
+    for eid, ts, emb in man["_entities"]:
+        assert corpus.entities[eid]["timestamp"] == ts
+        assert corpus.entities[eid]["embedding"] == emb
+
+
+def test_public_manifest_drops_private_arrays():
+    man = build_corpus(_Args())
+    public = {k: v for k, v in man.items() if not k.startswith("_")}
+    assert "_entities" not in public
+    assert "_edges" not in public
+    # everything rebuild_corpus needs is still present
+    for key in ("seed", "time_min", "time_max", "dim", "hub_dsts", "queries", "k"):
+        assert key in public
