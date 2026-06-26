@@ -1,7 +1,29 @@
 # TriDB Build Status — per-issue gating
 
-Updated: 2026-06-23. Legend: 🟢 unblocked here · 🟡 partial (design here,
+Updated: 2026-06-25. Legend: 🟢 unblocked here · 🟡 partial (design here,
 build on GX10) · 🔴 GX10-gated (needs live MSVBASE build).
+
+> **🟢 ON-TARGET SIGN-OFF 2026-06-25 — the fork now builds and runs on the real GX10.**
+> Ran `scripts/gx10build.sh` on the DGX Spark (`gx10-4210`, GB10, aarch64, 128 GB, 20 cores,
+> Docker 29.2.1, reachable over Tailscale as host `spark`). Results:
+> - **Build:** `[100%] Built target vectordb` → image `tridb/msvbase:gx10`. **DEV-1160/1161 signed off.**
+> - **Smoke** (`scripts/smoke_test.sh`): PASS — vectordb extension loads, 100k-row HNSW index
+>   builds, early-terminating ANN Index Scan path (TR-1) confirmed in EXPLAIN.
+> - **Engine suite** (`make graph-test IMAGE=tridb/msvbase:gx10`): exit 0, **47 PASS / 7
+>   "ALL TESTS PASSED"**, zero real failures. Validates on ARM64: graph traversal iterator
+>   (DEV-1165), FR-7 tri-store atomicity + SM-5 randomized (DEV-1166), crash/WAL recovery, and
+>   txn concurrency. The only non-PASS is the pre-documented logical-single-writer first-edge
+>   race (ADR-0003 KNOWN-LIMITATION), unchanged from x86.
+>
+> The first live run surfaced **two genuine ARM-only build deltas** the x86 standin could never
+> exercise — both fixed in `scripts/lib/msvbase_patches.sh` / `gx10build.sh` (branch
+> `dustin/dev-1161`): (1) `patch_cmake_arm_isa_flags` strips MSVBASE's hardcoded x86 ISA flags
+> (`-msse4.2 -maes -mavx2 -mmwaitx`) that aarch64 GCC rejects (failed every cmake probe as a
+> bogus "Could NOT find OpenMP_C"; hnswlib falls back to scalar L2Sqr); (2) a CWD-relative
+> smoke-test path in `gx10build.sh` (latent — that line had never run before).
+>
+> **Only remaining GX10 item: the 128 GB headline benchmark** (at-scale run; the functional
+> port is complete). Off-target benches stay x86-standin numbers.
 
 > **RE-GATED 2026-06-23:** the dev workstation was proven a viable **x86_64 standin** —
 > `scripts/x86build.sh --docker` builds the MSVBASE fork and `scripts/smoke_test.sh`
