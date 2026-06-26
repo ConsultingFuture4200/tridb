@@ -3,6 +3,23 @@
 Updated: 2026-06-26. Legend: 🟢 unblocked here · 🟡 partial (design here,
 build on GX10) · 🔴 GX10-gated (needs live MSVBASE build).
 
+> **🟡 ARM NEON L2 KERNEL ADDED 2026-06-26 (DEV-1234) — un-sandbags ANN/TJS latency on the GX10.**
+> On aarch64 the build strips MSVBASE's hardcoded x86 ISA flags (`scripts/lib/msvbase_patches.sh`
+> `patch_cmake_arm_isa_flags`), so hnswlib's `USE_SSE/AVX` SIMD paths are all dead and `L2Space` fell
+> back to the **scalar `L2Sqr`** for EVERY distance — the hottest loop in ANN search and the TJS
+> re-rank — making every ARM latency number wrong-low. Added a native NEON `L2Sqr` kernel to
+> `thirdparty/hnsw/hnswlib/space_l2.h` (`scripts/patches/tridb_neon_l2_distance.patch`, wired into
+> the patch chain + `verify_patches`; gated on `__ARM_NEON`, inert on x86 — no build-flag change).
+> Validated ON THE GX10 (aarch64): `tools/neon_l2_bench.c` shows the kernel equals scalar within
+> **1e-4 rel err** across dims (incl. residual paths 31/100) and is **3.6× (dim 32) / 6.1× (dim 128)
+> / 7.8× (dim 768)** faster per distance call; the patched header also compiles in-context and
+> `L2Space` returns correct distances at dims 16/32/100/128/768. ENGINE A/B ON THE GX10: rebuilding
+> `vectordb.so` through the real MSVBASE `make` (so the patch is proven to build AND run in the
+> engine), the HNSW **index-build time on a 20k×128 corpus drops 4.2× — 47.8 s (scalar) → 11.3 s
+> (NEON)** on the same cluster, consistent with the per-call kernel speedup (distance is the dominant
+> cost of HNSW construction). REMAINING (GX10): roll this into the 128 GB headline benchmark and
+> report the end-to-end query-latency delta at the operating point.
+
 > **🟢 TJS SCALE-DEFECT FIXED 2026-06-26 (DEV-1169) — the defining feature is now correct at scale.**
 > The first 100k/dim-768 GX10 benchmark exposed a predicate-blind early-termination bug in the TJS
 > operator: graph/relational predicate rejections were counted as VBASE "drops", so a selective

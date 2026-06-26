@@ -1,0 +1,88 @@
+diff --git a/hnswlib/space_l2.h b/hnswlib/space_l2.h
+--- a/hnswlib/space_l2.h
++++ b/hnswlib/space_l2.h
+@@ -1,6 +1,10 @@
+ #pragma once
+ #include "hnswlib.h"
+ 
++#if defined(__ARM_NEON)
++#include <arm_neon.h>  // TRIDB DEV-1234: AArch64 NEON intrinsics (must be included at global scope)
++#endif
++
+ namespace hnswlib {
+ 
+     static float
+@@ -205,6 +209,57 @@
+     }
+ #endif
+ 
++#if defined(__ARM_NEON)
++    // TRIDB (DEV-1234): native AArch64 NEON L2-squared kernel. The MSVBASE build strips x86 ISA
++    // flags on aarch64 (scripts/lib/msvbase_patches.sh: patch_cmake_arm_isa_flags), so USE_SSE/
++    // USE_AVX are never defined on ARM and L2Space would fall back to the scalar L2Sqr above for
++    // every distance -- the hottest loop in ANN search and in the TJS re-rank. This restores SIMD
++    // on the GX10. 16 floats/iteration over 4 independent 128-bit accumulators (hides FMA latency),
++    // AArch64 horizontal add. Verified equal to scalar within 1e-4 rel err and 3.6x (d32) / 6.1x
++    // (d128) / 7.8x (d768) faster by tools/neon_l2_bench.c run on the GX10 (aarch64).
++    static float
++    L2SqrSIMD16ExtNEON(const void *pVect1v, const void *pVect2v, const void *qty_ptr) {
++        float *pVect1 = (float *) pVect1v;
++        float *pVect2 = (float *) pVect2v;
++        size_t qty = *((size_t *) qty_ptr);
++        size_t qty16 = qty >> 4;
++        const float *pEnd1 = pVect1 + (qty16 << 4);
++
++        float32x4_t sum0 = vdupq_n_f32(0.0f);
++        float32x4_t sum1 = vdupq_n_f32(0.0f);
++        float32x4_t sum2 = vdupq_n_f32(0.0f);
++        float32x4_t sum3 = vdupq_n_f32(0.0f);
++
++        while (pVect1 < pEnd1) {
++            float32x4_t d0 = vsubq_f32(vld1q_f32(pVect1),      vld1q_f32(pVect2));
++            float32x4_t d1 = vsubq_f32(vld1q_f32(pVect1 + 4),  vld1q_f32(pVect2 + 4));
++            float32x4_t d2 = vsubq_f32(vld1q_f32(pVect1 + 8),  vld1q_f32(pVect2 + 8));
++            float32x4_t d3 = vsubq_f32(vld1q_f32(pVect1 + 12), vld1q_f32(pVect2 + 12));
++            sum0 = vfmaq_f32(sum0, d0, d0);
++            sum1 = vfmaq_f32(sum1, d1, d1);
++            sum2 = vfmaq_f32(sum2, d2, d2);
++            sum3 = vfmaq_f32(sum3, d3, d3);
++            pVect1 += 16;
++            pVect2 += 16;
++        }
++        float32x4_t sum = vaddq_f32(vaddq_f32(sum0, sum1), vaddq_f32(sum2, sum3));
++        return vaddvq_f32(sum);
++    }
++
++    // dim > 16 and not a multiple of 16: NEON over the aligned prefix + scalar tail (mirrors
++    // hnswlib's L2SqrSIMD16ExtResiduals).
++    static float
++    L2SqrNEON(const void *pVect1v, const void *pVect2v, const void *qty_ptr) {
++        size_t qty = *((size_t *) qty_ptr);
++        size_t qty16 = (qty >> 4) << 4;
++        float res = L2SqrSIMD16ExtNEON(pVect1v, pVect2v, &qty16);
++        size_t qty_left = qty - qty16;
++        float *pVect1 = (float *) pVect1v + qty16;
++        float *pVect2 = (float *) pVect2v + qty16;
++        return res + L2Sqr(pVect1, pVect2, &qty_left);
++    }
++#endif
++
+     class L2Space : public SpaceInterface<float> {
+ 
+         DISTFUNC<float> fstdistfunc_;
+@@ -233,6 +288,15 @@
+             else if (dim > 4)
+                 fstdistfunc_ = L2SqrSIMD4ExtResiduals;
+     #endif
++    #if defined(__ARM_NEON)
++            // TRIDB (DEV-1234): the USE_SSE/AVX block above is dead on aarch64 (ISA flags stripped),
++            // so fstdistfunc_ would remain the scalar L2Sqr. Select the NEON kernel instead. dim<=16
++            // non-multiples keep scalar L2Sqr (no full 16-float block to vectorize).
++            if (dim % 16 == 0)
++                fstdistfunc_ = L2SqrSIMD16ExtNEON;
++            else if (dim > 16)
++                fstdistfunc_ = L2SqrNEON;
++    #endif
+             dim_ = dim;
+             data_size_ = dim * sizeof(float);
+         }

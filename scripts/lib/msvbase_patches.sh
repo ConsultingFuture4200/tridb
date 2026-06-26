@@ -78,6 +78,8 @@ verify_patches() {
     || die "TriDB tridb_hnsw_rebuild_on_recovery.patch NOT applied — heap-rebuild-on-load missing (DEV-1235); drift?"
   grep -q 'rank_score >= kth' "$root/src/tjs_operator.cpp" 2>/dev/null \
     || die "TriDB tridb_tjs_predicate_termination.patch NOT applied — predicate-blind early termination (DEV-1169 scale defect); drift?"
+  grep -q 'L2SqrSIMD16ExtNEON' "$root/thirdparty/hnsw/hnswlib/space_l2.h" 2>/dev/null \
+    || die "TriDB tridb_neon_l2_distance.patch NOT applied — ARM NEON L2 kernel missing, scalar fallback sandbags latency (DEV-1234); drift?"
   log "all MSVBASE + TriDB fork patches verified present"
 }
 
@@ -250,6 +252,24 @@ apply_tridb_fork_patches() {
     log "applying TriDB fork patch: predicate-correct TJS early termination (DEV-1169 scale fix)"
     ( cd "$root" && git apply "$tjs_term_patch" ) \
       || die "tridb_tjs_predicate_termination.patch did not apply — MSVBASE/DEV-1236 drift? re-generate per DEV-1169"
+  fi
+
+  # tridb_neon_l2_distance.patch (DEV-1234): native AArch64 NEON L2-squared kernel in hnswlib's
+  #   space_l2.h. On aarch64 the build strips x86 ISA flags (patch_cmake_arm_isa_flags below), so
+  #   USE_SSE/AVX are undefined and L2Space falls back to the scalar L2Sqr for EVERY distance — the
+  #   hottest loop in ANN search and the TJS re-rank — sandbagging all latency numbers. Adds a NEON
+  #   path gated on __ARM_NEON (no build-flag change needed; inert on x86). Validated equal to scalar
+  #   within 1e-4 rel err and 3.6x-7.8x faster (dim 32..768) on the GX10 via tools/neon_l2_bench.c.
+  #   Applies INSIDE the hnsw submodule (paths a/hnswlib/...), like upstream scripts/patch.sh, and
+  #   AFTER hnsw.patch (which only makes L2SqrSIMD16Ext static — disjoint from these hunks).
+  local neon_patch="${_MSVBASE_LIB_DIR}/../patches/tridb_neon_l2_distance.patch"
+  [[ -f "$neon_patch" ]] || die "missing TriDB fork patch: $neon_patch"
+  if grep -q 'L2SqrSIMD16ExtNEON' "$root/thirdparty/hnsw/hnswlib/space_l2.h" 2>/dev/null; then
+    log "TriDB fork patch (NEON L2 kernel, DEV-1234) already applied"
+  else
+    log "applying TriDB fork patch: AArch64 NEON L2 distance kernel (DEV-1234)"
+    ( cd "$root/thirdparty/hnsw" && git apply "$neon_patch" ) \
+      || die "tridb_neon_l2_distance.patch did not apply — hnswlib drift? re-generate from thirdparty/hnsw/hnswlib/space_l2.h"
   fi
 
   # ----------------------------------------------------------------------------
