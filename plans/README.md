@@ -20,8 +20,14 @@ MSVBASE source except through the build scripts' patch layer.
 | 006 | Docs consistency pass | P2 | S | — | DONE (advisor/006-docs-consistency) |
 | 007 | Integrity-check build downloads | P2 | M | — | DONE (advisor/007-download-integrity) |
 | 008 | Python tooling hardening | P3 | S | — | DONE (advisor/008-python-hardening) |
+| 010 | TJS critical-path (DEV-1168/1166/1169/1167) | P1 | L | 005 | DONE (all four shipped; see plan 010 "RECONCILED 2026-06-26") |
 
 Status values: TODO | IN PROGRESS | DONE | BLOCKED (one-line reason) | REJECTED (one-line rationale)
+
+> **BACKLOG COMPLETE (reconciled 2026-06-26).** Every plan above is shipped. This audit
+> backlog (commit `cb097db`, 2026-06-24) is fully executed — including the TJS thesis. New work
+> (128 GB benchmark, DEV-1284 SM-2 re-measure, DEV-1170 join-order C port, HNSW index tuning,
+> crash_recovery flake) is post-dated; generate it with a fresh `/improve` audit, don't add it here.
 
 ## Dependency notes
 
