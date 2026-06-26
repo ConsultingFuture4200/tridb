@@ -166,6 +166,7 @@ def compare(tridb_obs: dict[int, dict], baseline: dict, manifest: dict) -> dict:
         ),
         "k": k,
         "seed": manifest.get("seed"),
+        "term_cond": manifest.get("term_cond"),
         "corpus_entities": manifest.get("entities"),
         "corpus_edges": manifest.get("edges"),
         "num_queries": counted,
@@ -212,7 +213,8 @@ def render_md(result: dict) -> str:
     w(
         f"- Corpus: {result['corpus_entities']} entities, "
         f"{result['corpus_edges']} edges, k={result['k']}, "
-        f"seed={result['seed']}, runs/query={result['runs']}"
+        f"seed={result['seed']}, runs/query={result['runs']}, "
+        f"term_cond={result['term_cond']} (tjs operating point; 0 = engine default 50)"
     )
     w("")
     w("## Methodology")
