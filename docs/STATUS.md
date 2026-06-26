@@ -20,6 +20,15 @@ build on GX10) · 🔴 GX10-gated (needs live MSVBASE build).
 > cost of HNSW construction). REMAINING (GX10): roll this into the 128 GB headline benchmark and
 > report the end-to-end query-latency delta at the operating point.
 
+> **🟢 REAL-DATASET BENCH HARNESS 2026-06-26 (DEV-1284) — recall measurable on real vectors today.**
+> `tools/real_corpus.py`: loads real embeddings (`.npy/.fvecs/.ivecs/.hdf5`, h5py lazy-imported),
+> synthesizes the same topical hub graph the synthetic harness uses, computes the EXACT numpy top-k
+> oracle, and emits the IDENTICAL `#BENCH` SQL + manifest the live harness consumes. The SQL emitter
+> is now shared (`tools/bench_corpus.py:build_sql`, single source of truth) so the format cannot drift
+> between the synthetic and real paths. Recall@k / SM-4 is gradeable on the x86 standin WITHOUT the
+> engine; latency (SM-2) / live candidates-examined (SM-3) stay GX10-gated and are never claimed.
+> 110 Python tests pass, lint clean. Seam to wire engine recall into `bench/live_report.py` documented.
+
 > **🟢 CRASH-RECOVERY SUITE-ORDERING FLAKE FIXED 2026-06-26 (DEV-1234 P1b).** `scripts/crash_recovery_test.sh`
 > scenario 2 (uncommitted tri-store txn) raced host load when it ran LAST in `make graph-test`: the
 > 40s sentinel poll could time out before the doomed txn went active, and a self-expiring `pg_sleep(60)`
