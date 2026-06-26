@@ -4,14 +4,21 @@
 #
 # Built on the PROVEN recipe: MSVBASE's own Dockerfile + the shared patch layer in
 # scripts/lib/msvbase_patches.sh (the same set of fixes the eight-iteration x86 build validated
-# in scripts/x86build.sh --docker). The ONLY target-specific delta vs. x86 is patch_cmake_aarch64:
-# the upstream Dockerfile hardcodes an x86_64 CMake tarball, swapped here for an aarch64 release.
+# in scripts/x86build.sh --docker). Two target-specific deltas vs. x86:
+#   1. patch_cmake_aarch64       — upstream Dockerfile hardcodes an x86_64 CMake tarball; swap for aarch64.
+#   2. patch_cmake_arm_isa_flags — MSVBASE's CMakeLists hardcodes x86 ISA flags (-msse4.2 -maes -mavx2
+#      -mmwaitx) that aarch64 GCC rejects, failing every cmake compile probe (surfaces as a bogus
+#      "Could NOT find OpenMP_C"); strip them so hnswlib builds via its scalar path. Found by the first
+#      live GX10 run — the x86 standin never exercised these (the flags are valid there).
 #
 # SPTAG is NOT disabled by an env var (MSVBASE's CMake builds it regardless); the modern-GCC
 # force-includes let it compile, matching the x86 image. Off-target (non-ARM64) this refuses to run.
 #
-# IMPORTANT: this is correct-by-construction against the proven recipe but is NOT independently
-# validated until actually run on the GX10 (DEV-1160/1161 sign-off). See docs/BUILD_NOTES.md.
+# VALIDATED ON-TARGET 2026-06-25: ran on the GX10 (GB10, aarch64, 128 GB). The fork builds
+# ([100%] Built target vectordb) and scripts/smoke_test.sh PASSES (vectordb extension loads,
+# 100k-row HNSW index builds, early-terminating ANN Index Scan path confirmed). The first live
+# run surfaced GX10 delta #2 (x86 ISA flags) and a CWD-relative smoke-test path bug, both fixed
+# here. This is the DEV-1160/1161 sign-off. See docs/BUILD_NOTES.md.
 #
 # Usage:
 #   scripts/gx10build.sh [--repo-url URL] [--commit SHA] [--image NAME] [--skip-clone]
@@ -38,10 +45,15 @@ done
 log() { printf '\033[1;34m[gx10build]\033[0m %s\n' "$*"; }
 die() { printf '\033[1;31m[gx10build] FATAL:\033[0m %s\n' "$*" >&2; exit 1; }
 
+# Absolute dir of THIS script, resolved BEFORE any cd. The build cd's into the MSVBASE tree
+# (vendor/MSVBASE) before the docker build + smoke test, so a CWD-relative dirname would point
+# the smoke-test/lib lookups at vendor/MSVBASE/scripts/* and break. Capture absolute now.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 # Shared MSVBASE clone/patch/verify logic (PIN_COMMIT default, apply_msvbase_patches,
 # verify_patches, patch_upstream_dockerfile, patch_modern_gcc_includes, patch_cmake_aarch64).
 # Sourced AFTER arg parsing so --commit survives the PIN_COMMIT default. Defines only.
-LIB="$(dirname "${BASH_SOURCE[0]}")/lib/msvbase_patches.sh"
+LIB="$SCRIPT_DIR/lib/msvbase_patches.sh"
 [[ -f "$LIB" ]] || die "missing shared lib: $LIB"
 # shellcheck source=lib/msvbase_patches.sh
 source "$LIB"
@@ -73,7 +85,8 @@ cd "$SRC"
 apply_msvbase_patches "$SRC"            # spann/hnsw/Postgres — relaxed monotonicity. MUST precede force-includes.
 patch_upstream_dockerfile "$SRC/Dockerfile"   # dead Boost URL, GID 999, drop --with-python
 patch_modern_gcc_includes "$SRC"        # modern-GCC force-includes into SPTAG (so SPTAG compiles)
-patch_cmake_aarch64 "$SRC/Dockerfile"   # GX10 delta: x86_64 -> aarch64 CMake tarball
+patch_cmake_aarch64 "$SRC/Dockerfile"   # GX10 delta #1: x86_64 -> aarch64 CMake tarball
+patch_cmake_arm_isa_flags "$SRC"        # GX10 delta #2: strip x86 ISA flags (-msse4.2/-maes/-mavx2/-mmwaitx)
 
 # --- build via MSVBASE's own Dockerfile (NOT make -C src — there is no src/Makefile) -------
 log "building MSVBASE via its Dockerfile on aarch64 -> $IMAGE"
@@ -84,6 +97,6 @@ log "image built: $IMAGE"
 # Reuse the proven harness; it runs test/smoke.sql in the image and asserts the ANN Index Scan
 # path (relaxed monotonicity / TR-1 early termination) is live. Fails loud on any error.
 log "smoke test: scripts/smoke_test.sh against $IMAGE"
-bash "$(dirname "${BASH_SOURCE[0]}")/smoke_test.sh" "$IMAGE"
+bash "$SCRIPT_DIR/smoke_test.sh" "$IMAGE"
 
 log "GX10 BUILD + SMOKE OK ($IMAGE). Update tridb_spec marker #1 ('builds with documented deltas') for ARM64."

@@ -339,3 +339,31 @@ patch_cmake_aarch64() {
     sed -i "s#${CMAKE_3_14_4_X86_64_SHA256}#${CMAKE_3_27_9_AARCH64_SHA256}#g" "$df"
   fi
 }
+
+# GX10/ARM-only delta #2: MSVBASE's CMakeLists.txt hardcodes x86-only ISA flags
+# (-msse4.2 -maes -mavx2 -mmwaitx) into the global CMAKE_C/CXX_FLAGS and two
+# target_compile_options(-mavx2). On aarch64 GCC these flags are UNRECOGNIZED, so
+# every cmake compile probe fails — the first visible casualty is the OpenMP probe
+# ("Could NOT find OpenMP_C (missing: OpenMP_C_FLAGS OpenMP_C_LIB_NAMES)"), NOT
+# OpenMP itself. Strip them on ARM. hnswlib's SIMD kernels are all gated on
+# __SSE__/__AVX__ (hnswlib.h: `#ifdef __SSE__` -> `#define USE_SSE`), which GCC
+# only predefines under -msse/-mavx; with the flags gone they compile via the
+# scalar L2Sqr/InnerProduct fallback (fstdistfunc_ = L2Sqr). Idempotent
+# (grep-guarded), with a post-condition assert that no x86 ISA flag survives.
+# Call ONLY on ARM, after patch_cmake_aarch64. (Performance tuning — Neoverse
+# -mcpu=native — is deferred; this is correctness-first to clear the ARM build.)
+patch_cmake_arm_isa_flags() {
+  local root="$1"
+  local top="$root/CMakeLists.txt"
+  local tp="$root/thirdparty/CMakeLists.txt"
+  [[ -f "$top" ]] || die "patch_cmake_arm_isa_flags: missing $top"
+  if grep -qE 'msse4\.2|maes|mavx2|mmwaitx' "$top" "$tp" 2>/dev/null; then
+    log "stripping hardcoded x86 ISA flags (-msse4.2 -maes -mavx2 -mmwaitx) for aarch64 (GX10 delta #2; hnswlib -> scalar path)"
+    sed -i -E -e 's/ -msse4\.2 -maes -mavx2//g' -e 's/ -mmwaitx//g' -e 's/ -mavx2//g' "$top"
+    [[ -f "$tp" ]] && sed -i -E -e 's/ -mavx2//g' "$tp"
+  fi
+  # post-condition: NO x86 ISA flag may remain on ARM (else the cmake probes re-fail)
+  if grep -qE 'msse4\.2|maes|mavx2|mmwaitx' "$top" "$tp" 2>/dev/null; then
+    die "patch_cmake_arm_isa_flags: x86 ISA flag still present after patch (upstream drift?) — inspect $top and $tp"
+  fi
+}
