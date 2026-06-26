@@ -109,8 +109,11 @@ services:
   postgres:
     image: postgres:16
     container_name: tridb-baseline-postgres
+    # Host port is overridable (BASELINE_PG_PORT) for boxes where 5432 is already
+    # taken by another local Postgres/PGlite. Point the harness at the same port
+    # with PGPORT. Container-internal port stays 5432.
     ports:
-      - "5432:5432"
+      - "${BASELINE_PG_PORT:-5432}:5432"
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres

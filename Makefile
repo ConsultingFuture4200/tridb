@@ -1,4 +1,4 @@
-.PHONY: test lint graph-test smoke-test test-all baseline-up baseline-down seed bench bench-live clean
+.PHONY: test lint graph-test smoke-test test-all baseline-up baseline-down seed bench bench-live sm2 clean
 
 IMAGE ?= tridb/msvbase:dev
 ENGINE_TESTS := test/graph_store_test.sql test/trimodal_compose.sql \
@@ -60,6 +60,20 @@ bench-live:
 	@docker image inspect $(IMAGE) >/dev/null 2>&1 || \
 	  { echo "image $(IMAGE) not built — run scripts/x86build.sh --docker"; exit 1; }
 	bash scripts/bench_live.sh $(IMAGE)
+
+# FAIR SM-2 head-to-head (DEV-1171): LIVE TriDB vs the LIVE multi-system baseline
+# (Milvus+Neo4j+Postgres). Both sides run the IDENTICAL corpus + queries + k from
+# one deterministic generator, and both are measured the SAME way (client-side
+# end-to-end wall-clock per query, warm connections, median of N runs, load/index
+# excluded). Emits bench/results/sm2_metrics.json + docs/benchmark_sm2_v0.1.0.md.
+# Needs the engine image (scripts/x86build.sh --docker) AND the baseline stack up
+# (make baseline-up) AND the repo .venv with pymilvus/neo4j/psycopg.
+sm2:
+	@docker image inspect $(IMAGE) >/dev/null 2>&1 || \
+	  { echo "image $(IMAGE) not built — run scripts/x86build.sh --docker"; exit 1; }
+	@docker ps --filter name=tridb-baseline --format '{{.Names}}' | grep -q tridb-baseline || \
+	  { echo "baseline stack not up — run make baseline-up"; exit 1; }
+	bash scripts/bench_sm2.sh $(IMAGE)
 
 baseline-up:
 	docker compose -f baseline/docker-compose.yml up -d
