@@ -33,6 +33,16 @@ build on GX10) · 🔴 GX10-gated (needs live MSVBASE build).
 > is the **100k/768** headline ([[DEV-1169]] measured the recall side). Full table + repro:
 > `docs/benchmark_neon_sweep_v0.1.0.md`; artifacts in `bench/results/neon_sweep_*`.
 
+> **🟡 TJS JOIN-ORDER INTEGRATION DESIGN 2026-06-26 (DEV-1285) — ADR + safe draft, operator change GX10-gated.**
+> The DEV-1170 decision core is shipped; integrating it is NOT a wiring task — `tjs()` is a C SRF (not a
+> CustomScan), and it is hardwired vector-first, so "filter-first" is a new physical path. ADR-0011
+> (`docs/decisions/0011-tjs-join-order-integration.md`) analyzes the two options and recommends **Option B**
+> (pass the chosen order into `tjs()` as a parameter; keeps the validated vector-first body + its
+> early-termination bound untouched, preserving TR-1). Delivered: the ADR, a safe additive
+> `src/planner/join_order_legstats.{c,h}` catalog helper (UNBUILT-HERE), and a GX10-gated FR-6 stub test.
+> Surfaced a real gap: the graph metapage has no `avg_out_degree` (needs `gm_edge_count`, graph-store
+> follow-up). The risky operator change (filter-first body) is deliberately NOT started — GX10-gated.
+
 > **🟢 REAL-DATASET BENCH HARNESS 2026-06-26 (DEV-1284) — recall measurable on real vectors today.**
 > `tools/real_corpus.py`: loads real embeddings (`.npy/.fvecs/.ivecs/.hdf5`, h5py lazy-imported),
 > synthesizes the same topical hub graph the synthetic harness uses, computes the EXACT numpy top-k
