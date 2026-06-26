@@ -20,6 +20,19 @@ build on GX10) · 🔴 GX10-gated (needs live MSVBASE build).
 > cost of HNSW construction). REMAINING (GX10): roll this into the 128 GB headline benchmark and
 > report the end-to-end query-latency delta at the operating point.
 
+> **🟡 HNSW RELOPTIONS + RECALL/LATENCY SWEEP 2026-06-26 (DEV-1286) — index quality unblocked by NEON.**
+> Exposed per-index `m` / `ef_construction` as HNSW reloptions (`WITH (m=.., ef_construction=..)`,
+> `scripts/patches/tridb_hnsw_reloptions.patch`, wired + verified; default 0 -> hnswlib defaults, so
+> existing indexes are unchanged). Swept index-quality × `term_cond` on the **NEON+reloptions engine
+> rebuilt through the real MSVBASE `make`** on the GX10 (20k×128, 8 queries, k=10; `tools/sweep_corpus.py`).
+> Live result: at the recall@10 = **100%** operating point (`term_cond=20`, default index) the canonical
+> `tjs()` query runs in **~1.8 ms median at 2.18% examined** — the first real latency on the target ISA
+> (closes the GTM R1 latency gate at moderate scale). High-quality `m=32/ef_construction=400` now builds
+> in **5.4 s** (impractical on the scalar fallback — the reason DEV-1286 was gated). At 20k×128 recall is
+> saturated, so quality/`term_cond` trade latency not recall; the recall *curve* (where they move recall)
+> is the **100k/768** headline ([[DEV-1169]] measured the recall side). Full table + repro:
+> `docs/benchmark_neon_sweep_v0.1.0.md`; artifacts in `bench/results/neon_sweep_*`.
+
 > **🟢 REAL-DATASET BENCH HARNESS 2026-06-26 (DEV-1284) — recall measurable on real vectors today.**
 > `tools/real_corpus.py`: loads real embeddings (`.npy/.fvecs/.ivecs/.hdf5`, h5py lazy-imported),
 > synthesizes the same topical hub graph the synthetic harness uses, computes the EXACT numpy top-k

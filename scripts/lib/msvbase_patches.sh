@@ -80,6 +80,8 @@ verify_patches() {
     || die "TriDB tridb_tjs_predicate_termination.patch NOT applied — predicate-blind early termination (DEV-1169 scale defect); drift?"
   grep -q 'L2SqrSIMD16ExtNEON' "$root/thirdparty/hnsw/hnswlib/space_l2.h" 2>/dev/null \
     || die "TriDB tridb_neon_l2_distance.patch NOT applied — ARM NEON L2 kernel missing, scalar fallback sandbags latency (DEV-1234); drift?"
+  grep -q 'offsetof(hnsw_ParaOptions, ef_construction)' "$root/src/hnswindex.cpp" 2>/dev/null \
+    || die "TriDB tridb_hnsw_reloptions.patch NOT applied — HNSW m/ef_construction reloptions missing (DEV-1286); drift?"
   log "all MSVBASE + TriDB fork patches verified present"
 }
 
@@ -270,6 +272,24 @@ apply_tridb_fork_patches() {
     log "applying TriDB fork patch: AArch64 NEON L2 distance kernel (DEV-1234)"
     ( cd "$root/thirdparty/hnsw" && git apply "$neon_patch" ) \
       || die "tridb_neon_l2_distance.patch did not apply — hnswlib drift? re-generate from thirdparty/hnsw/hnswlib/space_l2.h"
+  fi
+
+  # tridb_hnsw_reloptions.patch (DEV-1286): expose per-index HNSW build quality as reloptions
+  #   WITH (m=..., ef_construction=...) on the vectordb HNSW AM (the relopt table previously exposed
+  #   only dimension/distmethod). Default 0 -> hnswlib defaults (M=16 / ef_construction=200), so
+  #   existing indexes are unchanged; opt-in per index. Threads the values into the FRESH-build
+  #   constructor (hnswindex_builder.cpp). NOTE: the DEV-1235 rebuild-on-recovery path
+  #   (hnswindex_scan.cpp LoadIndex) still rebuilds at hnswlib defaults — a tuned index recovers at
+  #   default quality until reindexed; documented follow-up, not wired here. Unblocked by NEON
+  #   (DEV-1234): higher build quality is only affordable to build once the distance kernel is SIMD.
+  local relopt_patch="${_MSVBASE_LIB_DIR}/../patches/tridb_hnsw_reloptions.patch"
+  [[ -f "$relopt_patch" ]] || die "missing TriDB fork patch: $relopt_patch"
+  if grep -q 'offsetof(hnsw_ParaOptions, ef_construction)' "$root/src/hnswindex.cpp" 2>/dev/null; then
+    log "TriDB fork patch (HNSW m/ef_construction reloptions, DEV-1286) already applied"
+  else
+    log "applying TriDB fork patch: HNSW m/ef_construction reloptions (DEV-1286)"
+    ( cd "$root" && git apply "$relopt_patch" ) \
+      || die "tridb_hnsw_reloptions.patch did not apply — MSVBASE drift? re-generate from src/{hnswindex.hpp,hnswindex.cpp,lib.cpp,hnswindex_builder.cpp}"
   fi
 
   # ----------------------------------------------------------------------------
