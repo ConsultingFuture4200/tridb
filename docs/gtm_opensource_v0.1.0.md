@@ -12,6 +12,29 @@ that artifact. Lead the story with **one-system + local-hardware (DGX Spark)**, 
 with performance, and be ruthlessly honest about scope and the answer-quality data — because
 the honesty is the differentiator that survives HN.
 
+## Addendum 2026-06-26 — gate progress (NEON + measured latency)
+
+Two of the blockers this plan named have moved; recorded here (append, not rewrite):
+
+- **R1 "report latency in ms at the operating point" — now has a real number (moderate scale).**
+  The ARM **NEON** distance kernel ([[DEV-1234]]) landed and un-sandbagged the engine. On the
+  GX10, the canonical `tjs()` query at the recall@10 = 100% operating point runs in **~1.8 ms
+  median at 2.18% of the corpus examined** (20k×128); HNSW index build dropped **4.2×** (47.8 s →
+  11.3 s, same corpus). HNSW build-quality `m` / `ef_construction` are now **reloptions**
+  ([[DEV-1286]]) and a high-quality index builds in ~5 s. Full curve + method:
+  [[benchmark_neon_sweep_v0.1.0]]. **Still gated:** the *recall curve* where `term_cond` / index
+  quality actually move recall is the **100k / dim-768** headline (recall saturates at 20k/128);
+  and a *fair multi-system SM-2 head-to-head* is still not run (latency here is TriDB-side only).
+- **R3 "synthetic-benchmark credibility" — the public-dataset path now exists in tooling.**
+  `tools/real_corpus.py` ([[DEV-1284]]) loads real embedding datasets (`.npy/.fvecs/.hdf5`),
+  synthesizes the topical graph, and emits the identical canonical-query harness with an exact
+  recall oracle. Still TODO: pick + pin a recognized public dataset and a tuned multi-store
+  baseline, and the one-command repro (the make-or-break item below). Tooling no longer blocks it.
+
+Net: the *mechanism + on-target latency* are now real; the *public-workload value claim* and the
+*at-scale recall curve* remain the to-do list. Do not launch before the 100k/768 curve and a
+public-dataset run with one-command repro.
+
 ## Where we actually stand (don't oversell this)
 
 | Asset | State | Proof value |
