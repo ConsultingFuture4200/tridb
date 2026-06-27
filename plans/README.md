@@ -25,6 +25,7 @@ MSVBASE source except through the build scripts' patch layer.
 | 012 | Expose `term_cond` in the SM-2 benchmark harness | P1 | S | - | DONE (7591709) |
 | 013 | Refresh TJS termination and GX10 status documentation | P1 | S | 011, 012 | DONE (668f2a0; step 2 SQL COMMENT deferred) |
 | 014 | Run the full engine verification target in manual CI | P2 | S | - | TODO (BLOCKED: crash_recovery suite-ordering flake makes graph-test in CI flaky — harden first) |
+| 015 | Real-graph + QA-accuracy benchmark (HotpotQA fullwiki) | P0 | XL | 010, 012 | DONE-HERE (phases 1-4+6 built+RUN on dev slice: +15.6pt multi-hop joint recall@5; phase 5 SQL/wiring built, live run GX10-gated; LLM EM/F1 reader-gated — see docs/benchmark_graphrag_v0.1.0.md) |
 
 Status values: TODO | IN PROGRESS | DONE | BLOCKED (one-line reason) | REJECTED (one-line rationale)
 
