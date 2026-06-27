@@ -1,0 +1,121 @@
+ #BENCH ORACLE qid=0 ids=32381
+ #BENCH ORACLE_COUNTS qid=0 reached=199 filtered=111
+ #BENCH ORACLE qid=1 ids=3163
+ #BENCH ORACLE_COUNTS qid=1 reached=199 filtered=134
+ #BENCH ORACLE qid=2 ids=30006
+ #BENCH ORACLE_COUNTS qid=2 reached=199 filtered=130
+ #BENCH ORACLE qid=3 ids=2134
+ #BENCH ORACLE_COUNTS qid=3 reached=200 filtered=124
+ #BENCH ORACLE qid=4 ids=1251
+ #BENCH ORACLE_COUNTS qid=4 reached=200 filtered=129
+ #BENCH ORACLE qid=5 ids=23545
+ #BENCH ORACLE_COUNTS qid=5 reached=200 filtered=117
+ #BENCH ORACLE qid=6 ids=43685
+ #BENCH ORACLE_COUNTS qid=6 reached=199 filtered=135
+ #BENCH ORACLE qid=7 ids=23509
+ #BENCH ORACLE_COUNTS qid=7 reached=200 filtered=118
+ #BENCH ORACLE qid=8 ids=7007
+ #BENCH ORACLE_COUNTS qid=8 reached=200 filtered=115
+ #BENCH ORACLE qid=9 ids=6517
+ #BENCH ORACLE_COUNTS qid=9 reached=200 filtered=124
+#BENCH QSTART qid=0 src=0 k=10
+ #BENCH TRIDB_RESULT qid=0 ids=25561,1399,1288,18427,17705,37172,49759,20643,25846,21647
+ #BENCH TRIDB_EXAMINED qid=0 examined=2180
+#BENCH EXPLAIN_BEGIN qid=0
+                                                QUERY PLAN                                                 
+ Function Scan on tjs t  (cost=0.00..10.00 rows=1000 width=8) (actual time=15.636..15.637 rows=10 loops=1)
+ Planning Time: 0.025 ms
+ Execution Time: 15.645 ms
+#BENCH EXPLAIN_END qid=0
+#BENCH QEND qid=0
+#BENCH QSTART qid=1 src=1 k=10
+ #BENCH TRIDB_RESULT qid=1 ids=22250,30316,5977,16479,182,4829,20413,24359,12925,4590
+ #BENCH TRIDB_EXAMINED qid=1 examined=1822
+#BENCH EXPLAIN_BEGIN qid=1
+                                                QUERY PLAN                                                 
+ Function Scan on tjs t  (cost=0.00..10.00 rows=1000 width=8) (actual time=13.737..13.738 rows=10 loops=1)
+ Planning Time: 0.013 ms
+ Execution Time: 13.746 ms
+#BENCH EXPLAIN_END qid=1
+#BENCH QEND qid=1
+#BENCH QSTART qid=2 src=2 k=10
+ #BENCH TRIDB_RESULT qid=2 ids=24615,12440,13712,4,30248,16514,20451,4828,20781,42713
+ #BENCH TRIDB_EXAMINED qid=2 examined=1374
+#BENCH EXPLAIN_BEGIN qid=2
+                                                QUERY PLAN                                                 
+ Function Scan on tjs t  (cost=0.00..10.00 rows=1000 width=8) (actual time=10.016..10.017 rows=10 loops=1)
+ Planning Time: 0.016 ms
+ Execution Time: 10.040 ms
+#BENCH EXPLAIN_END qid=2
+#BENCH QEND qid=2
+#BENCH QSTART qid=3 src=3 k=10
+ #BENCH TRIDB_RESULT qid=3 ids=8499,44211,8839,105,17691,41201,45289,30461,44338,40882
+ #BENCH TRIDB_EXAMINED qid=3 examined=1429
+#BENCH EXPLAIN_BEGIN qid=3
+                                               QUERY PLAN                                                
+ Function Scan on tjs t  (cost=0.00..10.00 rows=1000 width=8) (actual time=9.813..9.815 rows=10 loops=1)
+ Planning Time: 0.013 ms
+ Execution Time: 9.824 ms
+#BENCH EXPLAIN_END qid=3
+#BENCH QEND qid=3
+#BENCH QSTART qid=4 src=4 k=10
+ #BENCH TRIDB_RESULT qid=4 ids=7919,43997,12963,20161,20783,19944,2067,21327,37397,16876
+ #BENCH TRIDB_EXAMINED qid=4 examined=2969
+#BENCH EXPLAIN_BEGIN qid=4
+                                                QUERY PLAN                                                 
+ Function Scan on tjs t  (cost=0.00..10.00 rows=1000 width=8) (actual time=20.532..20.533 rows=10 loops=1)
+ Planning Time: 0.012 ms
+ Execution Time: 20.541 ms
+#BENCH EXPLAIN_END qid=4
+#BENCH QEND qid=4
+#BENCH QSTART qid=5 src=5 k=10
+ #BENCH TRIDB_RESULT qid=5 ids=20964,30188,39578,29503,17692,23545,17588,9103,21478,23517
+ #BENCH TRIDB_EXAMINED qid=5 examined=1232
+#BENCH EXPLAIN_BEGIN qid=5
+                                               QUERY PLAN                                                
+ Function Scan on tjs t  (cost=0.00..10.00 rows=1000 width=8) (actual time=8.136..8.137 rows=10 loops=1)
+ Planning Time: 0.014 ms
+ Execution Time: 8.145 ms
+#BENCH EXPLAIN_END qid=5
+#BENCH QEND qid=5
+#BENCH QSTART qid=6 src=6 k=10
+ #BENCH TRIDB_RESULT qid=6 ids=7007,17546,20892,32667,19984,33480,32353,26171,17454,9170
+ #BENCH TRIDB_EXAMINED qid=6 examined=1846
+#BENCH EXPLAIN_BEGIN qid=6
+                                                QUERY PLAN                                                 
+ Function Scan on tjs t  (cost=0.00..10.00 rows=1000 width=8) (actual time=12.736..12.737 rows=10 loops=1)
+ Planning Time: 0.012 ms
+ Execution Time: 12.745 ms
+#BENCH EXPLAIN_END qid=6
+#BENCH QEND qid=6
+#BENCH QSTART qid=7 src=7 k=10
+ #BENCH TRIDB_RESULT qid=7 ids=7007,9416,16515,1526,8972,26173,30830,208,30846,16261
+ #BENCH TRIDB_EXAMINED qid=7 examined=2637
+#BENCH EXPLAIN_BEGIN qid=7
+                                                QUERY PLAN                                                 
+ Function Scan on tjs t  (cost=0.00..10.00 rows=1000 width=8) (actual time=18.490..18.491 rows=10 loops=1)
+ Planning Time: 0.025 ms
+ Execution Time: 18.518 ms
+#BENCH EXPLAIN_END qid=7
+#BENCH QEND qid=7
+#BENCH QSTART qid=8 src=8 k=10
+ #BENCH TRIDB_RESULT qid=8 ids=31508,2062,12081,25483,16912,30248,10673,26837,18151,30360
+ #BENCH TRIDB_EXAMINED qid=8 examined=1924
+#BENCH EXPLAIN_BEGIN qid=8
+                                                QUERY PLAN                                                 
+ Function Scan on tjs t  (cost=0.00..10.00 rows=1000 width=8) (actual time=13.688..13.689 rows=10 loops=1)
+ Planning Time: 0.017 ms
+ Execution Time: 13.698 ms
+#BENCH EXPLAIN_END qid=8
+#BENCH QEND qid=8
+#BENCH QSTART qid=9 src=9 k=10
+ #BENCH TRIDB_RESULT qid=9 ids=13444,23191,30758,21890,14465,18941,30,19578,11324,3252
+ #BENCH TRIDB_EXAMINED qid=9 examined=2532
+#BENCH EXPLAIN_BEGIN qid=9
+                                                QUERY PLAN                                                 
+ Function Scan on tjs t  (cost=0.00..10.00 rows=1000 width=8) (actual time=18.619..18.620 rows=10 loops=1)
+ Planning Time: 0.013 ms
+ Execution Time: 18.629 ms
+#BENCH EXPLAIN_END qid=9
+#BENCH QEND qid=9
+#BENCH DONE

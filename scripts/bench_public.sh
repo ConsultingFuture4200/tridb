@@ -29,6 +29,9 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # The SQL does CREATE EXTENSION graph_store, so we PGXS-build the graph_store_ext tree in the image,
 # exactly as scripts/bench_live.sh / bench_gx10_sweep.sh do.
 EXT="$ROOT/src/graph_store_ext"
+# Run real_corpus as `-m tools.real_corpus` from the repo root so its `from tools.bench_corpus
+# import build_sql` (the shared canonical SQL emitter) resolves — running it by path does not.
+cd "$ROOT"
 
 DATASET="${PUBLIC_DATASET:-gist-960-euclidean}"
 LIMIT="${PUBLIC_LIMIT:-20000}"
@@ -76,7 +79,7 @@ echo "[bench_public] generating canonical SQL + oracle over $DATASET" \
      "(limit=$LIMIT hubs=$HUBS fanout=$FANOUT queries=$QUERIES k=$K window=$WINDOW seed=$SEED)"
 EXTRA=()
 if [ "${LIMIT}" != "0" ]; then EXTRA+=(--limit "$LIMIT"); fi
-"$PY" "$ROOT/tools/real_corpus.py" \
+"$PY" -m tools.real_corpus \
   --vectors "$HDF5" --hdf5-dataset train \
   --hubs "$HUBS" --fanout "$FANOUT" --queries "$QUERIES" --k "$K" \
   --window "$WINDOW" --seed "$SEED" \
@@ -111,7 +114,7 @@ mkdir -p "$OUTDIR"
 echo "[bench_public] grading engine recall@k vs the exact numpy oracle"
 # real_corpus --report-recall parses the live #BENCH TRIDB_RESULT transcript and grades it against
 # the manifest's exact oracle (report_recall). Tee the human-readable summary AND keep it as an artifact.
-"$PY" "$ROOT/tools/real_corpus.py" --report-recall \
+"$PY" -m tools.real_corpus --report-recall \
   --manifest "$MANIFEST" --results "$RAW" | tee "$OUTDIR/bench_public_recall.txt"
 
 # Keep an auditable copy of the live transcript: the #BENCH observations + each query's EXPLAIN

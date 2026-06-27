@@ -41,7 +41,10 @@ source "$LIB"
 log "MSVBASE pin: $PIN_COMMIT"
 
 SRC="$(mktemp -d)"
-trap 'rm -rf "$SRC"' EXIT
+# Tolerant cleanup: leftover shallow-submodule git processes can still be writing into $SRC when the
+# trap fires, so a bare `rm -rf` intermittently errors "Directory not empty" and — under `set -e` —
+# would fail the job AFTER a successful verify. Never let cleanup change the exit status.
+trap 'rm -rf "$SRC" 2>/dev/null || true' EXIT
 
 # Fetch only the pinned commit (shallow) — avoids cloning full upstream history.
 log "cloning MSVBASE (shallow) -> $SRC"

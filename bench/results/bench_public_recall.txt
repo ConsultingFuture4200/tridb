@@ -1,0 +1,11 @@
+[real_corpus] recall@10 (graded vs results): mean 1.000 over 10 queries
+[real_corpus]   qid=0 recall=1.000
+[real_corpus]   qid=1 recall=1.000
+[real_corpus]   qid=2 recall=1.000
+[real_corpus]   qid=3 recall=1.000
+[real_corpus]   qid=4 recall=1.000
+[real_corpus]   qid=5 recall=1.000
+[real_corpus]   qid=6 recall=1.000
+[real_corpus]   qid=7 recall=1.000
+[real_corpus]   qid=8 recall=1.000
+[real_corpus]   qid=9 recall=1.000

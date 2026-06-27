@@ -25,13 +25,18 @@ Two of the blockers this plan named have moved; recorded here (append, not rewri
   [[benchmark_neon_sweep_v0.1.0]]. **The 100k / dim-768 headline curve is now run (NEON, GX10):**
   recall@10 **96.25% at ~36 ms / 3.3% examined** (`term_cond=20`) → **100% at ~41 ms / 4.4% examined**
   (`term_cond=1000`), every point under the 25% TR-1 ceiling — the real recall/effort/latency curve at
-  scale (the "toy scale" rebuttal). **Still gated:** a *fair multi-system SM-2 head-to-head* (latency
-  here is TriDB-side only), and the public-dataset value claim (below).
+  scale (the "toy scale" rebuttal). **SM-2 fair head-to-head now run** (2k/32, live tuned
+  Milvus+Neo4j+Postgres): TriDB wins **12/12** at **median 11.5× lower latency** (~1 ms vs ~16 ms) with
+  **exact answer parity** (Jaccard 1.0) — [[benchmark_sm2_v0.1.0]]. (A fair head-to-head at 100k scale
+  is the remaining stretch.)
 - **R3 "synthetic-benchmark credibility" — the public-dataset path now exists in tooling.**
   `tools/real_corpus.py` ([[DEV-1284]]) loads real embedding datasets (`.npy/.fvecs/.hdf5`),
   synthesizes the topical graph, and emits the identical canonical-query harness with an exact
-  recall oracle. Still TODO: pick + pin a recognized public dataset and a tuned multi-store
-  baseline, and the one-command repro (the make-or-break item below). Tooling no longer blocks it.
+  recall oracle. **First real run done:** `sift-128-euclidean` pinned (verified SHA256) + fetched + run
+  LIVE (50k slice) — recall@10 **100% at ~4% examined** (`term_cond≈1000`); the **default `term_cond=50`
+  gives only 16%**, so real clustered data needs a deeper scan than the synthetic implied
+  ([[benchmark_public_v0.1.0]]). `make fetch-dataset && make bench-public` is the one-command repro.
+  Still TODO: the **dim-960 GIST headline** (`PUBLIC_LIMIT=100000` on a networked GX10).
 
 Net: the *mechanism + on-target latency* are now real; the *public-workload value claim* and the
 *at-scale recall curve* remain the to-do list. Do not launch before the 100k/768 curve and a
