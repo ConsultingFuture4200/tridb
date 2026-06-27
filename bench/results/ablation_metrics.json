@@ -1,0 +1,48 @@
+{
+  "k": 10,
+  "graded": 260,
+  "groups": [
+    "all",
+    "comparison_query",
+    "inference_query",
+    "null_query",
+    "temporal_query"
+  ],
+  "summary": {
+    "vector_only": {
+      "all": 0.7467948717948718,
+      "comparison_query": 0.8066666666666668,
+      "inference_query": 0.6719858156028369,
+      "null_query": 0.0,
+      "temporal_query": 0.7626262626262627
+    },
+    "graph_only": {
+      "all": 0.0019230769230769232,
+      "comparison_query": 0.005,
+      "inference_query": 0.0,
+      "null_query": 0.0,
+      "temporal_query": 0.0
+    },
+    "relational_only": {
+      "all": 0.328525641025641,
+      "comparison_query": 0.27166666666666667,
+      "inference_query": 0.41046099290780147,
+      "null_query": 0.0,
+      "temporal_query": 0.29797979797979796
+    },
+    "fusion": {
+      "all": 0.8054487179487179,
+      "comparison_query": 0.855,
+      "inference_query": 0.7437943262411348,
+      "null_query": 0.0,
+      "temporal_query": 0.8181818181818182
+    },
+    "fusion_hardfilter": {
+      "all": 0.8105769230769231,
+      "comparison_query": 0.855,
+      "inference_query": 0.7579787234042553,
+      "null_query": 0.0,
+      "temporal_query": 0.8181818181818182
+    }
+  }
+}
