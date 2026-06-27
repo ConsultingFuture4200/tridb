@@ -56,7 +56,7 @@ import hashlib
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from urllib.request import urlopen
+from urllib.request import Request, urlopen
 
 # Sentinel for an unpinned checksum (see module docstring). A real pinned dataset
 # replaces this with its lowercase hex SHA256 digest.
@@ -104,7 +104,7 @@ REGISTRY: dict[str, Dataset] = {
     "sift-128-euclidean": Dataset(
         name="sift-128-euclidean",
         url=f"{_BASE}/sift-128-euclidean.hdf5",
-        sha256=_PENDING,
+        sha256="dd6f0a6ed6b7ebb8934680f861a33ed01ff33991eaee4fd60914d854a0ca5984",
         dim=128,
         distance="euclidean",
         note="SIFT1M; dim 128, L2. Fast pipeline smoke only — below the 768+ headline.",
@@ -151,7 +151,12 @@ def _download(url: str, dest: Path) -> None:
     dest.parent.mkdir(parents=True, exist_ok=True)
     part = dest.with_suffix(dest.suffix + ".part")
     print(f"[fetch_dataset] downloading {url}")
-    with urlopen(url) as resp, open(part, "wb") as out:  # noqa: S310 (pinned http mirror)
+    # The ann-benchmarks mirror 403s the default "Python-urllib" User-Agent; send a non-default UA
+    # (the SHA256 pin, not the transport, is the integrity guarantee — see verify_checksum).
+    req = Request(
+        url, headers={"User-Agent": "Mozilla/5.0 (compatible; tridb-fetch_dataset/1.0)"}
+    )
+    with urlopen(req) as resp, open(part, "wb") as out:  # noqa: S310 (pinned mirror + checksum-verified)
         while True:
             block = resp.read(1 << 20)
             if not block:

@@ -11,6 +11,31 @@ embeddings, so **correctness is measurable today**; the **live engine run + its
 latency are GX10/stack-gated**, and the **dataset download is network-gated**.
 Nothing in this doc claims a live number that was not produced.
 
+## First live run — sift-128, 50k slice (real public embeddings, 2026-06-27)
+
+The pipeline is proven end to end: `make fetch-dataset` (SHA256-verified) -> `make bench-public` on the
+LIVE forked-MSVBASE engine over the **first 50,000 real SIFT1M vectors** (dim 128), 10 queries, k=10,
+recall graded vs the exact numpy oracle. This used the **smoke** set (sift-128, below the 768+ headline)
+on the x86 dev image; the dim-960 GIST headline run is GX10/stack-gated.
+
+| `term_cond` | recall@10 | corpus examined | note |
+|---|---|---|---|
+| 50 (operator default) | **0.16** | ~0.1% | far too shallow for real clustered data |
+| 1000 | **1.00** | ~4.0% | exact — the real operating point |
+| 5000 | 1.00 | ~12% | exact; deeper than needed |
+
+**The honest finding — and the whole point of a public dataset:** real clustered embeddings are *much*
+harder than the synthetic gaussian corpus. On synthetic, recall saturated at the shipped default; on
+**real SIFT it needs `term_cond ≈ 1000`** to reach exact recall@10 — at which point it examines only
+**~4% of the corpus** (well under the 25% TR-1 ceiling). The shipped default (`term_cond=50`) returns
+only **16%** here and must be tuned per data distribution. This retires the "synthetic corpus" attack
+with a real number AND surfaces the real operating point honestly rather than quoting the optimistic
+synthetic curve. Artifacts (the `term_cond=1000` operating point): `bench/results/bench_public_*`.
+
+> Pinning status: `sift-128-euclidean` is now pinned with a verified SHA256 (501 MB, fetched + run here).
+> `gist-960-euclidean` stays `_PENDING` until its (~3.8 GB) first `--pin` fetch on a networked host —
+> that, at `PUBLIC_LIMIT=100000` on the GX10, is the dim-960 headline run.
+
 ## Why this dataset (gist-960-euclidean)
 
 The GTM headline asks for **real embeddings, dim 768+**, and the TriDB canonical
