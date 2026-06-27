@@ -95,3 +95,40 @@ diff --git a/src/hnswindex_builder.cpp b/src/hnswindex_builder.cpp
  }
  
  void HNSWComputeElementsCallback(Relation index,
+diff --git a/src/hnswindex_scan.cpp b/src/hnswindex_scan.cpp
+--- a/src/hnswindex_scan.cpp
++++ b/src/hnswindex_scan.cpp
+@@ -13,6 +13,12 @@
+ #include <utils/rel.h>
+ }
+ 
++// TRIDB DEV-1286: defined in hnswindex.cpp (C++ linkage). Read per-index HNSW build-quality
++// reloptions; both return 0 when unset so the recovery rebuild keeps hnswlib's defaults
++// (M=16 / ef_construction=200) — same fallback as ConstructInternalBuilder in hnswindex_builder.cpp.
++int hnsw_ParaGetM(Relation index);
++int hnsw_ParaGetEfConstruction(Relation index);
++
+ // TRIDB(DEV-1228 / ADR-0004): the hnswlib-backed HNSW AM is the reference implementer of the
+ // TriDB-owned vector-index scan contract. Assert conformance at compile time so a future
+ // refactor that breaks Open/Next/Close fails the build here, not at runtime.
+@@ -140,8 +146,19 @@
+     if (capacity < 16)
+         capacity = 16;
+ 
++    // TRIDB DEV-1286: honour the per-index M / ef_construction reloptions on the recovery
++    // rebuild too, so a tuned index (WITH (m=32, ef_construction=400)) recovers at the same
++    // quality it was built with instead of silently falling back to hnswlib defaults. Reloptions
++    // live on the SAME index catalog relation the fresh build reads (index->rd_options), so a
++    // tuned index recovers tuned. 0 -> 16 / 200 keeps untuned indexes unchanged (mirrors
++    // ConstructInternalBuilder's fallback exactly).
++    int relM = hnsw_ParaGetM(index);
++    int relEfc = hnsw_ParaGetEfConstruction(index);
++    size_t hnsw_M = (relM > 0) ? static_cast<size_t>(relM) : 16;
++    size_t hnsw_efc = (relEfc > 0) ? static_cast<size_t>(relEfc) : 200;
++
+     auto vector_index =
+-        std::make_shared<hnswlib::HierarchicalNSW<float>>(distanceFunction.get(), capacity);
++        std::make_shared<hnswlib::HierarchicalNSW<float>>(distanceFunction.get(), capacity, hnsw_M, hnsw_efc);
+ 
+     // Build IndexInfo for table_index_build_scan. BuildIndexInfo reads the
+     // index catalog (expression trees, predicate, etc.) — we need it even
