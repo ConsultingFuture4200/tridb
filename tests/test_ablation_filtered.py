@@ -102,6 +102,21 @@ def test_fusion_recovers_graph_relational_bridge_vector_misses():
     assert fus > vec
 
 
+def test_query_parsed_constraint_no_gold_leakage():
+    from tools.multihoprag_corpus import _parse_query_constraint
+
+    sources = ["The Verge", "TechCrunch"]
+    cats = ["technology", "sports"]
+    # source + year named in the query -> parsed constraint (deployable, no gold)
+    qc, qs, ymin, ymax = _parse_query_constraint(
+        "According to The Verge in 2023, what happened?", sources, cats
+    )
+    assert qs == ["The Verge"] and ymin == 202301 and ymax == 202312
+    # no relational cue -> empty constraint (relational leg is a no-op)
+    qc2, qs2, ymin2, ymax2 = _parse_query_constraint("Who won?", sources, cats)
+    assert qc2 == [] and qs2 == [] and ymin2 == 0
+
+
 def test_fusion_hardfilter_caps_when_constraint_excludes_gold():
     sl = _toy_ablation()
     # make the gold bridge (doc1) fail the relational constraint -> hard filter drops it

@@ -153,9 +153,14 @@ def build_entity_graph(
 
 def attach_questions(qa_rows: list[dict], docs: list[dict]) -> list[dict]:
     """Resolve each question's gold evidence -> corpus doc ids (by url, then title)
-    and derive its relational constraint (gold categories/sources + ym span)."""
+    and derive TWO relational constraints per question:
+      rel_*  : from GOLD evidence metadata = ORACLE upper bound (leaky, not deployable).
+      qrel_* : parsed from the QUERY TEXT (sources/categories named, years/months
+               mentioned) = what a real system actually knows. Sparse by design."""
     by_url = {d["url"]: d["id"] for d in docs if d["url"]}
     by_title = {" ".join(_tokens(d["title"])): d["id"] for d in docs if d["title"]}
+    corpus_sources = sorted({d["source"] for d in docs if d["source"]})
+    corpus_categories = sorted({d["category"] for d in docs if d["category"]})
     out = []
     for qi, r in enumerate(qa_rows):
         ev = r.get("evidence_list") or []
@@ -174,22 +179,74 @@ def attach_questions(qa_rows: list[dict], docs: list[dict]) -> list[dict]:
             if ym:
                 yms.append(ym)
         gold_ids = sorted(set(gold_ids))
+        query = r.get("query") or ""
+        qcats, qsrcs, qym_min, qym_max = _parse_query_constraint(
+            query, corpus_sources, corpus_categories
+        )
         out.append(
             {
                 "qid": qi,
-                "query": r.get("query") or "",
+                "query": query,
                 "answer": r.get("answer") or "",
                 "question_type": r.get("question_type") or "",
                 "gold_ids": gold_ids,
                 "n_gold": len(gold_ids),
-                # relational constraint derived from gold evidence metadata:
+                # ORACLE constraint (gold-derived) — upper bound, leaky:
                 "rel_categories": sorted(cats),
                 "rel_sources": sorted(srcs),
                 "rel_ym_min": min(yms) if yms else 0,
                 "rel_ym_max": max(yms) if yms else 0,
+                # DEPLOYABLE constraint (query-parsed) — what a system actually knows:
+                "qrel_categories": qcats,
+                "qrel_sources": qsrcs,
+                "qrel_ym_min": qym_min,
+                "qrel_ym_max": qym_max,
             }
         )
     return out
+
+
+_MONTHS = {
+    "january": 1,
+    "february": 2,
+    "march": 3,
+    "april": 4,
+    "may": 5,
+    "june": 6,
+    "july": 7,
+    "august": 8,
+    "september": 9,
+    "october": 10,
+    "november": 11,
+    "december": 12,
+}
+_YEAR = re.compile(r"\b(20\d{2})\b")
+
+
+def _parse_query_constraint(
+    query: str, sources: list[str], categories: list[str]
+) -> tuple[list[str], list[str], int, int]:
+    """Extract a relational constraint from the QUERY text only (no gold).
+
+    - sources/categories: corpus values named verbatim in the query.
+    - dates: a 20xx year (optionally narrowed to a named month) -> ym span.
+    Empty when the query states no relational cue (honest: relational helps only
+    when the question actually constrains by source/category/time)."""
+    ql = query.lower()
+    qsrcs = [s for s in sources if s.lower() in ql]
+    qcats = [c for c in categories if c.lower() in ql]
+    years = [int(y) for y in _YEAR.findall(query)]
+    months = [m for name, m in _MONTHS.items() if name in ql]
+    if years:
+        y = years[0]
+        if months:
+            ym_min = min(y * 100 + m for m in months)
+            ym_max = max(y * 100 + m for m in months)
+        else:
+            ym_min, ym_max = y * 100 + 1, y * 100 + 12
+    else:
+        ym_min = ym_max = 0
+    return qcats, qsrcs, ym_min, ym_max
 
 
 def embed(texts: list[str], model_name: str = EMBED_MODEL) -> np.ndarray:

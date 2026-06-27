@@ -1,8 +1,8 @@
 # TriDB Benchmark — Tri-Modal Fusion Ablation (MultiHopRAG)
 
-**Falsification test — NUANCED: fusion (0.805) beats the best single modality (0.747, vector) by +0.059 recall@10, BUT read the two caveats below — the lift is relational, not graph, and the relational constraint is an oracle upper bound.**
+**Falsification test — DEPLOYABLE fusion (query-parsed relational) = 0.784 vs vector-only 0.747 (+0.037 recall@10); ORACLE fusion (gold-derived relational) = 0.805 (+0.059) is the upper bound. The graph leg adds ~nothing on this news workload — read the caveats.**
 
-Same 260 MultiHopRAG questions (gold-resolved), recall@10 over a 609-article corpus with REAL relational metadata. Each config isolates a modality; fusion = vector-seed -> inject graph bridges that pass the relational gate -> vector fill (the tjs-style operator).
+Same 260 MultiHopRAG questions (gold-resolved), recall@10 over a 609-article corpus with REAL relational metadata. Each config isolates a modality; fusion = vector-seed -> inject graph bridges that pass the relational gate -> vector fill (the tjs-style operator). `*_qparse` use a relational constraint PARSED FROM THE QUERY (no gold leakage).
 
 ## recall@k by configuration
 
@@ -13,18 +13,21 @@ Same 260 MultiHopRAG questions (gold-resolved), recall@10 over a 609-article cor
 | relational_only | 0.329 | 0.272 | 0.410 | 0.000 | 0.298 |
 | fusion | 0.805 | 0.855 | 0.744 | 0.000 | 0.818 |
 | fusion_hardfilter | 0.811 | 0.855 | 0.758 | 0.000 | 0.818 |
+| relational_qparse | 0.229 | 0.208 | 0.137 | 0.000 | 0.391 |
+| fusion_qparse | 0.784 | 0.843 | 0.721 | 0.000 | 0.783 |
 
 ## Per-modality contribution (all questions)
 
 | modality step | recall@k | delta |
 |---|---:|---:|
 | vector_only (base) | 0.747 | — |
-| + relational filter (rel+vector) | 0.811 | +0.064 |
-| + graph inject (full fusion) | 0.805 | -0.005 |
+| + query-parsed relational (DEPLOYABLE fusion) | 0.784 | +0.037 |
+| + oracle relational (rel+vector, upper bound) | 0.811 | +0.064 |
+| + graph inject on oracle (full fusion) | 0.805 | -0.005 |
 
 ## Caveats (these decide whether the win is real)
 
-1. **The relational constraint is GOLD-DERIVED = an ORACLE upper bound.** It is built from the gold evidence's category/source/date span, which a real system does NOT know at query time. So the relational lift (+0.064) is the *best case* for the relational modality, not a deployable number — a query-parsed constraint is the honest next step.
+1. **Oracle vs deployable relational.** The `rel_*` constraint is GOLD-DERIVED (category/source/date of the gold evidence) = an ORACLE upper bound a real system does NOT have (+0.064). The `qrel_*` constraint is PARSED FROM THE QUERY TEXT (sources/categories named, years/months mentioned) and is deployable: query-parsed fusion still beats vector-only by +0.037, though the cue is sparse (many queries state no relational constraint, so the leg is a no-op there).
 2. **The graph leg adds ~nothing on this workload** (graph_only=0.002; graph on top of rel+vector = -0.005). News multi-hop evidence is already vector-retrievable and the entity graph is dense/noisy. CONTRAST Plan-015 HotpotQA, where graph injection lifted multi-hop joint recall +15.6 pts — graph helps Wikipedia-bridge multi-hop, not news-entity multi-hop. **Fusion's value is workload-dependent**; no single modality dominates across both, which is itself evidence FOR a multi-modal engine — but the graph leg is unproven here.
 3. **graph_only / relational_only use NO embeddings** (isolated modalities); the graph is embedding-independent (shared named-entity edges). recall is exact + host-side; live tjs() fused-operator latency is GX10/engine-gated.
 4. **fusion_hardfilter** (hard relational pre-filter, no graph) is shown as an ablation; the soft relational GATE in `fusion` avoids the recall cap a hard pre-filter imposes when the constraint is imperfect.

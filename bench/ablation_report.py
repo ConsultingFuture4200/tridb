@@ -105,14 +105,17 @@ def retrieve_graph(sl: Slice, qi: int, k: int, *, hops: int = 2) -> list[int]:
     return order[:k]
 
 
-def _relational_mask(sl: Slice, q: dict) -> np.ndarray:
+def _relational_mask(sl: Slice, q: dict, *, prefix: str = "rel") -> np.ndarray:
     """Docs passing the question's relational constraint (category OR source match,
-    AND within the gold date span when present)."""
-    cats, srcs = set(q["rel_categories"]), set(q["rel_sources"])
-    ym_min, ym_max = q["rel_ym_min"], q["rel_ym_max"]
+    AND within the date span when present). prefix='rel' = ORACLE (gold-derived);
+    prefix='qrel' = DEPLOYABLE (parsed from the query text). An empty constraint
+    (no cue) passes everything -> the relational leg is a no-op for that question."""
+    cats = set(q.get(f"{prefix}_categories", []))
+    srcs = set(q.get(f"{prefix}_sources", []))
+    ym_min, ym_max = q.get(f"{prefix}_ym_min", 0), q.get(f"{prefix}_ym_max", 0)
     mask = np.zeros(len(sl.docs), dtype=bool)
     for d in sl.docs:
-        ok = (not cats or d["category"] in cats) or (not srcs or d["source"] in srcs)
+        ok = True
         if cats or srcs:
             ok = (d["category"] in cats) or (d["source"] in srcs)
         if ok and ym_min and ym_max:
@@ -121,35 +124,40 @@ def _relational_mask(sl: Slice, q: dict) -> np.ndarray:
     return mask
 
 
-def retrieve_relational(sl: Slice, qi: int, k: int) -> list[int]:
+def retrieve_relational(
+    sl: Slice, qi: int, k: int, *, prefix: str = "rel"
+) -> list[int]:
     """Pure relational: filter by the constraint, rank by recency (ym desc)."""
-    q = sl.questions[qi]
-    ids = np.flatnonzero(_relational_mask(sl, q))
+    ids = np.flatnonzero(_relational_mask(sl, sl.questions[qi], prefix=prefix))
     if ids.size == 0:
         return []
     yms = np.array([sl.docs[i]["ym"] for i in ids])
     return [int(ids[j]) for j in np.argsort(-yms)[:k]]
 
 
-def retrieve_fusion_hardfilter(sl: Slice, qi: int, k: int) -> list[int]:
+def retrieve_fusion_hardfilter(
+    sl: Slice, qi: int, k: int, *, prefix: str = "rel"
+) -> list[int]:
     """ABLATION (naive) — HARD relational pre-filter, then vector-rank within it.
     Provably caps recall at the relational set: any gold the imperfect per-question
     constraint excludes is unrecoverable. Kept to show why the mechanism matters."""
     q = sl.query_emb[qi]
-    cand = np.flatnonzero(_relational_mask(sl, sl.questions[qi]))
+    cand = np.flatnonzero(_relational_mask(sl, sl.questions[qi], prefix=prefix))
     if cand.size == 0:
         cand = np.arange(len(sl.docs))
     return [int(cand[j]) for j in np.argsort(-(sl.corpus_emb[cand] @ q))[:k]]
 
 
-def retrieve_fusion(sl: Slice, qi: int, k: int, *, hops: int = 2) -> list[int]:
+def retrieve_fusion(
+    sl: Slice, qi: int, k: int, *, hops: int = 2, prefix: str = "rel"
+) -> list[int]:
     """tjs-style SOFT fusion — vector seed (recall base) -> INJECT graph bridges that
     ALSO pass the relational gate (the multi-hop evidence is entity-connected AND
     relationally coherent) -> vector fill. Relational is a gate on the injected
     bridges, NOT a hard pre-filter, so fusion never drops below the vector base."""
     qv = sl.query_emb[qi]
     vec_order = [int(x) for x in np.argsort(-(sl.corpus_emb @ qv))]
-    relmask = _relational_mask(sl, sl.questions[qi])
+    relmask = _relational_mask(sl, sl.questions[qi], prefix=prefix)
     seeds = vec_order[:2]
     # bridges: graph-reachable from the seeds AND relationally valid AND vector-plausible
     bridges, seen = [], set(seeds)
@@ -180,9 +188,16 @@ def retrieve_fusion(sl: Slice, qi: int, k: int, *, hops: int = 2) -> list[int]:
 RETRIEVERS = {
     "vector_only": retrieve_vector,
     "graph_only": retrieve_graph,
-    "relational_only": retrieve_relational,
-    "fusion": retrieve_fusion,
-    "fusion_hardfilter": retrieve_fusion_hardfilter,
+    "relational_only": lambda sl, qi, k: retrieve_relational(sl, qi, k, prefix="rel"),
+    "fusion": lambda sl, qi, k: retrieve_fusion(sl, qi, k, prefix="rel"),
+    "fusion_hardfilter": lambda sl, qi, k: retrieve_fusion_hardfilter(
+        sl, qi, k, prefix="rel"
+    ),
+    # DEPLOYABLE (query-parsed constraint, no gold leakage):
+    "relational_qparse": lambda sl, qi, k: retrieve_relational(
+        sl, qi, k, prefix="qrel"
+    ),
+    "fusion_qparse": lambda sl, qi, k: retrieve_fusion(sl, qi, k, prefix="qrel"),
 }
 
 
@@ -215,29 +230,29 @@ def run(sl: Slice, k: int) -> dict:
 
 def render_md(summary: dict, groups: list[str], sl: Slice, k: int, graded: int) -> str:
     vec = summary["vector_only"]["all"]
-    best_single = max(
-        summary[m]["all"] for m in ("vector_only", "graph_only", "relational_only")
-    )
-    fusion = summary["fusion"]["all"]
+    fusion = summary["fusion"]["all"]  # oracle relational
     relplusvec = summary["fusion_hardfilter"]["all"]
+    fusion_q = summary["fusion_qparse"]["all"]  # DEPLOYABLE (query-parsed)
     rel_contrib = relplusvec - vec  # value of the (oracle) relational filter
     graph_contrib = fusion - relplusvec  # value of ADDING graph on top of rel+vector
+    q_contrib = fusion_q - vec  # deployable fusion lift over vector
     lines: list[str] = []
     w = lines.append
     w("# TriDB Benchmark — Tri-Modal Fusion Ablation (MultiHopRAG)")
     w("")
     w(
-        f"**Falsification test — NUANCED: fusion ({fusion:.3f}) beats the best single "
-        f"modality ({best_single:.3f}, vector) by {fusion - best_single:+.3f} recall@{k}, "
-        "BUT read the two caveats below — the lift is relational, not graph, and the "
-        "relational constraint is an oracle upper bound.**"
+        f"**Falsification test — DEPLOYABLE fusion (query-parsed relational) = "
+        f"{fusion_q:.3f} vs vector-only {vec:.3f} ({q_contrib:+.3f} recall@{k}); "
+        f"ORACLE fusion (gold-derived relational) = {fusion:.3f} ({fusion - vec:+.3f}) is "
+        "the upper bound. The graph leg adds ~nothing on this news workload — read the caveats.**"
     )
     w("")
     w(
         f"Same {graded} MultiHopRAG questions (gold-resolved), recall@{k} over a "
         f"{sl.corpus_emb.shape[0]}-article corpus with REAL relational metadata. Each "
         "config isolates a modality; fusion = vector-seed -> inject graph bridges that "
-        "pass the relational gate -> vector fill (the tjs-style operator)."
+        "pass the relational gate -> vector fill (the tjs-style operator). `*_qparse` use "
+        "a relational constraint PARSED FROM THE QUERY (no gold leakage)."
     )
     w("")
     w("## recall@k by configuration")
@@ -252,17 +267,25 @@ def render_md(summary: dict, groups: list[str], sl: Slice, k: int, graded: int) 
     w("| modality step | recall@k | delta |")
     w("|---|---:|---:|")
     w(f"| vector_only (base) | {vec:.3f} | — |")
-    w(f"| + relational filter (rel+vector) | {relplusvec:.3f} | {rel_contrib:+.3f} |")
-    w(f"| + graph inject (full fusion) | {fusion:.3f} | {graph_contrib:+.3f} |")
+    w(
+        f"| + query-parsed relational (DEPLOYABLE fusion) | {fusion_q:.3f} | {q_contrib:+.3f} |"
+    )
+    w(
+        f"| + oracle relational (rel+vector, upper bound) | {relplusvec:.3f} | {rel_contrib:+.3f} |"
+    )
+    w(
+        f"| + graph inject on oracle (full fusion) | {fusion:.3f} | {graph_contrib:+.3f} |"
+    )
     w("")
     w("## Caveats (these decide whether the win is real)")
     w("")
     w(
-        f"1. **The relational constraint is GOLD-DERIVED = an ORACLE upper bound.** It is "
-        "built from the gold evidence's category/source/date span, which a real system "
-        "does NOT know at query time. So the relational lift "
-        f"({rel_contrib:+.3f}) is the *best case* for the relational modality, not a "
-        "deployable number — a query-parsed constraint is the honest next step."
+        f"1. **Oracle vs deployable relational.** The `rel_*` constraint is GOLD-DERIVED "
+        "(category/source/date of the gold evidence) = an ORACLE upper bound a real system "
+        f"does NOT have ({rel_contrib:+.3f}). The `qrel_*` constraint is PARSED FROM THE "
+        f"QUERY TEXT (sources/categories named, years/months mentioned) and is deployable: "
+        f"query-parsed fusion still beats vector-only by {q_contrib:+.3f}, though the cue is "
+        "sparse (many queries state no relational constraint, so the leg is a no-op there)."
     )
     w(
         f"2. **The graph leg adds ~nothing on this workload** (graph_only={summary['graph_only']['all']:.3f}; "
