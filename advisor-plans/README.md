@@ -13,11 +13,11 @@ C are **GX10-gated** (author + review here, build/verify on the GX10).
 
 | Plan | Title | Priority | Effort | Risk | Depends on | Verify here? | Status |
 |------|-------|----------|--------|------|------------|--------------|--------|
-| 001 | Harden + test the benchmark grading layer | P1 | M | LOW | — | YES (`make test`) | TODO |
-| 002 | CI: verify the fork patch-chain applies | P1 | M | MED | — | partial (CI is the gate) | TODO |
-| 005 | Fix stale @-scale parity row in the GTM doc | P2 | S | LOW | — | YES (read-back) | TODO |
-| 003 | Thread HNSW reloptions into crash-recovery rebuild | P2 | S | LOW | — | NO (GX10-gated) | TODO |
-| 004 | One-command sweep repro: `scripts/bench_gx10_sweep.sh` + `make sweep` | P2 | M | LOW | — | partial (script lints here; runs on GX10) | TODO |
+| 001 | Harden + test the benchmark grading layer | P1 | M | LOW | — | YES (`make test`) | DONE (`f604c27`) |
+| 002 | CI: verify the fork patch-chain applies | P1 | M | MED | — | partial (CI is the gate) | DONE (`74c59ef`) — full CI behavior verifies on next PR run |
+| 005 | Fix stale @-scale parity row in the GTM doc | P2 | S | LOW | — | YES (read-back) | DONE (`f6033dd`) |
+| 003 | Thread HNSW reloptions into crash-recovery rebuild | P2 | S | LOW | — | NO (GX10-gated) | DONE (`7a198af`) — patch git-apply-verified; GX10 build/run + a crash-driver shell still pending |
+| 004 | One-command sweep repro: `scripts/bench_gx10_sweep.sh` + `make sweep` | P2 | M | LOW | — | partial (script lints here; runs on GX10) | DONE — `bash -n`/`make -n` verified; live run GX10-gated |
 
 Recommended order: **001 → 002 → 005** (all cleanly verifiable on an x86 box, highest leverage),
 then **003 → 004** (GX10-gated execution/verification).
