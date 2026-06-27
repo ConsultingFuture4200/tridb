@@ -75,24 +75,27 @@ oracle top-10 (8/8 queries, set-identical).
 
 ## Reproduce
 
-The sweep SQL + grader are hardware-independent and unit-checked; the live run is GX10/engine-gated.
+The whole sweep is one committed command, `make sweep` (`scripts/bench_gx10_sweep.sh`). It is the
+sibling of `make bench-live`: it generates the sweep SQL + numpy oracle manifest with
+`tools/sweep_corpus.py`, runs the recipe (build `graph_store_ext`, load the corpus, run the sweep in
+one `psql` session capturing the `#SWEEP`/timing lines) on the LIVE engine in one container, and
+grades the transcript back into `bench/results/`. The engine is used as the image built it from the
+committed fork-patch chain (`scripts/lib/msvbase_patches.sh` — incl. `tridb_neon_l2_distance.patch`
++ `tridb_hnsw_reloptions.patch`), so no ad-hoc rebuild diverges from the chain. The SQL generation +
+grading are hardware-independent and unit-checked; the live container run is GX10/engine-gated.
 
 ```bash
-# 1. generate the sweep SQL + numpy oracle manifest (runs anywhere)
-python3 -m tools.sweep_corpus --entities 20000 --dim 128 --hubs 16 --fanout 200 \
-  --queries 8 --k 10 --index-configs "16:200,32:400" --term-conds "20,50,200,1000" \
-  --seed 42 --sql-out sweep.sql --manifest-out sweep_manifest.json
+# Reproduce the committed 20k/128 result (defaults baked into the script):
+make sweep
 
-# 2. on the GX10: rebuild vectordb.so with the NEON + reloptions patches, build graph_store,
-#    load the corpus and run sweep.sql in one psql session, capturing #SWEEP/timing lines.
-#    (recipe: scripts/lib/msvbase_patches.sh applies tridb_neon_l2_distance.patch +
-#     tridb_hnsw_reloptions.patch; see the in-image runner used for this result.)
-
-# 3. grade the captured transcript (runs anywhere)
-python3 -m tools.sweep_corpus --report sweep_raw.txt --manifest sweep_manifest.json
+# Headline (GTM gate, DEV-1286 — run on a quiet GX10): same script, bigger args.
+SWEEP_ENTITIES=100000 SWEEP_DIM=768 make sweep
 ```
 
-Deterministic via `--seed` (default 42). Artifacts for this run:
+The defaults match this run (`SWEEP_ENTITIES=20000 SWEEP_DIM=128 SWEEP_HUBS=16 SWEEP_FANOUT=200
+SWEEP_QUERIES=8 SWEEP_K=10 SWEEP_INDEX_CONFIGS="16:200,32:400" SWEEP_TERMCONDS="20,50,200,1000"
+SWEEP_SEED=42`); override any via the environment. Deterministic via the seed (default 42).
+Artifacts for this run:
 `bench/results/neon_sweep_metrics.json` (graded table), `bench/results/neon_sweep_raw.txt`
 (auditable `#SWEEP` transcript + build timings), `bench/results/sweep_manifest.json`
 (corpus/query/oracle manifest).

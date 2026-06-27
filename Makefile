@@ -1,4 +1,4 @@
-.PHONY: test lint graph-test smoke-test test-all baseline-up baseline-down seed bench bench-live sm2 clean
+.PHONY: test lint graph-test smoke-test test-all baseline-up baseline-down seed bench bench-live sweep sm2 clean
 
 IMAGE ?= tridb/msvbase:dev
 ENGINE_TESTS := test/graph_store_test.sql test/trimodal_compose.sql \
@@ -61,6 +61,17 @@ bench-live:
 	@docker image inspect $(IMAGE) >/dev/null 2>&1 || \
 	  { echo "image $(IMAGE) not built — run scripts/x86build.sh --docker"; exit 1; }
 	bash scripts/bench_live.sh $(IMAGE)
+
+# LIVE HNSW index-quality x term_cond sweep on the NEON+reloptions engine (DEV-1286). One-command
+# repro of bench/results/neon_sweep_* — the GTM launch gate (docs/gtm_opensource_v0.1.0.md). Sweeps
+# each index config (m/ef_construction reloptions) x term_cond, grading recall@k vs an exact numpy
+# oracle plus examined-% and EXPLAIN ANALYZE latency. Defaults reproduce the committed 20k/128 run;
+# the headline is the same script at scale: SWEEP_ENTITIES=100000 SWEEP_DIM=768 make sweep.
+# GX10/engine-gated — needs the image (scripts/x86build.sh --docker / gx10build.sh).
+sweep:
+	@docker image inspect $(IMAGE) >/dev/null 2>&1 || \
+	  { echo "image $(IMAGE) not built — run scripts/x86build.sh --docker / gx10build.sh"; exit 1; }
+	bash scripts/bench_gx10_sweep.sh $(IMAGE)
 
 # FAIR SM-2 head-to-head (DEV-1171): LIVE TriDB vs the LIVE multi-system baseline
 # (Milvus+Neo4j+Postgres). Both sides run the IDENTICAL corpus + queries + k from
