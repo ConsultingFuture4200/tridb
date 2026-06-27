@@ -1,121 +1,121 @@
 #SM2 QSTART qid=0 src=0 k=5
-Time: 1.496 ms
-Time: 1.509 ms
-Time: 1.383 ms
-Time: 1.452 ms
-Time: 1.535 ms
-Time: 1.459 ms
-Time: 0.997 ms
+Time: 1.225 ms
+Time: 1.860 ms
+Time: 2.052 ms
+Time: 2.090 ms
+Time: 3.119 ms
+Time: 1.503 ms
+Time: 1.670 ms
  #SM2 RESULT qid=0 ids=849,627,197,47,1408
 #SM2 QEND qid=0
 #SM2 QSTART qid=1 src=1 k=5
-Time: 1.772 ms
-Time: 1.279 ms
-Time: 1.598 ms
-Time: 0.987 ms
-Time: 1.832 ms
-Time: 1.302 ms
-Time: 1.684 ms
+Time: 2.922 ms
+Time: 3.701 ms
+Time: 3.265 ms
+Time: 3.457 ms
+Time: 3.474 ms
+Time: 3.347 ms
+Time: 3.676 ms
  #SM2 RESULT qid=1 ids=573,1909,1024,278,882
 #SM2 QEND qid=1
 #SM2 QSTART qid=2 src=2 k=5
-Time: 2.245 ms
-Time: 1.433 ms
-Time: 1.931 ms
-Time: 1.522 ms
-Time: 1.713 ms
-Time: 1.788 ms
-Time: 1.238 ms
+Time: 2.514 ms
+Time: 1.787 ms
+Time: 3.131 ms
+Time: 2.605 ms
+Time: 2.571 ms
+Time: 3.176 ms
+Time: 2.609 ms
  #SM2 RESULT qid=2 ids=1013,1209,905,1347,1754
 #SM2 QEND qid=2
 #SM2 QSTART qid=3 src=3 k=5
-Time: 1.945 ms
-Time: 1.314 ms
-Time: 1.025 ms
-Time: 1.138 ms
-Time: 1.218 ms
-Time: 1.065 ms
-Time: 0.971 ms
+Time: 4.184 ms
+Time: 1.530 ms
+Time: 3.867 ms
+Time: 4.040 ms
+Time: 2.104 ms
+Time: 1.625 ms
+Time: 1.679 ms
  #SM2 RESULT qid=3 ids=524,1105,1343,1938,1777
 #SM2 QEND qid=3
 #SM2 QSTART qid=4 src=4 k=5
-Time: 1.692 ms
-Time: 1.794 ms
-Time: 1.528 ms
-Time: 1.697 ms
-Time: 1.757 ms
-Time: 2.453 ms
-Time: 2.169 ms
+Time: 2.232 ms
+Time: 2.466 ms
+Time: 2.718 ms
+Time: 3.873 ms
+Time: 1.483 ms
+Time: 1.421 ms
+Time: 3.279 ms
  #SM2 RESULT qid=4 ids=508,1133,637,795,703
 #SM2 QEND qid=4
 #SM2 QSTART qid=5 src=5 k=5
-Time: 1.013 ms
-Time: 2.102 ms
-Time: 1.546 ms
-Time: 1.685 ms
-Time: 1.739 ms
-Time: 2.587 ms
-Time: 1.798 ms
+Time: 3.052 ms
+Time: 0.992 ms
+Time: 0.868 ms
+Time: 0.923 ms
+Time: 0.975 ms
+Time: 0.883 ms
+Time: 0.904 ms
  #SM2 RESULT qid=5 ids=1609,1905,889,1098,1087
 #SM2 QEND qid=5
 #SM2 QSTART qid=6 src=6 k=5
-Time: 1.507 ms
-Time: 1.758 ms
-Time: 1.586 ms
-Time: 1.507 ms
-Time: 1.595 ms
-Time: 1.893 ms
-Time: 1.737 ms
+Time: 1.330 ms
+Time: 1.425 ms
+Time: 1.805 ms
+Time: 1.138 ms
+Time: 1.179 ms
+Time: 2.037 ms
+Time: 1.229 ms
  #SM2 RESULT qid=6 ids=1946,669,339,280,1599
 #SM2 QEND qid=6
 #SM2 QSTART qid=7 src=7 k=5
-Time: 1.526 ms
-Time: 1.547 ms
-Time: 1.003 ms
-Time: 1.866 ms
-Time: 1.772 ms
-Time: 1.737 ms
-Time: 1.011 ms
+Time: 1.057 ms
+Time: 1.354 ms
+Time: 0.993 ms
+Time: 0.961 ms
+Time: 0.919 ms
+Time: 0.982 ms
+Time: 1.175 ms
  #SM2 RESULT qid=7 ids=164,1719,282,1339,1690
 #SM2 QEND qid=7
 #SM2 QSTART qid=8 src=8 k=5
-Time: 1.775 ms
-Time: 1.481 ms
-Time: 1.643 ms
-Time: 1.156 ms
-Time: 1.086 ms
-Time: 1.035 ms
-Time: 2.541 ms
+Time: 1.179 ms
+Time: 1.585 ms
+Time: 2.268 ms
+Time: 1.878 ms
+Time: 1.042 ms
+Time: 0.995 ms
+Time: 1.155 ms
  #SM2 RESULT qid=8 ids=701,460,1579,1840,53
 #SM2 QEND qid=8
 #SM2 QSTART qid=9 src=9 k=5
-Time: 1.137 ms
-Time: 1.650 ms
-Time: 1.373 ms
-Time: 2.587 ms
-Time: 1.563 ms
-Time: 1.095 ms
-Time: 1.007 ms
+Time: 1.004 ms
+Time: 0.996 ms
+Time: 1.012 ms
+Time: 1.034 ms
+Time: 1.189 ms
+Time: 1.113 ms
+Time: 2.090 ms
  #SM2 RESULT qid=9 ids=1238,1140,1829,1047,1142
 #SM2 QEND qid=9
 #SM2 QSTART qid=10 src=10 k=5
-Time: 1.912 ms
-Time: 0.915 ms
-Time: 1.390 ms
-Time: 1.402 ms
-Time: 1.503 ms
-Time: 1.789 ms
-Time: 1.851 ms
+Time: 0.995 ms
+Time: 1.053 ms
+Time: 0.931 ms
+Time: 0.848 ms
+Time: 0.929 ms
+Time: 0.930 ms
+Time: 1.055 ms
  #SM2 RESULT qid=10 ids=290,941,985,702,849
 #SM2 QEND qid=10
 #SM2 QSTART qid=11 src=11 k=5
-Time: 2.156 ms
-Time: 1.581 ms
-Time: 1.839 ms
-Time: 1.342 ms
-Time: 0.979 ms
-Time: 0.887 ms
-Time: 0.878 ms
+Time: 1.563 ms
+Time: 1.643 ms
+Time: 2.279 ms
+Time: 1.267 ms
+Time: 1.099 ms
+Time: 0.912 ms
+Time: 1.529 ms
  #SM2 RESULT qid=11 ids=727,1743,1095,745,1320
 #SM2 QEND qid=11
 #SM2 DONE
