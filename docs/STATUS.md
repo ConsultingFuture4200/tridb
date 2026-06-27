@@ -29,9 +29,12 @@ build on GX10) · 🔴 GX10-gated (needs live MSVBASE build).
 > `tjs()` query runs in **~1.8 ms median at 2.18% examined** — the first real latency on the target ISA
 > (closes the GTM R1 latency gate at moderate scale). High-quality `m=32/ef_construction=400` now builds
 > in **5.4 s** (impractical on the scalar fallback — the reason DEV-1286 was gated). At 20k×128 recall is
-> saturated, so quality/`term_cond` trade latency not recall; the recall *curve* (where they move recall)
-> is the **100k/768** headline ([[DEV-1169]] measured the recall side). Full table + repro:
-> `docs/benchmark_neon_sweep_v0.1.0.md`; artifacts in `bench/results/neon_sweep_*`.
+> saturated, so quality/`term_cond` trade latency not recall. **HEADLINE 100k×dim-768 NOW RUN (NEON):**
+> the curve bites — recall@10 **96.25% @ ~36 ms / 3.3% examined** (`term_cond=20`) → **100% @ ~41 ms /
+> 4.4% examined** (`term_cond=1000`), all under the 25% TR-1 ceiling. Index build 137 s (m16) / 489 s
+> (m32) — feasible only with NEON. Honest negative: `m=32/ef=400` gives identical recall/examined to the
+> default here (term_cond is the lever, not index quality). Full table + repro:
+> `docs/benchmark_neon_sweep_v0.1.0.md`; artifacts `bench/results/neon_sweep_100k_*`.
 
 > **🟡 TJS JOIN-ORDER INTEGRATION DESIGN 2026-06-26 (DEV-1285) — ADR + safe draft, operator change GX10-gated.**
 > The DEV-1170 decision core is shipped; integrating it is NOT a wiring task — `tjs()` is a C SRF (not a
