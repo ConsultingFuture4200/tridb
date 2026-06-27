@@ -1,4 +1,6 @@
-.PHONY: test lint graph-test smoke-test test-all baseline-up baseline-down seed bench bench-live sweep sm2 clean
+.PHONY: test lint graph-test smoke-test test-all baseline-up baseline-down seed bench bench-live sweep sm2 fetch-dataset bench-public clean
+
+PUBLIC_DATASET ?= gist-960-euclidean
 
 IMAGE ?= tridb/msvbase:dev
 ENGINE_TESTS := test/graph_store_test.sql test/trimodal_compose.sql \
@@ -86,6 +88,26 @@ sm2:
 	@docker ps --filter name=tridb-baseline --format '{{.Names}}' | grep -q tridb-baseline || \
 	  { echo "baseline stack not up — run make baseline-up"; exit 1; }
 	bash scripts/bench_sm2.sh $(IMAGE)
+
+# Fetch the PINNED recognized public ANN dataset for the public benchmark (GTM make-or-break).
+# NETWORK-GATED: this downloads (~hundreds of MB) and verifies the SHA256 — it is NOT run by tests
+# or CI. Default gist-960-euclidean (dim 960, L2 — the 768+ headline set). See tools/fetch_dataset.py
+# for the pinned URL/checksum + the first-fetch --pin flow. Override the set with PUBLIC_DATASET=...
+fetch-dataset:
+	python3 -m tools.fetch_dataset --dataset $(PUBLIC_DATASET)
+
+# LIVE benchmark on a RECOGNIZED PUBLIC dataset (the GTM make-or-break, docs/benchmark_public_v0.1.0.md).
+# Runs the canonical tjs() query on the LIVE forked-MSVBASE engine over a topical graph synthesized on
+# REAL public embeddings, grading recall@k against an exact numpy oracle. Sibling of bench-live/sweep:
+# it guards on BOTH the dataset being present (else: make fetch-dataset) AND the engine image (the live
+# run is GX10/stack-gated). The recall oracle is computed host-side on the real embeddings (no engine);
+# only the live tjs()/latency measurement is gated. One-command repro: make fetch-dataset && make bench-public.
+bench-public:
+	@test -f data/public/$(PUBLIC_DATASET).hdf5 || \
+	  { echo "dataset data/public/$(PUBLIC_DATASET).hdf5 missing — run: make fetch-dataset"; exit 1; }
+	@docker image inspect $(IMAGE) >/dev/null 2>&1 || \
+	  { echo "image $(IMAGE) not built (live run is ENGINE-GATED) — run scripts/x86build.sh --docker / gx10build.sh"; exit 1; }
+	PUBLIC_DATASET=$(PUBLIC_DATASET) bash scripts/bench_public.sh $(IMAGE)
 
 baseline-up:
 	docker compose -f baseline/docker-compose.yml up -d
