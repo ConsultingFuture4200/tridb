@@ -243,7 +243,18 @@ def test_recall_at_k_unit():
     assert rc.recall_at_k([1, 2, 3], [1, 2, 3], 3) == 1.0
     assert rc.recall_at_k([1, 2], [1, 2, 3, 4], 4) == 0.5
     assert rc.recall_at_k([9, 9], [1, 2], 2) == 0.0
-    # empty oracle -> defined as full recall (nothing to find)
+    # empty oracle + nothing returned -> defined as full recall (nothing to find)
+    assert rc.recall_at_k([], [], 5) == 1.0
+
+
+def test_recall_empty_oracle_returns_zero_on_false_positive():
+    """Regression: an empty oracle scores 1.0 ONLY if nothing was returned. A
+    false positive against empty truth must score 0.0, matching
+    tools/sweep_corpus._recall (the shared grading semantics)."""
+    assert rc.recall_at_k([1, 2], []) == 0.0
+    assert rc.recall_at_k([], []) == 1.0
+    # the k-truncated path agrees with the no-k path
+    assert rc.recall_at_k([1, 2], [], 5) == 0.0
     assert rc.recall_at_k([], [], 5) == 1.0
 
 

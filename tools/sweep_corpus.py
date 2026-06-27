@@ -67,6 +67,12 @@ def build(args) -> tuple[str, dict]:
         hub_dsts[h] = dsts
         edges.extend((h, d) for d in dsts)
 
+    if args.window > args.time_max - args.time_min + 1:
+        raise ValueError(
+            f"window ({args.window}) must fit in the time range "
+            f"({args.time_max - args.time_min + 1} = time_max - time_min + 1)"
+        )
+
     queries = []
     for qid in range(args.queries):
         h = hubs[qid % len(hubs)]
@@ -80,7 +86,7 @@ def build(args) -> tuple[str, dict]:
         if cand:
             cd = np.array(cand)
             d2 = np.sum((emb[cd] - qv) ** 2, axis=1)
-            order = cd[np.argsort(d2, kind="stable")]
+            order = cd[np.lexsort((cd, d2))]  # ties broken by id, like ORDER BY d2, id
             oracle = [int(x) for x in order[: args.k]]
         else:
             oracle = []
