@@ -29,3 +29,6 @@ __pycache__/
 # Editor
 .vscode/
 .idea/
+
+# VectorDBBench writes an empty log dir on import
+/logs/

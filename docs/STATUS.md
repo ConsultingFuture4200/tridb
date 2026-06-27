@@ -1,7 +1,42 @@
 # TriDB Build Status — per-issue gating
 
-Updated: 2026-06-26. Legend: 🟢 unblocked here · 🟡 partial (design here,
+Updated: 2026-06-27. Legend: 🟢 unblocked here · 🟡 partial (design here,
 build on GX10) · 🔴 GX10-gated (needs live MSVBASE build).
+
+> **🟢 FILTERED VECTOR SEARCH (VectorDBBench IntFilter) 2026-06-27 — LIVE GX10 headline, SIFT-1M.**
+> `tools/filtered_corpus.py` + `scripts/bench_filtered.sh` + `bench/filtered_report.py` (`make bench-filtered`):
+> fused `WHERE label>=t ORDER BY emb <-> q LIMIT k` (early-terminating Index Scan, TR-1) on REAL SIFT-128.
+> **LIVE on the GX10 NEON engine (tridb/msvbase:gx10), full SIFT-1M, recall@10 = 1.000 at every selectivity;
+> median latency 40.1 ms @ 1% pass → 87.9 ms @ 99% pass** — i.e. latency DROPS as the filter tightens
+> (the predicate is pushed into the scan, not post-filtered). Recall graded vs an exact numpy filtered oracle.
+> `bench/results/filtered_metrics.json`, `docs/benchmark_filtered_v0.1.0.md`. A `bench/vdbb_tridb.py` adapter
+> bridges the recognized VectorDBBench tool for the 768D1M1P Cohere case (GX10 runbook).
+
+> **🟡 TRI-MODAL FUSION ABLATION 2026-06-27 (MultiHopRAG) — the thesis-falsification test; NUANCED result.**
+> `tools/multihoprag_corpus.py` + `bench/ablation_report.py` (`make ablation`): vector / graph / relational /
+> fusion on 260 gold-resolved MultiHopRAG questions (real category/source/date metadata = a genuine relational
+> leg, unlike HotpotQA). recall@10: **vector 0.747 · graph 0.002 · relational 0.329 · fusion 0.805**. Fusion
+> beats best-single (+0.059) BUT two honest caveats: (1) the relational lift (+0.064) uses a GOLD-DERIVED
+> (oracle) constraint = upper bound, not deployable — query-parsed constraint is the next step; (2) the GRAPH
+> leg adds ~nothing here (graph_only≈0; graph-on-top = −0.005), CONTRAST Plan-015 HotpotQA where graph lifted
+> multi-hop +15.6pt. Lesson: fusion value is workload-dependent (graph helps Wiki-bridge, relational helps
+> news), and naive HARD relational pre-filter caps recall (kept as `fusion_hardfilter` ablation).
+> `docs/benchmark_ablation_v0.1.0.md`.
+
+> **🟡 GRAPHRAG QA-ACCURACY BENCHMARK 2026-06-27 (Plan 015) — the "is the answer right?" artifact, real result on a dev slice.**
+> Closes the gap that even the real-SIFT run synthesized its graph from the vectors and graded recall@ANN-oracle (not
+> answer accuracy). New harness over **REAL HotpotQA** multi-hop questions with a **REAL, embedding-INDEPENDENT graph**
+> (title-mention edges, a faithful proxy for Wikipedia hyperlinks) and BGE-base-768 embeddings: `tools/fetch_hotpot.py`
+> (HF mirror — CMU host is down), `tools/build_wiki_graph.py`, `tools/hotpot_corpus.py` (real_corpus-compatible manifest +
+> shared `build_sql`), `bench/graphrag_report.py`, `baseline/graphrag.py`, `scripts/bench_graphrag.sh`. **LIVE RESULT
+> (host-side, 150 dev q / 1490-para corpus):** injecting graph bridges into the context lifts multi-hop **joint** evidence
+> recall@5 on bridge questions **72.1% → 87.7% (+15.6 pts)** vs vector-only; the lift is **+17 pts joint @ k=3-4** and
+> shrinks as k saturates. **Honest negative:** the NAIVE graph retriever (gate + re-rank by query cosine) does NOT help —
+> the win requires *injecting* the low-similarity bridge, not re-ranking it. Full table + curve:
+> `docs/benchmark_graphrag_v0.1.0.md`; metrics `bench/results/graphrag_metrics.json`. 143 Python tests pass, lint clean.
+> **GATED:** the downstream LLM answer-EM/F1 headline is reader-gated (no `ANTHROPIC_API_KEY` here; AnthropicReader wired,
+> extractive non-LLM lower bound run in its place); the live `tjs()` latency-at-fixed-accuracy + the full
+> retrieve-from-all-Wikipedia fullwiki run are GX10/engine-gated (`make graphrag-live`, UNBUILT-HERE).
 
 > **🟡 ARM NEON L2 KERNEL ADDED 2026-06-26 (DEV-1234) — un-sandbags ANN/TJS latency on the GX10.**
 > On aarch64 the build strips MSVBASE's hardcoded x86 ISA flags (`scripts/lib/msvbase_patches.sh`
