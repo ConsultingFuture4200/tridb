@@ -1,0 +1,38 @@
+{
+  "source": "sift-128-euclidean (real)",
+  "entities": 1000000,
+  "dim": 128,
+  "k": 10,
+  "by_selectivity": {
+    "1": {
+      "recall_at_k": 1.0,
+      "median_latency_ms": 40.1145,
+      "qps_per_conn": 24.928641762953546,
+      "n_queries": 100
+    },
+    "5": {
+      "recall_at_k": 1.0,
+      "median_latency_ms": 42.5565,
+      "qps_per_conn": 23.498173017047925,
+      "n_queries": 100
+    },
+    "10": {
+      "recall_at_k": 1.0,
+      "median_latency_ms": 45.4805,
+      "qps_per_conn": 21.98744516880861,
+      "n_queries": 100
+    },
+    "50": {
+      "recall_at_k": 1.0,
+      "median_latency_ms": 66.27850000000001,
+      "qps_per_conn": 15.087849000807198,
+      "n_queries": 100
+    },
+    "99": {
+      "recall_at_k": 1.0,
+      "median_latency_ms": 87.89750000000001,
+      "qps_per_conn": 11.376887852327995,
+      "n_queries": 100
+    }
+  }
+}
