@@ -67,6 +67,12 @@ def build_corpus(args) -> dict:
         for d in dsts:
             edges.append((h, d))
 
+    if args.window > args.time_max - args.time_min + 1:
+        raise ValueError(
+            f"window ({args.window}) must fit in the time range "
+            f"({args.time_max - args.time_min + 1} = time_max - time_min + 1)"
+        )
+
     queries = []
     for qid in range(args.queries):
         h = hubs[qid % len(hubs)]

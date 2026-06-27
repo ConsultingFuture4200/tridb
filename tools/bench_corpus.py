@@ -81,6 +81,12 @@ def build(args) -> tuple[str, dict]:
     # (a user asking about the hub's topic), with a small jitter; a contiguous ts window
     # selective enough to drop a real fraction of the neighbourhood (relational leg
     # load-bearing) yet leave >= k qualifying answers.
+    if args.window > args.time_max - args.time_min + 1:
+        raise ValueError(
+            f"window ({args.window}) must fit in the time range "
+            f"({args.time_max - args.time_min + 1} = time_max - time_min + 1)"
+        )
+
     queries = []
     for qid in range(args.queries):
         h = hubs[qid % len(hubs)]

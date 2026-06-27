@@ -351,13 +351,14 @@ def recall_at_k(returned: list[int], oracle: list[int], k: int | None = None) ->
 
     Set-based (order-insensitive), matching how bench.metrics scores SM-4 parity
     (Jaccard there; recall here is the asymmetric "did we find the truth" view the
-    live report wants per query). An empty oracle (no qualifying dst) is defined as
-    recall 1.0 — both the engine and the truth agree there is nothing to return.
+    live report wants per query). An empty oracle (no qualifying dst) is recall 1.0
+    ONLY if nothing was returned — a false positive against an empty truth scores
+    0.0 (mirrors tools/sweep_corpus._recall, the shared semantics).
     """
     truth = oracle if k is None else oracle[:k]
-    if not truth:
-        return 1.0
     got = set(returned if k is None else returned[:k])
+    if not truth:
+        return 1.0 if not got else 0.0  # empty truth: perfect only if nothing returned
     return len(got & set(truth)) / len(truth)
 
 

@@ -42,7 +42,7 @@ public-dataset run with one-command repro.
 | Architecture (1 Postgres, 1 txn/WAL, global top-k, early term) | Real, lineage-backed (VBASE OSDI'23 / AkasicDB SIGMOD'26 / Chimera) | High — hard to dispute |
 | Builds + engine suite on GX10 (GB10, aarch64) | Done this session (47 PASS) | Medium — "it runs on a Spark" is a story |
 | SM-2 latency, 100k/dim-768, GX10 | 12.6× vs baseline, 12/12 | Medium — speed thesis holds at scale |
-| Answer parity vs baseline @ scale | **7/12 exact, Jaccard 0.58** (was 12/12 at toy scale) | **Open question** — see Risk R1 |
+| Answer parity vs baseline @ scale | **recall/effort curve: 58.5% → 100% exact across `term_cond`** (see R1) | **Fixed (DEV-1169) — a curve, not a point**; see Risk R1 |
 | Corpus + queries | **Synthetic, self-generated** | **Low** — must be replaced for external credibility |
 
 The honest summary: the *mechanism* is proven; the *value claim on a workload strangers

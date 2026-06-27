@@ -19,6 +19,20 @@ jobs:
       - run: pytest tests/ -q
       - run: ruff check . && ruff format --check .
 
+  # Fast per-PR gate that the fork patch-chain still APPLIES (apply + sentinels), without the
+  # 9.5 GB engine image build. Clones MSVBASE at the pinned commit, inits only the submodules the
+  # patches target (hnsw + Postgres; SPTAG is opt-in and skipped), then applies+verifies. This
+  # catches upstream drift or a mis-regenerated fork patch that would otherwise merge green and
+  # only surface when someone runs scripts/x86build.sh --docker by hand. Does NOT compile the C —
+  # the engine job below remains the compile/run gate.
+  patches:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+      - run: scripts/ci_check_patches.sh
+
   engine:
     runs-on: ubuntu-latest
     if: github.event_name == 'workflow_dispatch'

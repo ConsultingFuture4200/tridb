@@ -277,11 +277,14 @@ apply_tridb_fork_patches() {
   # tridb_hnsw_reloptions.patch (DEV-1286): expose per-index HNSW build quality as reloptions
   #   WITH (m=..., ef_construction=...) on the vectordb HNSW AM (the relopt table previously exposed
   #   only dimension/distmethod). Default 0 -> hnswlib defaults (M=16 / ef_construction=200), so
-  #   existing indexes are unchanged; opt-in per index. Threads the values into the FRESH-build
-  #   constructor (hnswindex_builder.cpp). NOTE: the DEV-1235 rebuild-on-recovery path
-  #   (hnswindex_scan.cpp LoadIndex) still rebuilds at hnswlib defaults — a tuned index recovers at
-  #   default quality until reindexed; documented follow-up, not wired here. Unblocked by NEON
-  #   (DEV-1234): higher build quality is only affordable to build once the distance kernel is SIMD.
+  #   existing indexes are unchanged; opt-in per index. Threads the values into BOTH construction
+  #   sites: the FRESH-build constructor (hnswindex_builder.cpp ConstructInternalBuilder) AND the
+  #   DEV-1235 rebuild-on-recovery path (hnswindex_scan.cpp LoadIndex). A tuned index
+  #   WITH (m=32, ef_construction=400) now recovers at the SAME quality it was built with after an
+  #   unclean crash, instead of silently falling back to hnswlib defaults until reindexed. Both sites
+  #   read the reloptions off the same index catalog relation and share the 0 -> 16/200 fallback.
+  #   Unblocked by NEON (DEV-1234): higher build quality is only affordable to build once the
+  #   distance kernel is SIMD.
   local relopt_patch="${_MSVBASE_LIB_DIR}/../patches/tridb_hnsw_reloptions.patch"
   [[ -f "$relopt_patch" ]] || die "missing TriDB fork patch: $relopt_patch"
   if grep -q 'offsetof(hnsw_ParaOptions, ef_construction)' "$root/src/hnswindex.cpp" 2>/dev/null; then
@@ -289,7 +292,7 @@ apply_tridb_fork_patches() {
   else
     log "applying TriDB fork patch: HNSW m/ef_construction reloptions (DEV-1286)"
     ( cd "$root" && git apply "$relopt_patch" ) \
-      || die "tridb_hnsw_reloptions.patch did not apply — MSVBASE drift? re-generate from src/{hnswindex.hpp,hnswindex.cpp,lib.cpp,hnswindex_builder.cpp}"
+      || die "tridb_hnsw_reloptions.patch did not apply — MSVBASE drift? re-generate from src/{hnswindex.hpp,hnswindex.cpp,lib.cpp,hnswindex_builder.cpp,hnswindex_scan.cpp}"
   fi
 
   # ----------------------------------------------------------------------------
