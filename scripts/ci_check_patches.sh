@@ -56,6 +56,12 @@ git -C "$SRC" checkout -q FETCH_HEAD
 log "init submodules: thirdparty/hnsw thirdparty/Postgres (SPTAG skipped — opt-in, kept lean)"
 git -C "$SRC" submodule update --init --depth 1 thirdparty/hnsw thirdparty/Postgres
 
+# A registered-but-uninitialized submodule still leaves an EMPTY placeholder directory in the
+# working tree. verify_patches guards the spann check with `[[ -d thirdparty/SPTAG ]]`, so that
+# empty dir makes the guard true while the tree has no MultiIndexScan -> false "spann.patch NOT
+# applied". Remove the placeholder so the guard correctly SKIPS the opt-in SPTAG check (disposable clone).
+rm -rf "$SRC/thirdparty/SPTAG"
+
 # apply_msvbase_patches already calls verify_patches at the end; the explicit re-run is a cheap
 # belt-and-suspenders. Any failed apply or missing sentinel calls die() -> non-zero exit.
 log "applying + verifying MSVBASE submodule patches + TriDB fork patches"
