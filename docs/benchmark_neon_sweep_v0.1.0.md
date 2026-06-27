@@ -56,7 +56,40 @@ oracle top-10 (8/8 queries, set-identical).
    higher-quality index reaches 100% recall at a *lower* examined-% than the default is the
    **100k / dim-768** scale, where the default `M=16` index needed `term_cond≈10000` /
    20.1% examined for exact parity ([[DEV-1169]] curve). Reproducing that full recall curve
-   *with NEON latency attached* is the remaining GX10 headline run — see "Gated" below.
+   *with NEON latency attached* is the **100k / dim-768 headline run, now done — see below.**
+
+## Headline run — 100k × dim-768 (the recall curve at scale, NEON, k=10)
+
+Run on the GX10 with the same NEON+reloptions engine, 100,000 entities × **dim 768**, 8 queries,
+k=10, recall graded against the exact numpy oracle. Here the curve **bites** (it was saturated at
+20k/128): `term_cond` trades real recall for real examined/latency.
+
+| config | `term_cond` | recall@10 | corpus examined | median latency |
+|---|---|---|---|---|
+| m16/ef200 | 20   | **0.9625** | 3.28% | **36.3 ms** |
+| m16/ef200 | 50   | 0.9625 | 3.31% | 36.4 ms |
+| m16/ef200 | 200  | 0.9875 | 3.51% | 37.1 ms |
+| m16/ef200 | 1000 | **1.0000** | 4.44% | 41.1 ms |
+| m16/ef200 | 5000 | 1.0000 | 8.46% | 57.4 ms |
+| m32/ef400 | 20   | 0.9625 | 3.28% | 39.4 ms |
+| m32/ef400 | 1000 | 1.0000 | 4.44% | 44.7 ms |
+| m32/ef400 | 5000 | 1.0000 | 8.46% | 62.3 ms |
+
+Index build (NEON): m16/ef200 = **137 s**, m32/ef400 = **489 s** — both feasible only because of the
+NEON kernel; on the scalar fallback these are single-core-bound and impractical at this scale (the
+DEV-1286 thesis, now confirmed at 100k/768). Artifacts: `bench/results/neon_sweep_100k_metrics.json`,
+`neon_sweep_100k_raw.txt`, `sweep100k_manifest.json`.
+
+**What it shows:** the canonical tri-modal query reaches **recall@10 = 96.25% at ~36 ms / 3.3%
+examined** (default index, `term_cond=20`) and climbs to **exact (100%) at ~41 ms / 4.4% examined**
+(`term_cond=1000`) — a real recall/effort/latency curve on real ARM SIMD, well under the 25% TR-1
+corpus-examined ceiling at every operating point. This is the proof-at-scale the GTM plan gated on.
+
+**Honest negative finding:** the higher-quality index (`m=32, ef_construction=400`) gives **identical
+recall and examined** to the default at every `term_cond` here — it only costs more to build (489 s vs
+137 s) and slightly more to query. At this corpus the recall lever is `term_cond`, **not** index
+quality; the m/ef reloptions are exposed and work, but do not move the curve on this workload. (A
+clustered/real-embedding corpus may differ — that's the public-dataset run, `docs/benchmark_public_v0.1.0.md`.)
 
 ## Live-measured vs gated
 

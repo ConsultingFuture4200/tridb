@@ -1,0 +1,100 @@
+{
+  "build_ms": {
+    "16_200": 137299.73,
+    "32_400": 489240.349
+  },
+  "sweep": [
+    {
+      "config": "16_200",
+      "term_cond": 20,
+      "mean_recall@10": 0.9625,
+      "mean_examined": 3275.6,
+      "examined_pct": 3.276,
+      "median_latency_ms": 36.266,
+      "n": 8
+    },
+    {
+      "config": "16_200",
+      "term_cond": 50,
+      "mean_recall@10": 0.9625,
+      "mean_examined": 3308.5,
+      "examined_pct": 3.308,
+      "median_latency_ms": 36.418,
+      "n": 8
+    },
+    {
+      "config": "16_200",
+      "term_cond": 200,
+      "mean_recall@10": 0.9875,
+      "mean_examined": 3510.9,
+      "examined_pct": 3.511,
+      "median_latency_ms": 37.138,
+      "n": 8
+    },
+    {
+      "config": "16_200",
+      "term_cond": 1000,
+      "mean_recall@10": 1.0,
+      "mean_examined": 4444.4,
+      "examined_pct": 4.444,
+      "median_latency_ms": 41.118,
+      "n": 8
+    },
+    {
+      "config": "16_200",
+      "term_cond": 5000,
+      "mean_recall@10": 1.0,
+      "mean_examined": 8464.5,
+      "examined_pct": 8.464,
+      "median_latency_ms": 57.418,
+      "n": 8
+    },
+    {
+      "config": "32_400",
+      "term_cond": 20,
+      "mean_recall@10": 0.9625,
+      "mean_examined": 3275.6,
+      "examined_pct": 3.276,
+      "median_latency_ms": 39.401,
+      "n": 8
+    },
+    {
+      "config": "32_400",
+      "term_cond": 50,
+      "mean_recall@10": 0.9625,
+      "mean_examined": 3308.5,
+      "examined_pct": 3.308,
+      "median_latency_ms": 39.389,
+      "n": 8
+    },
+    {
+      "config": "32_400",
+      "term_cond": 200,
+      "mean_recall@10": 0.9875,
+      "mean_examined": 3510.9,
+      "examined_pct": 3.511,
+      "median_latency_ms": 40.294,
+      "n": 8
+    },
+    {
+      "config": "32_400",
+      "term_cond": 1000,
+      "mean_recall@10": 1.0,
+      "mean_examined": 4444.4,
+      "examined_pct": 4.444,
+      "median_latency_ms": 44.709,
+      "n": 8
+    },
+    {
+      "config": "32_400",
+      "term_cond": 5000,
+      "mean_recall@10": 1.0,
+      "mean_examined": 8464.5,
+      "examined_pct": 8.464,
+      "median_latency_ms": 62.326,
+      "n": 8
+    }
+  ],
+  "corpus": 100000,
+  "k": 10
+}

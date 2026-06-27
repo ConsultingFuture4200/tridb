@@ -22,9 +22,11 @@ Two of the blockers this plan named have moved; recorded here (append, not rewri
   median at 2.18% of the corpus examined** (20k×128); HNSW index build dropped **4.2×** (47.8 s →
   11.3 s, same corpus). HNSW build-quality `m` / `ef_construction` are now **reloptions**
   ([[DEV-1286]]) and a high-quality index builds in ~5 s. Full curve + method:
-  [[benchmark_neon_sweep_v0.1.0]]. **Still gated:** the *recall curve* where `term_cond` / index
-  quality actually move recall is the **100k / dim-768** headline (recall saturates at 20k/128);
-  and a *fair multi-system SM-2 head-to-head* is still not run (latency here is TriDB-side only).
+  [[benchmark_neon_sweep_v0.1.0]]. **The 100k / dim-768 headline curve is now run (NEON, GX10):**
+  recall@10 **96.25% at ~36 ms / 3.3% examined** (`term_cond=20`) → **100% at ~41 ms / 4.4% examined**
+  (`term_cond=1000`), every point under the 25% TR-1 ceiling — the real recall/effort/latency curve at
+  scale (the "toy scale" rebuttal). **Still gated:** a *fair multi-system SM-2 head-to-head* (latency
+  here is TriDB-side only), and the public-dataset value claim (below).
 - **R3 "synthetic-benchmark credibility" — the public-dataset path now exists in tooling.**
   `tools/real_corpus.py` ([[DEV-1284]]) loads real embedding datasets (`.npy/.fvecs/.hdf5`),
   synthesizes the topical graph, and emits the identical canonical-query harness with an exact

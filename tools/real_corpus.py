@@ -149,24 +149,36 @@ def load_hdf5(path: Path, dataset: str = "train") -> np.ndarray:
     return np.ascontiguousarray(arr, dtype=np.float64)
 
 
-def load_vectors(path: Path, hdf5_dataset: str = "train") -> np.ndarray:
+def load_vectors(
+    path: Path, hdf5_dataset: str = "train", limit: int | None = None
+) -> np.ndarray:
     """Dispatch on file extension -> float64 (n, dim).
 
     Supported: `.npy`, `.fvecs`, `.ivecs`, `.hdf5`/`.h5` (lazy h5py).
+
+    `limit` (if set and > 0) takes the FIRST `limit` rows. Recognized public sets
+    are large (GIST1M / SIFT1M ship 1,000,000 train vectors), so a bounded live
+    smoke on a shared box runs over a deterministic prefix; the headline run omits
+    the limit (or sets a big one). The prefix is the first N rows of the on-disk
+    'train' matrix, so it is deterministic and reproducible across runs.
     """
     suffix = path.suffix.lower()
     if suffix == ".npy":
-        return load_npy(path)
-    if suffix == ".fvecs":
-        return load_fvecs(path)
-    if suffix == ".ivecs":
-        return load_ivecs(path)
-    if suffix in (".hdf5", ".h5"):
-        return load_hdf5(path, dataset=hdf5_dataset)
-    raise ValueError(
-        f"{path}: unsupported extension '{suffix}' "
-        f"(expected .npy, .fvecs, .ivecs, or .hdf5)"
-    )
+        arr = load_npy(path)
+    elif suffix == ".fvecs":
+        arr = load_fvecs(path)
+    elif suffix == ".ivecs":
+        arr = load_ivecs(path)
+    elif suffix in (".hdf5", ".h5"):
+        arr = load_hdf5(path, dataset=hdf5_dataset)
+    else:
+        raise ValueError(
+            f"{path}: unsupported extension '{suffix}' "
+            f"(expected .npy, .fvecs, .ivecs, or .hdf5)"
+        )
+    if limit is not None and limit > 0 and arr.shape[0] > limit:
+        arr = np.ascontiguousarray(arr[:limit])
+    return arr
 
 
 # --------------------------------------------------------------------------- #
@@ -487,6 +499,13 @@ def main(argv: list[str] | None = None) -> int:
         default="train",
         help="dataset name inside a .hdf5 file (ann-benchmarks: 'train')",
     )
+    p.add_argument(
+        "--limit",
+        type=int,
+        default=0,
+        help="take the first N rows of the vectors (0 = all). Recognized public "
+        "sets ship ~1M vectors; a bounded live smoke uses a deterministic prefix.",
+    )
     p.add_argument("--queries", type=int, default=12)
     p.add_argument("--k", type=int, default=5)
     p.add_argument("--hubs", type=int, default=12)
@@ -556,7 +575,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.sql_out is None or args.manifest_out is None:
         raise SystemExit("--sql-out and --manifest-out are required when generating")
 
-    emb = load_vectors(args.vectors, hdf5_dataset=args.hdf5_dataset)
+    emb = load_vectors(
+        args.vectors, hdf5_dataset=args.hdf5_dataset, limit=args.limit or None
+    )
     manifest = synthesize_corpus(
         emb,
         hubs=args.hubs,
