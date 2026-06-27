@@ -102,6 +102,24 @@ def test_fusion_recovers_graph_relational_bridge_vector_misses():
     assert fus > vec
 
 
+def test_recall_decay_curve_shape_and_bounds():
+    from bench.recall_decay import run
+
+    rng = np.random.default_rng(0)
+    vecs = rng.standard_normal((600, 16)).astype(np.float32)
+    queries = rng.standard_normal((10, 16)).astype(np.float32)
+    # generous ef (64) >> k over >=360 live elements so knn_query always returns k
+    # (the bound/shape asserts then hold regardless of hnswlib's threaded-build nondeterminism)
+    res = run(
+        vecs, queries, n=400, rounds=2, churn=0.1, k=5, m=16, efc=200, seed=0, ef=64
+    )
+    assert len(res["curve"]) == 3  # initial + 2 rounds
+    assert res["curve"][-1]["cum_churn_pct"] == 20.0  # 2 x 10%
+    for p in res["curve"]:
+        assert 0.0 <= p["recall_at_k"] <= 1.0
+    assert 0.0 <= res["recall_after_rebuild"] <= 1.0
+
+
 def test_query_parsed_constraint_no_gold_leakage():
     from tools.multihoprag_corpus import _parse_query_constraint
 

@@ -12,7 +12,20 @@ build on GX10) · 🔴 GX10-gated (needs live MSVBASE build).
 > `bench/results/filtered_metrics.json`, `docs/benchmark_filtered_v0.1.0.md`. A `bench/vdbb_tridb.py` adapter
 > bridges the recognized VectorDBBench tool for the 768D1M1P Cohere case (GX10 runbook).
 
+> **🟢 RECALL DECAY UNDER UPDATES 2026-06-27 (roadmap b) — vector-leg churn robustness.**
+> `bench/recall_decay.py` (`make recall-decay`): upsert/delete churn on **hnswlib (the fork's own
+> vector lib)**, real SIFT-128, recall@k vs a live exact oracle + a rebuild reference. **Host result
+> (20k, ef=20, 100% cumulative churn): recall@10 0.981 → 0.974 = ROBUST (no significant decay at this
+> scale).** The decay that motivates periodic rebuilds is a 1M+ phenomenon → GX10 follow-up. Honest
+> engine note: the fork builds HNSW once (no incremental insert post-build), so an update IS a rebuild;
+> the DIFFERENTIATED claim (one-WAL cross-modal consistency under churn vs bolt-on Milvus+Neo4j+pg) is
+> the engine-gated next step. `docs/benchmark_recall_decay_v0.1.0.md`.
+
 > **🟡 TRI-MODAL FUSION ABLATION 2026-06-27 (MultiHopRAG) — the thesis-falsification test; NUANCED result.**
+> **Oracle-leakage now killed (roadmap a):** the relational constraint is also parsed from the QUERY
+> TEXT (sources/categories named, years/months mentioned; 280/300 queries carry a cue). DEPLOYABLE
+> `fusion_qparse` = **0.784 vs vector-only 0.747 (+0.037 recall@10)**; the gold-derived oracle fusion
+> (0.805) is now reported only as the upper bound. Graph-leg finding unchanged (adds ~nothing on news).
 > `tools/multihoprag_corpus.py` + `bench/ablation_report.py` (`make ablation`): vector / graph / relational /
 > fusion on 260 gold-resolved MultiHopRAG questions (real category/source/date metadata = a genuine relational
 > leg, unlike HotpotQA). recall@10: **vector 0.747 · graph 0.002 · relational 0.329 · fusion 0.805**. Fusion

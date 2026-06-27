@@ -1,0 +1,49 @@
+{
+  "source": "sift-128-euclidean (real)",
+  "n_base": 20000,
+  "dim": 128,
+  "queries": 80,
+  "k": 10,
+  "rounds": 5,
+  "churn_per_round_pct": 20.0,
+  "hnsw": {
+    "M": 16,
+    "ef_construction": 200
+  },
+  "query_ef": 20,
+  "curve": [
+    {
+      "cum_churn_pct": 0.0,
+      "live": 20000,
+      "recall_at_k": 0.98125
+    },
+    {
+      "cum_churn_pct": 20.0,
+      "live": 20000,
+      "recall_at_k": 0.96875
+    },
+    {
+      "cum_churn_pct": 40.0,
+      "live": 20000,
+      "recall_at_k": 0.9725
+    },
+    {
+      "cum_churn_pct": 60.0,
+      "live": 20000,
+      "recall_at_k": 0.975
+    },
+    {
+      "cum_churn_pct": 80.0,
+      "live": 20000,
+      "recall_at_k": 0.97125
+    },
+    {
+      "cum_churn_pct": 100.0,
+      "live": 20000,
+      "recall_at_k": 0.97375
+    }
+  ],
+  "recall_after_rebuild": 0.96,
+  "recall_initial": 0.98125,
+  "recall_final_churned": 0.97375
+}

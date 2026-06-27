@@ -1,4 +1,4 @@
-.PHONY: test lint graph-test smoke-test test-all baseline-up baseline-down seed bench bench-live sweep sm2 fetch-dataset bench-public fetch-hotpot graphrag graphrag-live bench-filtered ablation clean
+.PHONY: test lint graph-test smoke-test test-all baseline-up baseline-down seed bench bench-live sweep sm2 fetch-dataset bench-public fetch-hotpot graphrag graphrag-live bench-filtered ablation recall-decay clean
 
 PUBLIC_DATASET ?= gist-960-euclidean
 
@@ -12,7 +12,7 @@ ENGINE_TESTS := test/graph_store_test.sql test/trimodal_compose.sql \
                 test/parse_canonical.sql
 
 test:
-	pytest tests/ -q
+	$(PY) -m pytest tests/ -q
 
 lint:
 	ruff check . && ruff format --check .
@@ -155,6 +155,15 @@ MHRAG_Q ?= 300
 ablation:
 	$(PY) -m tools.multihoprag_corpus --questions $(MHRAG_Q) --k 10
 	$(PY) -m bench.ablation_report --k 10
+
+# Vector recall decay under upsert/delete churn on hnswlib (the engine's own vector
+# lib), real SIFT-128, with a rebuild reference. Host-side; the at-scale (1M+) decay
+# curve is the GX10 follow-up. DECAY_LIMIT scales the base set.
+DECAY_LIMIT ?= 20000
+recall-decay:
+	@test -f data/public/sift-128-euclidean.hdf5 || \
+	  { echo "dataset missing — run: make fetch-dataset PUBLIC_DATASET=sift-128-euclidean"; exit 1; }
+	$(PY) -m bench.recall_decay --limit $(DECAY_LIMIT)
 
 baseline-up:
 	docker compose -f baseline/docker-compose.yml up -d
