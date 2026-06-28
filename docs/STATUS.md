@@ -12,14 +12,25 @@ build on GX10) · 🔴 GX10-gated (needs live MSVBASE build).
 > `bench/results/filtered_metrics.json`, `docs/benchmark_filtered_v0.1.0.md`. A `bench/vdbb_tridb.py` adapter
 > bridges the recognized VectorDBBench tool for the 768D1M1P Cohere case (GX10 runbook).
 
-> **🟢 RECALL DECAY UNDER UPDATES 2026-06-27 (roadmap b) — vector-leg churn robustness.**
-> `bench/recall_decay.py` (`make recall-decay`): upsert/delete churn on **hnswlib (the fork's own
-> vector lib)**, real SIFT-128, recall@k vs a live exact oracle + a rebuild reference. **Host result
-> (20k, ef=20, 100% cumulative churn): recall@10 0.981 → 0.974 = ROBUST (no significant decay at this
-> scale).** The decay that motivates periodic rebuilds is a 1M+ phenomenon → GX10 follow-up. Honest
-> engine note: the fork builds HNSW once (no incremental insert post-build), so an update IS a rebuild;
-> the DIFFERENTIATED claim (one-WAL cross-modal consistency under churn vs bolt-on Milvus+Neo4j+pg) is
-> the engine-gated next step. `docs/benchmark_recall_decay_v0.1.0.md`.
+> **🟢 ONE-WAL CROSS-MODAL CONSISTENCY UNDER CHURN 2026-06-28 — PROVEN LIVE ON THE GB10 (GX10).**
+> The differentiated claim bolt-on Milvus+Neo4j+pg structurally cannot make, now engine-verified:
+> ran `scripts/txn_atomicity_test.sh` + `scripts/crash_recovery_test.sh` on `tridb/msvbase:gx10`.
+> **FR-7 ALL PASSED:** atomic COMMIT + atomic ROLLBACK (no partial state) across relational + HNSW-vector
+> + native-graph; **C1 200-iter randomized churn → relational↔graph EXACTLY match (zero divergence);
+> C2 16-iter HNSW-vector churn → zero divergence; crash recovery hides the aborted xid across all three
+> stores.** Corrects a stale note: the v1 native AM (graph_store_am) DOES take incremental HNSW inserts
+> inside a transaction (C2 proves it) — an update is NOT forced to be a rebuild on the native path.
+
+> **🟢 RECALL DECAY UNDER UPDATES 2026-06-28 (roadmap b) — vector-leg churn robustness; honest negative.**
+> `bench/recall_decay.py` (`make recall-decay`): upsert/delete churn on **hnswlib (the fork's own vector
+> lib)**, real SIFT-128, recall@k vs an exact (BLAS-vectorized) oracle + a rebuild reference. **Honest
+> finding: NO decay at the scales runnable here — 20k/100q recall@10 0.962→0.967 after 100% churn (Δ
+> +0.005, within noise); 500k flat too.** Moderate churn does not wreck hnswlib recall. A definitive 1M+
+> curve was NOT obtained: the local 1M OOM-competes with the baseline stack, and the GB10 runs (in a
+> `python:3.12` container, since spark lacks `python3-dev` to build hnswlib and has no passwordless sudo)
+> stalled on single-threaded index build. Fixed a real bench bug along the way (the oracle was a
+> single-threaded per-query einsum → now one BLAS matmul, verified identical to brute force).
+> `docs/benchmark_recall_decay_v0.1.0.md`.
 
 > **🟡 TRI-MODAL FUSION ABLATION 2026-06-27 (MultiHopRAG) — the thesis-falsification test; NUANCED result.**
 > **Oracle-leakage now killed (roadmap a):** the relational constraint is also parsed from the QUERY

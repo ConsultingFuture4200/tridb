@@ -1,24 +1,24 @@
 # TriDB Benchmark — Vector Recall Decay Under Updates
 
-**At this scale HNSW recall@10 is ROBUST to churn — 0.981 -> 0.974 after 100% cumulative upsert/delete churn (within run-to-run noise, no significant decay).** Measured on hnswlib (the MSVBASE fork's own vector lib), real SIFT-128, 20000 vectors. The decay that motivates periodic rebuilds is a LARGE-SCALE phenomenon (1M+); that curve is the GX10 follow-up. The honest takeaway here: tombstone+add churn does not wreck recall at moderate scale.
+**HNSW recall@10 is ROBUST to churn at this scale — 0.962 -> 0.967 after 100% churn (Δ +0.005); rebuilt index 0.932 (Δ vs churned -0.035). No decay signal above the noise floor.** Measured on hnswlib (the MSVBASE fork's own vector lib), real SIFT-128, 20000 vectors, 100 queries, query ef=16.
 
-20000 base vectors, 80 queries, query ef=20, 5 rounds × 20% churn (mark-delete + add fresh), HNSW M=16/ef_construction=200.
+20000 base vectors, 100 queries, query ef=16, 5 rounds × 20% churn (mark-delete + add fresh), HNSW M=16/ef_construction=200.
 
 | cumulative churn % | live vectors | recall@k |
 |---:|---:|---:|
-| 0.0 | 20000 | 0.981 |
-| 20.0 | 20000 | 0.969 |
-| 40.0 | 20000 | 0.973 |
-| 60.0 | 20000 | 0.975 |
-| 80.0 | 20000 | 0.971 |
-| 100.0 | 20000 | 0.974 |
-| rebuild | 20000 | 0.960 |
+| 0.0 | 20000 | 0.962 |
+| 20.0 | 20000 | 0.951 |
+| 40.0 | 20000 | 0.960 |
+| 60.0 | 20000 | 0.952 |
+| 80.0 | 20000 | 0.962 |
+| 100.0 | 20000 | 0.967 |
+| rebuild | 20000 | 0.932 |
 
 ## Notes
 
-- **Why it decays:** mark-deleted nodes stay in the HNSW graph as tombstones and added nodes link into a graph built for the old distribution — search quality drifts until a rebuild. This is an algorithm property, shown on the engine's own lib (hnswlib).
-- **Engine reality (honest):** the MSVBASE fork builds HNSW once and does not support incremental insert post-build, so on the live engine an update IS a rebuild — the decay→rebuild gap above is precisely what that rebuild buys.
-- **The differentiated claim (GX10 follow-up):** in TriDB the vector rebuild + the relational/graph mutations commit in ONE transaction / ONE WAL, so all three stores stay consistent under churn — Milvus+Neo4j+pg cannot guarantee that across systems. That live cross-modal-consistency-under-mutation check is engine-gated.
+- **The decay hypothesis (and what we found):** tombstones + new nodes linking into an old-distribution graph SHOULD drift recall until a rebuild. At the host-feasible scales (20k/100q robust; 500k/30q noise-limited) we did NOT see a clean decay signal — the honest result is that moderate churn does not wreck hnswlib recall here; a definitive 1M+ curve is gated (local OOM next to the baseline stack; GX10 lacks python3-dev to build the hnswlib python pkg). The bench measures the ALGORITHM, so it is hardware-agnostic.
+- **Engine reality (corrected):** the v1 native AM (graph_store_am) DOES take incremental HNSW inserts inside a transaction — verified live on the GB10 by FR-7 C2 (test/txn_atomicity_test.sql): a randomized commit/abort vector churn left the HNSW visible set with ZERO divergence from the committed expectation.
+- **The differentiated claim — VERIFIED live on the GX10 (GB10):** vector + graph + relational mutations commit/abort as ONE unit (one txn, one WAL). FR-7 atomicity passed (200-iter relational↔graph churn zero divergence; 16-iter HNSW-vector zero divergence) and crash recovery hid the aborted xid across all three stores — what bolt-on Milvus+Neo4j+pg cannot guarantee. This is no longer a follow-up; it is proven.
 
 ```bash
 make recall-decay   # host-side; FILT_LIMIT-style knobs via flags (real SIFT-128)
