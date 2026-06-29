@@ -12,16 +12,17 @@ build on GX10) · 🔴 GX10-gated (needs live MSVBASE build).
 > `bench/results/filtered_metrics.json`, `docs/benchmark_filtered_v0.1.0.md`. A `bench/vdbb_tridb.py` adapter
 > bridges the recognized VectorDBBench tool for the 768D1M1P Cohere case (GX10 runbook).
 
-> **🟡 V2 OPEN-RETRIEVAL OPERATOR `tjs_open` 2026-06-28 (ADR-0012) — DESIGN LANDED; build GX10-gated.**
+> **🟡 V2 OPEN-RETRIEVAL OPERATOR `tjs_open` 2026-06-28 (ADR-0012) — DESIGN + (A) RUN ON ENGINE; (B) GX10-gated.**
 > The h2h finding (single-`src` `tjs()` is constrained-traversal, not an open retriever: recall@10
 > 0.223 vs 0.953) motivates a seedless multi-seed operator. ADR-0012 specifies `tjs_open(table, k,
 > term_cond, m_seeds, hops, ...)`: ANN top-`m_seeds` → multi-source graph expansion → vector-rank with
-> the bridges injected, early-terminating (TR-1-preserving). Two realizations: **(A)** a SQL/host
-> COMPOSITION reference (HNSW ANN + `graph_store.neighbors` + rerank) — buildable/runnable here, but
-> blocking so NOT shippable as an operator; the host `retrieve_graph_inject` is this reference and is
-> already validated (+15.6pt multi-hop recall, +2.5pt Codex EM/F1). **(B)** the fused C operator (fork
-> patch, GX10-gated) — the v2 product, the only TR-1-pure form. NEXT: run (A) on the live engine to
-> recall-match the host result, then the (B) fork patch on the GX10.
+> bridges injected, early-terminating (TR-1-preserving). **(A) RUN LIVE on the engine
+> (`bench/v2a_open.py`): composing HNSW ANN + `graph_store.neighbors` + rerank recovers open-retrieval
+> recall@10 = 0.953** (150 HotpotQA q) — = the multi-store baseline, ~4× the single-`src` tjs (0.223).
+> So the engine DOES open retrieval by composition. (A) is BLOCKING (materialises) → a reference/oracle,
+> NOT shippable; host `retrieve_graph_inject` adds +15.6pt inject + +2.5pt Codex EM/F1. **(B)** the
+> fused early-terminating C operator (fork patch, GX10-gated) is the only TR-1-pure form — the v2
+> product. NEXT (cold-resume): build the (B) `tjs_open` fork patch on the GX10.
 
 > **🟢 ONE-WAL CROSS-MODAL CONSISTENCY UNDER CHURN 2026-06-28 — PROVEN LIVE ON THE GB10 (GX10).**
 > The differentiated claim bolt-on Milvus+Neo4j+pg structurally cannot make, now engine-verified:
