@@ -80,7 +80,8 @@ recognize* is not yet. That gap is the entire to-do list.
 | "Strawman baseline" | Real tuned multi-store, configs public, "beat it" invitation |
 | "Toy scale" | GX10 100k/768 + scaling curve |
 | "You wrote both sides" | One-command public repro |
-| "Speed, but is the answer right?" | recall@k + QA accuracy at fixed latency; SM-4 oracle parity reported honestly |
+| "Speed, but is the answer right?" | recall@k + QA accuracy at fixed latency; SM-4 oracle parity reported honestly; **GraphRAG QA on real HotpotQA + a real (embedding-independent) graph — multi-hop joint evidence recall +15.6 pts @ k=5 vs vector-only (`docs/benchmark_graphrag_v0.1.0.md`, Plan 015)** |
+| "Graph just re-encodes the vectors" | Graph is real title-mention topology (rebuild with any encoder, edges don't move); naive graph-rerank is shown to NOT help — only injecting real bridges does |
 
 ## Part 2 — Repo readiness (open-source hygiene)
 

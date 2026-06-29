@@ -1,6 +1,9 @@
-.PHONY: test lint graph-test smoke-test test-all baseline-up baseline-down seed bench bench-live sweep sm2 fetch-dataset bench-public clean
+.PHONY: test lint graph-test smoke-test test-all baseline-up baseline-down seed bench bench-live sweep sm2 fetch-dataset bench-public fetch-hotpot graphrag graphrag-live bench-filtered ablation recall-decay clean
 
 PUBLIC_DATASET ?= gist-960-euclidean
+
+# Prefer the repo venv (has numpy/fastembed/baseline clients); fall back to python3.
+PY := $(shell [ -x .venv/bin/python ] && echo .venv/bin/python || echo python3)
 
 IMAGE ?= tridb/msvbase:dev
 ENGINE_TESTS := test/graph_store_test.sql test/trimodal_compose.sql \
@@ -9,7 +12,7 @@ ENGINE_TESTS := test/graph_store_test.sql test/trimodal_compose.sql \
                 test/parse_canonical.sql
 
 test:
-	pytest tests/ -q
+	$(PY) -m pytest tests/ -q
 
 lint:
 	ruff check . && ruff format --check .
@@ -108,6 +111,59 @@ bench-public:
 	@docker image inspect $(IMAGE) >/dev/null 2>&1 || \
 	  { echo "image $(IMAGE) not built (live run is ENGINE-GATED) — run scripts/x86build.sh --docker / gx10build.sh"; exit 1; }
 	PUBLIC_DATASET=$(PUBLIC_DATASET) bash scripts/bench_public.sh $(IMAGE)
+
+# GraphRAG QA-accuracy benchmark (Plan 015) — the "is the answer right?" artifact.
+# REAL multi-hop QA (HotpotQA), a REAL embedding-independent graph (title-mention
+# proxy for Wikipedia hyperlinks), graded on evidence recall + downstream answer
+# EM/F1: graph-constrained tjs() retrieval vs a vector-only ablation. ACCURACY is
+# host-side (no engine, like tools/real_corpus.py recall); the live tjs() latency
+# and the full retrieve-from-all-Wikipedia fullwiki run are GX10-gated (graphrag-live).
+HOTPOT_Q ?= 500
+GRAPHRAG_READER ?= extractive   # 'anthropic' for the LLM EM/F1 headline (needs ANTHROPIC_API_KEY)
+
+# Network-gated: pulls the HotpotQA dev slice from the HF mirror (CMU host is down).
+# NOT run by tests/CI, same policy as fetch-dataset.
+fetch-hotpot:
+	$(PY) -m tools.fetch_hotpot --questions $(HOTPOT_Q) --out data/hotpot/dev_slice.json
+
+# Host-side accuracy (buildable here). Needs the dev slice (make fetch-hotpot) and
+# the embedder (fastembed). Builds the real graph + BGE-768 embeddings, then grades.
+graphrag:
+	@test -f data/hotpot/dev_slice.json || { echo "no dev slice — run: make fetch-hotpot"; exit 1; }
+	$(PY) -m tools.hotpot_corpus --slice data/hotpot/dev_slice.json --k 10
+	$(PY) -m bench.graphrag_report --reader $(GRAPHRAG_READER)
+
+# LIVE engine head-to-head (GX10/engine-gated): canonical tjs() + live latency vs the
+# multi-store baseline. Guards on the image like bench-public; UNBUILT-HERE off-target.
+graphrag-live:
+	@docker image inspect $(IMAGE) >/dev/null 2>&1 || \
+	  { echo "image $(IMAGE) not built — graphrag-live is ENGINE-GATED (UNBUILT-HERE)"; exit 1; }
+	bash scripts/bench_graphrag.sh $(IMAGE)
+
+# Filtered vector search (VectorDBBench IntFilter methodology) on the live engine:
+# recall@k + latency vs filter SELECTIVITY on real SIFT-128. ENGINE-gated; keep
+# FILT_LIMIT small on the standin. GX10 headline: FILT_LIMIT=1000000 (NEON HNSW).
+bench-filtered:
+	@docker image inspect $(IMAGE) >/dev/null 2>&1 || \
+	  { echo "image $(IMAGE) not built — bench-filtered is ENGINE-GATED"; exit 1; }
+	bash scripts/bench_filtered.sh $(IMAGE)
+
+# 4-way tri-modal FUSION ABLATION on MultiHopRAG (vector / graph / relational /
+# fusion), recall@k — the thesis-falsification test. Host-side (no engine); needs
+# the embedder (fastembed) + HF reachable. Add --reuse-embeddings to skip re-embed.
+MHRAG_Q ?= 300
+ablation:
+	$(PY) -m tools.multihoprag_corpus --questions $(MHRAG_Q) --k 10
+	$(PY) -m bench.ablation_report --k 10
+
+# Vector recall decay under upsert/delete churn on hnswlib (the engine's own vector
+# lib), real SIFT-128, with a rebuild reference. Host-side; the at-scale (1M+) decay
+# curve is the GX10 follow-up. DECAY_LIMIT scales the base set.
+DECAY_LIMIT ?= 20000
+recall-decay:
+	@test -f data/public/sift-128-euclidean.hdf5 || \
+	  { echo "dataset missing — run: make fetch-dataset PUBLIC_DATASET=sift-128-euclidean"; exit 1; }
+	$(PY) -m bench.recall_decay --limit $(DECAY_LIMIT)
 
 baseline-up:
 	docker compose -f baseline/docker-compose.yml up -d

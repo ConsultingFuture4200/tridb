@@ -2,7 +2,7 @@
 
 **SM-2 = 100.00%** of 12 queries had TriDB end-to-end latency below the live multi-system baseline (target >= 80% -> **PASS**).
 
-- TriDB wins: 12/12  ·  median latency ratio (baseline/TriDB): 11.494×  ·  mean ratio: 11.481×
+- TriDB wins: 12/12  ·  median latency ratio (baseline/TriDB): 15.106×  ·  mean ratio: 15.587×
 - Answer parity (exact top-k set): 12/12  ·  mean Jaccard: 1.0
 - Corpus: 2000 entities, 1799 edges, k=5, seed=42, runs/query=7, term_cond=0 (tjs operating point; 0 = engine default 50)
 
@@ -14,18 +14,18 @@ Like-for-like client-side END-TO-END wall-clock per query on BOTH sides, over WA
 
 | qid | src | TriDB ms | baseline ms | ratio (b/T) | TriDB faster | answer match | Jaccard |
 |----:|----:|---------:|------------:|------------:|:------------:|:------------:|--------:|
-| 0 | 0 | 1.860 | 16.106 | 8.66× | yes | exact | 1.00 |
-| 1 | 1 | 3.457 | 17.651 | 5.11× | yes | exact | 1.00 |
-| 2 | 2 | 2.605 | 14.723 | 5.65× | yes | exact | 1.00 |
-| 3 | 3 | 2.104 | 16.590 | 7.88× | yes | exact | 1.00 |
-| 4 | 4 | 2.466 | 17.393 | 7.05× | yes | exact | 1.00 |
-| 5 | 5 | 0.923 | 15.936 | 17.27× | yes | exact | 1.00 |
-| 6 | 6 | 1.330 | 15.837 | 11.91× | yes | exact | 1.00 |
-| 7 | 7 | 0.993 | 16.060 | 16.17× | yes | exact | 1.00 |
-| 8 | 8 | 1.179 | 17.414 | 14.77× | yes | exact | 1.00 |
-| 9 | 9 | 1.034 | 15.514 | 15.00× | yes | exact | 1.00 |
-| 10 | 10 | 0.931 | 16.029 | 17.22× | yes | exact | 1.00 |
-| 11 | 11 | 1.529 | 16.941 | 11.08× | yes | exact | 1.00 |
+| 0 | 0 | 0.940 | 20.176 | 21.46× | yes | exact | 1.00 |
+| 1 | 1 | 0.997 | 20.689 | 20.75× | yes | exact | 1.00 |
+| 2 | 2 | 1.387 | 18.501 | 13.34× | yes | exact | 1.00 |
+| 3 | 3 | 1.304 | 16.838 | 12.91× | yes | exact | 1.00 |
+| 4 | 4 | 0.946 | 16.351 | 17.28× | yes | exact | 1.00 |
+| 5 | 5 | 1.038 | 16.582 | 15.97× | yes | exact | 1.00 |
+| 6 | 6 | 1.161 | 16.530 | 14.24× | yes | exact | 1.00 |
+| 7 | 7 | 1.461 | 17.694 | 12.11× | yes | exact | 1.00 |
+| 8 | 8 | 1.454 | 15.865 | 10.91× | yes | exact | 1.00 |
+| 9 | 9 | 2.138 | 17.266 | 8.08× | yes | exact | 1.00 |
+| 10 | 10 | 0.882 | 17.724 | 20.09× | yes | exact | 1.00 |
+| 11 | 11 | 0.893 | 17.758 | 19.89× | yes | exact | 1.00 |
 
 ## Baseline intermediate-result sizes (SM-1 cross-check)
 
