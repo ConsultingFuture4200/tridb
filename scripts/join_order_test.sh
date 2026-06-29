@@ -12,13 +12,19 @@ set -euo pipefail
 IMAGE="${1:-tridb/msvbase:dev}"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 EXT="$ROOT/src/planner"
+# join_order_legstats.c (plan 006, now in OBJS) #includes src/graph_store/gph_page.h via the
+# planner Makefile's `-I$(srcdir)/../graph_store`. Inside the container the build runs in
+# /tmp/build, so that include resolves to /tmp/build/../graph_store == /tmp/graph_store — mount
+# the graph_store headers there so the planner extension actually compiles.
+GRAPH="$ROOT/src/graph_store"
 SQL="$ROOT/test/join_order_test.sql"
 
 docker image inspect "$IMAGE" >/dev/null 2>&1 || {
   echo "image $IMAGE not built — run scripts/x86build.sh --docker (or gx10build.sh)" >&2; exit 1; }
 
 docker run --rm --entrypoint bash \
-  -v "${EXT}:/tmp/ext:ro" -v "${SQL}:/tmp/join_order_test.sql:ro" "$IMAGE" -c '
+  -v "${EXT}:/tmp/ext:ro" -v "${GRAPH}:/tmp/graph_store:ro" \
+  -v "${SQL}:/tmp/join_order_test.sql:ro" "$IMAGE" -c '
   set -e
   B=/u01/app/postgres/product/13.4/bin
   PGC=$B/pg_config

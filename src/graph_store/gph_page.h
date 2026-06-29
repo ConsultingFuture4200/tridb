@@ -60,6 +60,7 @@ typedef struct GphMeta
 	uint64		gm_next_vid;	/* next vertex id to assign (dense, monotone) */
 	uint32		gm_vertex_count;
 	uint32		gm_reserved;
+	uint64		gm_edge_count;	/* store-wide directed-edge count (FR-6 avg_out_degree source) */
 	BlockNumber	gm_first_vertex_blk;	/* head of the vertex-page chain (Invalid if none) */
 	BlockNumber	gm_last_vertex_blk;		/* tail of the vertex-page chain (append target) */
 } GphMeta;
