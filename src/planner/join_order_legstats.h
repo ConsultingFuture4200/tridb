@@ -49,9 +49,10 @@ typedef struct LegStats
  *   vector_topk           the tjs() k argument.
  *   out                   populated on success.
  *
- * Sets out->avg_out_degree = 0.0 (PLACEHOLDER: the graph metapage has no avg_out_degree yet —
- * see the .c and ADR-0011). avg_out_degree is NOT an input to tridb_choose_join_order (FROZEN
- * §10.1), so this placeholder does not affect the FR-6 ordering decision.
+ * Sets out->avg_out_degree = gm_edge_count / gm_vertex_count, read from the graph store metapage
+ * (plan 006; 0.0 when the store is absent/uninitialized or has no vertices). avg_out_degree is NOT
+ * an input to tridb_choose_join_order (FROZEN §10.1), so it does not affect the FR-6 ordering
+ * decision; it feeds tridb_estimate_intermediate's EXPLAIN graph fan-out only.
  */
 extern void tridb_build_legstats(Relation rel,
 								 float8 est_filter_selectivity,

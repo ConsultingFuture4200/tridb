@@ -21,8 +21,65 @@
  */
 
 #include "postgres.h"
-#include "utils/rel.h"			/* Relation, RelationData, Form_pg_class via rd_rel */
+#include "access/relation.h"	/* relation_open / relation_close                       */
+#include "catalog/namespace.h"	/* RangeVarGetRelid                                     */
+#include "nodes/makefuncs.h"	/* makeRangeVar                                         */
+#include "storage/bufmgr.h"		/* ReadBufferExtended, LockBuffer, BufferGetPage        */
+#include "utils/rel.h"			/* Relation, RelationData, Form_pg_class via rd_rel     */
 #include "join_order_legstats.h"
+
+/*
+ * The graph store's internal metapage layout (gm_edge_count / gm_vertex_count). This helper reads
+ * the metapage to derive avg_out_degree; the layout header lives in the graph_store source tree
+ * (src/graph_store/gph_page.h).
+ *
+ * BUILD WIRING (GX10, follow-on): this translation unit is still a DRAFT and is NOT yet compiled
+ * by src/planner/Makefile (OBJS = join_order.o only). When the Option-B lowering (ADR-0011) wires
+ * tridb_build_legstats into the planner, the planner Makefile must (a) add join_order_legstats.o to
+ * OBJS and (b) add the graph_store include dir, e.g. `PG_CPPFLAGS += -I$(top_srcdir)/src/graph_store`
+ * (or a relative -I../graph_store), so this #include resolves. Out of plan 006's file scope to edit
+ * the Makefile here; recorded so the seam is unambiguous.
+ */
+#include "gph_page.h"
+
+#define GPH_SCHEMA	"graph_store"
+#define GPH_RELNAME "gstore"
+
+/*
+ * Read a copy of the graph metapage (block GPH_META_BLKNO) under a share lock. Returns false if the
+ * graph store relation does not exist or has not been initialized (no blocks / bad magic) — in which
+ * case avg_out_degree falls back to 0.0. This mirrors graph_am.c's static gph_read_meta, re-declared
+ * here because that one is file-local to the graph_store translation unit (the two extensions are
+ * separately linked .so's; they share gph_page.h, not symbols). It does NOT change the FROZEN
+ * LegStats contract or tridb_build_legstats's signature — it is an internal read of a second store.
+ */
+static bool
+legstats_read_graph_meta(GphMeta *out)
+{
+	RangeVar   *rv = makeRangeVar(GPH_SCHEMA, GPH_RELNAME, -1);
+	Oid			relid = RangeVarGetRelid(rv, AccessShareLock, true /* missing_ok */);
+	Relation	rel;
+	Buffer		buf;
+
+	if (!OidIsValid(relid))
+		return false;			/* graph store not installed in this database */
+
+	rel = relation_open(relid, NoLock);	/* RangeVarGetRelid already took AccessShareLock */
+
+	if (RelationGetNumberOfBlocks(rel) == 0)
+	{
+		relation_close(rel, AccessShareLock);
+		return false;			/* store never initialized => no vertices/edges */
+	}
+
+	buf = ReadBufferExtended(rel, MAIN_FORKNUM, GPH_META_BLKNO, RBM_NORMAL, NULL);
+	LockBuffer(buf, BUFFER_LOCK_SHARE);
+	memcpy(out, GphPageRecordBase(BufferGetPage(buf)), sizeof(GphMeta));
+	UnlockReleaseBuffer(buf);
+	relation_close(rel, AccessShareLock);
+
+	return out->gm_magic == GPH_MAGIC;
+}
 
 /*
  * Clamp a restriction selectivity to [0.0, 1.0]. The Postgres estimators already return values in
@@ -86,19 +143,26 @@ tridb_build_legstats(Relation rel,
 	out->vector_topk = vector_topk;
 
 	/*
-	 * avg_out_degree: PLACEHOLDER 0.0.
+	 * avg_out_degree = gm_edge_count / gm_vertex_count, derived from the graph metapage (plan 006,
+	 * ADR-0011 Stage 0). The store-wide directed-edge count gm_edge_count is now maintained on the
+	 * metapage (incremented under GenericXLog in gph_insert_edge); we read it together with
+	 * gm_vertex_count and divide, guarding the zero-vertex case (NULLIF semantics -> 0.0).
 	 *
-	 * The graph store does NOT currently expose a mean out-degree: GphMeta (src/graph_store/
-	 * gph_page.h) carries gm_vertex_count but no store-wide edge count, gph_edge_count is per-page
-	 * only, and graph_am.c has no amanalyze hook. Adding gm_edge_count to the metapage (incremented
-	 * in gph_insert_edge) and deriving avg_out_degree = gm_edge_count / NULLIF(gm_vertex_count, 0)
-	 * is a graph-store-track follow-on (ADR-0011 Stage 0), NOT part of this additive draft.
+	 * If the graph store is absent/uninitialized in this database, legstats_read_graph_meta returns
+	 * false and avg_out_degree stays 0.0 — the same value the old placeholder produced.
 	 *
-	 * This is SAFE for the FR-6 decision: avg_out_degree is NOT an input to
+	 * This remains SAFE for the FR-6 decision: avg_out_degree is NOT an input to
 	 * tridb_choose_join_order (FROZEN §10.1 — it is carried only for tridb_estimate_intermediate's
 	 * EXPLAIN graph fan-out). The ordering decision is fully determined by rel_filter_matches,
-	 * table_size, and the threshold. Only the intermediate-row estimate omits graph fan-out until
-	 * Stage 0 lands — which is exactly what the simplified Python reference already does (§5).
+	 * table_size, and the threshold; populating avg_out_degree cannot change which order is chosen.
 	 */
-	out->avg_out_degree = 0.0;
+	{
+		GphMeta	gmeta;
+
+		if (legstats_read_graph_meta(&gmeta) && gmeta.gm_vertex_count > 0)
+			out->avg_out_degree =
+				(float8) gmeta.gm_edge_count / (float8) gmeta.gm_vertex_count;
+		else
+			out->avg_out_degree = 0.0;
+	}
 }
