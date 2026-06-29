@@ -120,9 +120,24 @@ scan provably early-terminates rather than blocking.
   it by forking the same `execFagins` lifecycle (the mandated v1 architecture). The fix belongs to
   the fork's executor-driving lifecycle (a separate hardening task, GX10-adjacent); the canonical
   e2e test sidesteps it by not co-issuing a second `entities` scan in the early-termination block.
-- **HNSW incremental-insert limitation (known fork issue).** Inserting into an already-indexed table
-  crashes the fork's HNSW AM (reproducible with `vectordb` alone). Tests build the full corpus before
-  `CREATE INDEX`. Also outside DEV-1169's scope.
+
+  > **CORRECTION (2026-06-29, supersedes the bullet above) — RESOLVED, root cause re-diagnosed.**
+  > Under controlled stock-vs-patched testing (ADR-0010 correction banner), the sibling-scan plpgsql
+  > shape **survives with AND without** the snapshot patch — the snapshot issue is *latent UB, not a
+  > reliable crash*. The crash actually filed under DEV-1236 was the **HNSW no-ORDER-BY bug**
+  > (`HNSWIndexScan::EndScan` on a null `ResultIterator` for a `count(*)` Index-Only Scan under
+  > `enable_seqscan=off`), now **fixed by `scripts/patches/tridb_hnsw_scan_no_orderby.patch`**;
+  > `tridb_fix_double_scan_snapshot.patch` ships as additional latent-UB + teardown-use-after-free
+  > hardening. See `docs/decisions/0010-fork-operator-snapshot-lifecycle.md` and
+  > `docs/fork_segfault_double_scan.md` for the corrected evidence. Treat the "segfaults the backend"
+  > wording above as historical, not current behavior.
+- **HNSW incremental-insert limitation (known fork issue) — STALE, see correction.** This bullet
+  originally claimed inserting into an already-indexed table crashes the fork's HNSW AM.
+  > **CORRECTION (2026-06-29):** `docs/STATUS.md` (FR-7 churn verification, scenario C2) proves the
+  > engine **does** take incremental HNSW-vector inserts inside a transaction with zero cross-store
+  > divergence — an update is **not** forced to be a rebuild on the native path. The build-before-
+  > `CREATE INDEX` pattern in the tests is a convenience, not a hard limitation. Treat the original
+  > claim as stale.
 - **`term_cond` = consecutive PAST-FRONTIER candidates (corrected — DEV-1169 scale fix).**
   Originally the bound counted EVERY non-improving candidate, *including graph-rejected ones*, and
   this ADR documented that as "correct". It was a **scale defect**: with a selective predicate the

@@ -52,6 +52,19 @@
 
 TriDB collapses all three into **one query plan, in one PostgreSQL process, under one transaction manager**. The win isn't better individual retrievers — it's enforcing the global top-k *during* execution so intermediate results never blow up. It is a clean-room implementation of **AkasicDB** (SIGMOD Companion '26), built by forking **MSVBASE** (VBASE, OSDI '23) and adding a native graph store, extending **Chimera**'s (PVLDB 18(2)) dual-store design to a triple store.
 
+**Why this exists vs. AkasicDB:** AkasicDB is the design TriDB descends from; TriDB is an **open, Postgres-native, locally-runnable** realization of it — it runs on a single DGX Spark, the whole stack is reproducible from this repo, and it leans on the pgvector/Postgres ecosystem rather than a closed system. The peer-reviewed lineage (VBASE / AkasicDB / Chimera) is the credibility anchor; the open + local + reproducible angle is the contribution.
+
+> [!NOTE]
+> **What v1 actually delivers (read before benchmarking):** TriDB wins decisively on **source-anchored
+> tri-modal queries** ("given entity X, find vector-similar entities reachable from X, filtered") and on
+> **one-WAL transactional consistency across all three stores** — a guarantee a bolt-on
+> Milvus+Neo4j+Postgres stack cannot make. It is **not yet a drop-in open-domain GraphRAG retriever**:
+> the single-source `tjs()` operator ranks vectors only within one source's reachable set, and the
+> seedless multi-seed `tjs_open` operator (ADR-0012) — whose *algorithm* is validated (multi-seed PPR +
+> rank-join termination beats a tuned multi-store on HotpotQA, `docs/decisions/0012-*`) — is the **next
+> build**, not a shipped engine feature. The cross-modal join-order heuristic ships but is **inert** until
+> the filter-first operator body lands (a v1.1 unlock). Lead with the source-anchored + consistency wins.
+
 ## Features
 
 - **Tri-modal in one plan** — vector + graph + relational compose in a single Volcano pipeline via the **TJS** (Traversal-Join-Similarity) operator, with a single global top-k.
@@ -88,8 +101,17 @@ Head-to-head against the multi-system baseline (Milvus + Neo4j + Postgres, app-s
 | **SM-1** | Intermediate-result reduction vs. baseline | ≥ 5× | **32×** |
 | **SM-2** | Lower end-to-end latency than baseline | ≥ 80% of queries | **100% (12/12), ~13× faster** |
 | **SM-3** | Corpus examined (k=5, worst case) | < 25% | **6.4%** |
-| **SM-4** | Answer-set parity vs. exact oracle | ≥ 99% | **100%** |
+| **SM-4** | Answer-set parity vs. exact oracle | ≥ 99% | **curve, not a point** (see note ↓) |
 | **SM-5** | Transaction atomicity across all stores | 100% | **100%** |
+
+> [!IMPORTANT]
+> **SM-4 is a recall/effort curve — read it honestly.** At the 2k/dim-32 standin scale the qualifying
+> rows sit in the top-50, so SM-4 reads 100%; that is *not* the at-scale number. At **100k/dim-768 on
+> the GX10 (NEON)** SM-4 trades recall for effort via `term_cond`: **58.5%** exact-parity at the shipped
+> default (`term_cond=50`, 3.6% examined) → **97.2%** (`term_cond=5000`) → **100%** (`term_cond=10000`,
+> 20.1% examined, still under the 25% TR-1 ceiling). Pin a `term_cond` per reported metric; do **not**
+> mix the default-`term_cond` latency number with the high-`term_cond` recall number. (SM-2's "100%"
+> means 100% of queries had *lower latency* — the recall metric is SM-4.)
 
 > [!NOTE]
 > These are measured on an **x86_64 standin** at standin scale (~1–2 ms/query vs. the baseline's ~16–20 ms). The **128 GB headline benchmark** runs only on the GX10 target (ARM64 + CUDA) and is not yet run. Full methodology and caveats: [`docs/benchmark_sm2_v0.1.0.md`](docs/benchmark_sm2_v0.1.0.md) and [`docs/benchmark_results_v0.1.0.md`](docs/benchmark_results_v0.1.0.md).
@@ -159,7 +181,7 @@ tests/       Python unit tests (harness, planner, corpus)
 
 ## Status
 
-Active development, tracked in Linear project **TriDB**. The tri-modal engine — native graph store, TJS operator, SQL/PGQ surface, HNSW vector durability, and cross-modal join ordering — is feature-complete. The **GX10 ARM64 build + engine suite are signed off** (the fork builds and the full suite passes on the DGX Spark; the first at-scale run found and fixed a TJS early-termination scale defect — SM-4 restored to 100%). Remaining on-target work: the **128 GB headline benchmark**, plus the honest SM-2 latency re-measurement at the corrected operating point (DEV-1284). See [`docs/STATUS.md`](docs/STATUS.md) for the per-issue breakdown.
+Active development, tracked in Linear project **TriDB**. The **v1 tri-modal core** — native graph store, single-source TJS operator, SQL/PGQ surface, HNSW vector durability, one-WAL atomicity — is built and the **GX10 ARM64 build + engine suite are signed off** (the fork builds and the full suite passes on the DGX Spark; the first at-scale run found and fixed a TJS early-termination scale defect — see the SM-4 curve above). **Honestly scoped — not yet done:** the seedless `tjs_open` multi-seed operator (ADR-0012, the open-GraphRAG retriever) is the **next build** (its algorithm is validated, the engine operator is not); the cross-modal join-order heuristic is shipped but **inert** until the filter-first operator lands (v1.1); the **128 GB headline benchmark** and the honest SM-2 re-measurement at the corrected operating point (DEV-1284) are pending. See [`docs/STATUS.md`](docs/STATUS.md) for the per-issue breakdown and [`advisor-plans/`](advisor-plans/) for the current improvement roadmap.
 
 ## License
 

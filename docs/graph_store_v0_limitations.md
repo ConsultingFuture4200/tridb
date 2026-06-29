@@ -45,3 +45,12 @@ NOT deliver — surfaced by the Linus verification loop (`graph-store-linus-loop
 - **Use-after-free** (critical): `neighbors[]` was `palloc`'d in SPI's context (freed by
   `SPI_finish`); now allocated explicitly in `multi_call_memory_ctx`. Tests had masked it.
 - Array decode now uses `get_typlenbyvalalign(INT8OID, ...)` instead of hardcoded byval args.
+
+## Measurement quirk (noted 2026-06-29, not a defect)
+- **`PERFORM ... FROM gph_neighbors(v) LIMIT k` inside a plpgsql loop does not early-stop the SRF.**
+  plpgsql `PERFORM` does not propagate the outer `LIMIT` down to early-terminate a set-returning
+  function the way a top-level `SELECT ... LIMIT k` does, so a benchmark written as `PERFORM 1 FROM
+  gph_neighbors(0) LIMIT 5` reads the whole adjacency list instead of stopping at 5. This is standard
+  PostgreSQL plpgsql behavior, **not** a defect in the graph scan (the iterator itself honors early
+  termination — a direct `SELECT ... FROM gph_neighbors(v) LIMIT 5` reads only the pages needed). Use
+  the direct-query form, not `PERFORM`, when measuring early-termination page reads.
