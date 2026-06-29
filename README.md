@@ -58,12 +58,15 @@ TriDB collapses all three into **one query plan, in one PostgreSQL process, unde
 > **What v1 actually delivers (read before benchmarking):** TriDB wins decisively on **source-anchored
 > tri-modal queries** ("given entity X, find vector-similar entities reachable from X, filtered") and on
 > **one-WAL transactional consistency across all three stores** — a guarantee a bolt-on
-> Milvus+Neo4j+Postgres stack cannot make. It is **not yet a drop-in open-domain GraphRAG retriever**:
-> the single-source `tjs()` operator ranks vectors only within one source's reachable set, and the
-> seedless multi-seed `tjs_open` operator (ADR-0012) — whose *algorithm* is validated (multi-seed PPR +
-> rank-join termination beats a tuned multi-store on HotpotQA, `docs/decisions/0012-*`) — is the **next
-> build**, not a shipped engine feature. The cross-modal join-order heuristic ships but is **inert** until
-> the filter-first operator body lands (a v1.1 unlock). Lead with the source-anchored + consistency wins.
+> Milvus+Neo4j+Postgres stack cannot make. The open-domain retriever is now a real engine operator
+> (first-cut): the single-source `tjs()` operator ranks vectors only within one source's reachable set,
+> while the seedless multi-seed **`tjs_open` operator (ADR-0012) ships as a first-cut** — seedless ANN
+> seeding + multi-source graph expansion + bridge injection past the vector frontier (TR-1-preserving),
+> at **recall@10 0.980 on real HotpotQA** (vs 0.967 vector-only). It uses reachability-bridge injection +
+> VBASE early termination; the PPR-graded + rank-join-fusion refinement (host-validated at 0.987,
+> `bench/tjs_open_ref.py`) is the next iteration. The cross-modal join-order heuristic ships but is
+> **inert** until the filter-first operator body lands (a v1.1 unlock). Lead with the source-anchored +
+> consistency wins; the open-retrieval operator is real but first-cut.
 
 ## Features
 
@@ -193,7 +196,7 @@ tests/       Python unit tests (harness, planner, corpus)
 
 ## Status
 
-Active development, tracked in Linear project **TriDB**. The **v1 tri-modal core** — native graph store, single-source TJS operator, SQL/PGQ surface, HNSW vector durability, one-WAL atomicity — is built and the **GX10 ARM64 build + engine suite are signed off** (the fork builds and the full suite passes on the DGX Spark; the first at-scale run found and fixed a TJS early-termination scale defect — see the SM-4 curve above). **Honestly scoped — not yet done:** the seedless `tjs_open` multi-seed operator (ADR-0012, the open-GraphRAG retriever) is the **next build** (its algorithm is validated, the engine operator is not); the cross-modal join-order heuristic is shipped but **inert** until the filter-first operator lands (v1.1); the **128 GB headline benchmark** and the honest SM-2 re-measurement at the corrected operating point (DEV-1284) are pending. See [`docs/STATUS.md`](docs/STATUS.md) for the per-issue breakdown and [`advisor-plans/`](advisor-plans/) for the current improvement roadmap.
+Active development, tracked in Linear project **TriDB**. The **v1 tri-modal core** — native graph store, single-source TJS operator, SQL/PGQ surface, HNSW vector durability, one-WAL atomicity — is built and the **GX10 ARM64 build + engine suite are signed off** (the fork builds and the full suite passes on the DGX Spark; the first at-scale run found and fixed a TJS early-termination scale defect — see the SM-4 curve above). **Honestly scoped:** the seedless `tjs_open` multi-seed operator (ADR-0012, the open-GraphRAG retriever) now **ships as a first-cut engine operator** — recall@10 0.980 on real HotpotQA (beating vector-only 0.967) via reachability-bridge injection + VBASE early termination; the PPR-graded + rank-join-fusion refinement (host-validated at 0.987) is the next iteration. The cross-modal join-order heuristic is shipped but **inert** until the filter-first operator lands (v1.1); the **128 GB headline benchmark** and the honest SM-2 re-measurement at the corrected operating point (DEV-1284) are pending. See [`docs/STATUS.md`](docs/STATUS.md) for the per-issue breakdown and [`advisor-plans/`](advisor-plans/) for the current improvement roadmap.
 
 ## License
 
