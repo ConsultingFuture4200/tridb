@@ -2,22 +2,33 @@
 
 > **Status: SPIKE / design note — prototype BUILT + BENCHMARKED on the x86 engine image.** This
 > is the design + analysis + measured-prototype deliverable of advisor Plan 009. It proposes a
-> layout change but does **not** merge it to the shipped layout: the prototype lives only on
-> branch `spike/009-csr-lite-prototype`. **Update (this run): the delta-tail CSR-lite prototype
-> (§5) was implemented for real in `src/graph_store/` and compiled + run inside the
-> `tridb/msvbase:dev` x86_64 fork image** (PG 13.4, `--with-blocksize=32`). `make graph-test` and
-> both FR-7 suites pass with zero divergence; the §7 benchmark is filled with REAL x86 numbers.
-> **ISA caveat:** this is x86_64, not the GX10 (ARM64+CUDA, 128 GB); the residency-pressure regime
-> the design targets is GX10-ideal and is NOT decisively exercised here (see §7, §8).
+> layout change but does **not** merge it to the shipped layout: the prototype lives only on the
+> spike branch. **Update (contiguity follow-up run, branch `spike/009-contiguity`): the two
+> mechanisms the prior run's NO-GO flagged as missing were BUILT and MEASURED** — (1) a real
+> CONTIGUOUS extent allocator (`gph_extend_pages_contig` + `gph_relayout_extent_contig`): a
+> vertex's adjacency pages now occupy a SEQUENTIAL run of block numbers, migrated to a fresh
+> contiguous run on every grow, so contiguity holds even under interleaved ingest; and (2) a
+> read-once-per-page streaming scan (bounded per-page buffer, no pin held across `Next()`)
+> replacing the prior re-read-per-neighbor scan. Implemented in `src/graph_store/` and compiled +
+> run inside the `tridb/msvbase:dev` x86_64 fork image (PG 13.4, `--with-blocksize=32`).
+> `make graph-test` and BOTH FR-7 suites pass with zero divergence; the §7 benchmark is filled
+> with REAL x86 numbers including the contiguity proof and a tiny-`shared_buffers`
+> residency-pressure run.
+> **ISA caveat:** this is x86_64 with a warm OS page cache, not the GX10 (ARM64+CUDA, 128 GB +
+> NVMe). The page-touch COUNT win and the contiguity GUARANTEE are now demonstrated here; the
+> decisive disk-seek / readahead component of the sequential-vs-random win still needs real disk
+> I/O (dropped caches / O_DIRECT) or the GX10 NVMe+128GB regime (see §7, §8).
 >
-> **Verdict (§8): CONDITIONAL — lean NO-GO on this evidence.** Write cost, correctness, and FR-7
-> are all favorable, but the traversal page-read win — the entire justification — did not (and
-> structurally could not) materialize on x86 with this chain-preserving prototype. Migration,
-> compression (#14), and WCOJ stay deferred pending a GX10 re-run of a contiguity-delivering
-> prototype.
+> **Verdict (§8): STILL-INCONCLUSIVE — leaning GO, gated on a GX10 real-I/O re-run.** The two
+> blockers from the prior run are RESOLVED here: contiguity is real (consecutive block numbers,
+> proven under interleaved load) and the scan reads each page once (full-hub page reads dropped
+> from 5005 to 6, ~830x fewer `ReadBuffer` calls, with an ~11% wall-clock win even on a warm
+> cache). Write cost stayed within noise; correctness + FR-7 are clean. What remains GX10-gated is
+> only the disk-seek magnitude (a warm x86 cache cannot show readahead). Migration / compression
+> (#14) / WCOJ stay deferred until the GX10 real-I/O number confirms the wall-clock win scales.
 >
-> **Author:** advisor executor (Plan 009), prototyped at branch `spike/009-csr-lite-prototype`.
-> **Amends (proposed):** ADR-0002 (addendum drafted in §8.2, NOT applied — verdict is not-GO).
+> **Author:** advisor executor (Plan 009), contiguity follow-up at branch `spike/009-contiguity`.
+> **Amends (proposed):** ADR-0002 (addendum drafted in §8.2, NOT applied — verdict not yet a hard GO).
 > **Gates downstream:** adjacency compression (audit #14) and WCOJ — neither may start until this
 > lands and the production decision is made (it has not).
 
@@ -43,14 +54,18 @@
   `tests/test_csr_extent_packing.py`), the MVCC and shared-WAL analysis, the degree-adaptive
   threshold, the prototype C sketch, the benchmark design, and a **conditional go** with the
   bar the GX10 numbers must clear.
-- **Recommendation (POST-measurement, x86 spike): CONDITIONAL — lean NO-GO on this evidence.**
-  The prototype is writeable (bulk load within noise of append), correct (output now sorted),
-  and FR-7-safe (zero divergence on both suites). **But the page-read traversal win — the entire
-  justification — did not appear, and structurally could not: the prototype keeps the page-chain
-  (no physical contiguity) and x86's warm 16 MB buffer pool cannot exercise the 128 GB residency
-  pressure the design targets.** A new GenericXLog 4-page-cap cost on hub merges surfaced too
-  (§7.2). Migration / compression #14 / WCOJ stay deferred; a GX10 re-run of a
-  contiguity-delivering prototype is required to revisit GO (§8.1).
+- **Recommendation (POST-measurement, contiguity follow-up): STILL-INCONCLUSIVE — leaning GO,
+  gated on a GX10 real-I/O re-run.** The prototype is writeable (bulk load within noise of
+  append), correct (output sorted), and FR-7-safe (zero divergence on both suites) — AND the two
+  prior blockers are now resolved: (a) **physical contiguity is real** — a hub's pages are a
+  consecutive block run (proven to hold even under interleaved load, where the page-chain baseline
+  scatters), via a real contiguous extent allocator + migrate-on-grow; (b) **the scan reads each
+  page once** — full-hub `ReadBuffer` count fell from 5005 (re-read per neighbor) to 6 (one per
+  page), an ~830x reduction, with an ~11% wall-clock win under tiny `shared_buffers` even on a
+  warm cache. The ONLY thing still GX10-gated is the disk-seek magnitude of the sequential vs
+  random pattern (a warm x86 OS cache masks readahead). The GenericXLog 4-page-cap finding (§7.2)
+  is handled (batched relayout). Migration / compression #14 / WCOJ stay deferred until the GX10
+  real-I/O number confirms the wall-clock win scales (§8.1).
 
 ---
 
@@ -287,6 +302,33 @@ fully-sorted run) stable-sorts the delta slots and merges them into the sorted r
 the extent under one `GenericXLogStart/Finish`, resetting `gph_delta_count` to 0 and refreshing
 `gph_min_dst`/`gph_max_dst`. Stable sort of whole 32-byte slots ⇒ `es_xmin` preserved (§4.1 A).
 
+### 5.4 Contiguity follow-up — real extent allocator + read-once scan (BUILT, branch `spike/009-contiguity`)
+
+The first run kept the `gph_next_pageno` chain and re-read a page per `Next()`, so neither physical
+contiguity nor the locality measurement existed. This follow-up adds the two missing mechanisms (in
+`src/graph_store/graph_am.c`):
+
+- **Physical contiguity — `gph_extend_pages_contig(rel, n)` + `gph_relayout_extent_contig(...)`.**
+  When a vertex's tail page fills (the extent must grow), instead of chaining one more `P_NEW` block
+  (which interleaves with every other vertex's pages → no contiguity), the whole extent is MIGRATED
+  into a fresh CONTIGUOUS run of `ceil(total_slots / slots_per_page)` blocks reserved in ONE relation
+  extension (sequential block numbers guaranteed by the extension lock). All slots are collected,
+  stable-sorted (so the new run is globally ordered, `delta_count = 0`), laid across the contiguous
+  pages chained to the physically-next block, written under `≤GPH_MERGE_BATCH`-page GenericXLog
+  records, and `vr_adj_head`/`vr_adj_tail`/`vr_adj_cap` are repointed. MVCC option (A) holds (whole
+  32-byte slot copies carry `es_xmin`), so abort/crash leave the identical visible set; the old chain
+  pages are orphaned dead space (compaction reclaims them). Result: a vertex's extent is a sequential
+  block run even under interleaved ingest (proven §7).
+- **Read-once-per-page streaming scan (`gs_read_page_into_buf` + reworked `gs_load_run_head`).** The
+  scan reads each extent page EXACTLY ONCE: on first entering a page it copies that page's sorted-run
+  slots into a bounded scan-local buffer (`page_buf`, ≤ slots/page) and IMMEDIATELY releases the
+  buffer, then serves neighbors one-per-`Next()` from the buffer until it drains, then reads the next
+  page once. No buffer pin is held across a `Next()` return — so it is LEAK-FREE on `LIMIT` early
+  abandon (the common TR-1 case, where a held pin would have leaked). Only ONE page is ever buffered
+  (streaming, bounded — not the whole list), so TR-1 holds and a `LIMIT k` stops before later extent
+  pages are read. This is what makes the §7 full-hub page-read count drop from 5005 (re-read per
+  neighbor) to 6 (one per page).
+
 ---
 
 ## 6. Benchmark design (IMPLEMENTED + RUN on x86 — see §7 for the numbers)
@@ -319,68 +361,81 @@ and method stated; a curve, not a bare number.
 
 ---
 
-## 7. Results — MEASURED on the x86 engine image (spike branch)
+## 7. Results — MEASURED on the x86 engine image (contiguity follow-up, branch `spike/009-contiguity`)
 
 > **Build/run environment.** Built + run inside the `tridb/msvbase:dev` x86_64 fork image (PG
 > 13.4, `--with-blocksize=32`, BLCKSZ 32768) via `scripts/graph_layout_bench.sh`, which compiles
-> BOTH layouts (sorted-extent = this branch's `src/graph_store/`; page-chain = the pre-spike
-> baseline, instrumented with the SAME `gph_page_reads()` probe) in one container and runs
-> `test/graph_layout_bench.sql` against each. **ISA caveat: this is x86_64, not the GX10
-> (ARM64+CUDA, 128 GB).** The plan framed the GX10 128 GB residency-pressure regime as the ideal;
-> these numbers are informative for write cost, correctness, and the page-read *artifact
-> structure*, but the sequential-vs-random-hop locality win the design targets is a buffer-pool /
-> prefetch effect this single box (16 MB `shared_buffers`) cannot decisively exercise. See §8.
+> BOTH layouts (sorted-extent + contiguous = this branch's `src/graph_store/`; page-chain = the
+> pre-spike baseline, instrumented with the SAME `gph_page_reads()` + `gph_adj_blocks()` probes) in
+> one container and runs `test/graph_layout_bench.sql` against each. **Residency-pressure regime:
+> `shared_buffers` set to the Postgres minimum (512 kB = 16 buffers) so the ~100-page working set
+> far exceeds the pool.** **ISA caveat: this is x86_64 with a WARM OS page cache, not the GX10
+> (ARM64+CUDA, 128 GB + NVMe).** The page-touch COUNT win and the contiguity guarantee are
+> demonstrated here; the disk-seek / readahead component of the win needs real disk I/O (dropped
+> caches / O_DIRECT) or the GX10 NVMe regime. See §8.
 >
 > **Corpus.** N = 20 000 vertices; 87 500 directed `:related_to` edges. Degree mix: three hubs
 > (deg 5000, 1500, 1000 — multi-page extents) + a band of 5 000 low-degree vertices (deg 16 —
 > single-page regime). dst ids are deliberately scattered (not ascending), so the sorted layout
-> genuinely re-orders them (delta tail + maintenance merge exercised, including the >4-page hub
-> merge that the GenericXLog 4-page cap forces into batches — see the finding in this section).
+> genuinely re-orders them. PLUS an INTERLEAVED-load sub-corpus: two deg-3000 hubs (vids 9000/9001)
+> grown in lockstep so their page extensions interleave — the case that distinguishes a real
+> contiguous allocator from the chain (the main corpus loads each hub back-to-back, so even the
+> chain happens to land contiguous there).
 
-| Metric | Page-chain (baseline) | Sorted-extent (CSR-lite) | Corpus / method |
+| Metric | Page-chain (baseline) | Sorted-extent + contiguous | Corpus / method |
 |---|---|---|---|
-| Pages read / k=5 traversal, low-degree (deg 16, single page) | 5 | 2 | vids 150/1000/3000; `gph_neighbors(v) LIMIT 5`, `gph_page_reads` delta |
-| Pages read / k=5 traversal, hub deg 1000 | 5 | 2 | vid 2 |
-| Pages read / k=5 traversal, hub deg 1500 | 5 | 3 | vid 1 |
-| Pages read / k=5 traversal, hub deg 5000 | 5 | 5 | vid 0 |
-| Pages read, FULL hub scan (deg 5000) | 5005 | 4095 | vid 0; `count(*) FROM gph_neighbors(0)` |
-| `tjs`-shaped predicate, **present** dst (ms/probe, 200 reps) | 5.03 | 5.39 | `EXISTS(… WHERE x=503)` on hub 0 |
-| `tjs`-shaped predicate, **absent** dst (ms/probe, 200 reps) | 5.37 | 5.63 | `EXISTS(… WHERE x=999999)` on hub 0 |
-| Bulk-load throughput (edges/sec) | 20 413 | 19 908 | 87 500 edges incl. the >4-page hub merges |
+| **Contiguity, back-to-back load** — hub deg 5000 block run | blks 21..25, `contiguous=t` | blks 31..35, `contiguous=t` | `gph_adj_blocks(0)`; both contiguous here (no interleave) |
+| **Contiguity, INTERLEAVED load** — hub A (vid 9000) | first=5029 last=5033 span=4 / 3 pages → **`contiguous=f`** (5029,5031,5033 scattered) | first=5046 last=5048 span=2 / 3 pages → **`contiguous=t`** | `gph_adj_blocks(9000)`; the decisive test |
+| **Contiguity, INTERLEAVED load** — hub B (vid 9001) | 5030,5032,5034 → **`contiguous=f`** | 5049,5050,5051 → **`contiguous=t`** | `gph_adj_blocks(9001)` |
+| Pages read / k=5 traversal (early-term), any bucket | 5 | 2 | `gph_neighbors(v) LIMIT 5`, `gph_page_reads` delta |
+| **Pages read, FULL hub scan (deg 5000)** | **5005** | **6** | vid 0; `count(*) FROM gph_neighbors(0)` — read-once-per-page |
+| **Wall-clock, repeated FULL hub scan (300 reps, tiny `shared_buffers`)** | **3.32 ms/scan** | **2.97 ms/scan (−11%)** | vid 0; residency-pressure section |
+| `tjs`-shaped predicate, **present** dst (ms/probe, 200 reps) | 3.22 | 2.74 | `EXISTS(… WHERE x=503)` on hub 0 |
+| `tjs`-shaped predicate, **absent** dst (ms/probe, 200 reps) | 3.47 | 2.92 | `EXISTS(… WHERE x=999999)` on hub 0 |
+| Bulk-load throughput (edges/sec) | 4 235 | 4 191 (**−1.0%**) | 87 500 edges incl. the contiguous relayout migrations |
 | Neighbor output order (hub 0) | insertion (`nondecreasing=f`) | **sorted asc** (`nondecreasing=t`) | correctness cross-check |
 | FR-7 txn-atomicity divergence | 0 | **0** | `txn_atomicity_test.sh` (SM-5, 200 randomized iters) |
 | FR-7 crash-recovery divergence | 0 | **0** | `crash_recovery_test.sh` scen. 1 (REDO) + 2 (abort) |
 
+> Note the edges/sec here (~4.2 k) is lower than the prior run's ~20 k because this run uses the
+> Postgres-minimum 512 kB `shared_buffers` (residency pressure) instead of 16 MB; both layouts pay
+> that cost equally, so the −1.0% RELATIVE write delta is the meaningful figure.
+
 ### 7.1 How to read these numbers (the honest interpretation)
 
-- **Write cost is the gating number and it passes:** 19 908 vs 20 413 edges/sec ≈ **−2.5%**, within
-  run-to-run noise (a second run measured 21 000 vs 21 072, i.e. −0.3%). The delta-tail hot path is
-  byte-identical to the append baseline, so bulk load is NOT cratered — the classic "sorted lists
-  are expensive to write" objection is neutralized, **including** the cost of the periodic
-  maintenance merges (the corpus build triggers them on every hub). This validates the §3.2 / §4.2
-  write-amplification analysis on real hardware.
-- **The k=5 page-read numbers are dominated by a measurement artifact, not by the layout's thesis.**
-  Both scans re-read a page on every `Next()` (no buffer pin held across calls — the leak-free
-  early-abandon contract). So the baseline reads exactly 5 buffers for ANY k=5 (even a 1-page
-  vertex re-reads the same cached page 5×). The sorted layout reads *fewer* in most cases only
-  because its bounded delta tail is materialized into backend memory once at Open and then served
-  from RAM — an incidental win, **not** the sequential-extent locality the design is about.
-- **The sequential-vs-random-hop win the design targets does NOT appear here, by construction.**
-  The prototype keeps the `gph_next_pageno` chain (it sorts WITHIN the existing page set; it does
-  not yet guarantee physically-contiguous extent allocation). So the "random `ReadBuffer` per
-  overflow hop → sequential extent read" improvement has no structural foothold in this prototype,
-  and the warm 16 MB buffer pool on x86 would mask it even if it did. The full-hub `4095 vs 5005`
-  delta is again the in-memory-delta artifact, not contiguity.
-- **The predicate is a wash (5.0–5.6 ms, sorted slightly slower).** The `gph_neighbors` SRF always
-  full-scans; the sorted layout's early-stop-on-merge advantage lives in the *consumer* (`tjs`
-  operator), which is explicitly out of scope here. The sorted path is marginally slower because of
-  the per-Open delta materialization + the 2-way merge bookkeeping. This confirms only that sorting
-  does not *hurt* the predicate at the SRF level; the predicate WIN must be demonstrated by the
-  downstream `tjs`-as-sorted-merge plan, not this layout spike.
-- **Correctness + FR-7 are unambiguous:** hub 0 comes out globally ascending (`nondecreasing=t`)
-  vs the baseline's insertion order (`f`), proving the layout actually sorts; and BOTH FR-7 suites
-  (atomicity incl. 200-iter randomized cross-store SM-5, and crash-recovery REDO + abort) show
-  **zero divergence** on the sorted layout. The re-layout did not break MVCC or crash atomicity.
+- **Contiguity is now REAL and proven where it matters.** Under interleaved growth the page-chain
+  baseline scatters each hub's pages (vid 9000 → 5029/5031/5033, `contiguous=f` — every other
+  vertex's page lands in between), exactly the random-hop pathology the design names. The
+  sorted-extent layout migrates each hub to a fresh contiguous run on every grow, so it stays a
+  consecutive block run (5046/5047/5048, `contiguous=t`) regardless of interleaving. This is the
+  §8 GO-precondition (a) — a real extent allocator, not the reused chain — delivered and verified.
+- **The scan reads each page ONCE.** Full deg-5000 hub scan: **6** page reads (sorted) vs **5005**
+  (chain) — the chain's `gs_getnext` re-reads a page on every `Next()` (one `ReadBuffer` per
+  emitted neighbor + chain hops), the prior prototype's measurement artifact. The read-once scan
+  buffers one page's run slots and serves the neighbors from RAM, touching each extent page exactly
+  once. This is GO-precondition (c) — a pin/read-once scan so the per-`Next()` re-read does not
+  swamp the locality signal — delivered. It stays STREAMING (one neighbor per `Next()`, only ONE
+  page buffered, bounded by slots/page) and LEAK-FREE on `LIMIT` early abandon (no pin held across
+  a `Next()` return, so abandoning the SRF mid-scan leaks nothing — the common TR-1 case).
+- **Wall-clock win is real but modest on a warm cache, and that is the HONEST caveat.** Under the
+  tiny 512 kB pool the full-hub scan is ~11% faster (2.97 vs 3.32 ms/scan) and the `tjs`-shaped
+  predicate is ~15% faster (2.74 vs 3.22 ms present). This is the CPU / buffer-lookup cost of
+  issuing 6 `ReadBuffer` calls instead of 5005 — NOT yet the disk-seek/readahead component. On a
+  warm x86 OS page cache every page the chain re-reads is still resident, so the random-vs-
+  sequential *seek* difference is masked; the contiguity layout makes the touches consecutive block
+  numbers, but the OS never has to seek for them here. The decisive seek/readahead magnitude needs
+  real disk pressure (dropped caches / O_DIRECT) or the GX10's NVMe+128 GB regime where the working
+  set genuinely exceeds RAM. **We measured what this box can measure and do not extrapolate the
+  seek win.**
+- **Write cost held:** 4 191 vs 4 235 edges/sec ≈ **−1.0%**, within noise — *including* the
+  contiguous-relayout migrations the corpus build triggers on every hub grow. The insert hot path
+  is still a byte-identical append + a `delta_count` bump; contiguity cost is paid off the hot path
+  in the migrate-on-grow relayout (which, like the prior in-place merge, rewrites the extent — same
+  asymptotic cost the prior prototype already paid, now also producing a contiguous run).
+- **Correctness + FR-7 are unambiguous:** hub 0 comes out globally ascending (`nondecreasing=t`) vs
+  the baseline's insertion order (`f`); and BOTH FR-7 suites (atomicity incl. 200-iter randomized
+  cross-store SM-5, and crash-recovery REDO + abort) show **zero divergence**. The contiguity
+  relayout and the read-once scan did not break MVCC, atomicity, or crash recovery.
 
 ### 7.2 GenericXLog 4-page cap — a real design finding
 
@@ -396,74 +451,105 @@ batches; only the global *order* is briefly imperfect until the merge re-runs. T
 FR-7 suites still pass. But it means the maintenance merge of a hub is **not itself crash-atomic**
 as a single unit — a finding the production plan must weigh (see §8).
 
+The contiguity follow-up's `gph_relayout_extent_contig` (migrate-on-grow) writes its NEW contiguous
+pages under the SAME `≤GPH_MERGE_BATCH`-page GenericXLog batching, for the same reason, then
+repoints `vr_adj_head`/`vr_adj_tail`/`vr_adj_cap` in a SEPARATE final GenericXLog record. **MVCC
+correctness across abort/crash is preserved** because the relayout COPIES whole slots (MVCC option
+A): each previously-committed edge keeps its original `es_xmin`, so it stays visible in the new run;
+the edge being inserted carries the inserting xid, so on abort/crash-before-commit it is invisible
+exactly as it would have been in the old layout. A post-abort scan of the vertex therefore sees the
+identical visible set it had before the aborted insert — which is why `crash_recovery_test.sh`
+scenario 2 (uncommitted) and the atomicity abort test both pass with zero divergence. The only
+residue is the OLD chain pages, now orphaned dead space in the container relation (a future
+compaction reclaims them) — a space cost, not a correctness one. As with the merge, the relayout of
+a >3-page hub is not a SINGLE atomic WAL record; the per-page slot multiset is crash-invariant
+across batch boundaries, so a crash mid-relayout (before the txn commits) leaves the old extent
+authoritative (the repoint record had not committed) — consistent. A production design wanting the
+grow itself a single atomic unit needs the shadow-extent swap / custom-rmgr discussion in §8.
+
 ---
 
 ## 8. Recommendation + proposed ADR-0002 addendum
 
-### 8.1 Go / no-go — VERDICT FROM THE MEASURED x86 SPIKE
+### 8.1 Go / no-go — VERDICT FROM THE MEASURED x86 SPIKE (contiguity follow-up)
 
-**Verdict: CONDITIONAL — lean NO-GO *on this evidence*; do NOT start the production migration
-(or compression #14 / WCOJ) yet.** The spike built and ran the delta-tail CSR-lite prototype for
-real on the x86 engine image and proved three of the four things it needed to, but **failed to
-demonstrate the one thing that justifies the whole HIGH-risk change** — the traversal win.
+**Verdict: STILL-INCONCLUSIVE — leaning GO, gated on ONE remaining GX10 real-I/O number; do NOT
+start the production migration (or compression #14 / WCOJ) until that number lands.** The prior run
+reached a lean NO-GO because the prototype "could not deliver or measure the win" — it kept the
+page-chain (no contiguity) and re-read a page per `Next()`. **This follow-up built BOTH missing
+mechanisms and the win that was structurally absent before now appears in every measure this box
+can take.** What is left is no longer a missing mechanism or an unproven correctness claim; it is a
+single magnitude question (how big is the disk-seek component) that a warm x86 cache physically
+cannot answer.
 
-What the spike PROVED (positive, real x86 numbers):
+What this run PROVED (positive, real x86 numbers — see §7):
 
-1. **Writeable.** Bulk load is within noise of the append baseline (−0.3% to −2.5% across runs),
-   *including* the maintenance merges the corpus build triggers on every hub. The "sorted lists
-   are expensive to write" objection is empirically dead. (§7.1)
-2. **Correct + MVCC-safe.** The layout actually sorts (hub 0 `nondecreasing=t` vs baseline `f`),
-   and MVCC option (A) (whole-slot moves) held: `gph_xmin_visible` is unchanged and every
-   visibility check passed.
-3. **FR-7 not regressed.** `txn_atomicity_test.sh` (incl. the 200-iter randomized SM-5 cross-store
-   consistency check) and `crash_recovery_test.sh` (REDO of a committed tri-store row + abort of a
-   crash-interrupted one) both show **zero divergence** on the spike branch. `make graph-test`
-   passes end-to-end.
+1. **Physical contiguity is real, including under interleaved load.** A real extent allocator
+   (`gph_extend_pages_contig`, one relation extension of N consecutive blocks) + migrate-on-grow
+   (`gph_relayout_extent_contig`) makes a vertex's extent a SEQUENTIAL block run. Proven decisively
+   by the interleaved-load test: the page-chain baseline scatters each hub (`contiguous=f`,
+   alternating block numbers) while the sorted-extent layout stays consecutive (`contiguous=t`).
+   This is the prior run's GO-precondition (a) — DELIVERED.
+2. **Read-once-per-page streaming scan.** Full deg-5000 hub scan drops from **5005** page reads
+   (chain, re-read per neighbor) to **6** (one per extent page), STREAMING and LEAK-FREE on `LIMIT`.
+   GO-precondition (c) — DELIVERED.
+3. **The traversal win now appears in wall-clock too** (the thing that was entirely absent before):
+   ~11% faster full-hub scan and ~15% faster `tjs`-shaped predicate under tiny `shared_buffers`,
+   from issuing 6 vs 5005 `ReadBuffer` calls. This is the buffer/CPU component; the seek component
+   is masked by the warm cache (the honest caveat, §7.1).
+4. **Writeable.** Bulk load within noise of the append baseline (−1.0% this run), *including* the
+   contiguous-relayout migrations on every hub grow. The "sorted/contiguous lists are expensive to
+   write" objection stays empirically dead.
+5. **Correct + MVCC-safe + FR-7 not regressed.** Output sorted (`nondecreasing=t`); whole-slot
+   copies (MVCC option A) keep `es_xmin` attached, so abort/crash leave the identical visible set;
+   `txn_atomicity_test.sh` (200-iter SM-5) and `crash_recovery_test.sh` (REDO + abort) both **zero
+   divergence**; `make graph-test` green end-to-end.
 
-What the spike did NOT prove (the blocker):
+What is STILL not proven (the single remaining gate):
 
-4. **The traversal page-read win did not materialize on this hardware, and could not have.** The
-   k=5 page-read numbers are dominated by the per-`Next()` re-read artifact (no pin across calls),
-   not by sequential-vs-random locality; and **the prototype keeps the `gph_next_pageno` chain, so
-   it does not even deliver physically-contiguous extents** — the exact mechanism (sequential
-   extent read replacing random hops at 128 GB residency pressure) that the design rests on has no
-   structural foothold in the prototype, and a warm 16 MB x86 buffer pool would mask it regardless.
-   The predicate is a wash at the SRF level (the merge-win is a downstream `tjs` concern, out of
-   scope). **So the central performance claim is still unproven.**
+6. **The disk-seek / readahead magnitude.** On this single x86 box the working set, though larger
+   than the 512 kB buffer pool, is fully resident in the OS page cache, so the random-vs-sequential
+   *seek* difference between the scattered chain and the contiguous extent is masked: the contiguity
+   layout makes the touches consecutive block numbers, but the OS never seeks for them here. We
+   therefore measured the page-touch COUNT win and the buffer/CPU wall-clock win, but NOT the seek
+   win the design ultimately rests on. That needs real disk pressure (dropped caches / O_DIRECT, or
+   a working set > RAM) — the GX10's NVMe + 128 GB regime — and is the ONE number that flips this to
+   a hard GO.
 
-Plus a new cost surfaced: **the hub maintenance merge is not crash-atomic as a single WAL record**
-(GenericXLog's 4-page cap forces ≥2 records for any extent >4 pages; §7.2). The multiset survives
-a crash, but a production design wanting the merge itself atomic would need a shadow-extent swap or
-a custom rmgr (the latter blocked by golden rule 2). That is extra design surface the migration
-must carry.
+Carried design cost (handled, but noted): **the hub maintenance merge AND the contiguous relayout
+are not single atomic WAL records** (GenericXLog's 4-page cap; §7.2). The per-page slot multiset is
+crash-invariant and MVCC visibility is preserved across batches (both FR-7 suites pass), and a
+crash mid-relayout leaves the OLD extent authoritative — but a production design wanting the
+grow/merge itself atomic as a unit needs a shadow-extent swap (golden rule 2 forbids a custom
+rmgr). Plus the migrate-on-grow leaves orphaned old-chain pages (dead space) that a compaction pass
+must reclaim — a space cost the production plan must own.
 
 **Decision rule applied:**
 
-- This is the plan's stated **NO-GO branch**: "the hub page-read win does not appear at runnable
-  scale → the page-chain is fine at the scales that matter → a HIGH-risk migration is unjustified."
-  We reach it not because the page-chain is proven fine at 128 GB, but because **the prototype as
-  built cannot deliver or measure the win**, and shipping a HIGH-risk layout change on an unproven
-  performance thesis is exactly the bar the plan set to avoid.
-- **This is recorded as CONDITIONAL, not a hard close**, because the *write/correctness/FR-7*
-  results are favorable and the design is sound — the gap is evidentiary, not a defect. The
-  finding is **parked pending a GX10 re-run of a contiguity-delivering prototype** (see the
-  conditions below), not deleted. Compression (#14) and WCOJ stay deferred until then.
+- The prior run's NO-GO was reached **only because the prototype could not deliver or measure the
+  win**. That reason is now gone: the win is delivered (contiguity + read-once scan) and measured
+  to the limit this hardware allows. So the NO-GO branch no longer applies.
+- We do NOT escalate to a hard GO, because a hard GO authorizes a HIGH-risk production migration and
+  the *decisive* number — the seek win at residency pressure beyond RAM — is still unmeasured here.
+  Calling GO now would be manufacturing the win from a warm-cache proxy. The honest status is
+  **STILL-INCONCLUSIVE, leaning GO**: every gate except disk-I/O magnitude is cleared.
+- Compression (#14) and WCOJ stay deferred until the GX10 real-I/O number confirms the wall-clock
+  win scales with seek cost.
 
-**To flip this to GO, a follow-up spike must (all of):**
+**To flip this to a hard GO, the GX10 re-run must (all of):**
 
-- (a) deliver **physically-contiguous extent allocation** (a real extent allocator, not the reused
-  chain), so the sequential-read mechanism actually exists to measure;
-- (b) run on the **GX10 at 128 GB with residency pressure** (working set > buffer pool), where the
-  random-hop penalty the design targets is real — x86 with a warm pool is the wrong instrument;
-- (c) measure pages-read with a **pin-held-across-Next streaming scan** (or `pg_statio` at the
-  relation level) so the per-`Next()` re-read artifact does not swamp the locality signal;
-- (d) keep bulk-load within noise and both FR-7 suites at zero divergence (the spike shows this is
-  achievable);
-- (e) settle the hub-merge crash-atomicity question (§7.2) — shadow-extent swap vs accepting the
-  multiset-preserving-but-not-order-atomic merge.
+- (a) ✅ DELIVERED here — physically-contiguous extent allocation (verified under interleaved load);
+- (b) run on the **GX10 with a working set > RAM** (real residency pressure / cold cache / O_DIRECT),
+  where the random-hop seek penalty is real — x86 with a warm OS cache is the wrong instrument for
+  the seek magnitude;
+- (c) ✅ DELIVERED here — read-once-per-page scan so the per-`Next()` re-read artifact does not swamp
+  the signal (the §7 numbers are taken with it);
+- (d) ✅ DELIVERED here — bulk-load within noise and both FR-7 suites at zero divergence;
+- (e) settle the hub merge/relayout crash-atomicity question (§7.2) — shadow-extent swap vs accepting
+  the multiset-preserving-but-not-unit-atomic relayout — and the orphan-page compaction.
 
-Until (a)–(c) are demonstrated, **the page-read thesis is unsubstantiated and the migration must
-not proceed.**
+Until (b) is measured, **the seek magnitude is unsubstantiated and the migration must not proceed —
+but the structural blockers are resolved and the evidence now leans GO.**
 
 ### 8.2 Proposed ADR-0002 addendum (DRAFT — not applied; append, do not rewrite)
 
@@ -526,7 +612,9 @@ for existing graph stores, gated on the FR-7 atomicity + crash-recovery suites p
 | This design note (layout, insert strategy, degree-adaptive, MVCC, WAL, recommendation) | **Done** |
 | `tools/csr_extent_packing.py` + `tests/test_csr_extent_packing.py` (host packing/WAL arithmetic) | **Done** — `make test`/`make lint` green (special size updated to 32 B) |
 | §5 prototype C (append/scan/merge edits) in `src/graph_store/` (spike branch) | **BUILT + RUN on x86 `tridb/msvbase:dev`** — compiles, all graph suites pass |
-| §6/§7 benchmark + filled results table | **DONE on x86** — `test/graph_layout_bench.sql` + `scripts/graph_layout_bench.sh`, real numbers in §7. ISA caveat: not GX10 |
+| Contiguity follow-up: `gph_extend_pages_contig` + `gph_relayout_extent_contig` (real extent allocator + migrate-on-grow) | **BUILT + RUN** — branch `spike/009-contiguity`; contiguity proven under interleaved load (§7) |
+| Read-once-per-page streaming scan (bounded per-page buffer, no pin across `Next()`, leak-free on `LIMIT`) | **BUILT + RUN** — full-hub page reads 5005→6 (§7) |
+| §6/§7 benchmark + filled results table (incl. contiguity proof + tiny-`shared_buffers` residency run) | **DONE on x86** — `test/graph_layout_bench.sql` + `scripts/graph_layout_bench.sh` + `gph_adj_blocks()` probe, real numbers in §7. Caveat: warm-cache x86, seek win still GX10-gated |
 | FR-7 atomicity + crash-recovery on spike branch | **PASS on x86** — `txn_atomicity_test.sh` + `crash_recovery_test.sh`, **zero divergence** |
-| ADR-0002 addendum (§8.2) | **Drafted, NOT applied** — verdict is CONDITIONAL / lean NO-GO |
-| Shipped layout on `master` (`gph_page.h`, `graph_am.c`) | **Unchanged** — the prototype lives only on `spike/009-csr-lite-prototype` |
+| ADR-0002 addendum (§8.2) | **Drafted, NOT applied** — verdict is STILL-INCONCLUSIVE / leaning GO (GX10 real-I/O number outstanding) |
+| Shipped layout on `master` (`gph_page.h`, `graph_am.c`) | **Unchanged** — the prototype lives only on the spike branch |
