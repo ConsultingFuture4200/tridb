@@ -236,6 +236,34 @@ on the same corpus:
 > not target — the build only runs on the GB10. The driver still gates on `import cuvs`, which now
 > succeeds on the Spark and no-ops everywhere else.)
 
+#### Recall A/B — measured on the GB10 (2026-06-29) + a latent-bug fix
+
+The recall half of the A/B was run on the GB10 (cuVS 26.06) on a **clustered synthetic 100k × 128**
+corpus (500 clusters + unit noise — ANN-friendly structure; a pure-Gaussian corpus is a curse-of-
+dimensionality worst case and gave a meaningless ~0.2 for every method), exact-L2 oracle, search
+`ef=200`, `k=10`:
+
+| Build path | recall@10 | build time | note |
+|---|---|---|---|
+| `from_cagra(hierarchy="none")` | **0.06** | CAGRA ~1.3 s | flat graph — no HNSW navigation |
+| `from_cagra(hierarchy="gpu")` ← **cuVS default** | **0.17** | CAGRA ~1.3 s | the default is recall-broken |
+| `from_cagra(hierarchy="cpu")` | **0.83** | CAGRA ~1.3 s + CPU hierarchy | the usable export |
+| `hnsw.build(ace_params=AceParams())` (cuVS ACE) | **0.9998** | ~1.5 s | GPU-accelerated; recall-optimal |
+
+**Two findings, both load-bearing:**
+1. **Latent bug fixed.** `scripts/gpu_build_index.py` called `from_cagra(IndexParams())`, i.e. the
+   cuVS **default `hierarchy="gpu"`** — a near-useless index (recall ~0.17). Fixed to
+   `hierarchy="cpu"` (recall ~0.83). This bug was invisible until run on the real GB10.
+2. **ACE is the recall-optimal GPU build** (~0.9998) and is the better path than a raw CAGRA export
+   if the goal is a high-recall index; both `from_cagra` and ACE produce an `hnsw.save`-able file.
+
+**Caveats (honest):** these are clustered-synthetic absolute numbers — the `from_cagra(cpu)` 0.83 vs
+ACE 0.9998 gap and the exact recall should be re-quantified on **real SIFT/BGE-768** (a corpus staged
+on the Spark) before any launch claim; and the **format-compat check (§3)** — whether the fork's
+(older) hnswlib actually loads the cuVS-26.06 `hnsw.save` layout, and whether its CPU search navigates
+the exported hierarchy — is the remaining **engine-integration** step (needs the `tridb/msvbase:gx10`
+image + a load path). Build + export + GPU-side recall are now measured; the fork-load A/B is the last piece.
+
 ### Deferred (its own plan, after Step 1 proves recall)
 
 Wiring RaBitQ **codes stored in-engine** alongside the HNSW node vectors, and feeding the RaBitQ

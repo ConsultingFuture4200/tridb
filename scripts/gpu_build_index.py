@@ -108,8 +108,15 @@ def build_cagra_export_hnsw(
     # time via the `hnsw` AM reloptions (plan 006/DEV-1286), not at export; it is
     # carried in the stats dict as build metadata only.
     out_path.parent.mkdir(parents=True, exist_ok=True)
+    # hierarchy="cpu" is REQUIRED (measured on the GB10, cuVS 26.06, 2026-06-29): the export
+    # builds the navigable HNSW upper layers from the CAGRA base graph. The cuVS DEFAULT is
+    # hierarchy="gpu", which on a clustered 100k×128 corpus searched at ef=200 gives recall@10
+    # ~0.17 (and "none" ~0.06) — a near-useless index — vs ~0.83 with hierarchy="cpu". For the
+    # highest recall, cuVS's GPU-accelerated ACE build (`hnsw.build(IndexParams(ace_params=
+    # AceParams()), X)`) reached ~0.9998 on the same corpus; it is the recall-optimal alternative
+    # to a raw CAGRA export. See docs/gpu_index_build_v0.1.0.md §5 for the A/B.
     hnsw_index = hnsw.from_cagra(  # pragma: no cover - GX10-only path
-        hnsw.IndexParams(), index
+        hnsw.IndexParams(hierarchy="cpu"), index
     )
     hnsw.save(str(out_path), hnsw_index)  # pragma: no cover - GX10-only path
 

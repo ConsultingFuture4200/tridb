@@ -36,7 +36,7 @@ maintainer selected. Findings #1 and #6 were code-verified against `src/graph_st
 |------|-------|-------------------|----------|--------|------|--------------|--------|
 | 006 | Graph metapage edge-count/degree stats → make FR-6 bind | #1 | P1 | S | MED | engine suite on x86 image | **DONE — engine-validated** (ARM sign-off optional) |
 | 007 | `tjs_open` ranking+termination host reference (PPR + NRA/FR + RRF) | #2/#3/#9 | P1 | M | LOW | full host run | **DONE — real HotpotQA, beats oracle** |
-| 008 | Idle-GPU: offline CAGRA/cuVS index build (default-OFF) + RaBitQ quant | #4/#5 | P2 | M | MED | RaBitQ on real SIFT; CAGRA build+export on GB10 | **DONE (host) · CAGRA build+export VALIDATED on GB10** (cuVS 26.06; recall A/B remaining) |
+| 008 | Idle-GPU: offline CAGRA/cuVS index build (default-OFF) + RaBitQ quant | #4/#5 | P2 | M | MED | RaBitQ on real SIFT; CAGRA build+export+recall on GB10 | **DONE (host) · CAGRA VALIDATED on GB10** (cuVS 26.06; recall A/B measured GPU-side + latent hierarchy bug fixed; fork-load remaining) |
 | 009 | Sorted-by-dst / CSR-lite adjacency layout spike | #6 | P2 | L | HIGH | prototype built+benchmarked on x86 image | **DESIGN-DONE · prototype → lean NO-GO** (FR-7 safe; locality unprovable on x86) |
 
 Status legend: **DONE — engine-validated** = built + full engine suite passed on the `tridb/msvbase:dev`
