@@ -78,6 +78,14 @@ verify_patches() {
     || die "TriDB tridb_hnsw_rebuild_on_recovery.patch NOT applied — heap-rebuild-on-load missing (DEV-1235); drift?"
   grep -q 'rank_score >= kth' "$root/src/tjs_operator.cpp" 2>/dev/null \
     || die "TriDB tridb_tjs_predicate_termination.patch NOT applied — predicate-blind early termination (DEV-1169 scale defect); drift?"
+  # Sentinel anchors on the load-bearing marker string (matching tjs_operator's convention), NOT a
+  # comment phrase, so a reformat cannot let verify pass on an unapplied patch.
+  grep -q 'TRIDB: TJS-OPEN operator' "$root/src/tjs_open_operator.cpp" 2>/dev/null \
+    || die "TriDB tridb_tjs_open_operator.patch NOT applied — seedless multi-seed tjs_open operator missing (ADR-0012 B); drift?"
+  grep -q 'src/tjs_open_operator.cpp' "$root/CMakeLists.txt" \
+    || die "TriDB tridb_tjs_open_operator.patch NOT wired into CMakeLists vectordb sources (ADR-0012 B); drift?"
+  grep -q 'tjs_open(table_name' "$root/sql/vectordb.sql" \
+    || die "TriDB tridb_tjs_open_operator.patch NOT applied in sql/vectordb.sql — tjs_open() not registered (ADR-0012 B); drift?"
   grep -q 'L2SqrSIMD16ExtNEON' "$root/thirdparty/hnsw/hnswlib/space_l2.h" 2>/dev/null \
     || die "TriDB tridb_neon_l2_distance.patch NOT applied — ARM NEON L2 kernel missing, scalar fallback sandbags latency (DEV-1234); drift?"
   grep -q 'offsetof(hnsw_ParaOptions, ef_construction)' "$root/src/hnswindex.cpp" 2>/dev/null \
@@ -293,6 +301,33 @@ apply_tridb_fork_patches() {
     log "applying TriDB fork patch: HNSW m/ef_construction reloptions (DEV-1286)"
     ( cd "$root" && git apply "$relopt_patch" ) \
       || die "tridb_hnsw_reloptions.patch did not apply — MSVBASE drift? re-generate from src/{hnswindex.hpp,hnswindex.cpp,lib.cpp,hnswindex_builder.cpp,hnswindex_scan.cpp}"
+  fi
+
+  #   tridb_tjs_open_operator.patch (ADR-0012 realization B): the `tjs_open` seedless multi-seed
+  #     open-domain retrieval operator — the engine form of the validated host prototype
+  #     (bench/tjs_open_ref.py, recall@10 ~0.987 on HotpotQA). Additive: tjs() (single-source) is
+  #     UNCHANGED. tjs_open derives m_seeds ANN seeds from the vector leg (no caller src), BFS-expands
+  #     the graph hops-deep from ALL seeds via graph_store.neighbors (the bridges), and emits the
+  #     top-k vector-ranked with the graph-reachable bridges INJECTED past the vector frontier — a
+  #     bridge does NOT reset the consecutive_drops counter, so the VBASE early-termination bound
+  #     still holds (TR-1, golden rule 1; only the bounded bridge set is materialized, never the
+  #     corpus). Adds src/tjs_open_operator.cpp, wires it into the UNCONDITIONAL vectordb sources
+  #     (after src/tjs_operator.cpp), and registers tjs_open()/tjs_open_candidates_examined()/
+  #     tjs_open_bridges_injected() in sql/vectordb.sql. Appends to the SAME CMakeLists source list and
+  #     SQL tail as the tjs chain, so it MUST apply AFTER tridb_tjs_operator.patch (the anchor lines).
+  #     hnswlib-only — no SPTAG. The bridge-distance read relies on l2_distance_scalar.patch (scalar
+  #     `<->` correct OUTSIDE an index scan). NOTE: this realizes ADR-0012's ORIGINAL (B) recipe
+  #     (vector rank + reachability-set bridge injection + consecutive_drops); the 2026-06-29 addendum
+  #     refinement (bounded-push PPR graph score + NRA/FR termination + RRF fusion) modeled in
+  #     bench/tjs_open_ref.py is a follow-up, NOT in this patch.
+  local tjs_open_patch="${_MSVBASE_LIB_DIR}/../patches/tridb_tjs_open_operator.patch"
+  [[ -f "$tjs_open_patch" ]] || die "missing TriDB fork patch: $tjs_open_patch"
+  if grep -q 'TRIDB: TJS-OPEN operator' "$root/src/tjs_open_operator.cpp" 2>/dev/null; then
+    log "TriDB fork patch (tjs_open multi-seed operator, ADR-0012 B) already applied"
+  else
+    log "applying TriDB fork patch: tjs_open seedless multi-seed retrieval operator (ADR-0012 B)"
+    ( cd "$root" && git apply "$tjs_open_patch" ) \
+      || die "tridb_tjs_open_operator.patch did not apply — MSVBASE/tjs-chain drift? re-generate per ADR-0012"
   fi
 
   # ----------------------------------------------------------------------------
