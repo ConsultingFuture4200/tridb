@@ -24,15 +24,29 @@ MSVBASE source except through the build scripts' patch layer.
 | 011 | Account for TJS reachable-set materialization in SM-1 | P1 | M | - | DONE (60fd891; SM-1 regen pending) |
 | 012 | Expose `term_cond` in the SM-2 benchmark harness | P1 | S | - | DONE (7591709) |
 | 013 | Refresh TJS termination and GX10 status documentation | P1 | S | 011, 012 | DONE (668f2a0; step 2 SQL COMMENT deferred) |
-| 014 | Run the full engine verification target in manual CI | P2 | S | - | TODO (BLOCKED: crash_recovery suite-ordering flake makes graph-test in CI flaky — harden first) |
-| 015 | Real-graph + QA-accuracy benchmark (HotpotQA fullwiki) | P0 | XL | 010, 012 | DONE-HERE (phases 1-4+6 built+RUN on dev slice: +15.6pt multi-hop joint recall@5; phase 5 SQL/wiring built, live run GX10-gated; LLM EM/F1 reader-gated — see docs/benchmark_graphrag_v0.1.0.md) |
+| 014 | Run the full engine verification target in manual CI | P2 | S | - | DONE (advisor/014-ci-test-all `22d32b6`; engine job runs `make test-all`; real CI run is GitHub-side) — see note ‡ |
+| 015 | Real-graph + QA-accuracy benchmark (HotpotQA fullwiki) | P0 | XL | 010, 012 | DONE (dev slice: +15.6pt multi-hop joint recall@5; fullwiki live run GX10-gated, LLM EM/F1 reader-gated — see docs/benchmark_graphrag_v0.1.0.md and note †) |
 
 Status values: TODO | IN PROGRESS | DONE | BLOCKED (one-line reason) | REJECTED (one-line rationale)
 
-> **BACKLOG COMPLETE (reconciled 2026-06-26).** Every plan above is shipped. This audit
-> backlog (commit `cb097db`, 2026-06-24) is fully executed — including the TJS thesis. New work
-> (128 GB benchmark, DEV-1284 SM-2 re-measure, DEV-1170 join-order C port, HNSW index tuning,
-> crash_recovery flake) is post-dated; generate it with a fresh `/improve` audit, don't add it here.
+> **‡ 014 is UNBLOCKED (reconciled 2026-06-29).** Its former blocker — the `crash_recovery`
+> suite-ordering flake — was **fixed 2026-06-26** in commit `b4513c1` (DEV-1234 P1b): the harness
+> now holds the doomed txn open with `pg_sleep(3600)` + a ~180s liveness-checked readiness budget,
+> robust to suite ordering / host load (`scripts/crash_recovery_test.sh:104-128`; 🟢 in
+> `docs/STATUS.md`). 014 is a standard, actionable CI plan — no hardening prerequisite remains. (The
+> earlier "BLOCKED: harden first" status predated that fix.)
+>
+> **† 015 is executed on the dev slice; the remainder is gated, not pending-work.** The fullwiki
+> live run is GX10-gated and the downstream LLM EM/F1 is reader-gated (no `ANTHROPIC_API_KEY`). It is
+> not a fully-template handoff plan but a completed-design + executed-benchmark record; treat it as
+> history, not as an actionable handoff.
+
+> **BACKLOG STATUS (reconciled 2026-06-29).** Plans 001-013 and 015 are executed (015 on the dev
+> slice, with its GX10/reader-gated remainder noted above). **Plan 014 is the one remaining
+> actionable item and is now unblocked.** New work beyond this backlog (128 GB benchmark, DEV-1284
+> SM-2 re-measure, DEV-1170 join-order C port, HNSW index tuning) is post-dated — generate it with a
+> fresh `/improve` audit rather than appending here. (Supersedes the 2026-06-26 "every plan shipped"
+> note, which predated the 014 reconciliation.)
 >
 > **FRESH AUDIT BATCH (2026-06-26, commit `fb3f08b`).** Plans 011-014 are a new
 > post-scale-fix audit batch. Execute these after the completed 001-010 backlog.
