@@ -74,7 +74,14 @@ def _load_neo4j(conn: Conn, edges: list[tuple[int, int]]) -> None:
     driver.close()
 
 
-def run_baseline(manifest: dict, conn: Conn, *, k: int, seeds: int, hops: int) -> dict:
+def _recall_at_k(top: list[int], gold: list[int]) -> float:
+    g = set(gold)
+    return (len(g & set(top)) / len(g)) if g else float("nan")
+
+
+def run_baseline(
+    manifest: dict, conn: Conn, *, k: int, seeds: int, hops: int, runs: int = 5
+) -> dict:
     corpus_emb = np.load(manifest["corpus_emb_path"]).astype(np.float32)
     query_emb = np.load(manifest["query_emb_path"]).astype(np.float32)
     edges = [(int(s), int(d)) for s, d in manifest["_edges"]]
@@ -89,11 +96,10 @@ def run_baseline(manifest: dict, conn: Conn, *, k: int, seeds: int, hops: int) -
     col = Collection(MILVUS_COLLECTION, using=alias)
     driver = connect_neo4j(conn)
 
-    per_query = []
-    for q in manifest["questions"]:
-        qv = query_emb[q["qid"]].tolist()
+    def one_query(qid: int) -> tuple[float, dict, list[int]]:
+        """One end-to-end multi-store retrieval; returns (total_ms, leg_ms, topk)."""
+        qv = query_emb[qid].tolist()
         t0 = time.perf_counter()
-        # 1) Milvus ANN seed
         res = col.search(
             [qv],
             "embedding",
@@ -103,7 +109,6 @@ def run_baseline(manifest: dict, conn: Conn, *, k: int, seeds: int, hops: int) -
         )
         seed_ids = [h.id for h in res[0]]
         t1 = time.perf_counter()
-        # 2) Neo4j hop expansion over mention edges
         with driver.session() as s:
             rows = s.run(
                 f"MATCH (a:para)-[:mentions*1..{hops}]->(b:para) WHERE a.id IN $ids RETURN DISTINCT b.id AS id",
@@ -111,31 +116,48 @@ def run_baseline(manifest: dict, conn: Conn, *, k: int, seeds: int, hops: int) -
             )
             reach = {r["id"] for r in rows} | set(seed_ids)
         t2 = time.perf_counter()
-        # 3) app-side re-rank by cosine
         cand = np.fromiter(reach, dtype=np.int64, count=len(reach))
-        scores = corpus_emb[cand] @ query_emb[q["qid"]]
+        scores = corpus_emb[cand] @ query_emb[qid]
         top = [int(x) for x in cand[np.argsort(-scores)][:k]]
         t3 = time.perf_counter()
+        legs = {
+            "milvus_ms": (t1 - t0) * 1e3,
+            "neo4j_ms": (t2 - t1) * 1e3,
+            "rerank_ms": (t3 - t2) * 1e3,
+        }
+        return (t3 - t0) * 1e3, legs, top
+
+    per_query = []
+    recalls = []
+    for q in manifest["questions"]:
+        qid = q["qid"]
+        one_query(qid)  # warm-up (excluded)
+        times, legs_last, top = [], None, None
+        for _ in range(runs):
+            tot, legs, top = one_query(qid)
+            times.append(tot)
+            legs_last = legs
+        med = float(np.median(times))
+        rec = _recall_at_k(top, q.get("gold_ids", []))
+        if rec == rec:  # not NaN
+            recalls.append(rec)
         per_query.append(
-            {
-                "qid": q["qid"],
-                "total_ms": (t3 - t0) * 1e3,
-                "milvus_ms": (t1 - t0) * 1e3,
-                "neo4j_ms": (t2 - t1) * 1e3,
-                "rerank_ms": (t3 - t2) * 1e3,
-                "topk": top,
-            }
+            {"qid": qid, "median_ms": med, **legs_last, "topk": top, "recall_at_k": rec}
         )
     driver.close()
-    med = float(np.median([p["total_ms"] for p in per_query]))
+    med_all = float(np.median([p["median_ms"] for p in per_query]))
+    mean_recall = float(np.mean(recalls)) if recalls else float("nan")
     print(
-        f"[graphrag-baseline] median end-to-end {med:.2f} ms/query over {len(per_query)} queries"
+        f"[graphrag-baseline] median end-to-end {med_all:.2f} ms/query, "
+        f"recall@{k}={mean_recall:.3f} over {len(per_query)} queries (warm, median of {runs})"
     )
     return {
         "k": k,
         "seeds": seeds,
         "hops": hops,
-        "median_ms": med,
+        "runs": runs,
+        "median_ms": med_all,
+        "recall_at_k": mean_recall,
         "per_query": per_query,
     }
 

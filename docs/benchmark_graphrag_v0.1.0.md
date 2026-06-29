@@ -35,20 +35,18 @@ Any-gold recall@k (same group):
 
 ## Downstream answer accuracy (EM / F1) @ k=5
 
-Reader = extractive-heuristic (NON-LLM lower bound).
+Reader = codex-cli (operator subscription); 40 questions.
 
 | retriever | answer EM | answer F1 | ev recall | ev joint |
 |---|---:|---:|---:|---:|
-| vector_only | 0.053 | 0.090 | 0.883 | 0.773 |
-| graph_inject | 0.053 | 0.085 | 0.947 | 0.900 |
-| graph_rerank | 0.053 | 0.090 | 0.883 | 0.773 |
+| vector_only | 0.600 | 0.744 | 0.887 | 0.800 |
+| graph_inject | 0.625 | 0.769 | 0.950 | 0.925 |
 
 ## Honesty notes
 
 - **Where graph helps:** at TIGHT, realistic RAG budgets (k=3-5) on multi-hop (`bridge`) questions — exactly where vector-only misses the low-query-similarity 2nd hop. At loose k the pool saturates and the lift shrinks; on single-hop (`comparison`) questions there is no 2nd hop to recover, so graph ~ vector. This k/type dependence is the real finding, reported as a curve, not a point.
 - **Scope:** host-side accuracy on a 150-question dev slice / 1490-paragraph corpus (HotpotQA `distractor` pool, gold guaranteed present). The full retrieve-from-all-Wikipedia run and the live tjs() latency-at-fixed-accuracy headline are GX10/engine-gated (scripts/bench_graphrag.sh).
 - **Graph is a mention-proxy, stated plainly:** the official Wikipedia hyperlink dump was unreachable here (CMU host down; HF mirrors gated). Title-mention edges are a faithful, embedding-independent stand-in; the on-target run can swap in the real hyperlink dump (the manifest records the edge source).
-- **Answer EM/F1 is a NON-LLM lower bound.** No ANTHROPIC_API_KEY on this box, so the headline LLM reader (AnthropicReader) is wired but unrun. Treat the evidence-recall lift as the real result and EM/F1 as plumbing until the reader runs.
 
 ## Reproduce
 

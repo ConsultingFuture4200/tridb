@@ -1,4 +1,4 @@
-.PHONY: test lint graph-test smoke-test test-all baseline-up baseline-down seed bench bench-live sweep sm2 fetch-dataset bench-public fetch-hotpot graphrag graphrag-live bench-filtered ablation recall-decay clean
+.PHONY: test lint graph-test smoke-test test-all baseline-up baseline-down seed bench bench-live sweep sm2 fetch-dataset bench-public fetch-hotpot graphrag graphrag-live bench-filtered ablation recall-decay graphrag-h2h clean
 
 PUBLIC_DATASET ?= gist-960-euclidean
 
@@ -164,6 +164,13 @@ recall-decay:
 	@test -f data/public/sift-128-euclidean.hdf5 || \
 	  { echo "dataset missing — run: make fetch-dataset PUBLIC_DATASET=sift-128-euclidean"; exit 1; }
 	$(PY) -m bench.recall_decay --limit $(DECAY_LIMIT)
+
+# Real-workload head-to-head (GTM #1): canonical tjs() on the live engine vs the
+# tuned multi-store baseline (Milvus+Neo4j+rerank), same HotpotQA corpus+queries+k,
+# recall@k + end-to-end latency. Needs the engine image + baseline stack up.
+graphrag-h2h:
+	@docker image inspect $(IMAGE) >/dev/null 2>&1 || { echo "image $(IMAGE) not built (ENGINE-GATED)"; exit 1; }
+	bash scripts/bench_graphrag_h2h.sh $(IMAGE)
 
 baseline-up:
 	docker compose -f baseline/docker-compose.yml up -d
