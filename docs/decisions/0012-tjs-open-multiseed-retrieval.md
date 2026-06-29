@@ -155,30 +155,65 @@ bridge-injection requirement, score-free.
 Host validation: `test_rrf_promotes_graph_high_vector_low_bridge`,
 `test_rrf_window_is_bounded`.
 
-### 4. Measured curves and what is host-proxy vs GX10-gated
+### 4. Measured curves on REAL HotpotQA (DATA-GATE CLOSED, 2026-06-29)
 
-- **HotpotQA full-corpus run is DATA-GATED on the x86 standin** (no `data/hotpot/manifest.json`
-  in the worktree; build via `make fetch-hotpot` / `tools/hotpot_corpus.py` where HF is
-  reachable). So the recall-match against `bench/v2a_open.py`'s ≈0.95 (A) oracle on real
-  HotpotQA is NOT measured here and remains the GX10/data-gated acceptance check.
-- The algorithms WERE exercised end-to-end on a synthetic bridge corpus (240 paragraphs,
-  60 questions whose gold pair is one vector-near anchor + one graph-reachable vector-far
-  bridge). Observed, synthetic-only, indicative — NOT a HotpotQA number:
-  - PPR ranking beat vector-only on graded recall@10 (≈0.83 vs 0.50) because every gold
-    pair has a real bridge — confirms the ranking primitive does its job when the graph
-    carries signal.
-  - `nodes_examined` rose monotonically as `r_max` fell (≈16.6% → 39.1% of corpus across
-    `r_max` 1e-2 → 5e-5) — the TR-1 proxy behaves as theory predicts (bounded, tunable).
-  - FR/RRF on a 240-node corpus with a 200-wide vector window examined nearly the whole
-    stream — an artifact of corpus≈window; the examined-fraction claim only becomes
-    meaningful at HotpotQA/SIFT scale, which is the gated run.
-- **Honest open question for the gated run:** whether bounded-push PPR matches the (A)
-  oracle's recall on the REAL HotpotQA title-mention graph (the fusion ablation found
-  graph helps Wiki-bridge but not news; if HotpotQA's graph is too sparse, PPR may not
-  beat vector-only there — a valid negative result that still decides the operator), and
-  whether the FR bound terminates early on that distribution or is loose (also a design
-  finding, not a failure). Neither is answerable without the manifest.
+The full-corpus run is now MEASURED. `make tjs-open-ref` against the real
+`data/hotpot/manifest.json` (1490 paragraphs, 745 edges, 150 graded questions; BGE 768-d
+embeddings; `m_seeds=5`, `alpha=0.15`, `vec_limit=200`) — metrics in
+`bench/results/tjs_open_ref_metrics.json`, table in
+`docs/benchmark_tjs_open_ref_v0.1.0.md`. These are real numbers, not the earlier
+synthetic-corpus proxy. **Verdict: POSITIVE.** PPR ranking + FR termination + RRF fusion
+match-or-beat the (A) blocking oracle while touching < 1 % of the corpus.
+
+**recall@10 vs `r_max` (the TR-1 curve).** Flat across the whole `r_max` sweep
+(1e-2 → 5e-5) because the HotpotQA title-mention graph is sparse (mean reach ≈ 10–11 nodes
+per query), so the local push converges almost immediately regardless of the floor:
+
+| r_max | recall@10 vec | recall@10 ppr | recall@10 FR | recall@10 RRF | nodes examined | % corpus | cand examined |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1e-2 | 0.967 | 0.980 | 0.987 | 0.983 | 10.6 | 0.71 % | 171.2 |
+| 1e-3 | 0.967 | 0.980 | 0.987 | 0.983 | 11.2 | 0.75 % | 171.6 |
+| 5e-5 | 0.967 | 0.980 | 0.987 | 0.983 | 11.4 | 0.77 % | 171.6 |
+
+**recall@5 strategy comparison (best `r_max` = 1e-2):**
+
+| strategy | recall@5 |
+|---|---:|
+| vector_only | 0.883 |
+| ppr_only | 0.863 |
+| rrf_fused | 0.907 |
+| fr_fused | 0.937 |
+| **A_oracle (blocking)** | **0.883** |
+
+What the real numbers establish:
+
+- **PPR+FR+RRF matches/beats the (A) oracle.** FR-fused recall@5 **0.937** and RRF-fused
+  **0.907** both exceed the blocking (A) oracle's **0.883** (which equals vector_only here,
+  because A's neighbor-union rarely changes the top-5 on this graph). At recall@10, FR
+  **0.987** > vector **0.967**. The streaming, TR-1-pure composition is not just *within
+  tolerance* of the blocking reference — it surpasses it. (`grade()` is fraction of the 2
+  gold supporting passages found, so these are joint multi-hop recalls.)
+- **The TR-1 proxy holds with large margin.** `nodes_examined` ≈ 11 of 1490 nodes
+  (**≈ 0.7 % of corpus**) at every `r_max` — bounded-push PPR touches a tiny graph
+  fraction, exactly the early-termination evidence (A)'s materialized reach cannot give.
+- **`ppr_only` alone underperforms vector_only at recall@5 (0.863 < 0.883)** — the graph
+  leg is not a standalone retriever on this sparse graph; its value is as a *fusion signal*
+  that promotes the vector-far bridge (RRF/FR both beat vector once fused). This is
+  consistent with the prior ablation finding (graph helps as a bridge signal, not alone).
+- **Negative/caveat — the `r_max` knob is inert on this distribution.** Because the graph
+  is sparse, recall and `nodes_examined` are flat across the entire `r_max` sweep; the
+  bound is not exercised. On a denser graph (Wiki-scale, MuSiQue/2Wiki) `r_max` will trade
+  recall against examined-% as theory predicts — the curve here is a single operating point
+  in disguise. The GX10/at-scale run is where `r_max` earns its keep.
+- **Termination — FR vs `consecutive_drops`.** The baseline heuristic reaches recall@10
+  **0.980** at `candidates_examined` as low as 20 (term_cond=10), while the FR bound
+  examines ≈ 171 candidates for **0.987**. On this small corpus (vector window 200 ≈
+  corpus-bounded reranked set) the FR bound is *looser in examined-count* than a tight
+  drop-counter but recovers higher recall and needs no bridge special-case. The
+  examined-fraction advantage of FR only becomes decisive at scale where the vector window
+  is ≪ corpus; here it is correctness-clean, not examined-cheaper.
 
 This addendum is the spec the realization-(B) fork patch is built against; its
 recall/examined curve on real HotpotQA must match `bench/tjs_open_ref.py` within tolerance
-as the acceptance test.
+(recall@10 FR ≈ 0.987, nodes_examined ≈ 0.7 % corpus) as the acceptance test. The
+denser-graph `r_max` sweep remains a GX10/at-scale follow-up.

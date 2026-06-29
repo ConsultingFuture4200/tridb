@@ -18,6 +18,7 @@ C are **GX10-gated** (author + review here, build/verify on the GX10).
 | 005 | Fix stale @-scale parity row in the GTM doc | P2 | S | LOW | — | YES (read-back) | DONE (`f6033dd`) |
 | 003 | Thread HNSW reloptions into crash-recovery rebuild | P2 | S | LOW | — | NO (GX10-gated) | DONE (`7a198af`) — patch git-apply-verified; GX10 build/run + a crash-driver shell still pending |
 | 004 | One-command sweep repro: `scripts/bench_gx10_sweep.sh` + `make sweep` | P2 | M | LOW | — | partial (script lints here; runs on GX10) | DONE — `bash -n`/`make -n` verified; live run GX10-gated |
+| 007 | De-risk `tjs_open` (B): PPR ranking + NRA/FR termination + RRF fusion host reference | P1 | M | LOW | — | YES (`make tjs-open-ref` on real HotpotQA) | DONE — DATA-GATE CLOSED on real HotpotQA: FR recall@10 0.987 / @5 0.937 ≥ (A) oracle 0.883, nodes_examined ≈ 0.7 % corpus; ADR-0012 §4 addendum updated |
 
 Recommended order: **001 → 002 → 005** (all cleanly verifiable on an x86 box, highest leverage),
 then **003 → 004** (GX10-gated execution/verification).
