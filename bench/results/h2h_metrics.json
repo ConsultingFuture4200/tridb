@@ -1,0 +1,19 @@
+{
+  "k": 10,
+  "tridb": {
+    "recall_at_k": 0.22333333333333333,
+    "median_latency_ms": 1.8045,
+    "n_queries": 150
+  },
+  "baseline": {
+    "recall_at_k": 0.9533333333333334,
+    "median_latency_ms": 6.73952151555568,
+    "per_leg_median_ms": {
+      "milvus_ms": 3.3651370322331786,
+      "neo4j_ms": 3.2094219932332635,
+      "rerank_ms": 0.10925898095592856
+    }
+  },
+  "termcond": 0,
+  "termcond_sweep_note": "term_cond 0->5000 moved TriDB recall 0.223->0.227 (not early-term)"
+}

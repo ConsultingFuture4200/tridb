@@ -12,6 +12,37 @@ that artifact. Lead the story with **one-system + local-hardware (DGX Spark)**, 
 with performance, and be ruthlessly honest about scope and the answer-quality data — because
 the honesty is the differentiator that survives HN.
 
+## Addendum 2026-06-28 — benchmark suite shipped + a POSITIONING finding (read this)
+
+This session built and ran the public-workload benchmark suite the plan called for, and
+the real-workload head-to-head (GTM #1) surfaced a finding that should reshape the launch claim.
+
+- **Closed (real, recognized data):** GraphRAG QA on HotpotQA (real embedding-independent graph;
+  graph-INJECT lifts multi-hop joint evidence recall +15.6pt vs vector-only — `benchmark_graphrag_v0.1.0.md`);
+  filtered vector search GX10 SIFT-1M (recall@10=1.000, latency drops as the filter tightens —
+  `benchmark_filtered_v0.1.0.md`); tri-modal fusion ablation on MultiHopRAG with query-parsed
+  (no-leakage) constraint (`benchmark_ablation_v0.1.0.md`); recall-decay (no decay at scale).
+- **PROVEN LIVE ON THE GB10:** one-WAL cross-modal consistency under churn (FR-7 atomicity 200-iter
+  zero divergence + crash recovery) — a differentiator bolt-on Milvus+Neo4j+pg cannot match.
+
+- **THE FINDING (GTM #1, `benchmark_h2h_v0.1.0.md`):** on HotpotQA the canonical single-`src`
+  `tjs()` retrieves **recall@10 0.223 vs a tuned multi-store's 0.953** — faster (1.8 vs 6.7 ms) but
+  at far lower recall. Root cause (confirmed: term_cond 0→5000 moved recall only 0.223→0.227, so it
+  is NOT early-termination): **`tjs()` is a SINGLE-SOURCE constrained-traversal operator, not an
+  open-domain retriever** — it ranks vectors only within one `src`'s graph-reachable set. The
+  +15.6pt graph result is a HOST-side prototype (multi-seed + bridge injection) the engine does NOT
+  execute in v1.
+
+- **Positioning implication — do not launch v1 as a drop-in open GraphRAG retriever.** What v1
+  actually wins:
+  1. **Source-anchored tri-modal queries** ("given entity X, find vector-similar entities reachable
+     from X, filtered"): SM-2 = 12/12 at ~15× lower latency with exact parity (`benchmark_sm2_v0.1.0`).
+  2. **One system, one WAL, transactional across all three stores** (proven on the GB10) — the
+     consistency story bolt-on stacks can't tell.
+  Lead with those. The open multi-hop retrieval claim needs a **multi-seed retrieval operator (v2)**;
+  until then it is a research prototype, not an engine feature. (Decision for the operator: reframe
+  the launch to source-anchored + consistency, or fund the v2 multi-seed operator first.)
+
 ## Addendum 2026-06-26 — gate progress (NEON + measured latency)
 
 Two of the blockers this plan named have moved; recorded here (append, not rewrite):
