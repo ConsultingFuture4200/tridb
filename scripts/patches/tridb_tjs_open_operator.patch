@@ -1,0 +1,974 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 25ff54a..6801bfe 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -119,6 +119,7 @@ set(VECTORDB_SOURCES
+     # UNCONDITIONAL (hnswlib-backed; drives the HNSW IndexScan like topk) — must NOT sit inside
+     # the if(WITH_SPTAG) block (ADR-0004/0007). The graph leg probes graph_store via SPI at runtime.
+     src/tjs_operator.cpp
++    src/tjs_open_operator.cpp
+ )
+ if(WITH_SPTAG)
+     list(APPEND VECTORDB_SOURCES
+diff --git a/sql/vectordb.sql b/sql/vectordb.sql
+index c605522..29b09a8 100644
+--- a/sql/vectordb.sql
++++ b/sql/vectordb.sql
+@@ -154,3 +154,27 @@ COMMENT ON FUNCTION tjs(text, integer, integer, bigint, text, text, text) IS
+ -- << corpus proves early termination (no blocking full scan). Mirrors graph_store.visits().
+ CREATE FUNCTION tjs_candidates_examined() RETURNS bigint
+ 	AS 'MODULE_PATHNAME' LANGUAGE C;
++
++-- TRIDB(ADR-0012 / tjs_open): seedless multi-seed open-domain retrieval operator. Additive — tjs()
++-- is unchanged. Derives m_seeds ANN seeds from the vector leg (no caller src), expands the graph
++-- from ALL seeds (hops deep) via graph_store.neighbors, and emits the top-k vector-ranked with the
++-- graph-reachable bridges injected past the vector frontier WITHOUT resetting the consecutive_drops
++-- termination bound (TR-1 preserved). attr_exp's FIRST column must be the candidate's graph id.
++CREATE FUNCTION tjs_open(table_name text, k integer, term_cond integer, m_seeds integer,
++                         hops integer, attr_exp text, filter_exp text, orderby_exp text)
++                RETURNS SETOF record
++	AS 'MODULE_PATHNAME' LANGUAGE C STABLE;
++
++COMMENT ON FUNCTION tjs_open(text, integer, integer, integer, integer, text, text, text) IS
++	'TriDB tjs_open — seedless multi-seed open-domain retrieval (ADR-0012 realization B). ANN '
++	'top-m_seeds from the vector leg -> hops-reachable graph union (bridges) -> vector-ranked top-k '
++	'with bridge injection past the frontier (drop counter not reset, so VBASE early termination '
++	'still holds). Additive to tjs(); attr/filter/orderby are raw SQL fragments — trusted input only.';
++
++-- TR-1 / SM-3 probe: ANN candidates pulled by the last tjs_open scan. << corpus proves early term.
++CREATE FUNCTION tjs_open_candidates_examined() RETURNS bigint
++	AS 'MODULE_PATHNAME' LANGUAGE C;
++
++-- Bridges admitted past the vector frontier in the last tjs_open scan (the graph contribution).
++CREATE FUNCTION tjs_open_bridges_injected() RETURNS bigint
++	AS 'MODULE_PATHNAME' LANGUAGE C;
+diff --git a/src/tjs_open_operator.cpp b/src/tjs_open_operator.cpp
+new file mode 100644
+index 0000000..9954de7
+--- /dev/null
++++ b/src/tjs_open_operator.cpp
+@@ -0,0 +1,924 @@
++// Copyright (c) TriDB. Licensed under the MIT License.
++//
++// tjs_open_operator.cpp — TriDB `tjs_open` multi-seed open-domain retrieval operator
++// (ADR-0012 realization B / DEV-tjs-open).
++//
++// Marker for the patch sentinel grep (scripts/lib/msvbase_patches.sh): TRIDB: TJS-OPEN operator.
++//
++// WHAT THIS IS
++// ------------
++// `tjs_open` is the SEEDLESS sibling of the canonical single-source `tjs()` (ADR-0007). Where tjs()
++// is given ONE source vertex and returns the vector-nearest entities reachable from it, tjs_open
++// derives its OWN seeds from the vector leg, expands the graph from ALL of them, and ranks the
++// union — the validated host prototype (bench/tjs_open_ref.py, recall@10 ~0.987 on HotpotQA) made
++// an engine operator. It is ADR-0012 realization (B): the TR-1-pure, NON-blocking form. Realization
++// (A) (materialize ANN top-m UNION their neighbors, then rerank) is the BLOCKING reference oracle —
++// NOT shipped here.
++//
++//   tjs_open(table, k, term_cond, m_seeds, hops, attr, filter, order)
++//
++// THE PIPELINE (one streaming pass over the vector leg)
++// -----------------------------------------------------
++//   1. SEEDLESS SEEDING. Build ONE HNSW IndexScan over `order` with `filter` in its WHERE (exactly
++//      like tjs()'s vector leg). Pull the first `m_seeds` candidates off that ANN stream; their
++//      graph ids (attr's first column, by contract) are the personalization seeds. No caller `src`.
++//   2. MULTI-SOURCE GRAPH EXPANSION. BFS `hops` deep from the UNION of all seeds via
++//      graph_store.neighbors (the native adjacency-list iterator, golden rule 3 — never a relational
++//      join). The reachable union is the "bridge set": graph-relevant nodes that the pure vector
++//      ranking may rank far down or miss. Bounded by m_seeds * avg_deg^hops, NOT |V| — so caching it
++//      is a bounded buffer, not a full-corpus materialization (TR-1 holds; this is NOT realization A
++//      which materializes seed+reach AND reranks it as the whole answer).
++//   3. VECTOR-RANKED MERGE WITH BRIDGE INJECTION. Continue draining the SAME vector stream into a
++//      bounded top-k priority queue. A candidate is admitted to the heap when it improves the top-k
++//      (the ordinary vector winner) OR when it is in the bridge set (the injected bridge), EVEN if
++//      its vector rank is past the frontier. CRUCIAL for TR-1: a bridge admitted past the frontier
++//      does NOT reset the consecutive_drops counter — so the VBASE early-termination bound still
++//      fires. (This is the ADR-0012 (B) contract: "a graph-reachable candidate is admitted to the
++//      heap even when its vector rank is past the frontier, but it does NOT reset the drop counter".)
++//
++// FIRST-CUT vs THE HOST REFERENCE. This realizes the ADR-0012 *original* (B) recipe: vector-ranked
++// stream + reachability-set bridge injection + VBASE consecutive_drops termination. The 2026-06-29
++// addendum's refinement (bounded-push PPR graph *score* + NRA/FR termination + RRF rank-fusion) is
++// the STRETCH — modeled by bench/tjs_open_ref.py but NOT implemented in C here. The bridge set is a
++// reachability membership (in/out), exactly the original (B) "bridges" leg; PPR grading is a TODO.
++//
++// TR-1 (golden rule 1): Open/Next/Close + early termination. The only materialized set is the
++// bounded bridge set (a graph-local BFS, not the corpus); the vector stream is drained only until
++// consecutive_drops >= term_cond. Mirrors tjs() / multicol_topk exactly.
++//
++// The SPI / snapshot / SRF lifecycle is forked verbatim from tjs_operator.cpp (DEV-1236): one SPI
++// connection, one RegisterSnapshot pinned for the whole multi-call SRF, children torn down at the
++// finish label. The graph BFS reuses the SAME single SPI connection (graph_store.neighbors' own SPI
++// nests cleanly under ours) — never a sibling SPI_connect, the fork's signature crash.
++
++#include "util.hpp"
++#include <vector>
++#include <assert.h>
++#include <queue>
++#include <stack>
++#include <unordered_set>
++#include <utility> // std::pair
++#include <algorithm> // std::min, std::max
++#include <string>
++#include <limits>  // std::numeric_limits
++
++extern "C"
++{
++#include <postgres.h>
++#include <catalog/pg_type_d.h>
++#include <utils/array.h>
++#include <funcapi.h>
++
++#include <nodes/print.h>
++#include <nodes/plannodes.h>
++#include <nodes/execnodes.h>
++
++#include <executor/spi.h>
++#include <executor/executor.h>
++
++#include <utils/snapmgr.h>
++#include <optimizer/cost.h>
++
++#include <access/table.h>
++#include <access/tableam.h>
++#include <access/relation.h>
++
++#include <access/genam.h>
++#include <access/relscan.h>
++#include <access/printtup.h>
++#include <access/htup_details.h>   // heap_getattr, heap_copytuple
++
++#include <commands/vacuum.h>
++#include <miscadmin.h>
++#include <utils/elog.h>
++#include <utils/rel.h>
++#include <utils/selfuncs.h>
++
++#include <nodes/makefuncs.h>     // makeRangeVar — for the SPI-free table-name -> OID resolution.
++#include <catalog/namespace.h>   // RangeVarGetRelid — search-path-aware syscache lookup.
++
++#include "libpq/pqformat.h"
++#include <utils/builtins.h>
++}
++
++extern "C"
++{
++    PGDLLEXPORT PG_FUNCTION_INFO_V1(tjs_open);
++}
++
++#ifdef NDEBUG
++#define DEBUG_PRINT(...) ;
++#else
++#define DEBUG_PRINT(...) do{ elog(WARNING, __VA_ARGS__); } while (false)
++#endif
++
++// ---------------------------------------------------------------------------
++// Shared helpers — forked from tjs_operator.cpp, with an "O" suffix to avoid ODR clashes with the
++// identically-shaped "T" helpers in the same shared library (both translation units are linked into
++// vectordb.so). Kept file-scope/static so this unit links independently.
++// ---------------------------------------------------------------------------
++
++// Read attribute `attno` (1-based) of `slot` as an int64 — the candidate's graph vertex id.
++inline bool getAttrAsInt64O(TupleTableSlot *slot, int attno, int64 *out){
++	bool isNull;
++	Datum value = slot_getattr(slot, attno, &isNull);
++	if (isNull)
++		return false;
++
++	TupleDesc tupdesc = slot->tts_tupleDescriptor;
++	Form_pg_attribute attr = TupleDescAttr(tupdesc, attno-1);
++	switch (attr->atttypid) {
++	case INT4OID:
++		*out = (int64) DatumGetInt32(value);
++		return true;
++	case INT8OID:
++		*out = DatumGetInt64(value);
++		return true;
++	default:
++		elog(ERROR, "tjs_open: candidate id column must be int4/int8, got oid = %d",
++			 attr->atttypid);
++	}
++	return false;
++}
++
++inline Oid getrelidO(const std::string relname){
++	RangeVar *rv = makeRangeVar(NULL, pstrdup(relname.c_str()), -1);
++	return RangeVarGetRelid(rv, NoLock, true /* missing_ok */);
++}
++
++IndexScanState* findIndexScanStateO(PlanState* node){
++	if (!node) return NULL;
++	if (nodeTag(node) == T_IndexScanState) return (IndexScanState*)node;
++	IndexScanState* r = findIndexScanStateO(outerPlanState(node));
++	if (r) return r;
++	return findIndexScanStateO(innerPlanState(node));
++}
++
++IndexScan* findIndexScanNodeO(Plan* node){
++	if (!node) return NULL;
++	if (nodeTag(node) == T_IndexScan) return (IndexScan*)node;
++	IndexScan* r = findIndexScanNodeO(outerPlan(node));
++	if (r) return r;
++	return findIndexScanNodeO(innerPlan(node));
++}
++
++PlannedStmt* extractIndexScanNodeO(char* query){
++	CachedPlan *cplan = NULL;
++	bool old_enable_seqscan = enable_seqscan;
++	enable_seqscan = false;
++	PlannedStmt* plan = NULL;
++	PG_TRY();
++	{
++		SPIPlanPtr planptr = SPI_prepare(query, 0, NULL);
++		cplan = SPI_plan_get_cached_plan(planptr);
++		List* stmt_list = cplan->stmt_list;
++		ListCell* lc;
++		IndexScan* node = NULL;
++		foreach(lc, stmt_list){
++			PlannedStmt *stmt = lfirst_node(PlannedStmt, lc);
++			if ( (node = findIndexScanNodeO(stmt->planTree)) != NULL ){
++				plan = stmt;
++			}
++		}
++	}
++	PG_CATCH();
++	{
++		enable_seqscan = old_enable_seqscan;
++		PG_RE_THROW();
++	}
++	PG_END_TRY();
++	enable_seqscan = old_enable_seqscan;
++	return plan;
++}
++
++inline uint64_t castToUint64O(const ItemPointerData& key)
++{
++	return (((uint64_t)key.ip_blkid.bi_hi)<<32) |
++		(((uint64_t)key.ip_blkid.bi_lo)<<16) | (uint64_t)key.ip_posid;
++}
++
++// Heap item: vector distance (first, the heap key), the copied result tuple, and the heap tid as an
++// explicit dedup key (ExecCopySlotHeapTuple does not reliably preserve t_self for our merge, and a
++// candidate can appear in both vec_pq and bridge_pq — finalizeTopKO dedups on this).
++struct pq_item_o_t {
++	float    first;   // distance (named `first` so existing `.first` accesses still compile)
++	HeapTuple second; // the copied tuple (named `second` likewise)
++	uint64_t tid;     // heap tid, the stable dedup key
++	pq_item_o_t() : first(0), second(nullptr), tid(0) {}
++	pq_item_o_t(float f, HeapTuple t, uint64_t id) : first(f), second(t), tid(id) {}
++};
++
++struct pq_item_compare_lt_o_t
++{
++	bool operator()(const pq_item_o_t& lhs, const pq_item_o_t& rhs)
++	{
++		return lhs.first < rhs.first;
++	}
++};
++
++inline HeapTuple copyItemO(TupleTableSlot* slot){
++	return ExecCopySlotHeapTuple(slot);
++}
++
++TupleDesc copyAndDropLastAttrO(TupleDesc tupdesc, bool doDrop){
++	TupleDesc desc = CreateTemplateTupleDesc(doDrop ? std::max(tupdesc->natts - 1, 0) : tupdesc->natts);
++	memcpy(TupleDescAttr(desc, 0), TupleDescAttr(tupdesc, 0),
++		   desc->natts * sizeof(FormData_pg_attribute));
++	for (int i = 0; i < desc->natts; i++) {
++		Form_pg_attribute att = TupleDescAttr(desc, i);
++		att->attnotnull   = false;
++		att->atthasdef    = false;
++		att->atthasmissing = false;
++		att->attidentity  = '\0';
++		att->attgenerated = '\0';
++	}
++	desc->tdtypeid = tupdesc->tdtypeid;
++	desc->tdtypmod = tupdesc->tdtypmod;
++	return desc;
++}
++
++// ---------------------------------------------------------------------------
++// Multi-source graph expansion — BFS `hops` deep from the UNION of all seeds.
++//
++// Mirrors tjs_operator.cpp's single-source graphReachableT, generalized to: (a) MANY seeds, (b)
++// multiple hops. Each frontier node's out-neighbors are pulled via graph_store.neighbors (the native
++// adjacency-list iterator, golden rule 3). Probed inside the SRF's ALREADY-OPEN SPI connection — we
++// do NOT SPI_connect/finish here (graph_store.neighbors does its own nested SPI; a sibling connection
++// is the fork's crash). The returned bridge set INCLUDES the seeds themselves (a seed is trivially
++// reachable from itself and should be admitted). Bounded by m_seeds * avg_deg^hops, not |V|.
++// ---------------------------------------------------------------------------
++static std::unordered_set<int64> expandMultiSeedO(const std::vector<int64>& seeds, int hops){
++	std::unordered_set<int64> bridges;
++	std::vector<int64> frontier;
++	for (int64 s : seeds) {
++		if (bridges.insert(s).second)
++			frontier.push_back(s);
++	}
++
++	for (int h = 0; h < hops && !frontier.empty(); h++) {
++		std::vector<int64> next;
++		for (int64 u : frontier) {
++			char cmd[256];
++			snprintf(cmd, sizeof(cmd),
++					 "SELECT dst FROM graph_store.neighbors(%lld) AS dst", (long long) u);
++			int ret = SPI_execute(cmd, true /* read_only */, 0);
++			if (ret != SPI_OK_SELECT)
++				elog(ERROR, "tjs_open graph expansion: graph_store.neighbors(%lld) failed (%d)",
++					 (long long) u, ret);
++			uint64 proc = SPI_processed;
++			SPITupleTable *tt = SPI_tuptable;
++			TupleDesc tupdesc = tt->tupdesc;
++			for (uint64 i = 0; i < proc; i++) {
++				bool isnull;
++				Datum d = SPI_getbinval(tt->vals[i], tupdesc, 1, &isnull);
++				if (isnull)
++					continue;
++				int64 v = DatumGetInt64(d);
++				if (bridges.insert(v).second)   // newly discovered -> expand next hop
++					next.push_back(v);
++			}
++		}
++		frontier.swap(next);
++	}
++	return bridges;
++}
++
++// ---------------------------------------------------------------------------
++// TJSOpenState — the seedless multi-source merge state. One vector orderby leg (rank authority + seed
++// source) plus the cached bridge set. The relational filter is baked into the vector leg's SQL.
++// ---------------------------------------------------------------------------
++typedef struct{
++	PlanState ps;
++	uint32_t topk;
++	uint32_t term_cond;
++	uint32_t m_seeds;
++	int      hops;
++	bool finish;
++
++	// Two bounded heaps (both max-on-distance, so .top() is the WORST = the eviction candidate):
++	//   vec_pq    — the top-k vector winners (NON-bridge candidates). Bounded at k.
++	//   bridge_pq — graph-reachable bridges, kept as the k best-by-distance bridges (bounded at k).
++	//               Bridges are GUARANTEED into the final budget regardless of their query similarity
++	//               (ADR-0012: "injected bridges guaranteed into the budget"), so they get their own
++	//               heap and are merged in with priority at finalization — they are NOT forced to beat
++	//               a near neighbor on vector distance to be admitted.
++	std::priority_queue<pq_item_o_t, std::vector<pq_item_o_t>, pq_item_compare_lt_o_t> *vec_pq;
++	std::priority_queue<pq_item_o_t, std::vector<pq_item_o_t>, pq_item_compare_lt_o_t> *bridge_pq;
++	std::unordered_set<uint64_t> *seenSet;
++	std::stack<pq_item_o_t> *result_stack;
++
++	// The bridge set: seeds + their hops-reachable union. Resolved AFTER the first m_seeds candidates
++	// are pulled from the vector stream (seedless seeding). Bounded; not the corpus (TR-1).
++	std::unordered_set<int64> *bridges;
++
++	int idAttno; // 1-based attribute of the candidate's graph id (attr's first column, by contract).
++
++	// SQL fragments needed to FETCH bridge rows directly by id (phase 2b bridge injection): a bridge
++	// that the vector leg ranks far past the frontier is never EMITTED by the ANN stream before
++	// termination, so we materialize its row directly. table/attr/filter/orderby are owned strings.
++	std::string *tbl_name;
++	std::string *attr_exp;
++	std::string *filter_exp;
++	std::string *orderby_exp;
++	std::string *id_col;       // first comma-token of attr_exp — the id column expression for WHERE.
++
++	Relation relation;
++	std::vector<IndexScanState*> *children;
++	std::vector<QueryDesc*>* qDescs;
++
++	MemoryContext result_cxt;
++
++	int64 examined;            // candidates pulled from the ANN stream (SM-3 / TR-1 proxy).
++	int64 bridges_injected;    // bridges admitted past the vector frontier (instrumentation).
++
++	bool children_closed;
++	Snapshot query_snapshot;   // DEV-1236: pinned for the SRF's whole lifetime.
++} TJSOpenState;
++
++// Per-backend instrumentation for the last tjs_open scan (read via tjs_open_candidates_examined()).
++static int64 tjs_open_last_examined = 0;
++static int64 tjs_open_last_bridges  = 0;
++
++// ---------------------------------------------------------------------------
++// pullOneCandidateO — advance the vector leg by ONE tuple. Returns the slot (or NULL at stream end),
++// sets *rank_score to the TRUE HNSW distance (xs_orderbyvals[0] — the sole rank authority), and
++// *cand_id to the candidate's graph id. Increments examined. Skips already-seen tids transparently
++// (advances until an unseen tuple or stream end). Must be called with the child's es_query_cxt as the
++// current memory context (caller switches).
++// ---------------------------------------------------------------------------
++static TupleTableSlot* pullOneCandidateO(TJSOpenState* estate, IndexScanState* child,
++										 float* rank_score, int64* cand_id, bool* have_id,
++										 uint64_t* tid_out){
++	for (;;) {
++		TupleTableSlot* slot = ExecProcNode((PlanState*) child);
++		if ( TupIsNull(slot) )
++			return NULL;
++		estate->examined++;
++
++		ItemPointerData tid = child->iss_ScanDesc->xs_heaptid_orig;
++		uint64_t tid_uint = castToUint64O(tid);
++		if ( estate->seenSet->find(tid_uint) != estate->seenSet->end() )
++			continue; // duplicate tid — pull the next
++		estate->seenSet->insert(tid_uint);
++
++		*rank_score = DatumGetFloat4(child->iss_ScanDesc->xs_orderbyvals[0]);
++		*have_id = getAttrAsInt64O(slot, estate->idAttno, cand_id);
++		*tid_out = tid_uint;
++		return slot;
++	}
++}
++
++// Push (score, copy-of-slot) into a bounded max-on-distance heap of capacity k: if full and the new
++// item is nearer than the current worst (.top()), evict the worst; otherwise drop it.
++static void boundedPushO(TJSOpenState* estate,
++						 std::priority_queue<pq_item_o_t, std::vector<pq_item_o_t>, pq_item_compare_lt_o_t>* pq,
++						 float rank_score, TupleTableSlot* slot, uint64_t tid, uint32_t cap){
++	if (pq->size() < cap) {
++		MemoryContext old = MemoryContextSwitchTo(estate->result_cxt);
++		pq->push(pq_item_o_t(rank_score, copyItemO(slot), tid));
++		MemoryContextSwitchTo(old);
++	} else if (pq->top().first > rank_score) {
++		pq->pop();
++		MemoryContext old = MemoryContextSwitchTo(estate->result_cxt);
++		pq->push(pq_item_o_t(rank_score, copyItemO(slot), tid));
++		MemoryContextSwitchTo(old);
++	}
++}
++
++// Admit an unseen candidate. Returns true iff it reset the drop run (i.e. made VECTOR progress).
++//
++// Bridge vs non-bridge are routed to SEPARATE bounded heaps:
++//   - Every candidate competes for vec_pq (the top-k by vector distance). A vec_pq win is the ONLY
++//     event that resets consecutive_drops (vector progress) — this is the VBASE termination signal.
++//   - A bridge additionally enters bridge_pq (the k best-by-distance bridges), GUARANTEED into the
++//     final budget regardless of its vector rank. A bridge that is past the vector frontier enters
++//     bridge_pq but does NOT reset the drop run — exactly the ADR-0012 (B) contract that keeps the
++//     consecutive_drops bound correct (a far bridge cannot stall termination).
++// Memory: surviving tuples are copied into result_cxt (multi-call ctx), not the child ctx.
++static bool admitCandidateO(TJSOpenState* estate, TupleTableSlot* slot, float rank_score,
++							uint64_t tid, bool is_bridge){
++	uint32_t k = estate->topk;
++	bool vec_not_full = (estate->vec_pq->size() < k);
++	bool vec_winner = vec_not_full || (estate->vec_pq->top().first > rank_score);
++
++	if (vec_winner)
++		boundedPushO(estate, estate->vec_pq, rank_score, slot, tid, k);
++
++	// NB: bridges are injected EXHAUSTIVELY and with exact distances by fetchBridgeRowsO (phase 2b),
++	// NOT from the stream — a far bridge never surfaces in the ANN stream before termination. Here we
++	// only need is_bridge to keep the drop counter honest: a candidate that is a bridge but past the
++	// vector frontier must NOT reset drops (the ADR-0012 (B) contract). Since vec_winner already
++	// governs the reset, nothing extra is needed; is_bridge is retained for clarity/future tuning.
++	(void) is_bridge;
++
++	return vec_winner; // reset drops only on vector progress
++}
++
++// Finalize: merge vec_pq + bridge_pq into the top-k, BRIDGES GUARANTEED. Strategy: take ALL bridges
++// (up to k, best-by-distance — they are guaranteed), then fill the remaining slots with the nearest
++// vector winners NOT already chosen as a bridge (dedup by tid). The combined set is then ordered
++// nearest-first for emission. This realizes "emit top-k vector-ranked WITH the bridges injected".
++static void finalizeTopKO(TJSOpenState* estate){
++	uint32_t k = estate->topk;
++
++	// Drain both heaps into vectors (each is small, <= k).
++	std::vector<pq_item_o_t> bridges_v, vecs_v;
++	while (!estate->bridge_pq->empty()) { bridges_v.push_back(estate->bridge_pq->top()); estate->bridge_pq->pop(); }
++	while (!estate->vec_pq->empty())    { vecs_v.push_back(estate->vec_pq->top());    estate->vec_pq->pop(); }
++	// Both are currently worst-first (max-heap pop order); sort nearest-first.
++	std::sort(bridges_v.begin(), bridges_v.end(),
++			  [](const pq_item_o_t& a, const pq_item_o_t& b){ return a.first < b.first; });
++	std::sort(vecs_v.begin(), vecs_v.end(),
++			  [](const pq_item_o_t& a, const pq_item_o_t& b){ return a.first < b.first; });
++
++	// Dedup by the candidate's graph id (read from the tuple): a node can be in BOTH heaps (a bridge
++	// fetched by id AND a near vector winner). vec items are keyed by heap tid and bridges by a tagged
++	// id, so the heap keys differ — id-from-tuple is the only sound cross-heap dedup key.
++	TupleDesc rd = estate->ps.ps_ResultTupleDesc;          // the visible (attr-only) descriptor
++	auto id_of = [&](const pq_item_o_t& it) -> int64 {
++		bool isn;
++		// The stored heap tuple may carry the trailing orderby/distance col, but the id is column
++		// idAttno either way. Build a transient slot is overkill; use heap_getattr on rd is unsafe if
++		// the tuple has more attrs. Use SPI-free heap_getattr against the result desc (attr cols only).
++		Datum d = heap_getattr(it.second, estate->idAttno, rd, &isn);
++		if (isn) return INT64_MIN;
++		Form_pg_attribute a = TupleDescAttr(rd, estate->idAttno - 1);
++		return (a->atttypid == INT4OID) ? (int64) DatumGetInt32(d) : DatumGetInt64(d);
++	};
++	std::unordered_set<int64> chosen_ids;
++	std::vector<pq_item_o_t> chosen;  // nearest-first
++
++	// 1) bridges first (guaranteed), nearest bridges win when > k bridges exist.
++	for (const auto& it : bridges_v) {
++		if (chosen.size() >= k) break;
++		if (chosen_ids.insert(id_of(it)).second)
++			chosen.push_back(it);
++	}
++	// 2) fill remaining with vector winners not already chosen.
++	for (const auto& it : vecs_v) {
++		if (chosen.size() >= k) break;
++		if (chosen_ids.insert(id_of(it)).second)
++			chosen.push_back(it);
++	}
++	// Re-order the merged budget nearest-first for emission stability.
++	std::sort(chosen.begin(), chosen.end(),
++			  [](const pq_item_o_t& a, const pq_item_o_t& b){ return a.first < b.first; });
++
++	// result_stack pops LAST-IN-FIRST-OUT; push farthest first so we emit nearest first.
++	for (auto it = chosen.rbegin(); it != chosen.rend(); ++it)
++		estate->result_stack->push(*it);
++}
++
++// ---------------------------------------------------------------------------
++// fetchBridgeRowsO — phase 2b: GUARANTEED bridge injection.
++//
++// A graph bridge whose vector rank is far past the frontier is NEVER emitted by the ANN stream before
++// early termination, so it cannot be picked up by the streaming admit. Per ADR-0012, bridges must be
++// "guaranteed into the budget regardless of their query similarity". We therefore MATERIALIZE the
++// bridge rows directly by id via SPI:
++//
++//   SELECT <attr_exp>, (<orderby_exp>) AS __d FROM <table>
++//   WHERE <id_col> = ANY (ARRAY[...bridge ids...]) [AND <filter_exp>]
++//
++// reusing the SAME orderby_exp so the bridge's TRUE query distance (the fork's scalar `<->` is correct
++// OUTSIDE an index scan after l2_distance_scalar.patch, used as the eviction key) is read into the
++// heap. The relational filter is also applied (a bridge that fails the filter is correctly excluded).
++// Each fetched tuple has the same shape as the vector leg's child slot (attr cols + a trailing
++// distance col), so it merges/dedups uniformly. Probed inside the SRF's already-open SPI connection.
++// This materializes only the BRIDGE SET (bounded by m_seeds*deg^hops), never the corpus — TR-1 holds.
++static void fetchBridgeRowsO(TJSOpenState* estate){
++	if (estate->bridges->empty())
++		return;
++
++	// Build the id-array literal: ARRAY[id1,id2,...].
++	std::string idlist;
++	bool first = true;
++	for (int64 b : *estate->bridges) {
++		if (!first) idlist += ",";
++		idlist += std::to_string((long long) b);
++		first = false;
++	}
++
++	std::string sql = "SELECT " + *estate->attr_exp + ", (" + *estate->orderby_exp + ") AS __d FROM " +
++					  *estate->tbl_name + " WHERE " + *estate->id_col + " = ANY (ARRAY[" + idlist + "])";
++	if (!estate->filter_exp->empty())
++		sql += " AND (" + *estate->filter_exp + ")";
++
++	int ret = SPI_execute(sql.c_str(), true /* read_only */, 0);
++	if (ret != SPI_OK_SELECT)
++		elog(ERROR, "tjs_open bridge fetch failed (%d): %s", ret, sql.c_str());
++
++	uint64 proc = SPI_processed;
++	SPITupleTable *tt = SPI_tuptable;
++	TupleDesc sd = tt->tupdesc;
++	int dcol = sd->natts; // the trailing __d distance column (1-based).
++	uint32_t k = estate->topk;
++
++	for (uint64 i = 0; i < proc; i++) {
++		HeapTuple src = tt->vals[i];
++		bool dnull;
++		Datum dd = SPI_getbinval(src, sd, dcol, &dnull);
++		float dist = dnull ? std::numeric_limits<float>::infinity() : (float) DatumGetFloat8(dd);
++
++		// dedup key: the id column value (col idAttno). Not a heap tid (SPI tuples carry no scan tid),
++		// but the id uniquely identifies a paragraph, so it is a sound dedup key across both heaps —
++		// EXCEPT vec_pq items are keyed by heap tid. To make them comparable we instead key bridges by
++		// a synthetic high-bit-tagged id so a bridge that is ALSO a vector winner is not double-emitted:
++		// finalizeTopKO dedups bridges-first, and vector winners that share the id are filtered by a
++		// secondary id check below. Simplicity: read the id and use it (tagged) as the heap key.
++		bool inull;
++		Datum idd = SPI_getbinval(src, sd, estate->idAttno, &inull);
++		int64 idv = 0;
++		if (!inull) {
++			Form_pg_attribute a = TupleDescAttr(sd, estate->idAttno - 1);
++			idv = (a->atttypid == INT4OID) ? (int64) DatumGetInt32(idd) : DatumGetInt64(idd);
++		}
++		// Tag bridge keys in the high bit so they never collide with a real heap tid (which is < 2^48).
++		uint64_t bkey = ((uint64_t) 1 << 62) | (uint64_t) idv;
++
++		MemoryContext old = MemoryContextSwitchTo(estate->result_cxt);
++		HeapTuple tcopy = heap_copytuple(src);
++		MemoryContextSwitchTo(old);
++
++		if (estate->bridge_pq->size() < k)
++			estate->bridge_pq->push(pq_item_o_t(dist, tcopy, bkey));
++		else if (estate->bridge_pq->top().first > dist) {
++			estate->bridge_pq->pop();
++			estate->bridge_pq->push(pq_item_o_t(dist, tcopy, bkey));
++		}
++		estate->bridges_injected++;
++	}
++}
++
++// ---------------------------------------------------------------------------
++// execTJSOpen — the streaming operator body. On the FIRST call it (1) pulls m_seeds, (2) expands the
++// graph from them, (3) re-considers the seeds and continues draining the vector stream with bridge
++// injection until consecutive_drops >= term_cond or the stream ends, then unspools the top-k into
++// result_stack. Each later call pops one row.
++// ---------------------------------------------------------------------------
++extern "C" TupleTableSlot* execTJSOpen(PlanState* node){
++	TJSOpenState* estate = (TJSOpenState*) node;
++	uint32_t term_cond = estate->term_cond;
++	uint32_t consecutive_drops = 0;
++
++	auto result_stack = estate->result_stack;
++	TupleTableSlot* result_slot = estate->ps.ps_ResultTupleSlot;
++
++	if (!estate->finish) {
++		IndexScanState* child = estate->children->at(0);
++		EState*         q_estate = estate->qDescs->at(0)->estate;
++
++		PushActiveSnapshot(estate->query_snapshot);
++		PG_TRY();
++		{
++			MemoryContext loopctx = MemoryContextSwitchTo(q_estate->es_query_cxt);
++
++			// -------- PHASE 1: SEEDLESS SEEDING — pull a bounded seed window, pick the nearest. --------
++			// The MSVBASE relaxed-monotonicity HNSW iterator emits in APPROXIMATELY descending-
++			// similarity order, NOT exact: the very first few tuples are graph-traversal artifacts and
++			// are often NOT the true nearest (e.g. the first emitted can be far). Taking the literal
++			// first-m_seeds-emitted as the personalization seeds would mis-seed the graph (matches the
++			// ann_seeds host ref only if exact). Instead we pull a bounded WINDOW of the first
++			// `seed_window` candidates and select the m_seeds NEAREST among them as the seeds — the
++			// host reference's `ann_seeds` (nearest m_seeds). The window is a small constant multiple of
++			// m_seeds, so this stays a bounded prefix (TR-1: not a corpus scan). ALL windowed candidates
++			// are still buffered and admitted to the merge — none are wasted.
++			uint32_t seed_window = estate->m_seeds * 8;
++			if (seed_window < estate->m_seeds + 32) seed_window = estate->m_seeds + 32;
++
++			// Buffered seed-window candidates: (rank_score, heaptuple, tid, cand_id, have_id).
++			struct SeedBuf { float score; HeapTuple tup; uint64_t tid; int64 id; bool have_id; };
++			std::vector<SeedBuf> seed_buf;
++			seed_buf.reserve(seed_window);
++
++			while (seed_buf.size() < seed_window) {
++				float score; int64 cid; bool have_id; uint64_t tid;
++				TupleTableSlot* slot = pullOneCandidateO(estate, child, &score, &cid, &have_id, &tid);
++				if (!slot) { estate->finish = true; break; }
++				MemoryContext old = MemoryContextSwitchTo(estate->result_cxt);
++				HeapTuple tcopy = copyItemO(slot);
++				MemoryContextSwitchTo(old);
++				seed_buf.push_back(SeedBuf{score, tcopy, tid, cid, have_id});
++			}
++
++			// Select the m_seeds NEAREST windowed candidates (smallest distance) as the seeds.
++			std::vector<int64> seeds;
++			{
++				std::vector<const SeedBuf*> by_dist;
++				for (const auto& sb : seed_buf)
++					if (sb.have_id) by_dist.push_back(&sb);
++				std::sort(by_dist.begin(), by_dist.end(),
++						  [](const SeedBuf* a, const SeedBuf* b){ return a->score < b->score; });
++				uint32_t take = std::min<uint32_t>(estate->m_seeds, (uint32_t)by_dist.size());
++				for (uint32_t i = 0; i < take; i++)
++					seeds.push_back(by_dist[i]->id);
++			}
++
++			// -------- PHASE 2: MULTI-SOURCE GRAPH EXPANSION (inside the open SPI conn). --------
++			*estate->bridges = expandMultiSeedO(seeds, estate->hops);
++
++			// -------- PHASE 2b: GUARANTEED bridge injection — fetch bridge rows directly by id. ------
++			// Bridges (incl. the seeds) are materialized with their TRUE query distance into bridge_pq,
++			// regardless of vector rank. Done BEFORE the streamed drain so the bridge_pq is complete.
++			fetchBridgeRowsO(estate);
++
++			// -------- PHASE 3a: admit the buffered seed-window candidates to the VECTOR heap. --------
++			// The windowed tuples were already copied into result_cxt during phase 1. They feed vec_pq
++			// (the pure-vector top-k). Bridges among them are already in bridge_pq via phase 2b, so we
++			// only route them to vec_pq here; finalizeTopKO dedups across heaps by id.
++			uint32_t k = estate->topk;
++			for (const SeedBuf& sb : seed_buf) {
++				bool vec_not_full = (estate->vec_pq->size() < k);
++				bool vec_winner = vec_not_full || (estate->vec_pq->top().first > sb.score);
++				if (vec_winner) {
++					if (estate->vec_pq->size() == k) estate->vec_pq->pop();
++					estate->vec_pq->push(pq_item_o_t(sb.score, sb.tup, sb.tid));
++					consecutive_drops = 0;
++				}
++			}
++
++			// -------- PHASE 3b: continue the vector stream (vector winners only; bridges done). ------
++			while (!estate->finish) {
++				float score; int64 cid; bool have_id; uint64_t tid;
++				TupleTableSlot* slot = pullOneCandidateO(estate, child, &score, &cid, &have_id, &tid);
++				if (!slot) { estate->finish = true; break; }
++
++				bool is_bridge = have_id &&
++					(estate->bridges->find(cid) != estate->bridges->end());
++
++				bool reset = admitCandidateO(estate, slot, score, tid, is_bridge);
++				if (reset)
++					consecutive_drops = 0;
++				else
++					consecutive_drops++;   // bridge-or-loss: drop run continues (TR-1 bound holds)
++
++				if (consecutive_drops >= term_cond)
++					estate->finish = true;
++			}
++
++			MemoryContextSwitchTo(loopctx);
++		}
++		PG_CATCH();
++		{
++			PopActiveSnapshot();
++			PG_RE_THROW();
++		}
++		PG_END_TRY();
++		PopActiveSnapshot();
++
++		// Merge vec_pq + bridge_pq into the final top-k (bridges guaranteed), nearest-first emission.
++		finalizeTopKO(estate);
++		tjs_open_last_examined = estate->examined;
++		tjs_open_last_bridges  = estate->bridges_injected;
++	}
++
++	if (result_stack->size() == 0)
++		return ExecClearTuple(result_slot);
++
++	auto top = result_stack->top();
++	HeapTuple tuple = top.second;
++	result_stack->pop();
++
++	ExecForceStoreHeapTuple(tuple, result_slot, true);
++	return result_slot;
++}
++
++TJSOpenState* InitTJSOpenState(Relation relation, uint32_t k, uint32_t term_cond,
++							   uint32_t m_seeds, int hops,
++							   std::vector<IndexScanState*> scans, std::vector<QueryDesc*> qDescs,
++							   Snapshot query_snapshot,
++							   const std::string& tbl, const std::string& attr,
++							   const std::string& filter, const std::string& orderby,
++							   const std::string& id_col){
++	TJSOpenState* state = (TJSOpenState*)malloc(sizeof(TJSOpenState));
++	memset(&(state->ps), 0, sizeof(PlanState));
++
++	state->ps.ps_ResultTupleDesc = copyAndDropLastAttrO(scans[0]->ss.ps.ps_ResultTupleDesc, true);
++	state->ps.ps_ResultTupleSlot = MakeTupleTableSlot(state->ps.ps_ResultTupleDesc,
++													  scans[0]->ss.ps.ps_ResultTupleSlot->tts_ops);
++	state->ps.ExecProcNode = execTJSOpen;
++
++	state->relation        = relation;
++	state->finish          = false;
++	state->topk            = k;
++	state->term_cond       = term_cond;
++	state->m_seeds         = m_seeds;
++	state->hops            = hops;
++
++	state->vec_pq           = new std::priority_queue<pq_item_o_t, std::vector<pq_item_o_t>, pq_item_compare_lt_o_t>();
++	state->bridge_pq        = new std::priority_queue<pq_item_o_t, std::vector<pq_item_o_t>, pq_item_compare_lt_o_t>();
++	state->seenSet          = new std::unordered_set<uint64_t>();
++	state->result_stack     = new std::stack<pq_item_o_t>();
++	state->bridges          = new std::unordered_set<int64>();
++	state->children         = new std::vector<IndexScanState*>(scans);
++	state->qDescs           = new std::vector<QueryDesc*>(qDescs);
++
++	state->tbl_name         = new std::string(tbl);
++	state->attr_exp         = new std::string(attr);
++	state->filter_exp       = new std::string(filter);
++	state->orderby_exp      = new std::string(orderby);
++	state->id_col           = new std::string(id_col);
++
++	state->idAttno          = 1; // attr's first column is the candidate id by contract.
++	state->examined         = 0;
++	state->bridges_injected = 0;
++	state->result_cxt       = CurrentMemoryContext;
++	state->children_closed  = false;
++	state->query_snapshot   = query_snapshot;
++
++	return state;
++}
++
++void EndTJSOpenChildren(TJSOpenState *state){
++	if (!state || state->children_closed) return;
++	table_close(state->relation, AccessShareLock);
++	for (QueryDesc* queryDesc: *(state->qDescs)) {
++		ExecutorFinish(queryDesc);
++		ExecutorEnd(queryDesc);
++		FreeQueryDesc(queryDesc);
++	}
++	state->children_closed = true;
++}
++
++void EndTJSOpenState(TJSOpenState *state){
++	if (!state) return;
++	EndTJSOpenChildren(state);
++	ExecDropSingleTupleTableSlot(state->ps.ps_ResultTupleSlot);
++	if (state->query_snapshot)
++		UnregisterSnapshot(state->query_snapshot);
++	delete(state->vec_pq);
++	delete(state->bridge_pq);
++	delete(state->seenSet);
++	delete(state->result_stack);
++	delete(state->bridges);
++	delete(state->qDescs);
++	delete(state->children);
++	delete(state->tbl_name);
++	delete(state->attr_exp);
++	delete(state->filter_exp);
++	delete(state->orderby_exp);
++	delete(state->id_col);
++	free(state);
++}
++
++// ---------------------------------------------------------------------------
++// tjs_open(table_name, k, term_cond, m_seeds, hops, attr_exp, filter_exp, orderby_exp) RETURNS SETOF record
++//
++//   table_name  — the relational+vector table (e.g. 'paragraphs').
++//   k           — global top-k.
++//   term_cond   — VBASE consecutive-drops early-termination bound (0 -> default 50).
++//   m_seeds     — number of ANN seeds drawn from the vector leg (0 -> default 5). NO caller src.
++//   hops        — graph-expansion depth from the seeds (0 -> default 2).
++//   attr_exp    — output columns; the FIRST must be the candidate's graph id. e.g. 'id'.
++//   filter_exp  — RELATIONAL leg: pushed into the vector leg's SQL WHERE. '' = none.
++//   orderby_exp — VECTOR leg: the HNSW orderby AND the seed/personalization vector.
++// ---------------------------------------------------------------------------
++Datum tjs_open(PG_FUNCTION_ARGS) {
++
++	FuncCallContext		*funcctx;
++	int					 call_cntr;
++	int					 max_calls;
++	TupleDesc			 tupdesc;
++	AttInMetadata		*attinmeta;
++
++	if (SRF_IS_FIRSTCALL()) {
++		MemoryContext	oldcontext;
++		funcctx = SRF_FIRSTCALL_INIT();
++		oldcontext = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
++
++		int argc = 0;
++		text *tablename = PG_GETARG_TEXT_PP(argc++);
++		uint32 k = PG_GETARG_UINT32(argc++);
++		Oid table_oid = getrelidO(std::string(text_to_cstring(tablename)));
++		if (!OidIsValid(table_oid))
++			ereport(ERROR,
++					(errcode(ERRCODE_UNDEFINED_TABLE),
++					 errmsg("tjs_open: relation \"%s\" does not exist", text_to_cstring(tablename))));
++
++		uint32 termCond = PG_GETARG_UINT32(argc++);
++		if (termCond == 0)
++			termCond = 50;
++
++		uint32 mSeeds = PG_GETARG_UINT32(argc++);
++		if (mSeeds == 0)
++			mSeeds = 5;
++
++		int32 hops = PG_GETARG_INT32(argc++);
++		if (hops <= 0)
++			hops = 2;
++
++		text* attr_exp_text   = PG_GETARG_TEXT_PP(argc++);
++		text* filter_exp_text = PG_GETARG_TEXT_PP(argc++);
++		text* orderby_text    = PG_GETARG_TEXT_PP(argc++);
++
++		DEBUG_PRINT("tjs_open: table=%s k=%u term=%u m_seeds=%u hops=%d attr=%s filter=%s orderby=%s",
++					text_to_cstring(tablename), k, termCond, mSeeds, hops,
++					text_to_cstring(attr_exp_text), text_to_cstring(filter_exp_text),
++					text_to_cstring(orderby_text));
++
++		std::vector<IndexScanState*> scannodes;
++		std::vector<QueryDesc*> qDescs;
++		SPI_connect();
++
++		// Build the vector leg: ONE index-scan SQL with the relational filter in WHERE. Seeds AND
++		// rank both come from this single stream (seedless seeding).
++		std::string orderby(text_to_cstring(orderby_text));
++		char sourceText[102400];
++		if ( strlen(text_to_cstring(filter_exp_text)) == 0 ){
++			snprintf(sourceText, sizeof(sourceText), "select %s from %s order by %s",
++					 text_to_cstring(attr_exp_text), text_to_cstring(tablename), orderby.c_str());
++		} else {
++			snprintf(sourceText, sizeof(sourceText), "select %s from %s where %s order by %s",
++					 text_to_cstring(attr_exp_text), text_to_cstring(tablename),
++					 text_to_cstring(filter_exp_text), orderby.c_str());
++		}
++		DEBUG_PRINT("tjs_open vector leg SQL: %s", sourceText);
++
++		PlannedStmt* plan = NULL;
++		if ( !(plan = extractIndexScanNodeO(sourceText)) )
++			elog(ERROR, "tjs_open: cannot find HNSW index for vector leg = %s", sourceText);
++
++		// DEV-1236: own a snapshot pinned for the SRF's entire multi-call lifetime.
++		Snapshot query_snapshot = RegisterSnapshot(GetTransactionSnapshot());
++
++		QueryEnvironment *queryEnv = create_queryEnv();
++		DestReceiver * dest = CreateDestReceiver(DestNone);
++		QueryDesc* queryDesc = CreateQueryDesc(plan, sourceText,
++											   query_snapshot, InvalidSnapshot,
++											   dest, NULL, queryEnv, 0);
++		qDescs.push_back(queryDesc);
++		standard_ExecutorStart(queryDesc, 0);
++
++		IndexScanState* scannode = findIndexScanStateO(queryDesc->planstate);
++		if (!scannode)
++			elog(ERROR, "tjs_open: no IndexScanState in vector leg plan");
++		scannodes.push_back(scannode);
++
++		// The id column expression for the bridge-fetch WHERE = the FIRST comma-token of attr_exp.
++		std::string attr_str(text_to_cstring(attr_exp_text));
++		std::string id_col = attr_str.substr(0, attr_str.find(','));
++		// trim surrounding whitespace
++		size_t a = id_col.find_first_not_of(" \t");
++		size_t b = id_col.find_last_not_of(" \t");
++		if (a != std::string::npos) id_col = id_col.substr(a, b - a + 1);
++
++		TJSOpenState* top_execNode = InitTJSOpenState(table_open(table_oid, AccessShareLock),
++													  k, termCond, mSeeds, hops,
++													  scannodes, qDescs, query_snapshot,
++													  std::string(text_to_cstring(tablename)),
++													  attr_str,
++													  std::string(text_to_cstring(filter_exp_text)),
++													  orderby, id_col);
++
++		funcctx->user_fctx = top_execNode;
++		funcctx->max_calls = k;
++		tupdesc = top_execNode->ps.ps_ResultTupleDesc;
++		attinmeta = TupleDescGetAttInMetadata(tupdesc);
++		funcctx->attinmeta = attinmeta;
++
++		MemoryContextSwitchTo(oldcontext);
++	}
++
++	funcctx = SRF_PERCALL_SETUP();
++	call_cntr = funcctx->call_cntr;
++	max_calls = funcctx->max_calls;
++	attinmeta = funcctx->attinmeta;
++
++	TJSOpenState* top_execNode = (TJSOpenState*)funcctx->user_fctx;
++
++	if (call_cntr < max_calls) {
++		TupleTableSlot *slot = execTJSOpen((PlanState*) top_execNode);
++		if ( TupIsNull(slot) )
++			goto finish;
++		Datum result = ExecFetchSlotHeapTupleDatum(slot);
++		SRF_RETURN_NEXT(funcctx, result);
++	}
++	else {
++		goto finish;
++	}
++
++ finish:
++	EndTJSOpenState(top_execNode);
++	SPI_finish();
++	DEBUG_PRINT("tjs_open done, processed = %u", call_cntr);
++	SRF_RETURN_DONE(funcctx);
++}
++
++// ---------------------------------------------------------------------------
++// tjs_open_candidates_examined() — TR-1 / SM-3 probe: ANN candidates pulled by the last tjs_open scan
++// in this backend. Asserting this << corpus proves early termination (no blocking full scan).
++// tjs_open_bridges_injected() — bridges admitted past the vector frontier (the graph contribution).
++// ---------------------------------------------------------------------------
++extern "C"
++{
++    PGDLLEXPORT PG_FUNCTION_INFO_V1(tjs_open_candidates_examined);
++    PGDLLEXPORT PG_FUNCTION_INFO_V1(tjs_open_bridges_injected);
++}
++
++Datum tjs_open_candidates_examined(PG_FUNCTION_ARGS) {
++	PG_RETURN_INT64(tjs_open_last_examined);
++}
++
++Datum tjs_open_bridges_injected(PG_FUNCTION_ARGS) {
++	PG_RETURN_INT64(tjs_open_last_bridges);
++}
