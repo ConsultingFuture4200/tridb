@@ -255,3 +255,51 @@ def test_explain_intermediate_matches_chosen_order():
     stats = LegStats(50, 10_000, 5.0, 5)  # filter_first
     out = explain(stats)
     assert out["intermediate_rows"] == estimated_intermediate_rows(stats, out["order"])
+
+
+# --------------------------------------------------------------------------- #
+# avg_out_degree derivation (plan 006)                                         #
+# --------------------------------------------------------------------------- #
+#
+# Reference for the C derivation in src/planner/join_order_legstats.c:
+#   avg_out_degree = gm_edge_count / gm_vertex_count, 0.0 when gm_vertex_count == 0
+#   (the NULLIF(gm_vertex_count, 0) guard). The C reads gm_edge_count/gm_vertex_count
+#   off the graph metapage; this pure-Python mirror pins the arithmetic so the GX10 C
+#   and the host reference can never silently diverge on the formula or the guard.
+
+
+def derive_avg_out_degree(edge_count: int, vertex_count: int) -> float:
+    """Mirror of join_order_legstats.c's avg_out_degree derivation (FROZEN formula)."""
+    if vertex_count <= 0:
+        return 0.0
+    return edge_count / vertex_count
+
+
+@pytest.mark.parametrize(
+    ("edge_count", "vertex_count", "expected"),
+    [
+        (500, 100, 5.0),  # plan §test-plan normal case
+        (0, 0, 0.0),  # empty store -> NULLIF guard
+        (0, 100, 0.0),  # vertices but no edges yet
+        (100, 0, 0.0),  # guard wins even if a stale edge count is present
+        (1, 1, 1.0),  # single edge, single vertex
+        (3, 2, 1.5),  # fractional mean out-degree
+    ],
+)
+def test_avg_out_degree_derivation(edge_count, vertex_count, expected):
+    assert derive_avg_out_degree(edge_count, vertex_count) == expected
+
+
+def test_avg_out_degree_is_not_a_decision_input():
+    # plan 006 invariant: populating avg_out_degree must NOT change the ordering
+    # decision (FROZEN §10.1 — it is carried only for the EXPLAIN graph fan-out).
+    # Same selectivity, different avg_out_degree -> identical chosen order.
+    base = dict(rel_filter_matches=50, table_size=10_000, vector_topk=5)
+    placeholder = LegStats(avg_out_degree=0.0, **base)  # old hardwired value
+    derived = LegStats(avg_out_degree=derive_avg_out_degree(500, 100), **base)  # 5.0
+    assert choose_order(placeholder) == choose_order(derived) == "filter_first"
+    assert relational_selectivity(placeholder) == relational_selectivity(derived)
+    # Intermediate-row estimate is also avg_out_degree-independent in the v1 model (§5).
+    assert estimated_intermediate_rows(
+        placeholder, "filter_first"
+    ) == estimated_intermediate_rows(derived, "filter_first")

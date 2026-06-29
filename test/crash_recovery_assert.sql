@@ -40,7 +40,7 @@ SELECT :'phase' = 'committed' AS is_committed \gset
 -- below checks the heap (seqscan) presence of the vector row, the native graph redo, and the
 -- relational redo. The index-redo gap is filed as the DEV-1166 follow-on (see ADR-0003a).
 DO $$
-DECLARE rel_hit bigint; vec_hit bigint; gc bigint; nbrs bigint[];
+DECLARE rel_hit bigint; vec_hit bigint; gc bigint; ec bigint; nbrs bigint[];
 BEGIN
     -- (i) relational heap row survived WAL redo
     SELECT id INTO rel_hit FROM entities WHERE id = 5000;
@@ -68,7 +68,15 @@ BEGIN
         RAISE EXCEPTION 'CRASH/committed: committed edge 0->6 not in neighbors=% after redo', nbrs;
     END IF;
 
-    RAISE NOTICE 'PASS crash/committed: relational + vector-heap + native graph all REDONE from WAL after immediate-stop crash (HNSW index-redo gap is a vendor KNOWN-LIMITATION)';
+    -- (iv) store-wide gm_edge_count (plan 006) survived redo. The baseline seed adds 6 vertices and
+    -- NO edges, so the single committed edge 0->6 leaves the counter at exactly 1 after recovery
+    -- (the increment is GenericXLog REDO-covered, logged atomically with the edge slot).
+    ec := gph_edge_count();
+    IF ec <> 1 THEN
+        RAISE EXCEPTION 'CRASH/committed: gph_edge_count = % (expected 1 — committed edge-count increment lost in redo)', ec;
+    END IF;
+
+    RAISE NOTICE 'PASS crash/committed: relational + vector-heap + native graph (vertex, edge, gm_edge_count=1) all REDONE from WAL after immediate-stop crash (HNSW index-redo gap is a vendor KNOWN-LIMITATION)';
 END $$;
 \else
 -- --------------------------------------------------------------------------
@@ -78,7 +86,7 @@ END $$;
 -- before the doomed txn had exactly 6 visible graph vertices (vids 0..5 seeded this data dir).
 -- --------------------------------------------------------------------------
 DO $$
-DECLARE rel_n bigint; gc bigint; nbrs bigint[];
+DECLARE rel_n bigint; gc bigint; ec bigint; nbrs bigint[];
 BEGIN
     -- (i) relational/vector heap row NOT visible (its inserting xid is crash-aborted). We read via
     -- a heap path (seqscan) so the assertion does not depend on the vendored HNSW index at all.
@@ -104,6 +112,14 @@ BEGIN
         RAISE EXCEPTION 'CRASH/uncommitted: doomed edge 0->6 visible after recovery (neighbors=%)', nbrs;
     END IF;
 
-    RAISE NOTICE 'PASS crash/uncommitted: relational/vector heap + native graph vertex AND edge all HIDE the crash-aborted xid after recovery';
+    -- (iv) store-wide gm_edge_count (plan 006) rolled back with the crash-aborted txn. The doomed
+    -- edge 0->6's increment was logged under GenericXLog with the page image, so recovery restores
+    -- the pre-txn counter: the baseline seed had 0 edges, so gm_edge_count must be 0 (NOT leaked).
+    ec := gph_edge_count();
+    IF ec <> 0 THEN
+        RAISE EXCEPTION 'CRASH/uncommitted: gph_edge_count = % (expected baseline 0 — doomed edge-count increment leaked across abort)', ec;
+    END IF;
+
+    RAISE NOTICE 'PASS crash/uncommitted: relational/vector heap + native graph vertex, edge, AND gm_edge_count (0) all HIDE/roll back the crash-aborted xid after recovery';
 END $$;
 \endif
