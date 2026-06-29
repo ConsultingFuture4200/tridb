@@ -257,6 +257,59 @@ class AnthropicReader:
         return msg.content[0].text.strip()
 
 
+class CodexReader:
+    """LLM reader via the `codex` CLI — uses the operator's Codex/ChatGPT subscription
+    (no API key). Shells out to `codex exec` non-interactively (read-only sandbox,
+    ephemeral, low reasoning effort) and captures ONLY the final message via -o.
+
+    Slow (~10s/call) -> use a sample for the EM/F1 pass. NOTE: this measures the
+    downstream answer quality of the HOST graph-inject PROTOTYPE's retrieval, not the
+    engine's single-src tjs() (see benchmark_h2h_v0.1.0.md)."""
+
+    name = "codex-cli (operator subscription)"
+
+    def answer(self, question: str, contexts: list[str]) -> str:
+        import subprocess
+        import tempfile
+
+        ctx = "\n\n".join(f"[{i + 1}] {c}" for i, c in enumerate(contexts))
+        prompt = (
+            "Answer the question using ONLY the context. Reply with the shortest exact "
+            "answer span (for yes/no questions reply 'yes' or 'no'). No explanation, no "
+            f"tools, no commands.\n\nContext:\n{ctx}\n\nQuestion: {question}\nAnswer:"
+        )
+        with tempfile.NamedTemporaryFile("w+", suffix=".txt", delete=False) as f:
+            out = f.name
+        try:
+            subprocess.run(
+                [
+                    "codex",
+                    "exec",
+                    "--ephemeral",
+                    "-s",
+                    "read-only",
+                    "--skip-git-repo-check",
+                    "-c",
+                    "model_reasoning_effort=low",
+                    "-o",
+                    out,
+                    prompt,
+                ],
+                capture_output=True,
+                timeout=180,
+                check=False,
+            )
+            return (
+                Path(out).read_text().strip().splitlines()[-1].strip()
+                if Path(out).read_text().strip()
+                else ""
+            )
+        except Exception:  # noqa: BLE001 — a failed/timed-out call scores 0, run continues
+            return ""
+        finally:
+            Path(out).unlink(missing_ok=True)
+
+
 def make_reader(kind: str):
     if kind == "anthropic":
         if not os.environ.get("ANTHROPIC_API_KEY"):
@@ -266,6 +319,12 @@ def make_reader(kind: str):
                 "labeled non-LLM lower bound."
             )
         return AnthropicReader()
+    if kind == "codex":
+        import shutil
+
+        if not shutil.which("codex"):
+            raise SystemExit("reader=codex needs the `codex` CLI on PATH.")
+        return CodexReader()
     return ExtractiveReader()
 
 
@@ -317,20 +376,31 @@ def sweep(sl: Slice, ks: list[int]) -> dict:
     return red
 
 
-def reader_scores(sl: Slice, reader, k: int) -> dict:
-    """Downstream answer EM/F1 (+ evidence) per retriever at one budget k."""
+def reader_scores(
+    sl: Slice, reader, k: int, *, sample: int = 0, only: list[str] | None = None
+) -> dict:
+    """Downstream answer EM/F1 (+ evidence) per retriever at one budget k.
+
+    sample>0 limits to the first `sample` questions (for slow LLM readers); `only`
+    restricts which retrievers get the (expensive) reader pass."""
     para_text = {p["id"]: f"{p['title']}. {p['text']}" for p in sl.paragraphs}
-    agg: dict = {name: defaultdict(list) for name in RETRIEVERS}
-    for qi, q in enumerate(sl.questions):
-        for name, fn in RETRIEVERS.items():
-            retrieved = fn(sl, qi, k)
+    names = [n for n in RETRIEVERS if (only is None or n in only)]
+    agg: dict = {name: defaultdict(list) for name in names}
+    qs = sl.questions[:sample] if sample else sl.questions
+    for q in qs:
+        qi = q["qid"]
+        for name in names:
+            retrieved = RETRIEVERS[name](sl, qi, k)
             ev = evidence_scores(retrieved, q["gold_ids"])
             pred = reader.answer(q["question"], [para_text[i] for i in retrieved])
             agg[name]["answer_em"].append(em_score(pred, q["answer"]))
             agg[name]["answer_f1"].append(f1_score(pred, q["answer"]))
             agg[name]["ev_recall"].append(ev["recall"])
             agg[name]["ev_joint"].append(ev["joint"])
-    return {name: {m: _mean(v) for m, v in d.items()} for name, d in agg.items()}
+    return {
+        "n_reader_questions": len(qs),
+        **{name: {m: _mean(v) for m, v in d.items()} for name, d in agg.items()},
+    }
 
 
 def render_md(
@@ -401,14 +471,17 @@ def render_md(
         gt = sw["graph_inject"][reader_k][t]["joint"]
         w(f"| {t} | {vt:.3f} | {gt:.3f} | {gt - vt:+.3f} |")
     w("")
+    nrq = rd.get("n_reader_questions", len(sl.questions))
     w(f"## Downstream answer accuracy (EM / F1) @ k={reader_k}")
     w("")
-    w(f"Reader = {reader_name}.")
+    w(f"Reader = {reader_name}; {nrq} questions.")
     w("")
     w("| retriever | answer EM | answer F1 | ev recall | ev joint |")
     w("|---|---:|---:|---:|---:|")
     for name in RETRIEVERS:
-        a = rd[name]
+        a = rd.get(name)
+        if not a:
+            continue  # this retriever was skipped for the (slow) reader pass
         w(
             f"| {name} | {a['answer_em']:.3f} | {a['answer_f1']:.3f} | "
             f"{a['ev_recall']:.3f} | {a['ev_joint']:.3f} |"
@@ -464,13 +537,26 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="GraphRAG QA-accuracy report.")
     ap.add_argument("--manifest", type=Path, default=Path("data/hotpot/manifest.json"))
     ap.add_argument(
-        "--reader", choices=["extractive", "anthropic"], default="extractive"
+        "--reader", choices=["extractive", "anthropic", "codex"], default="extractive"
     )
     ap.add_argument(
         "--ks", type=int, nargs="+", default=[2, 3, 5, 10], help="k sweep points"
     )
     ap.add_argument(
         "--reader-k", type=int, default=5, help="k budget for EM/F1 + by-type table"
+    )
+    ap.add_argument(
+        "--reader-sample",
+        type=int,
+        default=0,
+        help="limit the (slow LLM) reader pass to the first N questions (0 = all)",
+    )
+    ap.add_argument(
+        "--reader-only",
+        type=str,
+        nargs="+",
+        default=None,
+        help="restrict the reader pass to these retrievers (e.g. vector_only graph_inject)",
     )
     ap.add_argument(
         "--json-out", type=Path, default=Path("bench/results/graphrag_metrics.json")
@@ -488,7 +574,9 @@ def main(argv: list[str] | None = None) -> int:
         f"ks={ks}, reader_k={args.reader_k}, reader={reader.name}"
     )
     sw = sweep(sl, ks)
-    rd = reader_scores(sl, reader, args.reader_k)
+    rd = reader_scores(
+        sl, reader, args.reader_k, sample=args.reader_sample, only=args.reader_only
+    )
 
     args.json_out.parent.mkdir(parents=True, exist_ok=True)
     args.json_out.write_text(

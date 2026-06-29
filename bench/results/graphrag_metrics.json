@@ -6,7 +6,7 @@
     10
   ],
   "reader_k": 5,
-  "reader": "extractive-heuristic (NON-LLM lower bound)",
+  "reader": "codex-cli (operator subscription)",
   "n_questions": 150,
   "n_paragraphs": 1490,
   "sweep": {
@@ -186,23 +186,18 @@
     }
   },
   "reader_scores": {
+    "n_reader_questions": 40,
     "vector_only": {
-      "answer_em": 0.05333333333333334,
-      "answer_f1": 0.08980735930735931,
-      "ev_recall": 0.8833333333333333,
-      "ev_joint": 0.7733333333333333
+      "answer_em": 0.6,
+      "answer_f1": 0.7441071428571429,
+      "ev_recall": 0.8875,
+      "ev_joint": 0.8
     },
     "graph_inject": {
-      "answer_em": 0.05333333333333334,
-      "answer_f1": 0.08536291486291486,
-      "ev_recall": 0.9466666666666667,
-      "ev_joint": 0.9
-    },
-    "graph_rerank": {
-      "answer_em": 0.05333333333333334,
-      "answer_f1": 0.08980735930735931,
-      "ev_recall": 0.8833333333333333,
-      "ev_joint": 0.7733333333333333
+      "answer_em": 0.625,
+      "answer_f1": 0.7691071428571428,
+      "ev_recall": 0.95,
+      "ev_joint": 0.925
     }
   }
 }
