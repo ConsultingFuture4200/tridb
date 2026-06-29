@@ -22,8 +22,11 @@
   box) the CPU build path (`CREATE INDEX ... USING hnsw`) runs **bit-unchanged**. The toggle
   changes only **which machine built the graph**, never runtime behavior.
 - **RaBitQ** is the separate 128 GB-headline lever (smaller footprint per vector). The Step-1
-  numpy simulator (`bench/rabitq_sim.py`) proves the recall/footprint trade before any C. The
-  in-engine quantized storage is an explicitly **deferred** follow-on (§5).
+  numpy simulator (`bench/rabitq_sim.py`) proves the recall/footprint trade before any C, now
+  measured on **real SIFT-128** (§4): **4-bit RaBitQ + in-scan full-precision rerank reaches
+  recall@10 = 1.0 at a 7.5× footprint reduction**; 1-bit is unusable on real data (rerank does
+  not rescue it). The realistic recall-preserving compression is **≈7.5×**, not the plan's
+  aspirational 8–32×. The in-engine quantized storage is an explicitly **deferred** follow-on (§5).
 
 ---
 
@@ -136,33 +139,60 @@ estimate from the reconstructed code), and reports, per bit-width:
 - **empirical reconstruction error vs the closed-form grid bound** (the host-checkable core of
   the RaBitQ guarantee; the unit test asserts empirical ≤ bound for every bit-width).
 
-### Measured (SYNTHETIC clustered corpus — real-dataset numbers are DATA-GATED)
+### Measured — REAL SIFT-128 (ann-benchmarks `sift-128-euclidean.hdf5`)
 
-This standin has **no real `.npy`/`.fvecs`/`.hdf5` dataset checked into the worktree**, so the
-table below is on a **synthetic clustered corpus** (`n=5000, dim=128`, 16 clusters, `rerank=200`).
-The **shape of the trade is real** (recall and reconstruction error both improve strictly with
-bit-width; the bound holds throughout); the **absolute recall numbers depend on the dataset** and
-are data-gated until a real corpus is supplied (`make rabitq-sim DATASET=…`).
+These are the **real-dataset** numbers, measured on this x86 standin against the public
+**SIFT-128-euclidean** corpus (`data/public/sift-128-euclidean.hdf5`, 1M × 128 float32). They
+**replace** the earlier synthetic placeholder. Two independent runs agree:
 
-| bits | raw recall@10 | rerank@10 (R=200) | bits/vec | vs fp32 | emp. recon err | grid bound | within bound |
+**Run A — held-out queries** (corpus = first 49,800 `train` rows; 200 held-out `train` rows as
+queries; truth = exact L2 top-10 over the corpus; `rerank` shortlist R=100; `seed=42`). This is
+what `make rabitq-sim DATASET=…` reproduces:
+
+| bits | raw recall@10 | rerank@10 (R=100) | bits/vec | vs fp32 | emp. recon err | grid bound | within bound |
 |---:|---:|---:|---:|---:|---:|---:|:--:|
-| 1 | 0.031 | 0.656 | 160 | 25.6× | 72.95 | 128.00 | yes |
-| 2 | 0.069 | 0.775 | 288 | 14.2× | 4.73 | 14.22 | yes |
-| 4 | 0.400 | 1.000 | 544 | 7.5× | 0.189 | 0.569 | yes |
-| 8 | 0.956 | 1.000 | 1056 | 3.9× | 0.0007 | 0.0020 | yes |
+| 1 | 0.018 | 0.072 | 160 | 25.6× | 71.43 | 128.00 | yes |
+| 2 | 0.344 | 0.774 | 288 | 14.2× | 4.75 | 14.22 | yes |
+| 4 | 0.860 | 1.000 | 544 | 7.5× | 0.188 | 0.569 | yes |
+| 8 | 0.991 | 1.000 | 1056 | 3.9× | 0.0007 | 0.0020 | yes |
 
-**Honest reading (a real STOP-condition check from the plan):** at **2–4 bits the *raw*
-estimator recall is low** on this corpus (0.07 / 0.40) — the coarse code alone does not order
-near-neighbours well. **With a full-precision rerank shortlist, 4-bit recovers to 1.000** at a
-**7.5× footprint reduction**, and 8-bit raw is already 0.956. So the footprint lever is real but
-**leans on the rerank** (which, per ADR-0006, must live in-scan, not in SQL): the headline should
-be framed as "**N-bit RaBitQ + in-scan full-precision rerank**", not "N-bit alone". The
-aggressive 8–32× framing in the plan's *Why* section is a 1-bit-style figure; at the bit-widths
-that hold recall here (4-bit + rerank) the realistic compression is **≈7–8×**, still a large
-unified-memory win but not 32×. **This must be re-measured on a real embedding corpus before any
-launch-headline number is quoted** — that is the data-gated part.
+**Run B — canonical SIFT test set** (corpus = first 50,000 `train` rows; queries = first 100
+**real `test`** rows; truth = exact L2 top-10 over the corpus; shows the rerank-shortlist
+sensitivity at R=100 and R=500):
 
-Reproduce: `make rabitq-sim` (synthetic) or `make rabitq-sim DATASET=data/public/sift-128-euclidean.hdf5`.
+| bits | raw recall@10 | rerank@10 (R=100) | rerank@10 (R=500) | vs fp32 |
+|---:|---:|---:|---:|---:|
+| 1 | 0.030 | 0.106 | 0.233 | 25.6× |
+| 2 | 0.418 | 0.830 | 0.946 | 14.2× |
+| 4 | 0.877 | 1.000 | 1.000 | 7.5× |
+| 8 | 0.990 | 1.000 | 1.000 | 3.9× |
+
+**Honest reading (the plan's RaBitQ STOP-condition check, now on real data):**
+
+- **1-bit is unusable on real SIFT.** raw recall ≈ 0.02–0.03 and — unlike the synthetic corpus,
+  where a rerank pulled 1-bit up to ~0.66 — on real SIFT the rerank **does not rescue it**
+  (0.07 at R=100, still only 0.23 at R=500). The 1-bit code is too coarse to bring the true
+  neighbours into any practical shortlist. So the aspirational 25× (1-bit) footprint figure in
+  the plan's *Why* section **does not hold at recall** on a real corpus. This is a change from
+  the synthetic finding, where 1-bit + rerank looked viable; it was an artifact of the easy
+  synthetic clustering.
+- **4-bit is the recall-preserving sweet spot.** raw recall ≈ 0.86–0.88, and **with an
+  in-scan full-precision rerank it reaches 1.000 at a 7.5× footprint reduction** (even at the
+  small R=100 shortlist). 2-bit + rerank lands at ~0.77–0.83 (R=100) / 0.95 (R=500) — a
+  candidate if 2× more compression is worth a recall give-up, but 4-bit is the safe headline.
+- **8-bit raw is already 0.99** (no rerank needed) at 3.9×.
+
+**Net: the realistic recall-preserving compression on real SIFT is ≈7.5× (4-bit + in-scan
+rerank), not the 8–32× the plan's *Why* section quotes.** The footprint lever is real and still
+a large unified-memory win, but the launch-headline number must be **"4-bit RaBitQ + in-scan
+full-precision rerank ⇒ recall@10 = 1.0 at 7.5×"**, not a bare 1-bit/raw-estimator figure. Per
+ADR-0006 that rerank must live **inside the index scan** on the authoritative in-scan distance,
+never as a SQL re-rank.
+
+Reproduce: `make rabitq-sim DATASET=data/public/sift-128-euclidean.hdf5` (Run A; the held-out
+default). Full command for Run A: `python -m bench.rabitq_sim --dataset
+data/public/sift-128-euclidean.hdf5 --limit 50000 --queries 200 --k 10 --bits 1 2 4 8
+--rerank 100`. (h5py is an optional dep — `pip install h5py` for the .hdf5 loader.)
 
 ---
 
@@ -182,6 +212,19 @@ on the same corpus:
 **These numbers are GX10-MEASURED. They are NOT claimed here** — `scripts/gpu_build_index.{sh,py}`
 is authored and the off-cuVS guard is verified on this box, but the build itself is UNBUILT-HERE.
 Record the measured recall delta + build-time delta in this section when the GX10 run lands.
+
+> **CAGRA build stays GENUINELY GATED — confirmed on the GX10 host (2026-06-29).** The GX10
+> (DGX Spark, ssh `spark`) was checked directly: **`import cuvs` FAILS** (cuVS is not installed)
+> and **there is no CUDA toolkit / cuVS runtime present** to build a CAGRA graph. So the offline
+> CAGRA build (`scripts/gpu_build_index.{sh,py}`) **cannot run on the available GX10 either** — it
+> is not merely off-target on this x86 standin, it is unrunnable on the intended target until
+> cuVS + the matching CUDA toolkit are installed there. The script therefore remains **authored +
+> verified-no-op**: on every machine reachable today (this x86 box AND the GX10) the `import cuvs`
+> guard fails and the driver prints its no-op message and exits 0. We did **not** attempt to
+> install cuVS. Step 3's recall/build-time A/B is blocked on a GX10 cuVS+CUDA-toolkit install,
+> not on writing the builder — that work is done and dormant. (For reference, this x86 host does
+> ship `nvcc 12.0`, but its GPUs are sm_61 GTX-1070s that cuVS does not target, so it cannot
+> stand in for the build; the gate is correctly `import cuvs`, not "nvcc present".)
 
 ### Deferred (its own plan, after Step 1 proves recall)
 
