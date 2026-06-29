@@ -1,4 +1,4 @@
-.PHONY: test lint graph-test smoke-test test-all baseline-up baseline-down seed bench bench-live sweep sm2 fetch-dataset bench-public fetch-hotpot graphrag graphrag-live bench-filtered ablation recall-decay graphrag-h2h clean
+.PHONY: test lint graph-test smoke-test test-all baseline-up baseline-down seed bench bench-live sweep sm2 fetch-dataset bench-public fetch-hotpot graphrag graphrag-live bench-filtered ablation recall-decay tjs-open-ref graphrag-h2h clean
 
 PUBLIC_DATASET ?= gist-960-euclidean
 
@@ -165,6 +165,17 @@ recall-decay:
 	@test -f data/public/sift-128-euclidean.hdf5 || \
 	  { echo "dataset missing — run: make fetch-dataset PUBLIC_DATASET=sift-128-euclidean"; exit 1; }
 	$(PY) -m bench.recall_decay --limit $(DECAY_LIMIT)
+
+# tjs_open (B) host reference (Plan 007): bounded-push PPR ranking + NRA/FR-bound
+# termination + RRF fusion, the executable spec for the GX10/engine-gated realization (B).
+# Host-only (no engine, no LLM); recall@k vs gold_ids like v2a_open. The full HotpotQA run
+# is DATA-gated (needs data/hotpot/manifest.json from `make fetch-hotpot`); the unit tests
+# (tests/test_tjs_open_ref.py) run anywhere via `make test`.
+HOTPOT_MANIFEST ?= data/hotpot/manifest.json
+tjs-open-ref:
+	@test -f $(HOTPOT_MANIFEST) || \
+	  { echo "manifest $(HOTPOT_MANIFEST) missing — DATA-GATED; build it with: make fetch-hotpot"; exit 1; }
+	$(PY) -m bench.tjs_open_ref --manifest $(HOTPOT_MANIFEST)
 
 # Real-workload head-to-head (GTM #1): canonical tjs() on the live engine vs the
 # tuned multi-store baseline (Milvus+Neo4j+rerank), same HotpotQA corpus+queries+k,

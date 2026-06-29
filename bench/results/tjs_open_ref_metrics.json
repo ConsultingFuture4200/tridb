@@ -1,0 +1,117 @@
+{
+  "corpus": {
+    "n_paragraphs": 1490,
+    "n_edges": 745,
+    "n_questions_graded": 150
+  },
+  "params": {
+    "k": 10,
+    "k5": 5,
+    "m_seeds": 5,
+    "alpha": 0.15,
+    "vec_limit": 200
+  },
+  "rmax_curve": [
+    {
+      "r_max": 0.01,
+      "recall_at_k_vector": 0.9666666666666667,
+      "recall_at_k_ppr": 0.98,
+      "recall_at_k_fr": 0.9866666666666667,
+      "recall_at_k_rrf": 0.9833333333333333,
+      "nodes_examined_mean": 10.613333333333333,
+      "nodes_examined_pct_corpus": 0.712304250559284,
+      "candidates_examined_mean": 171.24666666666667,
+      "reach_mean": 9.82
+    },
+    {
+      "r_max": 0.005,
+      "recall_at_k_vector": 0.9666666666666667,
+      "recall_at_k_ppr": 0.98,
+      "recall_at_k_fr": 0.9866666666666667,
+      "recall_at_k_rrf": 0.9833333333333333,
+      "nodes_examined_mean": 10.713333333333333,
+      "nodes_examined_pct_corpus": 0.7190156599552572,
+      "candidates_examined_mean": 170.80666666666667,
+      "reach_mean": 10.273333333333333
+    },
+    {
+      "r_max": 0.001,
+      "recall_at_k_vector": 0.9666666666666667,
+      "recall_at_k_ppr": 0.98,
+      "recall_at_k_fr": 0.9866666666666667,
+      "recall_at_k_rrf": 0.9833333333333333,
+      "nodes_examined_mean": 11.153333333333334,
+      "nodes_examined_pct_corpus": 0.7485458612975393,
+      "candidates_examined_mean": 171.64666666666668,
+      "reach_mean": 10.813333333333333
+    },
+    {
+      "r_max": 0.0005,
+      "recall_at_k_vector": 0.9666666666666667,
+      "recall_at_k_ppr": 0.98,
+      "recall_at_k_fr": 0.9866666666666667,
+      "recall_at_k_rrf": 0.9833333333333333,
+      "nodes_examined_mean": 11.206666666666667,
+      "nodes_examined_pct_corpus": 0.7521252796420582,
+      "candidates_examined_mean": 171.57333333333332,
+      "reach_mean": 10.926666666666666
+    },
+    {
+      "r_max": 0.0001,
+      "recall_at_k_vector": 0.9666666666666667,
+      "recall_at_k_ppr": 0.98,
+      "recall_at_k_fr": 0.9866666666666667,
+      "recall_at_k_rrf": 0.9833333333333333,
+      "nodes_examined_mean": 11.393333333333333,
+      "nodes_examined_pct_corpus": 0.7646532438478747,
+      "candidates_examined_mean": 171.58,
+      "reach_mean": 11.306666666666667
+    },
+    {
+      "r_max": 5e-05,
+      "recall_at_k_vector": 0.9666666666666667,
+      "recall_at_k_ppr": 0.98,
+      "recall_at_k_fr": 0.9866666666666667,
+      "recall_at_k_rrf": 0.9833333333333333,
+      "nodes_examined_mean": 11.42,
+      "nodes_examined_pct_corpus": 0.7664429530201342,
+      "candidates_examined_mean": 171.58,
+      "reach_mean": 11.34
+    }
+  ],
+  "term_cond_curve": [
+    {
+      "term_cond": 10,
+      "recall_at_k": 0.98,
+      "candidates_examined_mean": 20.0
+    },
+    {
+      "term_cond": 50,
+      "recall_at_k": 0.98,
+      "candidates_examined_mean": 60.0
+    },
+    {
+      "term_cond": 200,
+      "recall_at_k": 0.98,
+      "candidates_examined_mean": 201.54666666666665
+    },
+    {
+      "term_cond": 1000,
+      "recall_at_k": 0.98,
+      "candidates_examined_mean": 201.77333333333334
+    },
+    {
+      "term_cond": 5000,
+      "recall_at_k": 0.98,
+      "candidates_examined_mean": 201.77333333333334
+    }
+  ],
+  "best_r_max": 0.01,
+  "recall_at_5": {
+    "vector_only": 0.8833333333333333,
+    "ppr_only": 0.8633333333333333,
+    "rrf_fused": 0.9066666666666666,
+    "fr_fused": 0.9366666666666666,
+    "A_oracle": 0.8833333333333333
+  }
+}
