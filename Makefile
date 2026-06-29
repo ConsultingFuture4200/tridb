@@ -1,4 +1,4 @@
-.PHONY: test lint graph-test smoke-test test-all baseline-up baseline-down seed bench bench-live sweep sm2 fetch-dataset bench-public fetch-hotpot graphrag graphrag-live bench-filtered ablation recall-decay tjs-open-ref graphrag-h2h clean
+.PHONY: test lint graph-test smoke-test test-all baseline-up baseline-down seed bench bench-live sweep sm2 fetch-dataset bench-public fetch-hotpot graphrag graphrag-live bench-filtered ablation recall-decay tjs-open-ref graphrag-h2h rabitq-sim gpu-build-index clean
 
 PUBLIC_DATASET ?= gist-960-euclidean
 
@@ -183,6 +183,32 @@ tjs-open-ref:
 graphrag-h2h:
 	@docker image inspect $(IMAGE) >/dev/null 2>&1 || { echo "image $(IMAGE) not built (ENGINE-GATED)"; exit 1; }
 	bash scripts/bench_graphrag_h2h.sh $(IMAGE)
+
+# RaBitQ quantization recall/footprint simulator (Plan 008, Step 1). PURE NUMPY,
+# runs HERE (no engine, no Docker, no GPU): quantizes a corpus to 1/2/4-bit RaBitQ
+# codes and reports recall@10 (raw + full-precision-rerank) vs footprint, plus the
+# empirical reconstruction error vs the theoretical grid bound. Without DATASET it
+# uses a SYNTHETIC clustered corpus and labels the numbers DATA-GATED; with a real
+# embedding file it measures real recall. The in-engine quantized storage + the GPU
+# CAGRA build are GX10-pending (see docs/gpu_index_build_v0.1.0.md).
+RABITQ_BITS ?= 1 2 4
+RABITQ_K ?= 10
+rabitq-sim:
+ifneq ($(DATASET),)
+	$(PY) -m bench.rabitq_sim --dataset $(DATASET) --k $(RABITQ_K) --bits $(RABITQ_BITS)
+else
+	$(PY) -m bench.rabitq_sim --k $(RABITQ_K) --bits $(RABITQ_BITS)
+endif
+
+# OFFLINE GPU index build (Plan 008, Step 3): cuVS builds a CAGRA graph on the GPU
+# and exports it to hnswlib HNSW format that the EXISTING CPU iterator loads
+# unchanged. GX10-ONLY (cuVS for ARM64 + sm_121). The build driver no-ops with a
+# clear message unless cuVS is importable, so this is safe to invoke anywhere — it
+# is UNBUILT-HERE off-target. DATASET + INDEX_OUT select the corpus / output file.
+INDEX_OUT ?= data/index/cagra_hnsw.bin
+gpu-build-index:
+	@test -n "$(DATASET)" || { echo "set DATASET=<.npy/.fvecs/.hdf5> (the corpus to index)"; exit 1; }
+	bash scripts/gpu_build_index.sh --vectors $(DATASET) --out $(INDEX_OUT)
 
 baseline-up:
 	docker compose -f baseline/docker-compose.yml up -d
