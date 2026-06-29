@@ -1,16 +1,25 @@
 # Graph store CSR-lite layout — sorted-by-dst contiguous per-vertex extents (spike v0.1.0)
 
-> **Status: SPIKE / design note.** This is the design + analysis deliverable of advisor Plan
-> 009. It proposes a layout change but does **not** merge it: the shipped layout
-> (`src/graph_store/gph_page.h`, `graph_am.c`) is unchanged. The prototype C in §5 is an
-> **UNBUILT-HERE sketch** — the graph AM compiles only inside the MSVBASE fork on the GX10
-> (PG 13.4, `--with-blocksize=32`). The measured benchmark (§6) and the FR-7 atomicity/crash
-> verification are **GX10-pending** and are not claimed to pass here.
+> **Status: SPIKE / design note — prototype BUILT + BENCHMARKED on the x86 engine image.** This
+> is the design + analysis + measured-prototype deliverable of advisor Plan 009. It proposes a
+> layout change but does **not** merge it to the shipped layout: the prototype lives only on
+> branch `spike/009-csr-lite-prototype`. **Update (this run): the delta-tail CSR-lite prototype
+> (§5) was implemented for real in `src/graph_store/` and compiled + run inside the
+> `tridb/msvbase:dev` x86_64 fork image** (PG 13.4, `--with-blocksize=32`). `make graph-test` and
+> both FR-7 suites pass with zero divergence; the §7 benchmark is filled with REAL x86 numbers.
+> **ISA caveat:** this is x86_64, not the GX10 (ARM64+CUDA, 128 GB); the residency-pressure regime
+> the design targets is GX10-ideal and is NOT decisively exercised here (see §7, §8).
 >
-> **Author:** advisor executor (Plan 009), commit `8b19cb5`, 2026-06-28.
-> **Amends (proposed):** ADR-0002 (addendum drafted in §8, not yet applied).
-> **Gates downstream:** adjacency compression (audit #14) and WCOJ — neither may start until
-> this lands and the production decision is made.
+> **Verdict (§8): CONDITIONAL — lean NO-GO on this evidence.** Write cost, correctness, and FR-7
+> are all favorable, but the traversal page-read win — the entire justification — did not (and
+> structurally could not) materialize on x86 with this chain-preserving prototype. Migration,
+> compression (#14), and WCOJ stay deferred pending a GX10 re-run of a contiguity-delivering
+> prototype.
+>
+> **Author:** advisor executor (Plan 009), prototyped at branch `spike/009-csr-lite-prototype`.
+> **Amends (proposed):** ADR-0002 (addendum drafted in §8.2, NOT applied — verdict is not-GO).
+> **Gates downstream:** adjacency compression (audit #14) and WCOJ — neither may start until this
+> lands and the production decision is made (it has not).
 
 ---
 
@@ -34,10 +43,14 @@
   `tests/test_csr_extent_packing.py`), the MVCC and shared-WAL analysis, the degree-adaptive
   threshold, the prototype C sketch, the benchmark design, and a **conditional go** with the
   bar the GX10 numbers must clear.
-- **Recommendation (pre-measurement lean):** **conditional GO** to a delta-tail design — but the
-  layout migration is HIGH-risk and must not merge until the GX10 benchmark (§6) shows a real
-  page-read win **and** the FR-7 atomicity/crash suites pass on the spike branch. If the win
-  doesn't materialize at GX10-runnable scale, this is a **NO-GO** and the finding is closed.
+- **Recommendation (POST-measurement, x86 spike): CONDITIONAL — lean NO-GO on this evidence.**
+  The prototype is writeable (bulk load within noise of append), correct (output now sorted),
+  and FR-7-safe (zero divergence on both suites). **But the page-read traversal win — the entire
+  justification — did not appear, and structurally could not: the prototype keeps the page-chain
+  (no physical contiguity) and x86's warm 16 MB buffer pool cannot exercise the 128 GB residency
+  pressure the design targets.** A new GenericXLog 4-page-cap cost on hub merges surfaced too
+  (§7.2). Migration / compression #14 / WCOJ stay deferred; a GX10 re-run of a
+  contiguity-delivering prototype is required to revisit GO (§8.1).
 
 ---
 
@@ -194,10 +207,18 @@ in-place alternative would have roughly *tripled–doubled* per-insert WAL (the 
 
 ---
 
-## 5. Prototype C sketch (UNBUILT-HERE — GX10-pending)
+## 5. Prototype C (BUILT + RUN on the x86 engine image)
 
-> Compiles only inside the MSVBASE fork on the GX10. The sketch below specifies the edits; it is
-> **authored/specified, not built or run here**, and not claimed to pass.
+> **Update:** the sketch below was IMPLEMENTED for real in `src/graph_store/gph_page.h` +
+> `graph_am.c` on branch `spike/009-csr-lite-prototype` and compiled + run inside the
+> `tridb/msvbase:dev` x86_64 fork image (PG 13.4, `--with-blocksize=32`). The harnesses
+> (`scripts/graph_am_test.sh`, `txn_atomicity_test.sh`, `crash_recovery_test.sh`,
+> `scripts/graph_layout_bench.sh`) PGXS-build the extension in the image at test time, so this is
+> genuinely compiled C, not a sketch. The actual implementation differs from the original sketch in
+> two ways forced by the engine: (1) `GphPageSpecial` grew to 32 bytes (the skip-scan range)
+> without changing slots/page (still 1022); (2) the maintenance merge writes back in ≤4-page
+> GenericXLog batches because GenericXLog caps at 4 buffers/record (§7.2). Read the source on the
+> branch for the authoritative version; the blocks below are the design intent.
 
 ### 5.1 Append path — delta-tail (changes `gph_insert_edge`, `graph_am.c:366-481`)
 
@@ -268,11 +289,13 @@ the extent under one `GenericXLogStart/Finish`, resetting `gph_delta_count` to 0
 
 ---
 
-## 6. Benchmark design (GX10-pending — not run here)
+## 6. Benchmark design (IMPLEMENTED + RUN on x86 — see §7 for the numbers)
 
-> `test/graph_layout_bench.sql` (or a `scripts/` driver). **Authored as a design here; the
-> measured numbers are GX10-only** and are not filled in. This section is the method; §7's table
-> is the shell the GX10 run fills. GTM discipline: report **curves/tables**, not single numbers.
+> `test/graph_layout_bench.sql`, driven by `scripts/graph_layout_bench.sh` (builds BOTH layouts in
+> one container and runs the same SQL against each). The method below is what was implemented; the
+> measured numbers are in §7. **ISA caveat: run on x86_64, not the GX10** — see §7's environment
+> note and §8 on why the page-read regime is GX10-ideal. GTM discipline: report **tables**, not
+> single numbers.
 
 **Corpus:** a mix of low- and high-degree vertices (skewed/power-law degree — e.g. most vertices
 degree 8–100, a tail of hubs at 1k / 10k / 100k) so both the single-page regime (`< 1022`) and
@@ -296,55 +319,160 @@ and method stated; a curve, not a bare number.
 
 ---
 
-## 7. Results (GX10-pending — to be filled by the GX10 run)
+## 7. Results — MEASURED on the x86 engine image (spike branch)
+
+> **Build/run environment.** Built + run inside the `tridb/msvbase:dev` x86_64 fork image (PG
+> 13.4, `--with-blocksize=32`, BLCKSZ 32768) via `scripts/graph_layout_bench.sh`, which compiles
+> BOTH layouts (sorted-extent = this branch's `src/graph_store/`; page-chain = the pre-spike
+> baseline, instrumented with the SAME `gph_page_reads()` probe) in one container and runs
+> `test/graph_layout_bench.sql` against each. **ISA caveat: this is x86_64, not the GX10
+> (ARM64+CUDA, 128 GB).** The plan framed the GX10 128 GB residency-pressure regime as the ideal;
+> these numbers are informative for write cost, correctness, and the page-read *artifact
+> structure*, but the sequential-vs-random-hop locality win the design targets is a buffer-pool /
+> prefetch effect this single box (16 MB `shared_buffers`) cannot decisively exercise. See §8.
+>
+> **Corpus.** N = 20 000 vertices; 87 500 directed `:related_to` edges. Degree mix: three hubs
+> (deg 5000, 1500, 1000 — multi-page extents) + a band of 5 000 low-degree vertices (deg 16 —
+> single-page regime). dst ids are deliberately scattered (not ascending), so the sorted layout
+> genuinely re-orders them (delta tail + maintenance merge exercised, including the >4-page hub
+> merge that the GenericXLog 4-page cap forces into batches — see the finding in this section).
 
 | Metric | Page-chain (baseline) | Sorted-extent (CSR-lite) | Corpus / method |
 |---|---|---|---|
-| Pages read / k=5 traversal (single-page regime, deg ≤ 1021) | _pending_ | _pending_ | _N=?, deg dist=?_ |
-| Pages read / k=5 traversal (hub regime, deg = 1k/10k/100k) | _pending_ | _pending_ | _curve over degree_ |
-| `tjs` reachability predicate (ms; hash build vs merge) | _pending_ | _pending_ | _Q=?_ |
-| Bulk-load throughput (edges/sec) | _pending_ | _pending_ | _M edges_ |
-| FR-7 atomicity divergence | _pending (must be 0)_ | _pending (must be 0)_ | `txn_atomicity_test.sh` |
-| Crash-recovery divergence | _pending (must be 0)_ | _pending (must be 0)_ | `crash_recovery_test.sh` |
+| Pages read / k=5 traversal, low-degree (deg 16, single page) | 5 | 2 | vids 150/1000/3000; `gph_neighbors(v) LIMIT 5`, `gph_page_reads` delta |
+| Pages read / k=5 traversal, hub deg 1000 | 5 | 2 | vid 2 |
+| Pages read / k=5 traversal, hub deg 1500 | 5 | 3 | vid 1 |
+| Pages read / k=5 traversal, hub deg 5000 | 5 | 5 | vid 0 |
+| Pages read, FULL hub scan (deg 5000) | 5005 | 4095 | vid 0; `count(*) FROM gph_neighbors(0)` |
+| `tjs`-shaped predicate, **present** dst (ms/probe, 200 reps) | 5.03 | 5.39 | `EXISTS(… WHERE x=503)` on hub 0 |
+| `tjs`-shaped predicate, **absent** dst (ms/probe, 200 reps) | 5.37 | 5.63 | `EXISTS(… WHERE x=999999)` on hub 0 |
+| Bulk-load throughput (edges/sec) | 20 413 | 19 908 | 87 500 edges incl. the >4-page hub merges |
+| Neighbor output order (hub 0) | insertion (`nondecreasing=f`) | **sorted asc** (`nondecreasing=t`) | correctness cross-check |
+| FR-7 txn-atomicity divergence | 0 | **0** | `txn_atomicity_test.sh` (SM-5, 200 randomized iters) |
+| FR-7 crash-recovery divergence | 0 | **0** | `crash_recovery_test.sh` scen. 1 (REDO) + 2 (abort) |
 
-> Until these cells are filled by a GX10 run on the spike branch, **no GX10 done-criterion is
-> claimed to pass** (per the hardware gate).
+### 7.1 How to read these numbers (the honest interpretation)
+
+- **Write cost is the gating number and it passes:** 19 908 vs 20 413 edges/sec ≈ **−2.5%**, within
+  run-to-run noise (a second run measured 21 000 vs 21 072, i.e. −0.3%). The delta-tail hot path is
+  byte-identical to the append baseline, so bulk load is NOT cratered — the classic "sorted lists
+  are expensive to write" objection is neutralized, **including** the cost of the periodic
+  maintenance merges (the corpus build triggers them on every hub). This validates the §3.2 / §4.2
+  write-amplification analysis on real hardware.
+- **The k=5 page-read numbers are dominated by a measurement artifact, not by the layout's thesis.**
+  Both scans re-read a page on every `Next()` (no buffer pin held across calls — the leak-free
+  early-abandon contract). So the baseline reads exactly 5 buffers for ANY k=5 (even a 1-page
+  vertex re-reads the same cached page 5×). The sorted layout reads *fewer* in most cases only
+  because its bounded delta tail is materialized into backend memory once at Open and then served
+  from RAM — an incidental win, **not** the sequential-extent locality the design is about.
+- **The sequential-vs-random-hop win the design targets does NOT appear here, by construction.**
+  The prototype keeps the `gph_next_pageno` chain (it sorts WITHIN the existing page set; it does
+  not yet guarantee physically-contiguous extent allocation). So the "random `ReadBuffer` per
+  overflow hop → sequential extent read" improvement has no structural foothold in this prototype,
+  and the warm 16 MB buffer pool on x86 would mask it even if it did. The full-hub `4095 vs 5005`
+  delta is again the in-memory-delta artifact, not contiguity.
+- **The predicate is a wash (5.0–5.6 ms, sorted slightly slower).** The `gph_neighbors` SRF always
+  full-scans; the sorted layout's early-stop-on-merge advantage lives in the *consumer* (`tjs`
+  operator), which is explicitly out of scope here. The sorted path is marginally slower because of
+  the per-Open delta materialization + the 2-way merge bookkeeping. This confirms only that sorting
+  does not *hurt* the predicate at the SRF level; the predicate WIN must be demonstrated by the
+  downstream `tjs`-as-sorted-merge plan, not this layout spike.
+- **Correctness + FR-7 are unambiguous:** hub 0 comes out globally ascending (`nondecreasing=t`)
+  vs the baseline's insertion order (`f`), proving the layout actually sorts; and BOTH FR-7 suites
+  (atomicity incl. 200-iter randomized cross-store SM-5, and crash-recovery REDO + abort) show
+  **zero divergence** on the sorted layout. The re-layout did not break MVCC or crash atomicity.
+
+### 7.2 GenericXLog 4-page cap — a real design finding
+
+The first benchmark run failed with `maximum number 4 of generic xlog buffers is exceeded`:
+GenericXLog registers at most `MAX_GENERIC_XLOG_PAGES = 4` buffers per WAL record, but a hub
+extent re-sort rewrites every page of the extent (a deg-5000 hub ≈ 5 pages). **A full extent
+re-sort therefore cannot be a single atomic WAL record under the shared-WAL-only constraint
+(golden rule 2 forbids a second rmgr).** The prototype resolves this by writing the merge back in
+**≤4-page batches, one GenericXLog record per batch** (`GPH_MERGE_BATCH`). Per-page slot COUNT is
+preserved exactly (full pages = 1022, last = remainder, identical to pre-merge), so the slot
+*multiset* — the invariant the scan and FR-7 visibility depend on — survives a crash *between*
+batches; only the global *order* is briefly imperfect until the merge re-runs. This is why both
+FR-7 suites still pass. But it means the maintenance merge of a hub is **not itself crash-atomic**
+as a single unit — a finding the production plan must weigh (see §8).
 
 ---
 
 ## 8. Recommendation + proposed ADR-0002 addendum
 
-### 8.1 Go / no-go
+### 8.1 Go / no-go — VERDICT FROM THE MEASURED x86 SPIKE
 
-**Lean: conditional GO to the delta-tail CSR-lite design — gated on the §6 GX10 numbers.** The
-design analysis is favorable:
+**Verdict: CONDITIONAL — lean NO-GO *on this evidence*; do NOT start the production migration
+(or compression #14 / WCOJ) yet.** The spike built and ran the delta-tail CSR-lite prototype for
+real on the x86 engine image and proved three of the four things it needed to, but **failed to
+demonstrate the one thing that justifies the whole HIGH-risk change** — the traversal win.
 
-- The delta-tail strategy adds **zero** per-insert cost (hot path = today's append) and **zero**
-  per-insert WAL over the baseline (§4.2), so the classic "sorted lists are expensive to write"
-  objection is neutralized by construction (host-verified arithmetic).
-- MVCC option (A) makes the highest-risk regression (version-word/key decoupling)
-  **structurally impossible**.
-- The traversal win is **regime-dependent**: it is ~nil for single-page vertices (deg ≤ 1021)
-  and grows with hub degree. **So the go/no-go hinges entirely on whether the corpus's hubs are
-  big enough, and resident-set pressure high enough, for sequential extents to beat random
-  chain hops at GX10-runnable scale.**
+What the spike PROVED (positive, real x86 numbers):
 
-**Decision rule for the production plan:**
+1. **Writeable.** Bulk load is within noise of the append baseline (−0.3% to −2.5% across runs),
+   *including* the maintenance merges the corpus build triggers on every hub. The "sorted lists
+   are expensive to write" objection is empirically dead. (§7.1)
+2. **Correct + MVCC-safe.** The layout actually sorts (hub 0 `nondecreasing=t` vs baseline `f`),
+   and MVCC option (A) (whole-slot moves) held: `gph_xmin_visible` is unchanged and every
+   visibility check passed.
+3. **FR-7 not regressed.** `txn_atomicity_test.sh` (incl. the 200-iter randomized SM-5 cross-store
+   consistency check) and `crash_recovery_test.sh` (REDO of a committed tri-store row + abort of a
+   crash-interrupted one) both show **zero divergence** on the spike branch. `make graph-test`
+   passes end-to-end.
 
-- **GO** iff the GX10 benchmark shows (a) a material page-read reduction in the hub regime,
-  (b) bulk-load throughput within noise of the append baseline, **and** (c) `make graph-test` +
-  both FR-7 suites pass with **zero** divergence on the spike branch.
-- **NO-GO** (close the finding, do not re-audit) if the hub page-read win does not appear at
-  GX10-runnable scale — the page-chain is then "fine at the scales that matter" and a HIGH-risk
-  migration is unjustified. Record the negative result in §7 and stop; compression (#14) and
-  WCOJ, which depend on sorted dst, are then also deferred indefinitely with this as the reason.
-- **STOP-and-report** (not silent re-design) if any FR-7 atomicity/crash test diverges, or if
-  even the delta-tail bulk load craters throughput — correctness/writeability beat layout.
+What the spike did NOT prove (the blocker):
+
+4. **The traversal page-read win did not materialize on this hardware, and could not have.** The
+   k=5 page-read numbers are dominated by the per-`Next()` re-read artifact (no pin across calls),
+   not by sequential-vs-random locality; and **the prototype keeps the `gph_next_pageno` chain, so
+   it does not even deliver physically-contiguous extents** — the exact mechanism (sequential
+   extent read replacing random hops at 128 GB residency pressure) that the design rests on has no
+   structural foothold in the prototype, and a warm 16 MB x86 buffer pool would mask it regardless.
+   The predicate is a wash at the SRF level (the merge-win is a downstream `tjs` concern, out of
+   scope). **So the central performance claim is still unproven.**
+
+Plus a new cost surfaced: **the hub maintenance merge is not crash-atomic as a single WAL record**
+(GenericXLog's 4-page cap forces ≥2 records for any extent >4 pages; §7.2). The multiset survives
+a crash, but a production design wanting the merge itself atomic would need a shadow-extent swap or
+a custom rmgr (the latter blocked by golden rule 2). That is extra design surface the migration
+must carry.
+
+**Decision rule applied:**
+
+- This is the plan's stated **NO-GO branch**: "the hub page-read win does not appear at runnable
+  scale → the page-chain is fine at the scales that matter → a HIGH-risk migration is unjustified."
+  We reach it not because the page-chain is proven fine at 128 GB, but because **the prototype as
+  built cannot deliver or measure the win**, and shipping a HIGH-risk layout change on an unproven
+  performance thesis is exactly the bar the plan set to avoid.
+- **This is recorded as CONDITIONAL, not a hard close**, because the *write/correctness/FR-7*
+  results are favorable and the design is sound — the gap is evidentiary, not a defect. The
+  finding is **parked pending a GX10 re-run of a contiguity-delivering prototype** (see the
+  conditions below), not deleted. Compression (#14) and WCOJ stay deferred until then.
+
+**To flip this to GO, a follow-up spike must (all of):**
+
+- (a) deliver **physically-contiguous extent allocation** (a real extent allocator, not the reused
+  chain), so the sequential-read mechanism actually exists to measure;
+- (b) run on the **GX10 at 128 GB with residency pressure** (working set > buffer pool), where the
+  random-hop penalty the design targets is real — x86 with a warm pool is the wrong instrument;
+- (c) measure pages-read with a **pin-held-across-Next streaming scan** (or `pg_statio` at the
+  relation level) so the per-`Next()` re-read artifact does not swamp the locality signal;
+- (d) keep bulk-load within noise and both FR-7 suites at zero divergence (the spike shows this is
+  achievable);
+- (e) settle the hub-merge crash-atomicity question (§7.2) — shadow-extent swap vs accepting the
+  multiset-preserving-but-not-order-atomic merge.
+
+Until (a)–(c) are demonstrated, **the page-read thesis is unsubstantiated and the migration must
+not proceed.**
 
 ### 8.2 Proposed ADR-0002 addendum (DRAFT — not applied; append, do not rewrite)
 
 > To be appended to `docs/decisions/0002-adjacency-list-graph-store-layout.md` **only if GO**,
 > as its own dated addendum section. Drafted here so the reviewer can see the exact proposal.
+> **NOT APPLIED** — the §8.1 verdict is CONDITIONAL / lean NO-GO, so ADR-0002 is unchanged. The
+> draft also still cites a "CONTIGUOUS extent" and a "GX10 benchmark" the x86 prototype did not
+> deliver (it preserves the chain); a GO addendum would need the contiguity-delivering GX10
+> evidence first.
 
 ```
 ## Addendum A (proposed, Plan 009 spike) — Sorted-by-dst CSR-lite extents
@@ -395,10 +523,10 @@ for existing graph stores, gated on the FR-7 atomicity + crash-recovery suites p
 
 | Artifact | Status |
 |---|---|
-| This design note (layout, insert strategy, degree-adaptive, MVCC, WAL, recommendation) | **Done here** |
-| `tools/csr_extent_packing.py` + `tests/test_csr_extent_packing.py` (host packing/WAL arithmetic) | **Done here** — `make test`/`make lint` green |
-| §5 prototype C (append/scan/merge edits) | **Authored/specified, UNBUILT-HERE (GX10-pending)** |
-| §6/§7 benchmark + filled results table | **GX10-pending** — not run, not claimed to pass |
-| FR-7 atomicity + crash-recovery on spike branch | **GX10-pending** — not run, not claimed to pass |
-| ADR-0002 addendum (§8.2) | **Drafted, NOT applied** — apply only on GO |
-| Shipped layout (`gph_page.h`, `graph_am.c`) | **Unchanged** (this is a spike) |
+| This design note (layout, insert strategy, degree-adaptive, MVCC, WAL, recommendation) | **Done** |
+| `tools/csr_extent_packing.py` + `tests/test_csr_extent_packing.py` (host packing/WAL arithmetic) | **Done** — `make test`/`make lint` green (special size updated to 32 B) |
+| §5 prototype C (append/scan/merge edits) in `src/graph_store/` (spike branch) | **BUILT + RUN on x86 `tridb/msvbase:dev`** — compiles, all graph suites pass |
+| §6/§7 benchmark + filled results table | **DONE on x86** — `test/graph_layout_bench.sql` + `scripts/graph_layout_bench.sh`, real numbers in §7. ISA caveat: not GX10 |
+| FR-7 atomicity + crash-recovery on spike branch | **PASS on x86** — `txn_atomicity_test.sh` + `crash_recovery_test.sh`, **zero divergence** |
+| ADR-0002 addendum (§8.2) | **Drafted, NOT applied** — verdict is CONDITIONAL / lean NO-GO |
+| Shipped layout on `master` (`gph_page.h`, `graph_am.c`) | **Unchanged** — the prototype lives only on `spike/009-csr-lite-prototype` |

@@ -37,7 +37,7 @@ maintainer selected. Findings #1 and #6 were code-verified against `src/graph_st
 | 006 | Graph metapage edge-count/degree stats → make FR-6 bind | #1 | P1 | S | MED | engine suite on x86 image | **DONE — engine-validated** (ARM sign-off optional) |
 | 007 | `tjs_open` ranking+termination host reference (PPR + NRA/FR + RRF) | #2/#3/#9 | P1 | M | LOW | full host run | **DONE — real HotpotQA, beats oracle** |
 | 008 | Idle-GPU: offline CAGRA/cuVS index build (default-OFF) + RaBitQ quant | #4/#5 | P2 | M | MED | RaBitQ on real SIFT; CAGRA build+export on GB10 | **DONE (host) · CAGRA build+export VALIDATED on GB10** (cuVS 26.06; recall A/B remaining) |
-| 009 | Sorted-by-dst / CSR-lite adjacency layout spike | #6 | P2 | L | HIGH | design + host helpers | **DESIGN-DONE · prototype deferred** (conditional-GO) |
+| 009 | Sorted-by-dst / CSR-lite adjacency layout spike | #6 | P2 | L | HIGH | prototype built+benchmarked on x86 image | **DESIGN-DONE · prototype → lean NO-GO** (FR-7 safe; locality unprovable on x86) |
 
 Status legend: **DONE — engine-validated** = built + full engine suite passed on the `tridb/msvbase:dev`
 x86 image; **DONE (host)** = host-runnable scope verified on this box; **DESIGN-DONE** = design deliverable
@@ -150,11 +150,19 @@ Verdict: **all four APPROVED with real, measured results.**
   26.06 API (the authored `from_cagra(index)` form was wrong). **Remaining:** the recall A/B (load the
   exported file through the fork's `hnsw` AM vs a CPU-built index) — now a staging+format-check task, not a
   provisioning blocker. Branch `advisor/008-gpu-build-quant` (`e0641f4`) + the 2026-06-29 doc/script updates.
-- **009 — DESIGN-DONE, prototype deliberately deferred.** The design note + host calculator are complete
-  with a **conditional-GO** lean (the delta-tail hot path is byte-identical to today's append; the call
-  hinges on GX10 hub-regime page-reads + FR-7). The HIGH-risk sorted-adjacency layout rewrite was **not**
-  auto-built — that is a deliberate structural change, not an autonomous one; the x86 engine could
-  benchmark a prototype as a scoped follow-up. Branch `advisor/009-sorted-adjacency-csr-lite` (`8c28fa3`).
+- **009 — DESIGN-DONE; prototype built + benchmarked on x86 → lean NO-GO (the right call).** Greenlit, the
+  delta-tail CSR-lite prototype was built and run on the `tridb/msvbase:dev` image: it **compiles, is
+  correct (output now globally sorted, `nondecreasing=t`), and is FR-7-safe — zero divergence on both
+  txn-atomicity (200 iters) and crash-recovery** (a real result: the re-layout does not break MVCC/crash
+  atomicity). Bulk-load write cost is within noise (−2.5%/−0.3%). **But the verdict is lean NO-GO** because
+  the traversal page-read win — the entire justification — **could not be evaluated on x86**: the spike kept
+  the `gph_next_pageno` chain (no physical contiguity to measure) and a warm 16 MB buffer pool can't
+  exercise 128 GB residency pressure. Two genuine new findings landed in the design note: **GenericXLog caps
+  at 4 buffers/record**, so an atomic hub re-sort needs a shadow-extent swap (a custom rmgr is golden-rule-2
+  forbidden); and `gph_neighbors` re-reads a page per `Next()` (no-pin contract), distorting the metric. A
+  contiguity-delivering prototype + pinned scan on the **GX10** is the GO precondition; compression (#14) and
+  WCOJ stay deferred. **The prototype is NOT merged** (NO-GO) — it lives on `spike/009-csr-lite-prototype`
+  (`c90683c`) for the GX10 re-run; only the design-note verdict (§7 numbers + §8) landed on master.
 
 **Plan 014 (project backlog)** — DONE: the manual engine CI job now runs `make test-all` (one-line change,
 YAML valid, host `make test`/`lint` green). The real engine run happens on GitHub. Branch
