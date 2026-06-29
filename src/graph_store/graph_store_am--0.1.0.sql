@@ -33,3 +33,10 @@ CREATE FUNCTION gph_visits() RETURNS bigint
 
 CREATE FUNCTION gph_vertex_count() RETURNS bigint
   AS 'MODULE_PATHNAME' LANGUAGE C VOLATILE;
+
+-- Store-wide directed-edge count (plan 006): the metapage gm_edge_count counter, the
+-- avg_out_degree source for the FR-6 join-order heuristic. Raw (non-MVCC) counter — v1 has no
+-- edge-delete path so it only grows; maintained under GenericXLog so aborts/crashes roll it back
+-- with the page image. Used by the crash-recovery edge-count assertion.
+CREATE FUNCTION gph_edge_count() RETURNS bigint
+  AS 'MODULE_PATHNAME' LANGUAGE C VOLATILE;

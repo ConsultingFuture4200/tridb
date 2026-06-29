@@ -155,6 +155,7 @@ gph_ensure_meta(Relation rel)
 	meta->gm_next_vid = 0;
 	meta->gm_vertex_count = 0;
 	meta->gm_reserved = 0;
+	meta->gm_edge_count = 0;
 	meta->gm_first_vertex_blk = InvalidBlockNumber;
 	meta->gm_last_vertex_blk = InvalidBlockNumber;
 	((PageHeader) page)->pd_lower += MAXALIGN(sizeof(GphMeta));
@@ -369,10 +370,13 @@ gph_insert_edge(PG_FUNCTION_ARGS)
 	uint64		dst = (uint64) PG_GETARG_INT64(1);
 	Relation	rel = gph_open_store(RowExclusiveLock);
 	GenericXLogState *state;
-	Buffer		vbuf,
+	Buffer		metabuf,
+				vbuf,
 				abuf;
-	Page		vpage,
+	Page		metapage,
+				vpage,
 				apage;
+	GphMeta    *meta;
 	BlockNumber	vblk,
 				ablk,
 				dst_blk;
@@ -384,7 +388,9 @@ gph_insert_edge(PG_FUNCTION_ARGS)
 	GphEdgeSlot	es;
 
 	/* Both endpoints must exist. Locate dst first (validate only), src last so
-	 * vblk/vslot/src_rec describe the source vertex we are about to update. */
+	 * vblk/vslot/src_rec describe the source vertex we are about to update. The
+	 * ereport(ERROR) aborts the txn before any page is locked or mutated, so a
+	 * rejected edge never bumps gm_edge_count (correct by construction). */
 	if (!gph_locate_vertex(rel, dst, &dst_blk, &dst_slot, &dst_rec))
 		ereport(ERROR,
 				(errmsg("graph_store: destination vertex " UINT64_FORMAT " does not exist", dst)));
@@ -398,6 +404,17 @@ gph_insert_edge(PG_FUNCTION_ARGS)
 	es.es_edge_type_id = GPH_EDGE_TYPE_RELATED_TO;
 	es.es_flags = 0;
 	es.es_xmin = GetCurrentTransactionId();
+
+	/*
+	 * Lock the metapage FIRST (block GPH_META_BLKNO), then the src vertex page. This matches the
+	 * metapage -> vertex page -> adjacency page lock order of gph_insert_vertex (graph_am.c) and
+	 * avoids a buffer-lock deadlock between the two writers. The store-wide gm_edge_count counter
+	 * lives on the metapage, so every edge insert serializes on this single buffer — acceptable
+	 * for the v1 bulk-load-then-query workload (ADR-0007); see the per-vertex vr_out_degree escape
+	 * hatch noted in plan 006 if concurrent ingest ever makes this a hot spot.
+	 */
+	metabuf = ReadBufferExtended(rel, MAIN_FORKNUM, GPH_META_BLKNO, RBM_NORMAL, NULL);
+	LockBuffer(metabuf, BUFFER_LOCK_EXCLUSIVE);
 
 	/* Lock the src vertex page (we will update vr_adj_head/tail) and RE-READ the record under
 	 * the lock: gph_locate_vertex released its share lock, so the cached src_rec.vr_adj_tail can
@@ -414,6 +431,8 @@ gph_insert_edge(PG_FUNCTION_ARGS)
 		ablk = BufferGetBlockNumber(abuf);
 
 		state = GenericXLogStart(rel);
+		metapage = GenericXLogRegisterBuffer(state, metabuf, 0);
+		meta = (GphMeta *) GphPageRecordBase(metapage);
 		vpage = GenericXLogRegisterBuffer(state, vbuf, 0);
 		apage = GenericXLogRegisterBuffer(state, abuf, GENERIC_XLOG_FULL_IMAGE);
 
@@ -427,6 +446,8 @@ gph_insert_edge(PG_FUNCTION_ARGS)
 		vr = GphPageGetRecord(vpage, vslot, sizeof(GphVertexRecord));
 		vr->vr_adj_head = ablk;
 		vr->vr_adj_tail = ablk;
+
+		meta->gm_edge_count += 1;
 	}
 	else
 	{
@@ -436,9 +457,13 @@ gph_insert_edge(PG_FUNCTION_ARGS)
 		if (GphPageHasRoom(BufferGetPage(abuf), sizeof(GphEdgeSlot)))
 		{
 			state = GenericXLogStart(rel);
+			metapage = GenericXLogRegisterBuffer(state, metabuf, 0);
+			meta = (GphMeta *) GphPageRecordBase(metapage);
 			apage = GenericXLogRegisterBuffer(state, abuf, 0);
 			GphPageAppendRecord(apage, &es, sizeof(GphEdgeSlot));
-			/* vertex record unchanged; do not register vbuf */
+			/* vertex record unchanged; do not register vbuf. metabuf IS registered so the
+			 * gm_edge_count increment is WAL-logged atomically with the edge slot. */
+			meta->gm_edge_count += 1;
 		}
 		else
 		{
@@ -449,6 +474,8 @@ gph_insert_edge(PG_FUNCTION_ARGS)
 						tailpage;
 
 			state = GenericXLogStart(rel);
+			metapage = GenericXLogRegisterBuffer(state, metabuf, 0);
+			meta = (GphMeta *) GphPageRecordBase(metapage);
 			vpage = GenericXLogRegisterBuffer(state, vbuf, 0);
 			tailpage = GenericXLogRegisterBuffer(state, abuf, 0);
 			newpage = GenericXLogRegisterBuffer(state, newbuf, GENERIC_XLOG_FULL_IMAGE);
@@ -464,10 +491,13 @@ gph_insert_edge(PG_FUNCTION_ARGS)
 			vr = GphPageGetRecord(vpage, vslot, sizeof(GphVertexRecord));
 			vr->vr_adj_tail = newblk;
 
+			meta->gm_edge_count += 1;
+
 			GenericXLogFinish(state);
 			UnlockReleaseBuffer(newbuf);
 			UnlockReleaseBuffer(abuf);
 			UnlockReleaseBuffer(vbuf);
+			UnlockReleaseBuffer(metabuf);
 			relation_close(rel, RowExclusiveLock);
 			PG_RETURN_VOID();
 		}
@@ -476,6 +506,7 @@ gph_insert_edge(PG_FUNCTION_ARGS)
 	GenericXLogFinish(state);
 	UnlockReleaseBuffer(abuf);
 	UnlockReleaseBuffer(vbuf);
+	UnlockReleaseBuffer(metabuf);
 	relation_close(rel, RowExclusiveLock);
 	PG_RETURN_VOID();
 }
@@ -777,4 +808,33 @@ gph_vertex_count(PG_FUNCTION_ARGS)
 
 	relation_close(rel, AccessShareLock);
 	PG_RETURN_INT64(n);
+}
+
+PG_FUNCTION_INFO_V1(gph_edge_count);
+
+/*
+ * gph_edge_count() RETURNS bigint — the store-wide directed-edge count carried on the metapage
+ * (gm_edge_count), read under a share lock. This is the raw counter, not an MVCC-visible count:
+ * v1 has no edge-delete path so the counter only grows, and it is maintained under GenericXLog so
+ * a crashed/aborted txn's increments roll back with the page image (full-image WAL). Like
+ * gph_vertex_count's metapage counter it is NOT abort-aware for the in-process-abort case — but
+ * there is no edge analogue of gph_vertex_count's per-record visibility scan because edge slots are
+ * not enumerated here; this exposes gm_edge_count directly for the avg_out_degree derivation and the
+ * crash-recovery assertion. (See plan 006 "Abort accounting caveat".)
+ */
+Datum
+gph_edge_count(PG_FUNCTION_ARGS)
+{
+	Relation	rel = gph_open_store(AccessShareLock);
+	GphMeta		meta;
+
+	if (RelationGetNumberOfBlocks(rel) == 0)
+	{
+		relation_close(rel, AccessShareLock);
+		PG_RETURN_INT64(0);
+	}
+
+	gph_read_meta(rel, &meta);
+	relation_close(rel, AccessShareLock);
+	PG_RETURN_INT64((int64) meta.gm_edge_count);
 }
