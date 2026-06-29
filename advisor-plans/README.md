@@ -36,7 +36,7 @@ maintainer selected. Findings #1 and #6 were code-verified against `src/graph_st
 |------|-------|-------------------|----------|--------|------|--------------|--------|
 | 006 | Graph metapage edge-count/degree stats → make FR-6 bind | #1 | P1 | S | MED | engine suite on x86 image | **DONE — engine-validated** (ARM sign-off optional) |
 | 007 | `tjs_open` ranking+termination host reference (PPR + NRA/FR + RRF) | #2/#3/#9 | P1 | M | LOW | full host run | **DONE — real HotpotQA, beats oracle** |
-| 008 | Idle-GPU: offline CAGRA/cuVS index build (default-OFF) + RaBitQ quant | #4/#5 | P2 | M | MED | RaBitQ on real SIFT | **DONE (host) · CAGRA build BLOCKED** (no cuVS on GX10) |
+| 008 | Idle-GPU: offline CAGRA/cuVS index build (default-OFF) + RaBitQ quant | #4/#5 | P2 | M | MED | RaBitQ on real SIFT; CAGRA build+export on GB10 | **DONE (host) · CAGRA build+export VALIDATED on GB10** (cuVS 26.06; recall A/B remaining) |
 | 009 | Sorted-by-dst / CSR-lite adjacency layout spike | #6 | P2 | L | HIGH | design + host helpers | **DESIGN-DONE · prototype deferred** (conditional-GO) |
 
 Status legend: **DONE — engine-validated** = built + full engine suite passed on the `tridb/msvbase:dev`
@@ -138,14 +138,18 @@ Verdict: **all four APPROVED with real, measured results.**
   standalone retriever on this sparse graph; and `r_max` is inert here (flat curve, mean reach ≈ 10 nodes),
   so its recall/examined tradeoff only bites on a denser/at-scale graph (GX10 follow-up). This de-risks the
   committed `tjs_open` (B) build with real evidence. Branch `advisor/007-tjs-open-ranking` (`b8bf340`).
-- **008 — DONE (host), real SIFT; CAGRA build BLOCKED on the GX10.** RaBitQ on real `sift-128` (two
-  agreeing runs): **4-bit + in-scan rerank → recall@10 = 1.0 at 7.5×** compression; 8-bit raw 0.99. This
-  *corrected* the synthetic finding — **1-bit is dead on real data** (rerank doesn't rescue it: 0.07@R=100;
-  the synthetic 1-bit viability was an easy-clustering artifact), so the honest recall-preserving lever is
-  ~7.5× (4-bit), not 8-32×. The design note's footprint/toggle analysis stands (zero serving-path GPU
-  footprint, default-OFF `WITH_CUVS`). **CAGRA build is genuinely BLOCKED:** the GX10 host has no cuVS and
-  no CUDA toolkit (`import cuvs` fails, no `nvcc`); the build script stays authored + verified-no-op.
-  Provisioning cuVS on the GX10 is a separate decision. Branch `advisor/008-gpu-build-quant` (`e0641f4`).
+- **008 — DONE (host), real SIFT; CAGRA build+export now VALIDATED on the GB10.** RaBitQ on real
+  `sift-128` (two agreeing runs): **4-bit + in-scan rerank → recall@10 = 1.0 at 7.5×** compression; 8-bit
+  raw 0.99. This *corrected* the synthetic finding — **1-bit is dead on real data** (rerank doesn't rescue
+  it: 0.07@R=100; the synthetic 1-bit viability was an easy-clustering artifact), so the honest
+  recall-preserving lever is ~7.5× (4-bit), not 8-32×. The design note's footprint/toggle analysis stands
+  (zero serving-path GPU footprint, default-OFF `WITH_CUVS`). **CAGRA UNBLOCKED (2026-06-29):** cuVS
+  **26.06** was provisioned on the GB10 (aarch64 + CUDA 13 + sm_121, isolated `~/cuvs-env`), and the build
+  path is **verified live** — `cagra.build` (20k×128 in ~1.96 s) + `hnsw.from_cagra(IndexParams(), idx)` →
+  `hnsw.save` produces a 13.2 MB HNSW file. `scripts/gpu_build_index.py` was reconciled to the real cuVS
+  26.06 API (the authored `from_cagra(index)` form was wrong). **Remaining:** the recall A/B (load the
+  exported file through the fork's `hnsw` AM vs a CPU-built index) — now a staging+format-check task, not a
+  provisioning blocker. Branch `advisor/008-gpu-build-quant` (`e0641f4`) + the 2026-06-29 doc/script updates.
 - **009 — DESIGN-DONE, prototype deliberately deferred.** The design note + host calculator are complete
   with a **conditional-GO** lean (the delta-tail hot path is byte-identical to today's append; the call
   hinges on GX10 hub-regime page-reads + FR-7). The HIGH-risk sorted-adjacency layout rewrite was **not**

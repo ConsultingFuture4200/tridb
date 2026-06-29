@@ -1,9 +1,10 @@
 # GPU offline index build (CAGRA/cuVS → HNSW) + RaBitQ quantization — design note v0.1.0
 
 > **Plan**: advisor-plans/008. **Status of measurements**: the RaBitQ recall/footprint
-> simulator (Step 1) runs **here** on this x86 standin (pure numpy); the CAGRA GPU build A/B
-> (Step 3) is **GX10-pending** (cuVS needs ARM64 + sm_121 — UNBUILT-HERE). This note is the
-> contract any later production wiring must satisfy.
+> simulator (Step 1) runs **here** on this x86 standin (pure numpy); the CAGRA GPU build + HNSW
+> export (Step 3) are **VALIDATED on the GB10** (cuVS 26.06, sm_121, CUDA 13 — see §5); the
+> recall A/B vs a CPU-built index is the one remaining Step-3 piece. This note is the contract any
+> later production wiring must satisfy.
 
 ## TL;DR
 
@@ -96,9 +97,10 @@ The export is only safe if the file cuVS writes is one the fork's `hnsw` AM can 
   host-side bench mirror pins **`hnswlib>=0.8`** (`requirements.txt`). The builder records the
   pin string `hnswlib>=0.8 (PG13.4 fork hnsw AM; ADR-0004)` in its output and in
   `scripts/gpu_build_index.py` (`HNSWLIB_FORMAT_PIN`).
-- **Export path.** cuVS provides `cuvs.neighbors.hnsw.from_cagra(index)` + `hnsw.save(...)`,
-  which serialize a CAGRA graph into the hnswlib on-disk layout. The builder uses exactly this
-  path (the CAGRA graph degree maps to HNSW `M`; `ef_construction` is passed through).
+- **Export path.** cuVS provides `cuvs.neighbors.hnsw.from_cagra(IndexParams(), index)` +
+  `hnsw.save(path, index)`, which serialize a CAGRA graph into the hnswlib on-disk layout (verified
+  on cuVS 26.06 / the GB10, §5). The builder uses exactly this path (the CAGRA graph degree maps to
+  HNSW `M`; `ef_construction` is a CPU search-time param applied via the `hnsw` AM reloptions).
 - **Validation (Step 3, GX10).** On the GX10: build CAGRA → export → **load the file through the
   unchanged `hnsw` AM** and run the engine's normal ANN scan. If the AM loads it and returns
   results, the format is compatible. If the AM **cannot** load it (a format/version mismatch),
@@ -198,7 +200,7 @@ data/public/sift-128-euclidean.hdf5 --limit 50000 --queries 200 --k 10 --bits 1 
 
 ## 5. Step 3 (GX10-pending) and the deferred RaBitQ-in-engine follow-on
 
-### Step 3 — CAGRA build → HNSW export → recall/build-time A/B (GX10 only, UNBUILT-HERE)
+### Step 3 — CAGRA build → HNSW export → recall/build-time A/B (build+export VALIDATED on GB10; recall A/B remaining)
 
 On the GX10 (cuVS for ARM64 + sm_121): build a CAGRA graph over the 768-dim corpus, export to
 HNSW, load through the **unchanged** CPU iterator, and compare against a CPU-built hnswlib index
@@ -209,22 +211,30 @@ on the same corpus:
 - **build wall-clock** should drop materially vs the documented CPU baselines (**137 s / 489 s**
   at 100k×768, `docs/benchmark_neon_sweep_v0.1.0.md`); the literature reports ~10×.
 
-**These numbers are GX10-MEASURED. They are NOT claimed here** — `scripts/gpu_build_index.{sh,py}`
-is authored and the off-cuVS guard is verified on this box, but the build itself is UNBUILT-HERE.
-Record the measured recall delta + build-time delta in this section when the GX10 run lands.
-
-> **CAGRA build stays GENUINELY GATED — confirmed on the GX10 host (2026-06-29).** The GX10
-> (DGX Spark, ssh `spark`) was checked directly: **`import cuvs` FAILS** (cuVS is not installed)
-> and **there is no CUDA toolkit / cuVS runtime present** to build a CAGRA graph. So the offline
-> CAGRA build (`scripts/gpu_build_index.{sh,py}`) **cannot run on the available GX10 either** — it
-> is not merely off-target on this x86 standin, it is unrunnable on the intended target until
-> cuVS + the matching CUDA toolkit are installed there. The script therefore remains **authored +
-> verified-no-op**: on every machine reachable today (this x86 box AND the GX10) the `import cuvs`
-> guard fails and the driver prints its no-op message and exits 0. We did **not** attempt to
-> install cuVS. Step 3's recall/build-time A/B is blocked on a GX10 cuVS+CUDA-toolkit install,
-> not on writing the builder — that work is done and dormant. (For reference, this x86 host does
-> ship `nvcc 12.0`, but its GPUs are sm_61 GTX-1070s that cuVS does not target, so it cannot
-> stand in for the build; the gate is correctly `import cuvs`, not "nvcc present".)
+> **CAGRA build + HNSW export are VALIDATED on the GB10 (2026-06-29) — the blocker is gone.**
+> cuVS **26.06.00** was installed on the GX10 (DGX Spark, ssh `spark`; aarch64 + CUDA **13.0** +
+> compute capability **12.1 / sm_121**) into an isolated user-space `~/cuvs-env` (uv venv, no sudo,
+> no system change). Verified live on the GB10:
+> - `cuvs.neighbors.cagra.build(IndexParams(graph_degree=32, intermediate_graph_degree=64), X)`
+>   builds a CAGRA graph over a **20 000 × 128** corpus in **~1.96 s**;
+> - `cuvs.neighbors.hnsw.from_cagra(hnsw.IndexParams(), index)` + `hnsw.save(path, index)` exports it
+>   to an hnswlib on-disk file (**13.2 MB** for that corpus).
+>
+> `scripts/gpu_build_index.py` was **reconciled to this verified cuVS-26.06 API**: the prior
+> `from_cagra(index)` / `save(..., ef_construction=)` form was wrong — `from_cagra` requires the
+> `IndexParams` object as its first arg. The earlier "GENUINELY GATED" note (cuVS absent) is
+> superseded — the user installed cuVS and the build/export path is proven on the real target.
+>
+> **Remaining — the recall A/B (now a staging task, not a provisioning blocker):** load the
+> cuVS-exported HNSW file through the fork's `hnsw` AM and compare recall@10 + build wall-clock vs a
+> CPU-built hnswlib index on the same 768-dim corpus (the A/B specified above, against the
+> 137 s / 489 s CPU baselines). This needs (a) the repo + a 768-dim corpus staged on the Spark and
+> (b) the **format-compat check (§3)** — confirming the fork's hnswlib version loads the cuVS-26.06
+> export layout. The build/export blocker is resolved; the A/B is the outstanding piece.
+>
+> (For reference, the x86 dev host ships `nvcc 12.0` but its GPUs are sm_61 GTX-1070s that cuVS does
+> not target — the build only runs on the GB10. The driver still gates on `import cuvs`, which now
+> succeeds on the Spark and no-ops everywhere else.)
 
 ### Deferred (its own plan, after Step 1 proves recall)
 

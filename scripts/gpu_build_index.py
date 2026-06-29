@@ -101,10 +101,17 @@ def build_cagra_export_hnsw(
 
     # Export CAGRA -> hnswlib on-disk format. The fork's `hnsw` AM loads this file
     # UNCHANGED; the CPU iterator searches it identically to a CPU-built index.
+    # API reconciled to cuVS 26.06 and VERIFIED on the GB10 (sm_121, CUDA 13,
+    # 2026-06-29): from_cagra(IndexParams, index) -> save(path, index). The earlier
+    # from_cagra(index)/save(..., ef_construction=) form was wrong (from_cagra needs
+    # the params object). ef_construction is a CPU search-list param applied at query
+    # time via the `hnsw` AM reloptions (plan 006/DEV-1286), not at export; it is
+    # carried in the stats dict as build metadata only.
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    hnsw.save(  # pragma: no cover - GX10-only path
-        str(out_path), hnsw.from_cagra(index), ef_construction=ef_construction
+    hnsw_index = hnsw.from_cagra(  # pragma: no cover - GX10-only path
+        hnsw.IndexParams(), index
     )
+    hnsw.save(str(out_path), hnsw_index)  # pragma: no cover - GX10-only path
 
     return {
         "n": int(n),
