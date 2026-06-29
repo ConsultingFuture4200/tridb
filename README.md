@@ -116,6 +116,18 @@ Head-to-head against the multi-system baseline (Milvus + Neo4j + Postgres, app-s
 > [!NOTE]
 > These are measured on an **x86_64 standin** at standin scale (~1–2 ms/query vs. the baseline's ~16–20 ms). The **128 GB headline benchmark** runs only on the GX10 target (ARM64 + CUDA) and is not yet run. Full methodology and caveats: [`docs/benchmark_sm2_v0.1.0.md`](docs/benchmark_sm2_v0.1.0.md) and [`docs/benchmark_results_v0.1.0.md`](docs/benchmark_results_v0.1.0.md).
 
+### Reproduce the benchmark (one command, public data)
+
+One command runs TriDB's retrieval against **recognized public datasets** and grades **recall@k against an exact oracle** — pinned data (SHA256), pinned seeds. The recall headline reproduces on a commodity x86 box (no engine, no GPU): on the **HotpotQA** dev slice, injecting real graph bridges lifts multi-hop **joint** evidence recall@5 by **+15.6 pt** over vector-only. Live `tjs()` latency stays GX10-gated and is never fabricated.
+
+```bash
+make fetch-hotpot HOTPOT_Q=150 && make graphrag    # HotpotQA dev slice + BGE-768 graph (network-gated)
+make fetch-dataset PUBLIC_DATASET=sift-128-euclidean   # pinned SIFT1M public-ANN set
+make bench-repro                                    # grade recall@k vs exact oracle -> JSON + table
+```
+
+Full writeup, the tuned "beat it" baseline, and the honest real-vs-gated split: [`docs/benchmark_public_repro_v0.1.0.md`](docs/benchmark_public_repro_v0.1.0.md).
+
 ## The Canonical Query
 
 TriDB targets one locked query template for v1 — assembled from existing SQL/PGQ + pgvector standards, no new syntax:

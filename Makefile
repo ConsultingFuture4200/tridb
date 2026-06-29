@@ -1,4 +1,4 @@
-.PHONY: test lint graph-test smoke-test test-all baseline-up baseline-down seed bench bench-live sweep sm2 fetch-dataset bench-public fetch-hotpot graphrag graphrag-live bench-filtered ablation recall-decay tjs-open-ref graphrag-h2h rabitq-sim gpu-build-index clean
+.PHONY: test lint graph-test smoke-test test-all baseline-up baseline-down seed bench bench-live sweep sm2 fetch-dataset bench-public bench-repro fetch-hotpot graphrag graphrag-live bench-filtered ablation recall-decay tjs-open-ref graphrag-h2h rabitq-sim gpu-build-index clean
 
 PUBLIC_DATASET ?= gist-960-euclidean
 
@@ -112,6 +112,24 @@ bench-public:
 	@docker image inspect $(IMAGE) >/dev/null 2>&1 || \
 	  { echo "image $(IMAGE) not built (live run is ENGINE-GATED) — run scripts/x86build.sh --docker / gx10build.sh"; exit 1; }
 	PUBLIC_DATASET=$(PUBLIC_DATASET) bash scripts/bench_public.sh $(IMAGE)
+
+# ONE-COMMAND PUBLIC-DATASET REPRODUCTION (GTM make-or-break — the artifact a
+# stranger runs from a clean checkout). Assembles the two host-gradeable pieces on
+# recognized public data: (1) HotpotQA GraphRAG evidence-recall (REAL recall, graded
+# host-side vs gold — graph-inject lifts multi-hop joint recall@5 +15.6pt), and
+# (2) the sift-128-euclidean public-ANN pin (SHA256-verified) + exact numpy oracle.
+# Emits bench/results/bench_repro_metrics.json + a rendered table. Pinned data,
+# pinned seeds. RUNS HERE on the x86 standin (recall is host-gradeable, no engine);
+# the live tjs() latency stays GX10-gated and is NEVER fabricated. Full writeup +
+# attack-preempt table: docs/benchmark_public_repro_v0.1.0.md.
+#
+# Data gates (network-gated fetches, NOT run by tests/CI):
+#   - HotpotQA manifest: make fetch-hotpot HOTPOT_Q=150 && make graphrag
+#   - SIFT public set:    make fetch-dataset PUBLIC_DATASET=sift-128-euclidean
+bench-repro:
+	@test -f data/hotpot/manifest.json || \
+	  { echo "HotpotQA manifest missing — run: make fetch-hotpot HOTPOT_Q=150 && make graphrag"; exit 1; }
+	$(PY) -m bench.bench_repro
 
 # GraphRAG QA-accuracy benchmark (Plan 015) — the "is the answer right?" artifact.
 # REAL multi-hop QA (HotpotQA), a REAL embedding-independent graph (title-mention

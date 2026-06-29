@@ -1,0 +1,218 @@
+{
+  "seed": 42,
+  "reader_k": 5,
+  "hotpot": {
+    "dataset": "HotpotQA dev slice",
+    "graph": "real title-mention edges (Wikipedia-hyperlink proxy, embedding-independent)",
+    "embeddings": "BGE-base-en-v1.5 (dim 768), cosine",
+    "n_questions": 150,
+    "n_paragraphs": 1490,
+    "ks": [
+      2,
+      3,
+      5,
+      10
+    ],
+    "reader_k": 5,
+    "headline_group": "bridge",
+    "sweep": {
+      "vector_only": {
+        "2": {
+          "all": {
+            "recall": 0.75,
+            "joint": 0.5266666666666666
+          },
+          "comparison": {
+            "recall": 0.9464285714285714,
+            "joint": 0.8928571428571429
+          },
+          "bridge": {
+            "recall": 0.7049180327868853,
+            "joint": 0.4426229508196721
+          }
+        },
+        "3": {
+          "all": {
+            "recall": 0.83,
+            "joint": 0.6666666666666666
+          },
+          "comparison": {
+            "recall": 0.9642857142857143,
+            "joint": 0.9285714285714286
+          },
+          "bridge": {
+            "recall": 0.7991803278688525,
+            "joint": 0.6065573770491803
+          }
+        },
+        "5": {
+          "all": {
+            "recall": 0.8833333333333333,
+            "joint": 0.7733333333333333
+          },
+          "comparison": {
+            "recall": 1.0,
+            "joint": 1.0
+          },
+          "bridge": {
+            "recall": 0.8565573770491803,
+            "joint": 0.7213114754098361
+          }
+        },
+        "10": {
+          "all": {
+            "recall": 0.9666666666666667,
+            "joint": 0.9333333333333333
+          },
+          "comparison": {
+            "recall": 1.0,
+            "joint": 1.0
+          },
+          "bridge": {
+            "recall": 0.9590163934426229,
+            "joint": 0.9180327868852459
+          }
+        }
+      },
+      "graph_inject": {
+        "2": {
+          "all": {
+            "recall": 0.75,
+            "joint": 0.5266666666666666
+          },
+          "comparison": {
+            "recall": 0.9464285714285714,
+            "joint": 0.8928571428571429
+          },
+          "bridge": {
+            "recall": 0.7049180327868853,
+            "joint": 0.4426229508196721
+          }
+        },
+        "3": {
+          "all": {
+            "recall": 0.9,
+            "joint": 0.8066666666666666
+          },
+          "comparison": {
+            "recall": 0.9642857142857143,
+            "joint": 0.9285714285714286
+          },
+          "bridge": {
+            "recall": 0.8852459016393442,
+            "joint": 0.7786885245901639
+          }
+        },
+        "5": {
+          "all": {
+            "recall": 0.9466666666666667,
+            "joint": 0.9
+          },
+          "comparison": {
+            "recall": 1.0,
+            "joint": 1.0
+          },
+          "bridge": {
+            "recall": 0.9344262295081968,
+            "joint": 0.8770491803278688
+          }
+        },
+        "10": {
+          "all": {
+            "recall": 0.9833333333333333,
+            "joint": 0.9666666666666667
+          },
+          "comparison": {
+            "recall": 1.0,
+            "joint": 1.0
+          },
+          "bridge": {
+            "recall": 0.9795081967213115,
+            "joint": 0.9590163934426229
+          }
+        }
+      },
+      "graph_rerank": {
+        "2": {
+          "all": {
+            "recall": 0.75,
+            "joint": 0.5266666666666666
+          },
+          "comparison": {
+            "recall": 0.9464285714285714,
+            "joint": 0.8928571428571429
+          },
+          "bridge": {
+            "recall": 0.7049180327868853,
+            "joint": 0.4426229508196721
+          }
+        },
+        "3": {
+          "all": {
+            "recall": 0.83,
+            "joint": 0.6666666666666666
+          },
+          "comparison": {
+            "recall": 0.9642857142857143,
+            "joint": 0.9285714285714286
+          },
+          "bridge": {
+            "recall": 0.7991803278688525,
+            "joint": 0.6065573770491803
+          }
+        },
+        "5": {
+          "all": {
+            "recall": 0.8833333333333333,
+            "joint": 0.7733333333333333
+          },
+          "comparison": {
+            "recall": 1.0,
+            "joint": 1.0
+          },
+          "bridge": {
+            "recall": 0.8565573770491803,
+            "joint": 0.7213114754098361
+          }
+        },
+        "10": {
+          "all": {
+            "recall": 0.9533333333333334,
+            "joint": 0.9133333333333333
+          },
+          "comparison": {
+            "recall": 1.0,
+            "joint": 1.0
+          },
+          "bridge": {
+            "recall": 0.9426229508196722,
+            "joint": 0.8934426229508197
+          }
+        }
+      }
+    },
+    "types": [
+      "bridge",
+      "comparison"
+    ]
+  },
+  "sift": {
+    "dataset": "sift-128-euclidean",
+    "note": "SIFT1M; dim 128, L2. Fast pipeline smoke only \u2014 below the 768+ headline.",
+    "dim": 128,
+    "distance": "euclidean",
+    "pinned_sha256": "dd6f0a6ed6b7ebb8934680f861a33ed01ff33991eaee4fd60914d854a0ca5984",
+    "present": true,
+    "observed_sha256": "dd6f0a6ed6b7ebb8934680f861a33ed01ff33991eaee4fd60914d854a0ca5984",
+    "checksum_verified": true,
+    "vectors_loaded": 20000,
+    "limit": 20000,
+    "queries": 12,
+    "k": 10,
+    "seed": 42,
+    "oracle_selfcheck_recall": 1.0,
+    "state": "PINNED + VERIFIED; exact oracle built host-side",
+    "live_recall_at_k": "GX10/engine-gated (needs live tjs() transcript)",
+    "latency": "GX10/engine-gated (EXPLAIN ANALYZE on the live engine)"
+  }
+}

@@ -9,3 +9,6 @@ psycopg[binary]>=3.1
 fastembed>=0.8
 # Recall-decay-under-updates bench — the engine's own HNSW lib (host-side)
 hnswlib>=0.8
+# Public-ANN dataset reader (ann-benchmarks .hdf5) for the one-command repro
+# (make bench-repro). Soft dep elsewhere; required only to build the SIFT oracle.
+h5py>=3.10
