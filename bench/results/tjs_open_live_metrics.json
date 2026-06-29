@@ -1,0 +1,6 @@
+{
+  "k": 10,
+  "operator": "tjs_open",
+  "n_queries": 150,
+  "recall_at_k": 0.98
+}

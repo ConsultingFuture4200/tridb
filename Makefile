@@ -1,4 +1,4 @@
-.PHONY: test lint graph-test smoke-test test-all baseline-up baseline-down seed bench bench-live sweep sm2 fetch-dataset bench-public bench-repro fetch-hotpot graphrag graphrag-live bench-filtered ablation recall-decay tjs-open-ref graphrag-h2h rabitq-sim gpu-build-index clean
+.PHONY: test lint graph-test smoke-test test-all baseline-up baseline-down seed bench bench-live sweep sm2 fetch-dataset bench-public bench-repro fetch-hotpot graphrag graphrag-live bench-filtered ablation recall-decay tjs-open-ref tjs-open-live graphrag-h2h rabitq-sim gpu-build-index clean
 
 PUBLIC_DATASET ?= gist-960-euclidean
 
@@ -130,6 +130,19 @@ bench-repro:
 	@test -f data/hotpot/manifest.json || \
 	  { echo "HotpotQA manifest missing — run: make fetch-hotpot HOTPOT_Q=150 && make graphrag"; exit 1; }
 	$(PY) -m bench.bench_repro
+
+# LIVE engine recall for the tjs_open(B) operator (ADR-0012) — the reproducible recall harness.
+# Builds the corpus+HNSW+graph on the real forked-MSVBASE engine, runs the FUSED tjs_open operator
+# per HotpotQA question, grades top-k vs gold host-side. Engine-gated (needs tridb/msvbase:dev with
+# the tjs_open patch — scripts/x86build.sh --docker). One-command repro of recall@10 = 0.980.
+tjs-open-live:
+	@docker image inspect $(IMAGE) >/dev/null 2>&1 || \
+	  { echo "image $(IMAGE) not built — run scripts/x86build.sh --docker"; exit 1; }
+	@test -f data/hotpot/manifest.json || \
+	  { echo "HotpotQA manifest missing — run: make fetch-hotpot HOTPOT_Q=150 && make graphrag"; exit 1; }
+	$(PY) -m bench.tjs_open_live --emit-sql /tmp/tjsopen_live.sql --k 10 --seeds 5 --hops 2 --term-cond 0
+	bash scripts/graph_test.sh $(IMAGE) /tmp/tjsopen_live.sql > /tmp/tjsopen_live_raw.txt 2>&1
+	$(PY) -m bench.tjs_open_live --raw /tmp/tjsopen_live_raw.txt --k 10
 
 # GraphRAG QA-accuracy benchmark (Plan 015) — the "is the answer right?" artifact.
 # REAL multi-hop QA (HotpotQA), a REAL embedding-independent graph (title-mention
