@@ -31,6 +31,12 @@ CREATE FUNCTION gph_traverse(bigint, OUT src bigint, OUT dst bigint) RETURNS SET
 CREATE FUNCTION gph_visits() RETURNS bigint
   AS 'MODULE_PATHNAME' LANGUAGE C VOLATILE;
 
+-- Per-backend adjacency-page-read counter (read-once scan probe): one increment per adjacency page
+-- a traversal reads, NOT per neighbor emitted. Backend-local + monotonic; read DELTAS. Demonstrates
+-- that a degree-D hub over P chained pages now costs ~P page reads instead of ~D.
+CREATE FUNCTION gph_page_reads() RETURNS bigint
+  AS 'MODULE_PATHNAME' LANGUAGE C VOLATILE;
+
 CREATE FUNCTION gph_vertex_count() RETURNS bigint
   AS 'MODULE_PATHNAME' LANGUAGE C VOLATILE;
 

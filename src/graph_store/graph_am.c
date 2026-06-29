@@ -80,6 +80,15 @@ gph_xmin_visible(TransactionId xmin)
  */
 static int64 gph_visit_counter = 0;
 
+/*
+ * Per-backend adjacency-page-read counter (one increment per adjacency page READ by a traversal
+ * scan, NOT per neighbor emitted). Backend-local and monotonic for the life of the backend: read
+ * DELTAS (v1 - v0), never the absolute value. With the read-once scan a degree-D hub on P chained
+ * pages costs ~P page reads instead of ~D (one ReadBuffer per emitted neighbor) — this counter is
+ * the probe that demonstrates that reduction.
+ */
+static int64 gph_page_read_counter = 0;
+
 /* ------------------------------------------------------------------ */
 /* Relation + metapage helpers                                         */
 /* ------------------------------------------------------------------ */
@@ -517,16 +526,29 @@ gph_insert_edge(PG_FUNCTION_ARGS)
 
 /*
  * GraphScanDescData — the concrete body of the opaque GraphScanDesc declared in graphstore.h.
- * Holds only the cursor (current adjacency page + next slot) plus the source/direction; it does
- * NOT retain the container Relation or a buffer pin, so the iterator is leak-free under early
- * abandon (LIMIT) and the caller manages the Relation lifetime (passed to gs_getnext).
+ * Holds the cursor plus a per-scan in-memory copy of the CURRENT adjacency page's edge slots:
+ * each page is read ONCE (ReadBuffer + SHARE-lock + memcpy all slots + UnlockReleaseBuffer in one
+ * gs_getnext call) and its neighbors are then served one-per-Next() from page_buf, instead of
+ * re-reading the page on every neighbor. It does NOT retain the container Relation or hold a
+ * buffer pin across a Next() return (the page is copied to palloc'd memory and the buffer released
+ * within the same call), so the iterator stays leak-free under early abandon (LIMIT) and the
+ * caller manages the Relation lifetime (passed to gs_getnext).
  */
 struct GraphScanDescData
 {
 	GraphVertexId		src;		/* source vertex of this traversal */
 	GraphScanDirection	direction;	/* v1: GRAPH_SCAN_OUTGOING only */
-	BlockNumber			cur_blk;	/* current adjacency page; Invalid = exhausted */
-	uint32				cur_slot;	/* next EdgeSlot index on cur_blk */
+	BlockNumber			cur_blk;	/* NEXT adjacency page to read; Invalid = no more pages */
+
+	/*
+	 * Bounded per-page in-memory slot buffer: the current page's edge slots, read once and drained
+	 * one per Next(). Sized to slots_per_page (~1022 * 32B ~= 32KB); exactly one page is ever
+	 * buffered (streaming). Refilled from cur_blk only when page_i reaches page_n AND another
+	 * Next() is called, so a LIMIT that stops mid-page never triggers the next page's read.
+	 */
+	GphEdgeSlot		   *page_buf;	/* palloc'd once (slots_per_page); reused per page */
+	uint32				page_n;		/* # slots currently buffered from the current page */
+	uint32				page_i;		/* next buffered slot to serve */
 };
 
 /*
@@ -551,7 +573,10 @@ gs_open(GraphScanDesc *scan, Relation rel, GraphVertexId start, GraphScanDirecti
 	scan->src = start;
 	scan->direction = direction;
 	scan->cur_blk = InvalidBlockNumber;
-	scan->cur_slot = 0;
+	/* Bounded per-page slot buffer (read each page once; one page buffered = streaming). */
+	scan->page_buf = (GphEdgeSlot *) palloc(sizeof(GphEdgeSlot) * GphEdgeSlotsPerPage());
+	scan->page_n = 0;
+	scan->page_i = 0;
 
 	if (!gph_locate_vertex(rel, start, &vblk, &vslot, &src_rec))
 		return false;			/* absent => caller decides (empty scan vs raise) */
@@ -560,78 +585,108 @@ gs_open(GraphScanDesc *scan, Relation rel, GraphVertexId start, GraphScanDirecti
 }
 
 /*
+ * gs_read_page_into_buf — read ONE adjacency page (scan->cur_blk) exactly once into the bounded
+ * per-scan page_buf: copies the page's edge slots, then IMMEDIATELY releases the buffer (no pin
+ * held across Next()). Advances cur_blk to the chained next page. Increments the page-read counter
+ * once (per page, not per neighbor). Returns true if a page was read (page_buf refilled), false if
+ * there are no more pages. Visibility/type/delete filtering is applied later in gs_getnext, exactly
+ * matching the pre-change per-slot semantics.
+ */
+static bool
+gs_read_page_into_buf(Relation rel, GraphScanDesc *scan)
+{
+	Buffer		buf;
+	Page		page;
+	uint32		count,
+				j;
+	BlockNumber	next_blk;
+
+	if (scan->cur_blk == InvalidBlockNumber)
+		return false;
+
+	CHECK_FOR_INTERRUPTS();
+	buf = ReadBufferExtended(rel, MAIN_FORKNUM, scan->cur_blk, RBM_NORMAL, NULL);
+	gph_page_read_counter++;	/* ONE read per adjacency page (was: one per neighbor) */
+	LockBuffer(buf, BUFFER_LOCK_SHARE);
+	page = BufferGetPage(buf);
+	count = GphPageRecordCount(page, sizeof(GphEdgeSlot));
+	next_blk = GphPageSpecialPtr(page)->gph_next_pageno;
+
+	scan->page_n = 0;
+	scan->page_i = 0;
+	for (j = 0; j < count; j++)
+		memcpy(&scan->page_buf[scan->page_n++],
+			   GphPageGetRecord(page, j, sizeof(GphEdgeSlot)), sizeof(GphEdgeSlot));
+
+	UnlockReleaseBuffer(buf);	/* no pin held across Next() => leak-free on LIMIT early abandon */
+	scan->cur_blk = next_blk;
+	return true;
+}
+
+/*
  * gs_getnext — advance the scan by ONE visible :related_to edge (the Next of Open/Next/Close).
- * Reads at most one adjacency page per call from `rel` and holds no buffer pin across calls, so a
- * LIMIT above stops before later chain pages are ever read (TR-1 storage-level early termination)
- * and abandoning the scan early leaks nothing. Fills *out and returns true; on exhaustion sets
- * out->kind = GRAPH_ELEM_NONE and returns false.
+ * Serves neighbors from the per-scan in-memory copy of the current adjacency page; reads the NEXT
+ * page (once) only when the in-memory buffer is exhausted AND another Next() is requested. Holds no
+ * buffer pin across calls (each page is copied to palloc'd memory and its buffer released within
+ * gs_read_page_into_buf), so a LIMIT above stops before later chain pages are ever read (TR-1
+ * storage-level early termination) and abandoning the scan early leaks nothing. Fills *out and
+ * returns true; on exhaustion sets out->kind = GRAPH_ELEM_NONE and returns false.
  */
 static bool
 gs_getnext(Relation rel, GraphScanDesc *scan, GraphElement *out)
 {
 	out->kind = GRAPH_ELEM_NONE;
 
-	while (scan->cur_blk != InvalidBlockNumber)
+	for (;;)
 	{
-		Buffer		buf;
-		Page		page;
-		uint32		count;
-		GphEdgeSlot	slot;
-		bool		have_edge = false;
-
-		CHECK_FOR_INTERRUPTS();
-		buf = ReadBufferExtended(rel, MAIN_FORKNUM, scan->cur_blk, RBM_NORMAL, NULL);
-		LockBuffer(buf, BUFFER_LOCK_SHARE);
-		page = BufferGetPage(buf);
-		count = GphPageRecordCount(page, sizeof(GphEdgeSlot));
-
-		if (scan->cur_slot < count)
+		/* Drain the in-memory copy of the current page. */
+		while (scan->page_i < scan->page_n)
 		{
-			memcpy(&slot, GphPageGetRecord(page, scan->cur_slot, sizeof(GphEdgeSlot)),
-				   sizeof(GphEdgeSlot));
-			scan->cur_slot++;
-			have_edge = true;
-		}
-		else
-		{
-			scan->cur_blk = GphPageSpecialPtr(page)->gph_next_pageno;
-			scan->cur_slot = 0;
-		}
-		UnlockReleaseBuffer(buf);
+			GphEdgeSlot *slot = &scan->page_buf[scan->page_i++];
 
-		if (have_edge)
-		{
-			if (slot.es_flags & GPH_FLAG_DELETED)
+			if (slot->es_flags & GPH_FLAG_DELETED)
 				continue;
-			if (slot.es_edge_type_id != GPH_EDGE_TYPE_RELATED_TO)
+			if (slot->es_edge_type_id != GPH_EDGE_TYPE_RELATED_TO)
 				continue;
-			if (!gph_xmin_visible(slot.es_xmin))
+			if (!gph_xmin_visible(slot->es_xmin))
 				continue;		/* edge from an aborted/uncommitted txn */
 
 			out->kind = GRAPH_ELEM_EDGE;
 			out->edge_id = GRAPHSTORE_INVALID_ID;	/* v1 edge slots carry no stored id */
-			out->edge_src = slot.es_src_vid;
-			out->edge_dst = slot.es_dst_vid;
-			out->vertex_id = slot.es_dst_vid;		/* convenience: the reached neighbor */
+			out->edge_src = slot->es_src_vid;
+			out->edge_dst = slot->es_dst_vid;
+			out->vertex_id = slot->es_dst_vid;		/* convenience: the reached neighbor */
 			out->payload = NULL;
 			out->payload_len = 0;
 			gph_visit_counter++;	/* one unit of traversal work, per edge emitted */
 			return true;
 		}
-		/* else: advanced to next chain page (or exhausted); loop again */
+
+		/*
+		 * Buffer exhausted. Read the next chain page once (lazily, only on the getnext call AFTER
+		 * the buffer empties — so a LIMIT that stopped mid-page never reached here), or finish.
+		 */
+		if (!gs_read_page_into_buf(rel, scan))
+			return false;
 	}
-	return false;
 }
 
-/* gs_close — release a traversal scan (the Close of Open/Next/Close). The scan holds no buffer
- * pin or Relation, so this only resets the cursor; idempotent on NULL. */
+/* gs_close — release a traversal scan (the Close of Open/Next/Close). Frees the per-page in-memory
+ * slot buffer; the scan holds NO buffer pin (read-once-per-page releases each buffer immediately),
+ * so early abandon under LIMIT leaks nothing. Idempotent on NULL. */
 static void
 gs_close(GraphScanDesc *scan)
 {
 	if (scan == NULL)
 		return;
+	if (scan->page_buf != NULL)
+	{
+		pfree(scan->page_buf);
+		scan->page_buf = NULL;
+	}
+	scan->page_n = 0;
+	scan->page_i = 0;
 	scan->cur_blk = InvalidBlockNumber;
-	scan->cur_slot = 0;
 }
 
 PG_FUNCTION_INFO_V1(gph_neighbors);
@@ -756,6 +811,20 @@ Datum
 gph_visits(PG_FUNCTION_ARGS)
 {
 	PG_RETURN_INT64(gph_visit_counter);
+}
+
+PG_FUNCTION_INFO_V1(gph_page_reads);
+
+/*
+ * gph_page_reads() RETURNS bigint — per-backend adjacency-page-read counter (one increment per
+ * adjacency page a traversal scan reads, NOT per neighbor). Backend-local + monotonic; read DELTAS
+ * (v1 - v0). With the read-once scan a degree-D hub over P chained pages costs ~P page reads, not
+ * ~D — this probe lets the harness measure that reduction without touching pg_statio.
+ */
+Datum
+gph_page_reads(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_INT64(gph_page_read_counter);
 }
 
 PG_FUNCTION_INFO_V1(gph_vertex_count);
