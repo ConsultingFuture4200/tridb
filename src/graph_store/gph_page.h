@@ -145,4 +145,17 @@ GphPageGetRecord(Page page, uint32 i, Size record_size)
 	return (void *) (GphPageRecordBase(page) + (Size) i * record_size);
 }
 
+/*
+ * Capacity, in EdgeSlots, of one adjacency page — the upper bound on the number of slots a single
+ * page can hold given the host packing geometry (page header + special area subtracted). Used by
+ * the read-once traversal scan to size its per-page in-memory slot buffer. With BLCKSZ 32768,
+ * header 24, special 32 => 32712/32 = 1022 slots/page. Pure geometry arithmetic; carries no
+ * layout assumption (no sorted run / delta tail — the chained page format is unchanged).
+ */
+static inline uint32
+GphEdgeSlotsPerPage(void)
+{
+	return (uint32) ((BLCKSZ - SizeOfPageHeaderData - GPH_SPECIAL_SIZE) / sizeof(GphEdgeSlot));
+}
+
 #endif							/* TRIDB_GRAPH_STORE_GPH_PAGE_H */
