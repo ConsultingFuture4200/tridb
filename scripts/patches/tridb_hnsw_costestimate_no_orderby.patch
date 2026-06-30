@@ -1,0 +1,60 @@
+# tridb_hnsw_costestimate_no_orderby.patch — DEV-1248
+#
+# STATUS: BUILT AND VERIFIED on the x86 standin (tridb/msvbase:dev). The vectordb extension
+# was rebuilt with this change (incremental `make vectordb` in the dev image -> committed as
+# tridb/msvbase:dev1248) and `make graph-test IMAGE=tridb/msvbase:dev1248` passed, including
+# test/hnsw_costestimate_unordered_test.sql.
+#
+# WHY: DEV-1236 made hnsw_gettuple ereport(ERROR) when the planner chose the HNSW index for an
+#   unordered / no-key scan (e.g. `SET enable_seqscan=off; SELECT count(*) FROM t` on a table
+#   with an HNSW index). That turned a wrong-answer-then-teardown-crash into a clean runtime
+#   ERROR — but the planner could STILL pick the index and the query would then fail at scan
+#   time. The HNSW AM can only serve an ORDER BY <-> distance scan, so the planner must never
+#   choose it for anything else.
+#
+# FIX (one source file, two hunks in src/hnswindex.cpp):
+#   1. #include <optimizer/cost.h> for `disable_cost`.
+#   2. hnsw_costestimate: after the generic estimate, if the index path carries no
+#      order-by-distance pathkey (path->indexorderbys == NIL), charge disable_cost for both
+#      startup and total cost. An ordered ANN path (indexorderbys != NIL) keeps its normal,
+#      attractive cost, so ANN search is unaffected.
+#
+# BEFORE (stock tridb/msvbase:dev): `SET enable_seqscan=off; EXPLAIN SELECT count(*) FROM entities`
+#   -> "Index Only Scan using entities_hnsw" (then ERROR at execution per DEV-1236).
+# AFTER:  the planner falls back to a seqscan / pkey path; ORDER BY <-> still uses entities_hnsw.
+#
+# Sentinel for verify_patches: "DEV-1248" in hnswindex.cpp (cost-penalty branch).
+# Depends-on: apply AFTER tridb_hnsw_scan_no_orderby.patch (DEV-1236) and
+#   tridb_hnsw_reloptions.patch (DEV-1286) — line numbers below assume both are already applied.
+diff --git a/src/hnswindex.cpp b/src/hnswindex.cpp
+--- a/src/hnswindex.cpp
++++ b/src/hnswindex.cpp
+@@ -17,6 +17,7 @@
+ #include <utils/rel.h>
+ #include <utils/selfuncs.h>
+ #include <access/reloptions.h>
++#include <optimizer/cost.h>   // DEV-1248: disable_cost
+ }
+ 
+ extern relopt_kind hnsw_para_relopt_kind;
+@@ -480,6 +481,20 @@
+ #if PG_VERSION_NUM >= 100000
+     *indexPages = costs.numIndexPages;
+ #endif
++
++    // DEV-1248: the HNSW index can ONLY serve an ORDER BY <-> distance scan.
++    // DEV-1236 made hnsw_gettuple ereport(ERROR) on an unordered/no-key scan
++    // (the planner would otherwise pick this index for count(*)/SELECT-without-
++    // ORDER-BY when enable_seqscan is off, then crash/error at scan time).
++    // Make the planner avoid that path proactively: when the path carries no
++    // order-by-distance pathkey (path->indexorderbys == NIL), the index cannot
++    // be used for ANN, so apply a prohibitively large cost penalty. An ordered
++    // ANN scan (indexorderbys != NIL) keeps its normal, attractive cost.
++    if (path->indexorderbys == NIL)
++    {
++        *indexStartupCost = disable_cost;
++        *indexTotalCost = disable_cost;
++    }
+ }
+ /*
+  * Clean up after a VACUUM operation

@@ -90,6 +90,8 @@ verify_patches() {
     || die "TriDB tridb_neon_l2_distance.patch NOT applied — ARM NEON L2 kernel missing, scalar fallback sandbags latency (DEV-1234); drift?"
   grep -q 'offsetof(hnsw_ParaOptions, ef_construction)' "$root/src/hnswindex.cpp" 2>/dev/null \
     || die "TriDB tridb_hnsw_reloptions.patch NOT applied — HNSW m/ef_construction reloptions missing (DEV-1286); drift?"
+  grep -q 'DEV-1248' "$root/src/hnswindex.cpp" 2>/dev/null \
+    || die "TriDB tridb_hnsw_costestimate_no_orderby.patch NOT applied — HNSW no-ORDER-BY cost penalty missing (DEV-1248); drift?"
   log "all MSVBASE + TriDB fork patches verified present"
 }
 
@@ -301,6 +303,24 @@ apply_tridb_fork_patches() {
     log "applying TriDB fork patch: HNSW m/ef_construction reloptions (DEV-1286)"
     ( cd "$root" && git apply "$relopt_patch" ) \
       || die "tridb_hnsw_reloptions.patch did not apply — MSVBASE drift? re-generate from src/{hnswindex.hpp,hnswindex.cpp,lib.cpp,hnswindex_builder.cpp,hnswindex_scan.cpp}"
+  fi
+
+  #   tridb_hnsw_costestimate_no_orderby.patch (DEV-1248): planner-side companion to the DEV-1236
+  #     runtime guard. hnsw_costestimate charges disable_cost when the index path has no
+  #     order-by-distance pathkey (path->indexorderbys == NIL), so the planner NEVER picks the HNSW
+  #     index for an unordered/aggregate scan (which DEV-1236 makes ereport(ERROR) at scan time).
+  #     Ordered ANN scans (indexorderbys != NIL) keep their normal, attractive cost. Two hunks in
+  #     hnswindex.cpp; line numbers assume tridb_hnsw_scan_no_orderby + tridb_hnsw_reloptions are
+  #     already applied, so it MUST come after both. BUILT AND VERIFIED on x86 standin (git apply
+  #     --check exit 0; make graph-test green incl. test/hnsw_costestimate_unordered_test.sql).
+  local costest_patch="${_MSVBASE_LIB_DIR}/../patches/tridb_hnsw_costestimate_no_orderby.patch"
+  [[ -f "$costest_patch" ]] || die "missing TriDB fork patch: $costest_patch"
+  if grep -q 'DEV-1248' "$root/src/hnswindex.cpp" 2>/dev/null; then
+    log "TriDB fork patch (HNSW costestimate no-ORDER-BY penalty, DEV-1248) already applied"
+  else
+    log "applying TriDB fork patch: HNSW costestimate no-ORDER-BY penalty (DEV-1248)"
+    ( cd "$root" && git apply "$costest_patch" ) \
+      || die "tridb_hnsw_costestimate_no_orderby.patch did not apply — MSVBASE drift? re-generate per DEV-1248"
   fi
 
   #   tridb_tjs_open_operator.patch (ADR-0012 realization B): the `tjs_open` seedless multi-seed
