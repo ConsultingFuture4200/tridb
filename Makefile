@@ -17,15 +17,17 @@ test:
 lint:
 	ruff check . && ruff format --check .
 
-# Native-AM harnesses (DEV-1164/1165/1166) — each PGXS-builds src/graph_store in the image and
-# FAILS LOUD on any error (build output -> log, nonzero make aborts; no piping to tail).
+# Native-AM + fork-regression harnesses — each FAILS LOUD on any error (nonzero make aborts).
+# The graph-store AM harnesses (DEV-1164/1165/1166) PGXS-build src/graph_store in the image; the
+# HNSW / fork-bug oracle harnesses are no-build and may pipe output through grep.
 AM_TESTS := scripts/graph_am_test.sh \
             scripts/txn_atomicity_test.sh \
             scripts/crash_recovery_test.sh \
             scripts/graph_concurrency_test.sh \
             scripts/graph_edge_count_test.sh \
             scripts/join_order_test.sh \
-            scripts/fork_bug_multicol_test.sh
+            scripts/fork_bug_multicol_test.sh \
+            scripts/hnsw_abort_stress_test.sh
 
 # Engine test suites — require the tridb/msvbase:dev image (scripts/x86build.sh --docker).
 graph-test:
