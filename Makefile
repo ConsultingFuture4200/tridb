@@ -24,7 +24,8 @@ AM_TESTS := scripts/graph_am_test.sh \
             scripts/crash_recovery_test.sh \
             scripts/graph_concurrency_test.sh \
             scripts/graph_edge_count_test.sh \
-            scripts/join_order_test.sh
+            scripts/join_order_test.sh \
+            scripts/fork_bug_multicol_test.sh
 
 # Engine test suites — require the tridb/msvbase:dev image (scripts/x86build.sh --docker).
 graph-test:

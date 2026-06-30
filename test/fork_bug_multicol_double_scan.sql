@@ -1,5 +1,7 @@
--- _fork_bug_multicol_double_scan.sql — NOT IN CI (leading underscore; absent from Makefile
--- ENGINE_TESTS). Manual diagnostic. Deterministic repro of the REPRODUCIBLE DEV-1236 crash.
+-- fork_bug_multicol_double_scan.sql — IN CI (DEV-1249). Deterministic regression test for the
+-- REPRODUCIBLE DEV-1236 crash: asserts the patched build raises a clean ERROR (not a SIGSEGV).
+-- Driven by scripts/fork_bug_multicol_test.sh (runs WITHOUT ON_ERROR_STOP=1 so the expected
+-- post-fix ERROR does not halt the liveness probe), wired into the Makefile AM_TESTS list.
 --
 -- ROOT CAUSE (backtrace: HNSWIndexScan::EndScan -> hnsw_endscan -> ExecEndIndexOnlyScan):
 --   With enable_seqscan off, the PG planner picks an Index-Only Scan on the HNSW index for an
@@ -20,7 +22,7 @@
 -- actual deterministic crash. See docs/fork_segfault_double_scan.md.
 --
 -- Run WITHOUT -v ON_ERROR_STOP=1 so the expected post-fix ERROR does not halt the liveness probe:
---   scripts/smoke_test.sh tridb/msvbase:dev $PWD/test/_fork_bug_multicol_double_scan.sql
+--   scripts/fork_bug_multicol_test.sh tridb/msvbase:dev   (the CI harness; asserts the outcome)
 
 CREATE EXTENSION vectordb;
 
