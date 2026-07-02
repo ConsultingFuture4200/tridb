@@ -3,6 +3,13 @@
 Updated: 2026-07-01. Legend: 🟢 unblocked here · 🟡 partial (design here,
 build on GX10) · 🔴 GX10-gated (needs live MSVBASE build).
 
+> **🟡 HNSW INDEX-MAP CACHE INVALIDATION 2026-07-02 (ADR-0014, advisor plan 023) — DESIGN + repro.**
+> The process-global `vector_index_map` (`src/hnswindex_scan.cpp`) is never erased, so a pooled backend
+> serves a STALE (DROP+CREATE same name / REINDEX) or wrong-dimension (→ plan-019 OOB) HNSW graph.
+> ADR-0014 recommends a `CacheRegisterRelcacheCallback` eviction (hot path untouched) with a shared_ptr
+> ownership rule; repro `scripts/hnsw_stale_index_repro.sh` (engine-gated). Implementation deferred to
+> DEV-1259 Phase C.
+
 > **🟡 V1 REWIRE DESIGN (ADR-0013) 2026-07-01 — decision pending maintainer review.** Headline
 > numbers to date (SM-2, SIFT-1M filtered, GraphRAG, neon sweep) measure the **v0 heap-backed graph
 > extension** (`src/graph_store_ext/`), NOT the v1 native access method the thesis is about — both
