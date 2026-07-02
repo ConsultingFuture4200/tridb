@@ -74,8 +74,13 @@ if [[ "$SKIP_CLONE" -eq 0 ]]; then
   [[ -d "$SRC/.git" ]] || { log "cloning MSVBASE -> $SRC"; git clone "$REPO_URL" "$SRC"; }
   cd "$SRC"
   if [[ -n "$PIN_COMMIT" ]]; then log "checking out pinned commit $PIN_COMMIT"; git fetch --quiet origin && git checkout -q "$PIN_COMMIT"; fi
-  log "init submodules (Postgres fork, hnsw, SPTAG)"
-  git submodule update --init --recursive
+  log "init submodules (Postgres fork + hnsw; SPTAG skipped — WITH_SPTAG=OFF per DEV-1228)"
+  # Scoped submodule init (advisor plan 021 / UP-BUILD-05): fetch only the submodules a default
+  # (WITH_SPTAG=OFF, DEV-1228) build needs — NOT --recursive, which also drags in SPTAG + its
+  # Git-LFS objects (upstream issue #18 can block a fresh clone). GIT_LFS_SKIP_SMUDGE=1 matches
+  # upstream CI (azure-pipelines.yml). For a -DWITH_SPTAG=ON build, restore the recursive form.
+  export GIT_LFS_SKIP_SMUDGE=1
+  git submodule update --init thirdparty/Postgres thirdparty/hnsw
 fi
 cd "$SRC"
 

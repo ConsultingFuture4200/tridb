@@ -66,7 +66,12 @@ if [[ "$USE_DOCKER" -eq 1 ]]; then
   [[ -d "$SRC/.git" ]] || git clone "$REPO_URL" "$SRC"
   cd "$SRC"
   if [[ -n "$PIN_COMMIT" ]]; then git fetch --quiet origin && git checkout -q "$PIN_COMMIT"; fi
-  git submodule update --init --recursive
+  # Scoped submodule init (advisor plan 021 / UP-BUILD-05): fetch only the submodules a default
+  # (WITH_SPTAG=OFF, DEV-1228) build needs — NOT --recursive, which also drags in SPTAG + its
+  # Git-LFS objects (upstream issue #18 can block a fresh clone). GIT_LFS_SKIP_SMUDGE=1 matches
+  # upstream CI (azure-pipelines.yml). For a -DWITH_SPTAG=ON build, restore the recursive form.
+  export GIT_LFS_SKIP_SMUDGE=1
+  git submodule update --init thirdparty/Postgres thirdparty/hnsw
   apply_msvbase_patches "$SRC"        # spann/hnsw/Postgres — relaxed monotonicity. MUST precede force-includes.
   patch_upstream_dockerfile "$SRC/Dockerfile"
   patch_modern_gcc_includes "$SRC"
@@ -89,8 +94,10 @@ if [[ "$SKIP_CLONE" -eq 0 ]]; then
   [[ -d "$SRC/.git" ]] || { log "cloning MSVBASE -> $SRC"; git clone "$REPO_URL" "$SRC"; }
   cd "$SRC"
   if [[ -n "$PIN_COMMIT" ]]; then git fetch --quiet origin && git checkout -q "$PIN_COMMIT"; fi
-  log "init submodules"
-  git submodule update --init --recursive
+  log "init submodules (Postgres fork + hnsw; SPTAG skipped — WITH_SPTAG=OFF per DEV-1228)"
+  # Scoped submodule init (advisor plan 021 / UP-BUILD-05): see the --docker path above.
+  export GIT_LFS_SKIP_SMUDGE=1
+  git submodule update --init thirdparty/Postgres thirdparty/hnsw
 fi
 cd "$SRC"
 

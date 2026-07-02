@@ -32,6 +32,12 @@ BOOST_1_81_0_SHA256="205666dea9f6a7cfed87c7a6dfbeb52a2c1b9de55712c9c1a87735d7181
 CMAKE_3_14_4_X86_64_SHA256="9f414df8e432c4a143c2d6d81e170581badba8d89df1cf8944735b9122765c50"
 CMAKE_3_27_9_AARCH64_SHA256="11bf3d30697df465cdf43664a9473a586f010c528376a966fd310a3a22082461"
 
+# Base-image digest pin (advisor plan 021, UP-BUILD-02). `FROM gcc:12.3.0` is a floating tag;
+# pinning it by digest makes two builds months apart pull identical base layers. Resolved
+# 2026-07-01 via `docker buildx imagetools inspect gcc:12.3.0 --format '{{.Manifest.Digest}}'`.
+# REFRESH INTENTIONALLY (like the checksums above) when the base image is deliberately bumped.
+GCC_12_3_0_DIGEST="sha256:de5c5093e2ceb5c09901ed541ecab0660d1f01b7fd79587ad0294fa758a1690e"
+
 # Sentinels proving each MSVBASE patch applied. The vendored scripts/patch.sh has no `set -e`
 # and ignores `git apply`'s exit code, so a failed patch yields a clean build of the WRONG
 # database (stock Postgres, no relaxed monotonicity). Verify the end-state and die on any miss.
@@ -486,6 +492,13 @@ apply_tridb_fork_patches() {
 patch_upstream_dockerfile() {
   local df="$1"
   [[ -f "$df" ]] || return 0
+  # Digest-pin the floating base image for reproducibility (advisor plan 021 / UP-BUILD-02).
+  # Guard on the exact pristine line ('FROM gcc:12.3.0' with nothing after) so a re-run over an
+  # already-pinned Dockerfile ('FROM gcc:12.3.0@sha256:...') is a no-op.
+  if grep -q '^FROM gcc:12.3.0$' "$df"; then
+    log "digest-pinning base image (FROM gcc:12.3.0 -> gcc:12.3.0@${GCC_12_3_0_DIGEST}) for reproducibility"
+    sed -i "s|^FROM gcc:12.3.0\$|FROM gcc:12.3.0@${GCC_12_3_0_DIGEST}|" "$df"
+  fi
   if grep -q 'boostorg.jfrog.io' "$df"; then
     log "patching dead Boost URL (boostorg.jfrog.io left JFrog in 2024) -> archives.boost.io"
     sed -i 's#https://boostorg.jfrog.io/artifactory/main/release/1.81.0/source/boost_1_81_0.tar.gz#https://archives.boost.io/release/1.81.0/source/boost_1_81_0.tar.gz#g' "$df"
@@ -514,6 +527,14 @@ patch_upstream_dockerfile() {
 harden_dockerfile_downloads() {
   local df="$1"
   [[ -f "$df" ]] || return 0
+  # Remove the global git TLS-off setting (advisor plan 021 / UP-BUILD-01). Upstream bakes
+  # `RUN git config --global http.sslverify false` into the image, disabling cert verification for
+  # ALL git traffic at build AND runtime — the MITM path the tarball hardening below closed,
+  # reopened for git. Delete the whole RUN line (git defaults to sslverify=true). Idempotent.
+  if grep -q 'git config --global http.sslverify false' "$df"; then
+    log "removing global git TLS-off (RUN git config --global http.sslverify false) — restores cert verification for git"
+    sed -i '/git config --global http.sslverify false/d' "$df"
+  fi
   if grep -q -- '--no-check-certificate' "$df"; then
     log "restoring TLS verification on Dockerfile downloads (drop --no-check-certificate)"
     sed -i 's/ --no-check-certificate//g' "$df"

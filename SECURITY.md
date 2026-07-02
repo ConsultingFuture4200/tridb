@@ -50,6 +50,14 @@ beyond that use.
   comparison stack) uses placeholder credentials (e.g. `testpassword`, `postgres`) read from env with
   local defaults. These are **not** secrets and exist only to stand up the local benchmark; never reuse
   them anywhere real.
+- **The inherited MSVBASE image entrypoint provisions a SUPERUSER open to `0.0.0.0/0`.** The vendored
+  `scripts/pg_scripts/docker-entrypoint.sh` (baked into any TriDB-built image) creates a database
+  superuser and appends a `host all all 0.0.0.0/0` rule to `pg_hba.conf` — appropriate only for a
+  throwaway local dev container. **Any TriDB image published beyond a local dev box MUST** override the
+  entrypoint to: scope `pg_hba.conf` to the container network (not `0.0.0.0/0`), drop SUPERUSER for the
+  application role, and set a rotated, non-default `PGPASSWORD`. This is a publish-time checklist item,
+  not a code change in this repo; TriDB does not use upstream's `dockerrun.sh` (which supplies a weak
+  default password), but the superuser-on-all-interfaces posture is inherited by the image.
 
 ## Out of scope
 
