@@ -3,6 +3,14 @@
 Updated: 2026-07-01. Legend: 🟢 unblocked here · 🟡 partial (design here,
 build on GX10) · 🔴 GX10-gated (needs live MSVBASE build).
 
+> **🟡 V1 REWIRE DESIGN (ADR-0013) 2026-07-01 — decision pending maintainer review.** Headline
+> numbers to date (SM-2, SIFT-1M filtered, GraphRAG, neon sweep) measure the **v0 heap-backed graph
+> extension** (`src/graph_store_ext/`), NOT the v1 native access method the thesis is about — both
+> operators and all 9 bench drivers still install v0. ADR-0013 (`docs/decisions/0013-graph-store-v1-rewire.md`,
+> design `docs/graph_rewire_design_v0.1.0.md`, spike `scripts/graph_v0v1_bench.sh`) specifies the
+> staged rewire; the 128 GB headline run should wait for this decision so it measures the right store.
+> See ADR-0013 Context for the coupling facts.
+
 > **🟢 FILTERED VECTOR SEARCH (VectorDBBench IntFilter) 2026-06-27 — LIVE GX10 headline, SIFT-1M.**
 > `tools/filtered_corpus.py` + `scripts/bench_filtered.sh` + `bench/filtered_report.py` (`make bench-filtered`):
 > fused `WHERE label>=t ORDER BY emb <-> q LIMIT k` (early-terminating Index Scan, TR-1) on REAL SIFT-128.
