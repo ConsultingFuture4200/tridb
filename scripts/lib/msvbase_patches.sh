@@ -98,6 +98,13 @@ verify_patches() {
     || die "TriDB tridb_hnsw_am_entry_guards.patch NOT applied in util.cpp — array-content validation missing (advisor plan 019); drift?"
   grep -q 'TRIDB: HNSW AM entry guards' "$root/src/hnswindex_scan.cpp" 2>/dev/null \
     || die "TriDB tridb_hnsw_am_entry_guards.patch NOT applied in hnswindex_scan.cpp — BulkDelete NULL-stats/TID guard missing (advisor plan 019); drift?"
+  # advisor plan 018: unused PostgresMain approximate_sum rewriter removed. Assert the sentinel is
+  # present AND the rewriter's active marker `approximate_sum(` is GONE from postgres.c, so a
+  # partial/failed apply (sentinel absent, or block still present) is caught.
+  grep -q 'TRIDB: MSVBASE approximate_sum PostgresMain rewriter removed' "$root/thirdparty/Postgres/src/backend/tcop/postgres.c" 2>/dev/null \
+    || die "TriDB tridb_remove_pgmain_rewriter.patch NOT applied — PostgresMain rewriter sentinel missing (advisor plan 018); drift?"
+  ! grep -q 'approximate_sum(' "$root/thirdparty/Postgres/src/backend/tcop/postgres.c" 2>/dev/null \
+    || die "TriDB tridb_remove_pgmain_rewriter.patch INCOMPLETE — approximate_sum( rewriter still present in postgres.c (advisor plan 018); drift?"
   log "all MSVBASE + TriDB fork patches verified present"
 }
 
@@ -378,6 +385,31 @@ apply_tridb_fork_patches() {
     log "applying TriDB fork patch: HNSW AM entry guards (dim/array validation, bulkdelete, range dist) (advisor plan 019)"
     ( cd "$root" && git apply "$am_guards_patch" ) \
       || die "tridb_hnsw_am_entry_guards.patch did not apply — MSVBASE/fork-chain drift? re-generate per advisor plan 019"
+  fi
+
+  #   tridb_remove_pgmain_rewriter.patch (advisor plan 018): MSVBASE's Postgres.patch injects a
+  #     hand-written string rewriter into PostgresMain's simple-query handler that intercepts any
+  #     statement containing approximate_sum(...) and rewrites it to a topk(...) call. TriDB NEVER
+  #     uses this path (its canonical query lowers directly to tjs()/tjs_open(); grep -rn
+  #     approximate_sum src/ test/ tools/ bench/ is empty), yet inherits the whole liability: a
+  #     char* order[100] stack overflow, an unbounded strcat past palloc(strlen*2), '-unescaped SQL
+  #     injection, a pfree(NULL) crash on a WHERE-less query, plus an always-on per-query heap leak
+  #     (lowercase()+palloc freed only inside the taken branch) and an ereport(LOG) that logs the
+  #     full text of EVERY query. Removes the entire rewrite block from PostgresMain (restoring the
+  #     plain query_string/exec_simple_query flow, leaving a one-line sentinel) and its dependent
+  #     pfree(result). Edits thirdparty/Postgres/src/backend/tcop/postgres.c, which ONLY the base
+  #     Postgres.patch touches, so ordering vs the other fork patches is immaterial; it MUST apply
+  #     AFTER the base patch (scripts/patch.sh) that introduced the block. The executor hunks of
+  #     Postgres.patch (nodeSort/nodeIndexscan relaxed monotonicity) are LEFT intact — plan 022.
+  #     Applies inside the Postgres submodule (paths a/src/backend/tcop/...), like upstream patch.sh.
+  local pgmain_patch="${_MSVBASE_LIB_DIR}/../patches/tridb_remove_pgmain_rewriter.patch"
+  [[ -f "$pgmain_patch" ]] || die "missing TriDB fork patch: $pgmain_patch"
+  if grep -q 'TRIDB: MSVBASE approximate_sum PostgresMain rewriter removed' "$root/thirdparty/Postgres/src/backend/tcop/postgres.c" 2>/dev/null; then
+    log "TriDB fork patch (remove PostgresMain approximate_sum rewriter, advisor plan 018) already applied"
+  else
+    log "applying TriDB fork patch: remove unused PostgresMain approximate_sum query rewriter (advisor plan 018)"
+    ( cd "$root/thirdparty/Postgres" && git apply "$pgmain_patch" ) \
+      || die "tridb_remove_pgmain_rewriter.patch did not apply — MSVBASE/Postgres.patch drift? re-generate per advisor plan 018"
   fi
 
   # ----------------------------------------------------------------------------
