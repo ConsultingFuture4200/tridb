@@ -49,7 +49,7 @@ image from `scripts/x86build.sh --docker`:
 
 ```bash
 make smoke-test              # -> test/smoke.sql (vector + relational) in the image
-make graph-test              # -> all four test/*.sql engine suites, fail-fast
+make graph-test              # -> the ENGINE_TESTS + AM_TESTS suites (see Makefile), fail-fast
 make test-all                # -> test + lint + smoke-test + graph-test (full verify)
 
 # Stand up the multi-system baseline (DEV-1171)

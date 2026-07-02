@@ -221,7 +221,7 @@ findings → vetted table → these 8 plans (all 8 clusters selected by the main
 | 010 | tjs_open: unify heap metric (squared L2), bounded bridge share, wire orphaned smoke test | P1 | M | MED | — (before 017) | patch-chain CI here; engine run gated | TODO |
 | 011 | tjs/tjs_open STRICT + NULL guards; quote table_name (make SECURITY.md true); CI permissions + SHA pins | P1 | S | LOW | — | patch-chain CI here; engine run gated | TODO |
 | 012 | Wire orphaned engine tests: HNSW recovery oracle, missing reloptions driver, tjs double-scan regression, sleep→poll, dead runner | P1 | M | LOW | — | bash -n / make -n here; engine run gated | TODO |
-| 013 | Docs/number reconciliation: one SM-2 value, true scale labels, ADR-0011/0012 + STATUS + spec markers current | P1 | S | LOW | — | YES (greps) | TODO |
+| 013 | Docs/number reconciliation: one SM-2 value, true scale labels, ADR-0011/0012 + STATUS + spec markers current | P1 | S | LOW | — | YES (greps) | DONE — one canonical SM-2 (15.1×); greps + `make test`/`lint` green |
 | 014 | Bench grading hardening: DONE-gates everywhere, one baseline-merge semantics, reader-failure tally, one recall_at_k | P2 | M | MED | — | YES (`make test`) | TODO |
 | 015 | Toolchain determinism: lockfile, pinned ruff + pyproject, venv-consistent lint, sed post-conditions, .env.example | P2 | S | LOW | — (coord. 011 on ci.yml) | YES | TODO |
 | 016 | v0→v1 graph-store rewire — DESIGN plan (ADR-0013 + measured spike; migration is a follow-on) | P2* | L | MED | — | harness lints here; spike run gated | TODO |

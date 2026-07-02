@@ -1,7 +1,8 @@
 # ADR-0011: Wiring the join-order decision into TJS — pass the order as a parameter, not a CustomScan rewrite
 
-**Status:** Proposed (2026-06-26). Design + the SAFE additive `LegStats` builder land here;
-the operator-shaping change is GX10-gated and NOT started (deliberately — see Scope).
+**Status:** Accepted — Stages 0-2 landed; Stage 3 (filter-first body) open as DEV-1290
+(proposed 2026-06-26, accepted 2026-07-01). Design + the SAFE additive `LegStats` builder land here;
+the operator-shaping change is GX10-gated and NOT started (deliberately — see Scope). See Addendum 2026-07-01.
 **Issue:** DEV-1285 (FR-6 — make the join-order decision actually change execution)
 **Related:** DEV-1170 / `docs/join_order_heuristic_v0.1.0.md` (FROZEN decision core, shipped),
 ADR-0007 / DEV-1169 (TJS operator — SRF now, CustomScan later), ADR-0006 (relaxed-monotonicity
@@ -233,3 +234,14 @@ a new node — that is the risk this ADR routes around.
 | Store `avg_out_degree` as a float on the metapage | Redundant — derive it from `gm_edge_count / gm_vertex_count` on read; storing a float invites staleness between the two counts. (And the whole stat is out of the FR-6 decision path anyway.) |
 | Model the filter-first path as relational JOINs feeding the graph | Violates golden rule 3 (graph is native traversal, never relational joins). The filter-first body must drive the native `gs_getnext` iterator. |
 | Implement the filter-first body on the x86 standin and call it done | GX10-gated: the operator is MSVBASE-fork C with SPI-driven executor lifecycle; it builds and the TR-1/SM-3 evidence is measurable ONLY on the GX10 (CLAUDE.md hardware reality). |
+
+## Addendum 2026-07-01 — Stage 0 landed (advisor plan 006, engine-validated)
+
+The metapage degree-stat gap this ADR flagged as an open follow-up is now closed. Advisor
+plan 006 added `uint64 gm_edge_count` to `src/graph_store/gph_page.h` (store-wide directed-edge
+count, the FR-6 `avg_out_degree` source), and `src/planner/join_order_legstats.c` now reads it
+to derive `avg_out_degree` instead of the earlier `avg_out_degree = 0.0` placeholder. This was
+built + passed the full native-AM engine suite on the `tridb/msvbase:dev` x86 image (including
+crash-recovery abort-safety), so Stage 0 is landed, not just designed. The body above is
+unchanged; this addendum carries the delta. Remaining open work: Stage 3, the filter-first
+operator body (DEV-1290), which is still GX10-gated and deliberately not started.

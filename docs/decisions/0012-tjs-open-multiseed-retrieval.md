@@ -217,3 +217,13 @@ This addendum is the spec the realization-(B) fork patch is built against; its
 recall/examined curve on real HotpotQA must match `bench/tjs_open_ref.py` within tolerance
 (recall@10 FR ≈ 0.987, nodes_examined ≈ 0.7 % corpus) as the acceptance test. The
 denser-graph `r_max` sweep remains a GX10/at-scale follow-up.
+
+## Addendum 2026-07-01 — realization (B) shipped first-cut
+
+Status: Accepted (first-cut engine operator shipped; refinement pending). Realization (B), the
+fused early-terminating C operator, now **ships as a first-cut engine operator**
+(`scripts/patches/tridb_tjs_open_operator.patch`, merged `3888d45`) — live recall@10 0.980 on
+real HotpotQA (beating vector-only 0.967) via reachability-bridge injection + VBASE early
+termination. The PPR-graded + FR-bound + RRF-fusion refinement specified in the 2026-06-29
+addendum above (host-validated at recall@10 0.987) is the next iteration on top of this
+first cut, not a prerequisite for it.

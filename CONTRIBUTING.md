@@ -59,7 +59,7 @@ not merely on `master`.
 - **Branches:** `feat/…`, `fix/…`, `chore/…`, `docs/…`, `spec/…` (or `dustin/dev-NNNN` matching Linear).
 - **Decisions that lock in structure get an ADR** in `docs/decisions/NNNN-*.md` (numbered).
 - **Specs evolve by addendum / version bump**, not silent rewrite.
-- **Python:** `ruff` for lint + format, `pytest` for tests, `pyproject`/`requirements.txt` (no `setup.py`).
+- **Python:** `ruff` for lint + format, `pytest` for tests, `requirements.txt` (no `setup.py`).
 - **C:** targets PostgreSQL 13.4 access-method APIs, 32 KB block size; MSVBASE edits ship as patches
   under `scripts/patches/` (vendored source is re-cloned), wired idempotently into
   `scripts/lib/msvbase_patches.sh` with a `verify_patches` sentinel.
