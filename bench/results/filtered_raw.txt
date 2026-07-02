@@ -1,0 +1,481 @@
+#FILT QSTART qid=0 sel=1 run=0 tag=WARM
+Time: 894.681 ms
+#FILT QEND qid=0 sel=1 run=0
+#FILT QSTART qid=0 sel=1 run=1 tag=RUN
+Time: 1.349 ms
+#FILT QEND qid=0 sel=1 run=1
+#FILT QSTART qid=0 sel=1 run=2 tag=RUN
+Time: 1.501 ms
+#FILT QEND qid=0 sel=1 run=2
+#FILT QSTART qid=0 sel=1 run=3 tag=RUN
+Time: 1.617 ms
+#FILT QEND qid=0 sel=1 run=3
+#FILT QSTART qid=0 sel=10 run=0 tag=WARM
+Time: 0.722 ms
+#FILT QEND qid=0 sel=10 run=0
+#FILT QSTART qid=0 sel=10 run=1 tag=RUN
+Time: 0.661 ms
+#FILT QEND qid=0 sel=10 run=1
+#FILT QSTART qid=0 sel=10 run=2 tag=RUN
+Time: 0.610 ms
+#FILT QEND qid=0 sel=10 run=2
+#FILT QSTART qid=0 sel=10 run=3 tag=RUN
+Time: 1.190 ms
+#FILT QEND qid=0 sel=10 run=3
+#FILT QSTART qid=0 sel=50 run=0 tag=WARM
+Time: 0.657 ms
+#FILT QEND qid=0 sel=50 run=0
+#FILT QSTART qid=0 sel=50 run=1 tag=RUN
+Time: 0.533 ms
+#FILT QEND qid=0 sel=50 run=1
+#FILT QSTART qid=0 sel=50 run=2 tag=RUN
+Time: 0.362 ms
+#FILT QEND qid=0 sel=50 run=2
+#FILT QSTART qid=0 sel=50 run=3 tag=RUN
+Time: 0.462 ms
+#FILT QEND qid=0 sel=50 run=3
+#FILT QSTART qid=0 sel=99 run=0 tag=WARM
+Time: 0.430 ms
+#FILT QEND qid=0 sel=99 run=0
+#FILT QSTART qid=0 sel=99 run=1 tag=RUN
+Time: 0.439 ms
+#FILT QEND qid=0 sel=99 run=1
+#FILT QSTART qid=0 sel=99 run=2 tag=RUN
+Time: 0.487 ms
+#FILT QEND qid=0 sel=99 run=2
+#FILT QSTART qid=0 sel=99 run=3 tag=RUN
+Time: 0.315 ms
+#FILT QEND qid=0 sel=99 run=3
+#FILT QSTART qid=1 sel=1 run=0 tag=WARM
+Time: 0.882 ms
+#FILT QEND qid=1 sel=1 run=0
+#FILT QSTART qid=1 sel=1 run=1 tag=RUN
+Time: 1.148 ms
+#FILT QEND qid=1 sel=1 run=1
+#FILT QSTART qid=1 sel=1 run=2 tag=RUN
+Time: 0.925 ms
+#FILT QEND qid=1 sel=1 run=2
+#FILT QSTART qid=1 sel=1 run=3 tag=RUN
+Time: 1.195 ms
+#FILT QEND qid=1 sel=1 run=3
+#FILT QSTART qid=1 sel=10 run=0 tag=WARM
+Time: 0.450 ms
+#FILT QEND qid=1 sel=10 run=0
+#FILT QSTART qid=1 sel=10 run=1 tag=RUN
+Time: 0.365 ms
+#FILT QEND qid=1 sel=10 run=1
+#FILT QSTART qid=1 sel=10 run=2 tag=RUN
+Time: 0.424 ms
+#FILT QEND qid=1 sel=10 run=2
+#FILT QSTART qid=1 sel=10 run=3 tag=RUN
+Time: 0.551 ms
+#FILT QEND qid=1 sel=10 run=3
+#FILT QSTART qid=1 sel=50 run=0 tag=WARM
+Time: 0.664 ms
+#FILT QEND qid=1 sel=50 run=0
+#FILT QSTART qid=1 sel=50 run=1 tag=RUN
+Time: 0.689 ms
+#FILT QEND qid=1 sel=50 run=1
+#FILT QSTART qid=1 sel=50 run=2 tag=RUN
+Time: 0.679 ms
+#FILT QEND qid=1 sel=50 run=2
+#FILT QSTART qid=1 sel=50 run=3 tag=RUN
+Time: 0.664 ms
+#FILT QEND qid=1 sel=50 run=3
+#FILT QSTART qid=1 sel=99 run=0 tag=WARM
+Time: 0.557 ms
+#FILT QEND qid=1 sel=99 run=0
+#FILT QSTART qid=1 sel=99 run=1 tag=RUN
+Time: 0.588 ms
+#FILT QEND qid=1 sel=99 run=1
+#FILT QSTART qid=1 sel=99 run=2 tag=RUN
+Time: 0.577 ms
+#FILT QEND qid=1 sel=99 run=2
+#FILT QSTART qid=1 sel=99 run=3 tag=RUN
+Time: 0.547 ms
+#FILT QEND qid=1 sel=99 run=3
+#FILT QSTART qid=2 sel=1 run=0 tag=WARM
+Time: 1.280 ms
+#FILT QEND qid=2 sel=1 run=0
+#FILT QSTART qid=2 sel=1 run=1 tag=RUN
+Time: 1.192 ms
+#FILT QEND qid=2 sel=1 run=1
+#FILT QSTART qid=2 sel=1 run=2 tag=RUN
+Time: 0.875 ms
+#FILT QEND qid=2 sel=1 run=2
+#FILT QSTART qid=2 sel=1 run=3 tag=RUN
+Time: 1.038 ms
+#FILT QEND qid=2 sel=1 run=3
+#FILT QSTART qid=2 sel=10 run=0 tag=WARM
+Time: 0.389 ms
+#FILT QEND qid=2 sel=10 run=0
+#FILT QSTART qid=2 sel=10 run=1 tag=RUN
+Time: 0.302 ms
+#FILT QEND qid=2 sel=10 run=1
+#FILT QSTART qid=2 sel=10 run=2 tag=RUN
+Time: 0.304 ms
+#FILT QEND qid=2 sel=10 run=2
+#FILT QSTART qid=2 sel=10 run=3 tag=RUN
+Time: 0.297 ms
+#FILT QEND qid=2 sel=10 run=3
+#FILT QSTART qid=2 sel=50 run=0 tag=WARM
+Time: 0.230 ms
+#FILT QEND qid=2 sel=50 run=0
+#FILT QSTART qid=2 sel=50 run=1 tag=RUN
+Time: 0.268 ms
+#FILT QEND qid=2 sel=50 run=1
+#FILT QSTART qid=2 sel=50 run=2 tag=RUN
+Time: 0.248 ms
+#FILT QEND qid=2 sel=50 run=2
+#FILT QSTART qid=2 sel=50 run=3 tag=RUN
+Time: 0.236 ms
+#FILT QEND qid=2 sel=50 run=3
+#FILT QSTART qid=2 sel=99 run=0 tag=WARM
+Time: 0.236 ms
+#FILT QEND qid=2 sel=99 run=0
+#FILT QSTART qid=2 sel=99 run=1 tag=RUN
+Time: 0.261 ms
+#FILT QEND qid=2 sel=99 run=1
+#FILT QSTART qid=2 sel=99 run=2 tag=RUN
+Time: 0.332 ms
+#FILT QEND qid=2 sel=99 run=2
+#FILT QSTART qid=2 sel=99 run=3 tag=RUN
+Time: 0.389 ms
+#FILT QEND qid=2 sel=99 run=3
+#FILT QSTART qid=3 sel=1 run=0 tag=WARM
+Time: 1.176 ms
+#FILT QEND qid=3 sel=1 run=0
+#FILT QSTART qid=3 sel=1 run=1 tag=RUN
+Time: 1.402 ms
+#FILT QEND qid=3 sel=1 run=1
+#FILT QSTART qid=3 sel=1 run=2 tag=RUN
+Time: 1.458 ms
+#FILT QEND qid=3 sel=1 run=2
+#FILT QSTART qid=3 sel=1 run=3 tag=RUN
+Time: 1.405 ms
+#FILT QEND qid=3 sel=1 run=3
+#FILT QSTART qid=3 sel=10 run=0 tag=WARM
+Time: 0.502 ms
+#FILT QEND qid=3 sel=10 run=0
+#FILT QSTART qid=3 sel=10 run=1 tag=RUN
+Time: 0.457 ms
+#FILT QEND qid=3 sel=10 run=1
+#FILT QSTART qid=3 sel=10 run=2 tag=RUN
+Time: 0.474 ms
+#FILT QEND qid=3 sel=10 run=2
+#FILT QSTART qid=3 sel=10 run=3 tag=RUN
+Time: 0.449 ms
+#FILT QEND qid=3 sel=10 run=3
+#FILT QSTART qid=3 sel=50 run=0 tag=WARM
+Time: 0.530 ms
+#FILT QEND qid=3 sel=50 run=0
+#FILT QSTART qid=3 sel=50 run=1 tag=RUN
+Time: 0.535 ms
+#FILT QEND qid=3 sel=50 run=1
+#FILT QSTART qid=3 sel=50 run=2 tag=RUN
+Time: 0.360 ms
+#FILT QEND qid=3 sel=50 run=2
+#FILT QSTART qid=3 sel=50 run=3 tag=RUN
+Time: 0.356 ms
+#FILT QEND qid=3 sel=50 run=3
+#FILT QSTART qid=3 sel=99 run=0 tag=WARM
+Time: 0.466 ms
+#FILT QEND qid=3 sel=99 run=0
+#FILT QSTART qid=3 sel=99 run=1 tag=RUN
+Time: 0.390 ms
+#FILT QEND qid=3 sel=99 run=1
+#FILT QSTART qid=3 sel=99 run=2 tag=RUN
+Time: 0.423 ms
+#FILT QEND qid=3 sel=99 run=2
+#FILT QSTART qid=3 sel=99 run=3 tag=RUN
+Time: 0.457 ms
+#FILT QEND qid=3 sel=99 run=3
+#FILT QSTART qid=4 sel=1 run=0 tag=WARM
+Time: 1.394 ms
+#FILT QEND qid=4 sel=1 run=0
+#FILT QSTART qid=4 sel=1 run=1 tag=RUN
+Time: 1.297 ms
+#FILT QEND qid=4 sel=1 run=1
+#FILT QSTART qid=4 sel=1 run=2 tag=RUN
+Time: 1.465 ms
+#FILT QEND qid=4 sel=1 run=2
+#FILT QSTART qid=4 sel=1 run=3 tag=RUN
+Time: 1.163 ms
+#FILT QEND qid=4 sel=1 run=3
+#FILT QSTART qid=4 sel=10 run=0 tag=WARM
+Time: 0.396 ms
+#FILT QEND qid=4 sel=10 run=0
+#FILT QSTART qid=4 sel=10 run=1 tag=RUN
+Time: 0.335 ms
+#FILT QEND qid=4 sel=10 run=1
+#FILT QSTART qid=4 sel=10 run=2 tag=RUN
+Time: 0.382 ms
+#FILT QEND qid=4 sel=10 run=2
+#FILT QSTART qid=4 sel=10 run=3 tag=RUN
+Time: 0.502 ms
+#FILT QEND qid=4 sel=10 run=3
+#FILT QSTART qid=4 sel=50 run=0 tag=WARM
+Time: 0.560 ms
+#FILT QEND qid=4 sel=50 run=0
+#FILT QSTART qid=4 sel=50 run=1 tag=RUN
+Time: 0.583 ms
+#FILT QEND qid=4 sel=50 run=1
+#FILT QSTART qid=4 sel=50 run=2 tag=RUN
+Time: 0.579 ms
+#FILT QEND qid=4 sel=50 run=2
+#FILT QSTART qid=4 sel=50 run=3 tag=RUN
+Time: 0.483 ms
+#FILT QEND qid=4 sel=50 run=3
+#FILT QSTART qid=4 sel=99 run=0 tag=WARM
+Time: 0.566 ms
+#FILT QEND qid=4 sel=99 run=0
+#FILT QSTART qid=4 sel=99 run=1 tag=RUN
+Time: 0.588 ms
+#FILT QEND qid=4 sel=99 run=1
+#FILT QSTART qid=4 sel=99 run=2 tag=RUN
+Time: 0.583 ms
+#FILT QEND qid=4 sel=99 run=2
+#FILT QSTART qid=4 sel=99 run=3 tag=RUN
+Time: 0.522 ms
+#FILT QEND qid=4 sel=99 run=3
+#FILT QSTART qid=5 sel=1 run=0 tag=WARM
+Time: 1.981 ms
+#FILT QEND qid=5 sel=1 run=0
+#FILT QSTART qid=5 sel=1 run=1 tag=RUN
+Time: 1.257 ms
+#FILT QEND qid=5 sel=1 run=1
+#FILT QSTART qid=5 sel=1 run=2 tag=RUN
+Time: 1.055 ms
+#FILT QEND qid=5 sel=1 run=2
+#FILT QSTART qid=5 sel=1 run=3 tag=RUN
+Time: 0.845 ms
+#FILT QEND qid=5 sel=1 run=3
+#FILT QSTART qid=5 sel=10 run=0 tag=WARM
+Time: 0.316 ms
+#FILT QEND qid=5 sel=10 run=0
+#FILT QSTART qid=5 sel=10 run=1 tag=RUN
+Time: 0.315 ms
+#FILT QEND qid=5 sel=10 run=1
+#FILT QSTART qid=5 sel=10 run=2 tag=RUN
+Time: 0.301 ms
+#FILT QEND qid=5 sel=10 run=2
+#FILT QSTART qid=5 sel=10 run=3 tag=RUN
+Time: 0.328 ms
+#FILT QEND qid=5 sel=10 run=3
+#FILT QSTART qid=5 sel=50 run=0 tag=WARM
+Time: 0.386 ms
+#FILT QEND qid=5 sel=50 run=0
+#FILT QSTART qid=5 sel=50 run=1 tag=RUN
+Time: 0.331 ms
+#FILT QEND qid=5 sel=50 run=1
+#FILT QSTART qid=5 sel=50 run=2 tag=RUN
+Time: 0.443 ms
+#FILT QEND qid=5 sel=50 run=2
+#FILT QSTART qid=5 sel=50 run=3 tag=RUN
+Time: 0.485 ms
+#FILT QEND qid=5 sel=50 run=3
+#FILT QSTART qid=5 sel=99 run=0 tag=WARM
+Time: 0.587 ms
+#FILT QEND qid=5 sel=99 run=0
+#FILT QSTART qid=5 sel=99 run=1 tag=RUN
+Time: 0.707 ms
+#FILT QEND qid=5 sel=99 run=1
+#FILT QSTART qid=5 sel=99 run=2 tag=RUN
+Time: 0.861 ms
+#FILT QEND qid=5 sel=99 run=2
+#FILT QSTART qid=5 sel=99 run=3 tag=RUN
+Time: 0.691 ms
+#FILT QEND qid=5 sel=99 run=3
+#FILT QSTART qid=6 sel=1 run=0 tag=WARM
+Time: 1.344 ms
+#FILT QEND qid=6 sel=1 run=0
+#FILT QSTART qid=6 sel=1 run=1 tag=RUN
+Time: 1.184 ms
+#FILT QEND qid=6 sel=1 run=1
+#FILT QSTART qid=6 sel=1 run=2 tag=RUN
+Time: 1.318 ms
+#FILT QEND qid=6 sel=1 run=2
+#FILT QSTART qid=6 sel=1 run=3 tag=RUN
+Time: 1.270 ms
+#FILT QEND qid=6 sel=1 run=3
+#FILT QSTART qid=6 sel=10 run=0 tag=WARM
+Time: 0.536 ms
+#FILT QEND qid=6 sel=10 run=0
+#FILT QSTART qid=6 sel=10 run=1 tag=RUN
+Time: 0.443 ms
+#FILT QEND qid=6 sel=10 run=1
+#FILT QSTART qid=6 sel=10 run=2 tag=RUN
+Time: 0.394 ms
+#FILT QEND qid=6 sel=10 run=2
+#FILT QSTART qid=6 sel=10 run=3 tag=RUN
+Time: 0.475 ms
+#FILT QEND qid=6 sel=10 run=3
+#FILT QSTART qid=6 sel=50 run=0 tag=WARM
+Time: 0.473 ms
+#FILT QEND qid=6 sel=50 run=0
+#FILT QSTART qid=6 sel=50 run=1 tag=RUN
+Time: 0.446 ms
+#FILT QEND qid=6 sel=50 run=1
+#FILT QSTART qid=6 sel=50 run=2 tag=RUN
+Time: 0.441 ms
+#FILT QEND qid=6 sel=50 run=2
+#FILT QSTART qid=6 sel=50 run=3 tag=RUN
+Time: 0.434 ms
+#FILT QEND qid=6 sel=50 run=3
+#FILT QSTART qid=6 sel=99 run=0 tag=WARM
+Time: 0.496 ms
+#FILT QEND qid=6 sel=99 run=0
+#FILT QSTART qid=6 sel=99 run=1 tag=RUN
+Time: 0.492 ms
+#FILT QEND qid=6 sel=99 run=1
+#FILT QSTART qid=6 sel=99 run=2 tag=RUN
+Time: 0.418 ms
+#FILT QEND qid=6 sel=99 run=2
+#FILT QSTART qid=6 sel=99 run=3 tag=RUN
+Time: 0.597 ms
+#FILT QEND qid=6 sel=99 run=3
+#FILT QSTART qid=7 sel=1 run=0 tag=WARM
+Time: 2.057 ms
+#FILT QEND qid=7 sel=1 run=0
+#FILT QSTART qid=7 sel=1 run=1 tag=RUN
+Time: 2.150 ms
+#FILT QEND qid=7 sel=1 run=1
+#FILT QSTART qid=7 sel=1 run=2 tag=RUN
+Time: 2.153 ms
+#FILT QEND qid=7 sel=1 run=2
+#FILT QSTART qid=7 sel=1 run=3 tag=RUN
+Time: 2.153 ms
+#FILT QEND qid=7 sel=1 run=3
+#FILT QSTART qid=7 sel=10 run=0 tag=WARM
+Time: 0.375 ms
+#FILT QEND qid=7 sel=10 run=0
+#FILT QSTART qid=7 sel=10 run=1 tag=RUN
+Time: 0.326 ms
+#FILT QEND qid=7 sel=10 run=1
+#FILT QSTART qid=7 sel=10 run=2 tag=RUN
+Time: 0.316 ms
+#FILT QEND qid=7 sel=10 run=2
+#FILT QSTART qid=7 sel=10 run=3 tag=RUN
+Time: 0.343 ms
+#FILT QEND qid=7 sel=10 run=3
+#FILT QSTART qid=7 sel=50 run=0 tag=WARM
+Time: 0.388 ms
+#FILT QEND qid=7 sel=50 run=0
+#FILT QSTART qid=7 sel=50 run=1 tag=RUN
+Time: 0.405 ms
+#FILT QEND qid=7 sel=50 run=1
+#FILT QSTART qid=7 sel=50 run=2 tag=RUN
+Time: 0.392 ms
+#FILT QEND qid=7 sel=50 run=2
+#FILT QSTART qid=7 sel=50 run=3 tag=RUN
+Time: 0.323 ms
+#FILT QEND qid=7 sel=50 run=3
+#FILT QSTART qid=7 sel=99 run=0 tag=WARM
+Time: 0.301 ms
+#FILT QEND qid=7 sel=99 run=0
+#FILT QSTART qid=7 sel=99 run=1 tag=RUN
+Time: 0.364 ms
+#FILT QEND qid=7 sel=99 run=1
+#FILT QSTART qid=7 sel=99 run=2 tag=RUN
+Time: 0.295 ms
+#FILT QEND qid=7 sel=99 run=2
+#FILT QSTART qid=7 sel=99 run=3 tag=RUN
+Time: 0.431 ms
+#FILT QEND qid=7 sel=99 run=3
+#FILT QSTART qid=8 sel=1 run=0 tag=WARM
+Time: 1.200 ms
+#FILT QEND qid=8 sel=1 run=0
+#FILT QSTART qid=8 sel=1 run=1 tag=RUN
+Time: 0.947 ms
+#FILT QEND qid=8 sel=1 run=1
+#FILT QSTART qid=8 sel=1 run=2 tag=RUN
+Time: 1.639 ms
+#FILT QEND qid=8 sel=1 run=2
+#FILT QSTART qid=8 sel=1 run=3 tag=RUN
+Time: 2.341 ms
+#FILT QEND qid=8 sel=1 run=3
+#FILT QSTART qid=8 sel=10 run=0 tag=WARM
+Time: 0.644 ms
+#FILT QEND qid=8 sel=10 run=0
+#FILT QSTART qid=8 sel=10 run=1 tag=RUN
+Time: 0.637 ms
+#FILT QEND qid=8 sel=10 run=1
+#FILT QSTART qid=8 sel=10 run=2 tag=RUN
+Time: 0.508 ms
+#FILT QEND qid=8 sel=10 run=2
+#FILT QSTART qid=8 sel=10 run=3 tag=RUN
+Time: 0.488 ms
+#FILT QEND qid=8 sel=10 run=3
+#FILT QSTART qid=8 sel=50 run=0 tag=WARM
+Time: 0.669 ms
+#FILT QEND qid=8 sel=50 run=0
+#FILT QSTART qid=8 sel=50 run=1 tag=RUN
+Time: 0.528 ms
+#FILT QEND qid=8 sel=50 run=1
+#FILT QSTART qid=8 sel=50 run=2 tag=RUN
+Time: 0.532 ms
+#FILT QEND qid=8 sel=50 run=2
+#FILT QSTART qid=8 sel=50 run=3 tag=RUN
+Time: 0.568 ms
+#FILT QEND qid=8 sel=50 run=3
+#FILT QSTART qid=8 sel=99 run=0 tag=WARM
+Time: 0.434 ms
+#FILT QEND qid=8 sel=99 run=0
+#FILT QSTART qid=8 sel=99 run=1 tag=RUN
+Time: 0.449 ms
+#FILT QEND qid=8 sel=99 run=1
+#FILT QSTART qid=8 sel=99 run=2 tag=RUN
+Time: 0.517 ms
+#FILT QEND qid=8 sel=99 run=2
+#FILT QSTART qid=8 sel=99 run=3 tag=RUN
+Time: 0.557 ms
+#FILT QEND qid=8 sel=99 run=3
+#FILT QSTART qid=9 sel=1 run=0 tag=WARM
+Time: 1.221 ms
+#FILT QEND qid=9 sel=1 run=0
+#FILT QSTART qid=9 sel=1 run=1 tag=RUN
+Time: 1.071 ms
+#FILT QEND qid=9 sel=1 run=1
+#FILT QSTART qid=9 sel=1 run=2 tag=RUN
+Time: 1.079 ms
+#FILT QEND qid=9 sel=1 run=2
+#FILT QSTART qid=9 sel=1 run=3 tag=RUN
+Time: 0.964 ms
+#FILT QEND qid=9 sel=1 run=3
+#FILT QSTART qid=9 sel=10 run=0 tag=WARM
+Time: 0.432 ms
+#FILT QEND qid=9 sel=10 run=0
+#FILT QSTART qid=9 sel=10 run=1 tag=RUN
+Time: 0.484 ms
+#FILT QEND qid=9 sel=10 run=1
+#FILT QSTART qid=9 sel=10 run=2 tag=RUN
+Time: 0.484 ms
+#FILT QEND qid=9 sel=10 run=2
+#FILT QSTART qid=9 sel=10 run=3 tag=RUN
+Time: 0.509 ms
+#FILT QEND qid=9 sel=10 run=3
+#FILT QSTART qid=9 sel=50 run=0 tag=WARM
+Time: 0.400 ms
+#FILT QEND qid=9 sel=50 run=0
+#FILT QSTART qid=9 sel=50 run=1 tag=RUN
+Time: 0.470 ms
+#FILT QEND qid=9 sel=50 run=1
+#FILT QSTART qid=9 sel=50 run=2 tag=RUN
+Time: 0.501 ms
+#FILT QEND qid=9 sel=50 run=2
+#FILT QSTART qid=9 sel=50 run=3 tag=RUN
+Time: 0.680 ms
+#FILT QEND qid=9 sel=50 run=3
+#FILT QSTART qid=9 sel=99 run=0 tag=WARM
+Time: 0.606 ms
+#FILT QEND qid=9 sel=99 run=0
+#FILT QSTART qid=9 sel=99 run=1 tag=RUN
+Time: 0.528 ms
+#FILT QEND qid=9 sel=99 run=1
+#FILT QSTART qid=9 sel=99 run=2 tag=RUN
+Time: 0.566 ms
+#FILT QEND qid=9 sel=99 run=2
+#FILT QSTART qid=9 sel=99 run=3 tag=RUN
+Time: 0.549 ms
+#FILT QEND qid=9 sel=99 run=3
+#FILT DONE
