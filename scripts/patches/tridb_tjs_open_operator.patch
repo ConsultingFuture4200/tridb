@@ -27,7 +27,7 @@ index c605522..29b09a8 100644
 +CREATE FUNCTION tjs_open(table_name text, k integer, term_cond integer, m_seeds integer,
 +                         hops integer, attr_exp text, filter_exp text, orderby_exp text)
 +                RETURNS SETOF record
-+	AS 'MODULE_PATHNAME' LANGUAGE C STABLE;
++	AS 'MODULE_PATHNAME' LANGUAGE C STABLE STRICT;
 +
 +COMMENT ON FUNCTION tjs_open(text, integer, integer, integer, integer, text, text, text) IS
 +	'TriDB tjs_open — seedless multi-seed open-domain retrieval (ADR-0012 realization B). ANN '
@@ -47,7 +47,7 @@ new file mode 100644
 index 0000000..9954de7
 --- /dev/null
 +++ b/src/tjs_open_operator.cpp
-@@ -0,0 +1,924 @@
+@@ -0,0 +1,936 @@
 +// Copyright (c) TriDB. Licensed under the MIT License.
 +//
 +// tjs_open_operator.cpp — TriDB `tjs_open` multi-seed open-domain retrieval operator
@@ -550,7 +550,8 @@ index 0000000..9954de7
 +	}
 +
 +	std::string sql = "SELECT " + *estate->attr_exp + ", (" + *estate->orderby_exp + ") AS __d FROM " +
-+					  *estate->tbl_name + " WHERE " + *estate->id_col + " = ANY (ARRAY[" + idlist + "])";
++					  quote_identifier(estate->tbl_name->c_str()) + " WHERE " + *estate->id_col +
++					  " = ANY (ARRAY[" + idlist + "])";
 +	if (!estate->filter_exp->empty())
 +		sql += " AND (" + *estate->filter_exp + ")";
 +
@@ -836,6 +837,13 @@ index 0000000..9954de7
 +		funcctx = SRF_FIRSTCALL_INIT();
 +		oldcontext = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
 +
++		/* STRICT already rejects NULL args, but guard explicitly per the repo convention
++		 * (join_order.c): PG_GETARG_TEXT_PP on a NULL datum is UB. Belt-and-braces. */
++		for (int _i = 0; _i < PG_NARGS(); _i++)
++			if (PG_ARGISNULL(_i))
++				ereport(ERROR, (errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
++						errmsg("tjs_open: argument %d must not be NULL", _i + 1)));
++
 +		int argc = 0;
 +		text *tablename = PG_GETARG_TEXT_PP(argc++);
 +		uint32 k = PG_GETARG_UINT32(argc++);
@@ -874,12 +882,16 @@ index 0000000..9954de7
 +		// rank both come from this single stream (seedless seeding).
 +		std::string orderby(text_to_cstring(orderby_text));
 +		char sourceText[102400];
++		// table_name is interpolated into the generated SQL; quote it as an identifier so it cannot
++		// break out (SECURITY.md). quote_identifier returns the input unchanged when quoting is
++		// unneeded, so ordinary names are byte-identical — no behavior change for existing callers.
++		const char *qtbl = quote_identifier(text_to_cstring(tablename));
 +		if ( strlen(text_to_cstring(filter_exp_text)) == 0 ){
 +			snprintf(sourceText, sizeof(sourceText), "select %s from %s order by %s",
-+					 text_to_cstring(attr_exp_text), text_to_cstring(tablename), orderby.c_str());
++					 text_to_cstring(attr_exp_text), qtbl, orderby.c_str());
 +		} else {
 +			snprintf(sourceText, sizeof(sourceText), "select %s from %s where %s order by %s",
-+					 text_to_cstring(attr_exp_text), text_to_cstring(tablename),
++					 text_to_cstring(attr_exp_text), qtbl,
 +					 text_to_cstring(filter_exp_text), orderby.c_str());
 +		}
 +		DEBUG_PRINT("tjs_open vector leg SQL: %s", sourceText);

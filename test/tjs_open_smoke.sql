@@ -117,4 +117,22 @@ BEGIN
     RAISE NOTICE 'PASS multi-hop expansion: 777 admitted only at hops=2';
 END $$;
 
+-- ===========================================================================
+-- ASSERTION 5: STRICT NULL guard. tjs_open is STRICT, so a NULL argument yields a clean
+-- zero-row result (the SRF is never entered), not a backend crash (previously: NULL table_name
+-- dereferenced -> segfault, an unprivileged single-statement DoS).
+-- ===========================================================================
+DO $$
+DECLARE n bigint;
+BEGIN
+    -- STRICT: NULL arg returns no rows (previously: backend segfault)
+    SELECT count(*) INTO n
+    FROM tjs_open(NULL, 5, 0, 3, 1, 'id', '',
+                  'embedding <-> ''{19,0,0,0,0,0,0,0}''') AS t(id bigint);
+    IF n <> 0 THEN
+        RAISE EXCEPTION 'tjs_open NULL-arg guard FAILED: expected 0 rows, got %', n;
+    END IF;
+    RAISE NOTICE 'PASS STRICT NULL guard: tjs_open(NULL,...) returned 0 rows (no crash)';
+END $$;
+
 SELECT 'tjs_open smoke: ALL ASSERTIONS PASSED' AS result;
