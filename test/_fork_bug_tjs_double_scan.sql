@@ -4,8 +4,10 @@
 -- DEV-1236 (DIAGNOSE): minimal repro for the "second-scan-in-the-same-plpgsql-block" segfault.
 -- Co-issuing ANY second table scan in the SAME plpgsql block as topk()/multicol_topk()/tjs()
 -- terminates the backend with signal 11. This file captures the FAILING SHAPE across all three
--- operators so the root-cause analysis (docs/fork_segfault_double_scan.md) and the draft fix
--- (scripts/patches/tridb_fix_double_scan_snapshot.patch, UNBUILT) have a single executable witness.
+-- operators so the root-cause analysis (docs/fork_segfault_double_scan.md) has a single executable
+-- witness. The fix shipped (tridb_fix_double_scan_snapshot.patch, applied + sentinel-verified); this
+-- file remains only as the crash-witness for pre-fix builds — the passing regression is
+-- test/fork_bug_tjs_double_scan.sql.
 --
 -- Companion: test/_fork_bug_multicol_double_scan.sql (DEV-1169 attribution, multicol_topk only).
 -- This file generalizes it to all three operators AND isolates the two independent triggers below.

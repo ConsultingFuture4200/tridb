@@ -55,10 +55,32 @@ runuser -u postgres -- $PSQL -c \
 
 echo "--- crash: pg_ctl stop -m immediate (no shutdown checkpoint) ---"
 runuser -u postgres -- "$B/pg_ctl" -D "$D" -m immediate stop >/dev/null 2>&1 || true
-sleep 1
+# Bounded, fail-loud wait for the postmaster to actually exit (replaces a bare sleep): poll for
+# postmaster.pid removal up to ~60s, matching scripts/crash_recovery_test.sh:104-130.
+stopped=0
+for i in $(seq 1 120); do
+  if [ ! -f "$D/postmaster.pid" ]; then stopped=1; break; fi
+  sleep 0.5
+done
+if [ "$stopped" != "1" ]; then
+  echo "=== ORACLE A FAIL: postmaster did not exit within ~60s after -m immediate stop ==="
+  exit 1
+fi
 
 echo "--- restart: WAL-redo recovers committed heap tuple ---"
 runuser -u postgres -- "$B/pg_ctl" -D "$D" -o "-p 5432" -w start >/dev/null 2>&1
+# Bounded, fail-loud wait for the recovered postmaster to accept queries (SELECT 1) up to ~60s.
+ready=0
+for i in $(seq 1 120); do
+  if [ "$(runuser -u postgres -- $PSQL -tA -c "SELECT 1;" 2>/dev/null || true)" = "1" ]; then
+    ready=1; break
+  fi
+  sleep 0.5
+done
+if [ "$ready" != "1" ]; then
+  echo "=== ORACLE A FAIL: postmaster did not accept SELECT 1 within ~60s after restart ==="
+  exit 1
+fi
 
 echo "--- oracle A query: HNSW scan must return R=9001 ---"
 runuser -u postgres -- $PSQL -f /tmp/hnsw_recovery_test.sql
