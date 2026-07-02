@@ -92,6 +92,12 @@ verify_patches() {
     || die "TriDB tridb_hnsw_reloptions.patch NOT applied — HNSW m/ef_construction reloptions missing (DEV-1286); drift?"
   grep -q 'DEV-1248' "$root/src/hnswindex.cpp" 2>/dev/null \
     || die "TriDB tridb_hnsw_costestimate_no_orderby.patch NOT applied — HNSW no-ORDER-BY cost penalty missing (DEV-1248); drift?"
+  # advisor plan 019: HNSW AM entry guards. Sentinel on the distinctive marker at the single
+  # choke point (util.cpp) AND the bulkdelete site so a partial/failed apply is caught.
+  grep -q 'TRIDB: HNSW AM entry guards' "$root/src/util.cpp" 2>/dev/null \
+    || die "TriDB tridb_hnsw_am_entry_guards.patch NOT applied in util.cpp — array-content validation missing (advisor plan 019); drift?"
+  grep -q 'TRIDB: HNSW AM entry guards' "$root/src/hnswindex_scan.cpp" 2>/dev/null \
+    || die "TriDB tridb_hnsw_am_entry_guards.patch NOT applied in hnswindex_scan.cpp — BulkDelete NULL-stats/TID guard missing (advisor plan 019); drift?"
   log "all MSVBASE + TriDB fork patches verified present"
 }
 
@@ -348,6 +354,30 @@ apply_tridb_fork_patches() {
     log "applying TriDB fork patch: tjs_open seedless multi-seed retrieval operator (ADR-0012 B)"
     ( cd "$root" && git apply "$tjs_open_patch" ) \
       || die "tridb_tjs_open_operator.patch did not apply — MSVBASE/tjs-chain drift? re-generate per ADR-0012"
+  fi
+
+  #   tridb_hnsw_am_entry_guards.patch (advisor plan 019): defensive validation on the HNSW AM
+  #     entry points an unprivileged SQL query reaches. The insert/build paths validate
+  #     caller-supplied arrays; the scan/vacuum/range paths did not, so a short/empty/mistyped
+  #     vector literal could OOB-read the distance kernel or NULL-deref VACUUM. Four additive
+  #     guards: (1) hnsw_gettuple checks the query-vector length against the index dimension in
+  #     BOTH the ORDER BY (== dim) and range (== dim+1, non-empty) branches; (2) the single
+  #     choke point convert_array_to_vector rejects multi-dim / NULL-containing / non-float8[]
+  #     arrays (mirrors convert_array_to_vector_str), defending build/insert/scan uniformly;
+  #     (3) HNSWIndexScan::BulkDelete palloc0s a NULL stats (ambulkdelete's first call) and builds
+  #     the visibility TID with ItemPointerSet instead of malformed brace-elision; (4)
+  #     range_l2_distance / range_inner_product_distance length-check lhs == rhs-1. Touches four
+  #     already-TriDB-patched files, so it MUST apply LAST (diffed against the full chain above).
+  #     The endscan NULL guard the plan also called for is ALREADY present (added by
+  #     tridb_hnsw_scan_no_orderby.patch, DEV-1236), so it is not duplicated here.
+  local am_guards_patch="${_MSVBASE_LIB_DIR}/../patches/tridb_hnsw_am_entry_guards.patch"
+  [[ -f "$am_guards_patch" ]] || die "missing TriDB fork patch: $am_guards_patch"
+  if grep -q 'TRIDB: HNSW AM entry guards' "$root/src/util.cpp" 2>/dev/null; then
+    log "TriDB fork patch (HNSW AM entry guards, advisor plan 019) already applied"
+  else
+    log "applying TriDB fork patch: HNSW AM entry guards (dim/array validation, bulkdelete, range dist) (advisor plan 019)"
+    ( cd "$root" && git apply "$am_guards_patch" ) \
+      || die "tridb_hnsw_am_entry_guards.patch did not apply — MSVBASE/fork-chain drift? re-generate per advisor plan 019"
   fi
 
   # ----------------------------------------------------------------------------
