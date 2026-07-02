@@ -105,6 +105,13 @@ verify_patches() {
     || die "TriDB tridb_remove_pgmain_rewriter.patch NOT applied — PostgresMain rewriter sentinel missing (advisor plan 018); drift?"
   ! grep -q 'approximate_sum(' "$root/thirdparty/Postgres/src/backend/tcop/postgres.c" 2>/dev/null \
     || die "TriDB tridb_remove_pgmain_rewriter.patch INCOMPLETE — approximate_sum( rewriter still present in postgres.c (advisor plan 018); drift?"
+  # advisor plan 022: relaxed-monotonicity executor guard. Two sentinels on LOAD-BEARING code
+  # tokens (not comment phrases): the xs_inorder zero-init in genam.c AND the amcanrelaxedorderbyop
+  # gate in nodeIndexscan.c — a partial/failed apply misses one and die()s.
+  grep -q 'scan->xs_inorder = false' "$root/thirdparty/Postgres/src/backend/access/index/genam.c" 2>/dev/null \
+    || die "TriDB tridb_relaxed_order_executor_guard.patch NOT applied — xs_inorder zero-init missing in genam.c (advisor plan 022); drift?"
+  grep -q 'amcanrelaxedorderbyop' "$root/thirdparty/Postgres/src/backend/executor/nodeIndexscan.c" 2>/dev/null \
+    || die "TriDB tridb_relaxed_order_executor_guard.patch NOT applied — amcanrelaxedorderbyop gate/guard missing in nodeIndexscan.c (advisor plan 022); drift?"
   log "all MSVBASE + TriDB fork patches verified present"
 }
 
@@ -410,6 +417,34 @@ apply_tridb_fork_patches() {
     log "applying TriDB fork patch: remove unused PostgresMain approximate_sum query rewriter (advisor plan 018)"
     ( cd "$root/thirdparty/Postgres" && git apply "$pgmain_patch" ) \
       || die "tridb_remove_pgmain_rewriter.patch did not apply — MSVBASE/Postgres.patch drift? re-generate per advisor plan 018"
+  fi
+
+  #   tridb_relaxed_order_executor_guard.patch (advisor plan 022): harden the VBASE relaxed-
+  #     monotonicity executor path that TR-1 early termination rides on. Three additive changes:
+  #     (1) genam.c RelationGetIndexScan zero-inits scan->xs_inorder (a new, un-zeroed
+  #     IndexScanDescData field the base Postgres.patch added) so a bounded Sort over an ORDINARY
+  #     index can no longer read garbage and truncate its top-N; (2) nodeIndexscan.c gates the
+  #     is_index_inorder EState flag (which arms nodeSort's bounded early-stop) on the driving
+  #     AM's amcanrelaxedorderbyop, so the early-stop fires ONLY for a genuinely-relaxed (HNSW)
+  #     scan; (3) nodeIndexscan.c restores the base patch's removed `index returned tuples in
+  #     wrong order` ERROR, guarded to the NON-relaxed case (relaxed scans legitimately violate
+  #     strict order). Also documents the fixed hnswindex.cpp emission-window heuristics
+  #     (range=86 / distanceThreshold=3 / queueThreshold=50, upstream issue #22) as approximate,
+  #     term_cond-not-window being the real recall knob (ADR-0007 addendum). Spans BOTH the
+  #     Postgres submodule (executor/genam) AND src/hnswindex.cpp, so it applies from $root (NOT
+  #     inside thirdparty/Postgres like the pgmain patch) and MUST come LAST — after the
+  #     hnswindex.cpp fork chain (reloptions/costestimate/scan_no_orderby/am_entry_guards) whose
+  #     line offsets it is diffed against. The executor hunks (genam/nodeIndexscan) are untouched
+  #     by any other fork patch, so their offsets are stable. Interim hardening only; the real fix
+  #     is the ADR-0007 CustomScan migration (relaxed order as a path, no global executor bool).
+  local relaxed_guard_patch="${_MSVBASE_LIB_DIR}/../patches/tridb_relaxed_order_executor_guard.patch"
+  [[ -f "$relaxed_guard_patch" ]] || die "missing TriDB fork patch: $relaxed_guard_patch"
+  if grep -q 'scan->xs_inorder = false' "$root/thirdparty/Postgres/src/backend/access/index/genam.c" 2>/dev/null; then
+    log "TriDB fork patch (relaxed-order executor guard, advisor plan 022) already applied"
+  else
+    log "applying TriDB fork patch: relaxed-monotonicity executor guard (xs_inorder zero-init + amcanrelaxedorderbyop gate + wrong-order ERROR restore) (advisor plan 022)"
+    ( cd "$root" && git apply "$relaxed_guard_patch" ) \
+      || die "tridb_relaxed_order_executor_guard.patch did not apply — MSVBASE/fork-chain drift? re-generate per advisor plan 022"
   fi
 
   # ----------------------------------------------------------------------------

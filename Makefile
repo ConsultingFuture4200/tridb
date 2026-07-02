@@ -11,7 +11,7 @@ ENGINE_TESTS := test/graph_store_test.sql test/trimodal_compose.sql \
                 test/vector_relaxed_mono_test.sql test/canonical_e2e_test.sql \
                 test/parse_canonical.sql test/hnsw_costestimate_unordered_test.sql \
                 test/tjs_open_smoke.sql test/hnsw_am_guards.sql \
-                test/pgmain_rewriter_removed.sql
+                test/pgmain_rewriter_removed.sql test/relaxed_order_guard.sql
 
 test:
 	$(PY) -m pytest tests/ -q
