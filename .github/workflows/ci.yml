@@ -1,5 +1,10 @@
 name: CI
 
+# Least privilege: these jobs only read the repo (checkout, run tests, apply patches). Grant the
+# default token read-only so a compromised action or PR cannot write to the repo.
+permissions:
+  contents: read
+
 # Fast layer (python) runs on every push/PR. The engine layer builds a ~9.5 GB
 # Docker image and is gated behind workflow_dispatch — far too heavy for per-PR runners.
 on:
@@ -11,8 +16,8 @@ jobs:
   python:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: '3.12'
       - run: pip install -r requirements.txt
@@ -28,7 +33,7 @@ jobs:
   patches:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           submodules: false
       - run: scripts/ci_check_patches.sh
@@ -37,7 +42,7 @@ jobs:
     runs-on: ubuntu-latest
     if: github.event_name == 'workflow_dispatch'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           submodules: false
       - run: scripts/x86build.sh --docker

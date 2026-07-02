@@ -219,7 +219,7 @@ findings → vetted table → these 8 plans (all 8 clusters selected by the main
 | Plan | Title | Priority | Effort | Risk | Depends on | Verify here? | Status |
 |------|-------|----------|--------|------|------------|--------------|--------|
 | 010 | tjs_open: unify heap metric (squared L2), bounded bridge share, wire orphaned smoke test | P1 | M | MED | — (before 017) | patch-chain CI here; engine run gated | TODO |
-| 011 | tjs/tjs_open STRICT + NULL guards; quote table_name (make SECURITY.md true); CI permissions + SHA pins | P1 | S | LOW | — | patch-chain CI here; engine run gated | TODO |
+| 011 | tjs/tjs_open STRICT + NULL guards; quote table_name (make SECURITY.md true); CI permissions + SHA pins | P1 | S | LOW | — | patch-chain CI here; engine run gated | DONE — patch-chain `ci_check_patches.sh` + `make test`/`lint` green; NULL-arg asserts added (engine run gated) |
 | 012 | Wire orphaned engine tests: HNSW recovery oracle, missing reloptions driver, tjs double-scan regression, sleep→poll, dead runner | P1 | M | LOW | — | bash -n / make -n here; engine run gated | TODO |
 | 013 | Docs/number reconciliation: one SM-2 value, true scale labels, ADR-0011/0012 + STATUS + spec markers current | P1 | S | LOW | — | YES (greps) | DONE — one canonical SM-2 (15.1×); greps + `make test`/`lint` green |
 | 014 | Bench grading hardening: DONE-gates everywhere, one baseline-merge semantics, reader-failure tally, one recall_at_k | P2 | M | MED | — | YES (`make test`) | TODO |
