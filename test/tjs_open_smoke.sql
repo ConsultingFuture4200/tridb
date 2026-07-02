@@ -202,4 +202,52 @@ BEGIN
     RAISE NOTICE 'PASS bounded bridge share: pure vector winner 301 survived a >= k bridge set';
 END $$;
 
+-- ===========================================================================
+-- ASSERTION 8: BATCHED-BFS SET EQUIVALENCE (plan 017). The graph expansion now issues ONE SPI call
+-- per hop over the whole frontier (LATERAL over unnest'd ids) instead of one per frontier node. BFS
+-- is order-insensitive (the bridge set dedups), so the batched form must be RESULT-IDENTICAL to the
+-- per-node form. We pin the whole returned id set on a hand-computed graph with 2 OVERLAPPING seeds
+-- and a node reachable via TWO paths (dedup path exercised).
+--
+--   corpus: near filler ids 1..20 (embedding [id]) + far bridges 500,600,700,800 (never vector winners).
+--   q = origin -> the 2 nearest = seeds {1,2}.
+--   edges: 1->500, 1->600, 2->600, 2->700, 500->800, 700->800.
+--   hops=2 reachable (incl. seeds): {1,2} U hop1{500,600,700} U hop2{800} = {1,2,500,600,700,800}.
+--     (600 is a neighbor of BOTH seeds; 800 is reached via 500 AND 700 — both dedup at insert.)
+--   k=12 -> bridge_cap=k/2=6, so all 6 bridges are guaranteed into the budget; the remaining 6 slots
+--   go to the nearest non-chosen vector winners {3,4,5,6,7,8}.
+--   => final set (sorted) = {1,2,3,4,5,6,7,8,500,600,700,800}.
+-- ===========================================================================
+CREATE TABLE eq_paragraphs (id bigint PRIMARY KEY, embedding float8[8]);
+INSERT INTO eq_paragraphs
+SELECT k, ARRAY[k::float8,0,0,0,0,0,0,0]::float8[] FROM generate_series(1, 20) AS k;
+INSERT INTO eq_paragraphs VALUES
+    (500, ARRAY[500.0,0,0,0,0,0,0,0]::float8[]),
+    (600, ARRAY[600.0,0,0,0,0,0,0,0]::float8[]),
+    (700, ARRAY[700.0,0,0,0,0,0,0,0]::float8[]),
+    (800, ARRAY[800.0,0,0,0,0,0,0,0]::float8[]);
+CREATE INDEX eq_paragraphs_hnsw ON eq_paragraphs USING hnsw(embedding)
+    WITH (dimension = 8, distmethod = l2_distance);
+SELECT graph_store.add_edge(1, 500);
+SELECT graph_store.add_edge(1, 600);
+SELECT graph_store.add_edge(2, 600);
+SELECT graph_store.add_edge(2, 700);
+SELECT graph_store.add_edge(500, 800);
+SELECT graph_store.add_edge(700, 800);
+
+DO $$
+DECLARE got bigint[];
+BEGIN
+    SELECT array_agg(id ORDER BY id) INTO got FROM (
+        SELECT t.id
+        FROM tjs_open('eq_paragraphs', 12, 0, 2, 2, 'id', '',
+                      'embedding <-> ''{0,0,0,0,0,0,0,0}''') AS t(id bigint)
+    ) q;
+    RAISE NOTICE 'batched-BFS hops=2 set (sorted) = %', got;
+    IF got IS DISTINCT FROM ARRAY[1,2,3,4,5,6,7,8,500,600,700,800]::bigint[] THEN
+        RAISE EXCEPTION 'tjs_open BATCHED-BFS EQUIVALENCE FAILED: got % (expected {1,2,3,4,5,6,7,8,500,600,700,800})', got;
+    END IF;
+    RAISE NOTICE 'PASS batched-BFS set equivalence: hops=2 bridge set {1,2,500,600,700,800} reproduced';
+END $$;
+
 SELECT 'tjs_open smoke: ALL ASSERTIONS PASSED' AS result;
