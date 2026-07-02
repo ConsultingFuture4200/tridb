@@ -84,8 +84,14 @@ docker run --rm --entrypoint bash \
   # re-applied reloptions/NEON patch) without a full multi-hour image rebuild — the same refresh the
   # original hand-built committed run used. Guarded so the default (no persistent tree) path is a
   # clean no-op and never silently builds a divergent .so.
-  if [ -d /tmp/vectordb/build ]; then
-    echo "#SWEEP NOTE refreshing vectordb.so from persistent /tmp/vectordb/build (incremental)"
+  # Opt-in ONLY (SWEEP_REFRESH_VECTORDB=1). By default the image .so IS the build we want (the
+  # committed patch chain, or a full gx10build --image rebuild), so no refresh is needed — and the
+  # incremental `make install` reinstalls a ROOT-owned vectordb.control that the non-root container
+  # user cannot chmod ("Operation not permitted"), which would abort a sweep on a freshly-rebuilt
+  # image for no benefit. Reserve the refresh for the maintainer picking up a bare vectordb source
+  # change against an OLD image without a multi-hour rebuild.
+  if [ "${SWEEP_REFRESH_VECTORDB:-0}" = "1" ] && [ -d /tmp/vectordb/build ]; then
+    echo "#SWEEP NOTE refreshing vectordb.so from persistent /tmp/vectordb/build (incremental, opt-in)"
     if ! make -C /tmp/vectordb/build vectordb >/tmp/vbuild.log 2>&1; then
       echo "VECTORDB REBUILD FAILED:"; tail -40 /tmp/vbuild.log; exit 1; fi
     if ! make -C /tmp/vectordb/build install >/tmp/vinstall.log 2>&1; then
