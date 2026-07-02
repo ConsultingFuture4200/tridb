@@ -133,13 +133,15 @@ Create `pyproject.toml` containing only:
 ```toml
 [tool.ruff]
 target-version = "py312"
-line-length = 100
+line-length = 88
 ```
-Set `line-length` to whatever the codebase already conforms to: run
-`.venv/bin/ruff format --check .` after adding the file — if it reports files needing reformat,
-try 100 and 120 and keep the one with zero diffs; if neither is clean, STOP (the repo has mixed
-widths; report the counts). In `requirements.txt`, tighten `ruff>=0.6` to the installed minor
-(e.g. `ruff~=0.15.18` — read the actual version from `.venv/bin/ruff --version`).
+`line-length = 88` is ruff's default and is exactly what this codebase already conforms to
+(`.venv/bin/ruff format --check .` exits 0 with no reformats at 88 — verified 2026-07-02). Setting
+it explicitly pins the value so a future ruff default change can't silently reformat. After adding
+the file, confirm `.venv/bin/ruff format --check .` still exits 0 with zero diffs; if it does NOT
+(i.e. the codebase has drifted off 88 since this plan was written), STOP and report the reformat
+count rather than picking a new width. In `requirements.txt`, tighten `ruff>=0.6` to the installed
+minor (e.g. `ruff~=0.15.18` — read the actual version from `.venv/bin/ruff --version`).
 
 **Verify**: `make lint` → exit 0 with zero reformat output.
 
@@ -205,7 +207,8 @@ addable.
 
 ## STOP conditions
 
-- Neither line-length 100 nor 120 makes `ruff format --check` clean (mixed widths — report file
+- `ruff format --check` at line-length 88 is NOT clean (the codebase drifted since this plan was
+  written — report the reformat count; do not reformat the codebase or pick another width) (mixed widths — report file
   counts per width; do not reformat the codebase).
 - `pip freeze` emits editable/local-path entries you can't cleanly strip.
 - `ci_check_patches.sh` fails AFTER Step 4 — the post-condition found real drift today; report

@@ -103,7 +103,7 @@ in any of these merges green today.
 - `scripts/crash_recovery_reloptions_test.sh` (create)
 - `scripts/fork_bug_tjs_double_scan_test.sh` (create) + `test/fork_bug_tjs_double_scan.sql` (create)
 - `test/_fork_bug_tjs_double_scan.sql` (header note only, or delete after replacement — see Step 4)
-- `scripts/tjs_test.sh` (delete)
+- (Step 5 dropped — `scripts/tjs_test.sh` is intentionally NOT deleted; it is referenced by docs + ADR-0013)
 - `advisor-plans/README.md` (status row)
 
 **Out of scope**:
@@ -170,13 +170,16 @@ regression is test/fork_bug_tjs_double_scan.sql". Keep the witness file.
 image exists — **if the new test FAILS, that is a real finding: STOP and report it as such (the
 fix may not cover the tjs shape), do not weaken the assert.**
 
-### Step 5: Delete the dead runner
+### Step 5: (DROPPED) leave `scripts/tjs_test.sh` in place
 
-`git rm scripts/tjs_test.sh` (its target SQL is already in ENGINE_TESTS; nothing references the
-script — re-verify with `grep -rn "tjs_test.sh" Makefile scripts/ .github/ docs/ README.md` and
-STOP if any hit appears outside the file itself).
+REVISED 2026-07-02: the original plan deleted `scripts/tjs_test.sh` as a dead runner, but it is
+referenced by `scripts/bench_live.sh:12` (a structural comment), `docs/sqlpgq_logical_plan_v0.1.0.md`,
+`docs/fork_segfault_double_scan.md`, and `docs/decisions/0013-graph-store-v1-rewire.md` (created by
+advisor plan 016). Deleting it would strand four references and entangle this plan with 016's ADR.
+The deletion is low-value cleanup; **do NOT delete `scripts/tjs_test.sh`** — it stays. This step is
+now a no-op. (The valuable work of this plan is Steps 1–4: wiring the orphaned engine regressions.)
 
-**Verify**: the grep above → no matches; `make -n graph-test && make -n smoke-test` → exit 0.
+**Verify**: `test -f scripts/tjs_test.sh` → exit 0 (still present, intentionally).
 
 ## Test plan
 
@@ -191,7 +194,7 @@ inspection, and an explicit "engine-gated: unbuilt here" note per suite.
 - [ ] `scripts/crash_recovery_reloptions_test.sh` exists, `bash -n` clean, two-phase per the SQL header
 - [ ] No bare `sleep 1` remains in `scripts/crash_recovery_hnsw_test.sh`
 - [ ] `test/fork_bug_tjs_double_scan.sql` + driver exist; quarantined witness header updated
-- [ ] `scripts/tjs_test.sh` deleted; no dangling references
+- [ ] `scripts/tjs_test.sh` left in place (Step 5 dropped — still referenced by docs/ADR-0013)
 - [ ] `make test && make lint` exit 0; `git status` clean outside scope
 - [ ] Engine `make graph-test` PASS or explicit "engine-gated: unbuilt here" per suite
 - [ ] `advisor-plans/README.md` status row updated
