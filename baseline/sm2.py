@@ -316,6 +316,9 @@ def merge_canonical(
 ):
     """Merge the three legs into the final top-k (realized canonical semantics).
 
+    ANN-pruned merge: models the real Milvus over-fetch (k*32); the exact-oracle
+    variant lives only in bench/harness.py:baseline_query_inprocess's spec-model.
+
     A dst qualifies iff it is (a) reached from src, (b) survived the time filter,
     and (c) appeared in the over-fetched ANN candidate set (has a distance). The
     survivors are ordered by DST embedding distance to the question vector (the

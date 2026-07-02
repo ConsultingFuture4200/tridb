@@ -145,12 +145,16 @@ def baseline_query_canonical(q: dict, k: int, corpus: Corpus, src: int) -> Query
     question vector (the fork's sole rank authority is the dst HNSW scan — see
     test/canonical_e2e_test.sql / ADR notes), top-k.
 
+    ANN-pruned merge: models the real Milvus over-fetch (k*32); the exact-oracle
+    variant lives only in bench/harness.py:baseline_query_inprocess's spec-model.
+
     But it pays the BASELINE's cost, not TriDB's: it must
       1. ANN over the WHOLE corpus, over-fetching k * BASELINE_ANN_FANOUT on the
          dst vector leg (no graph/time pushdown into the vector scan),
       2. materialize the full reachable (src -> dst) pair set from the graph,
       3. filter the reached dst by timestamp (relational leg),
-      4. merge app-side and take top-k by dst distance.
+      4. merge app-side and take top-k by dst distance, keeping only dst that the
+         ANN over-fetch surfaced (intersect with the vector candidate set).
     `peak_intermediate_rows` is the largest set it held (the SM-1 surface);
     `corpus_examined` is the full corpus (the un-pushed ANN scan touches all rows).
     This is the in-process replay of baseline/harness.py — a live three-system
@@ -181,9 +185,13 @@ def baseline_query_canonical(q: dict, k: int, corpus: Corpus, src: int) -> Query
         if d in corpus.entities and corpus.entities[d]["timestamp"] in time_range
     }
 
-    # 4) merge: dst that survived all three legs, ordered by dst distance, top-k.
+    # 4) merge: dst that survived all three legs AND appeared in the over-fetched
+    #    ANN candidate set (models the real Milvus over-fetch — a multi-system
+    #    baseline cannot return an answer its vector store never surfaced), ordered
+    #    by dst distance, top-k. Matches baseline/sm2.merge_canonical's ANN prune.
     ranked_dst = sorted(
-        kept.keys(), key=lambda d: _l2_sq(corpus.entities[d]["embedding"], q_emb)
+        (d for d in kept if d in vector_hits),
+        key=lambda d: _l2_sq(corpus.entities[d]["embedding"], q_emb),
     )
     chunks: list[str] = []
     seen: set[int] = set()

@@ -29,6 +29,7 @@ import json
 import os
 import re
 import string
+import sys
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
@@ -268,7 +269,7 @@ class CodexReader:
 
     name = "codex-cli (operator subscription)"
 
-    def answer(self, question: str, contexts: list[str]) -> str:
+    def answer(self, question: str, contexts: list[str]) -> str | None:
         import subprocess
         import tempfile
 
@@ -304,8 +305,10 @@ class CodexReader:
                 if Path(out).read_text().strip()
                 else ""
             )
-        except Exception:  # noqa: BLE001 — a failed/timed-out call scores 0, run continues
-            return ""
+        except Exception:  # noqa: BLE001 — a failed/timed-out call is a reader FAILURE
+            # Sentinel: None (not "") so the scoring loop can tally it and exclude
+            # it from the EM/F1 denominator instead of silently scoring it 0.
+            return None
         finally:
             Path(out).unlink(missing_ok=True)
 
@@ -387,18 +390,35 @@ def reader_scores(
     names = [n for n in RETRIEVERS if (only is None or n in only)]
     agg: dict = {name: defaultdict(list) for name in names}
     qs = sl.questions[:sample] if sample else sl.questions
+    reader_failures = 0
     for q in qs:
         qi = q["qid"]
         for name in names:
             retrieved = RETRIEVERS[name](sl, qi, k)
             ev = evidence_scores(retrieved, q["gold_ids"])
-            pred = reader.answer(q["question"], [para_text[i] for i in retrieved])
-            agg[name]["answer_em"].append(em_score(pred, q["answer"]))
-            agg[name]["answer_f1"].append(f1_score(pred, q["answer"]))
             agg[name]["ev_recall"].append(ev["recall"])
             agg[name]["ev_joint"].append(ev["joint"])
+            # A None return (or a raised exception) is a reader FAILURE, not a wrong
+            # answer: tally it and EXCLUDE it from the EM/F1 denominator. An
+            # empty-but-successful answer still scores 0 (unchanged).
+            try:
+                pred = reader.answer(q["question"], [para_text[i] for i in retrieved])
+            except Exception:  # noqa: BLE001
+                pred = None
+            if pred is None:
+                reader_failures += 1
+                continue
+            agg[name]["answer_em"].append(em_score(pred, q["answer"]))
+            agg[name]["answer_f1"].append(f1_score(pred, q["answer"]))
+    if reader_failures:
+        print(
+            f"[graphrag] WARNING: {reader_failures} reader call(s) failed — "
+            "excluded from the EM/F1 denominator",
+            file=sys.stderr,
+        )
     return {
         "n_reader_questions": len(qs),
+        "reader_failures": reader_failures,
         **{name: {m: _mean(v) for m, v in d.items()} for name, d in agg.items()},
     }
 

@@ -95,6 +95,8 @@ def emit_tridb_sql(
 
 def parse_tridb(raw: str) -> dict:
     """{qid: {"ids": [...], "times": [ms,...]}} from the engine transcript."""
+    if "#H2H DONE" not in raw:
+        raise SystemExit("H2H transcript did not reach '#H2H DONE' — incomplete")
     res: dict = {}
     cur = None
     in_ids = False

@@ -22,6 +22,8 @@ _INT = re.compile(r"^\s*(\d+)\s*$")
 
 def parse(raw: str) -> dict:
     """Return {(qid,sel): {"ids":[...first measured run...], "times":[measured ms]}}."""
+    if "#FILT DONE" not in raw:
+        raise SystemExit("filtered transcript did not reach '#FILT DONE' — incomplete")
     out: dict = defaultdict(lambda: {"ids": None, "times": []})
     cur = None
     cur_ids: list[int] = []

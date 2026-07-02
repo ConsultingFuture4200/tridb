@@ -27,6 +27,10 @@ import json
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
+# Single-source recall@k semantics (empty truth: 1.0 iff nothing returned). Every
+# bench module should score recall through this re-export, not a hand-rolled copy.
+from tools.real_corpus import recall_at_k  # noqa: E402,F401
+
 # --------------------------------------------------------------------------- #
 # SM targets (spec §7) — the single place the numbers live.
 # --------------------------------------------------------------------------- #
