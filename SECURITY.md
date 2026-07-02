@@ -37,8 +37,9 @@ beyond that use.
   they are fed **exclusively** from the controlled lowering of the single canonical query (ADR-0007,
   DEV-1167), never from end users, which is the mitigation. **Do not expose these operators' expression
   arguments to untrusted callers.** A future multi-query surface must validate/bind these fragments
-  before exposing the operators externally. (The `table_name` argument is *not* part of this surface —
-  it is resolved via the catalog with `RangeVarGetRelid`, not string-interpolated.)
+  before exposing the operators externally. (The `table_name` argument is resolved via the catalog
+  with `RangeVarGetRelid` and then interpolated as a quoted identifier (`quote_identifier`), so it
+  cannot break out of the generated SQL.)
 - **No multi-tenant isolation / row-level security is implemented** beyond what stock PostgreSQL
   provides. TriDB is a single-tenant, local-hardware engine; do not treat it as a hardened multi-user
   service.
