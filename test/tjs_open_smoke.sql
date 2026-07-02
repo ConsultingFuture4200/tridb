@@ -135,4 +135,71 @@ BEGIN
     RAISE NOTICE 'PASS STRICT NULL guard: tjs_open(NULL,...) returned 0 rows (no crash)';
 END $$;
 
+-- ===========================================================================
+-- ASSERTION 6: UNIFIED-METRIC EMISSION ORDER. A bridge and a vector winner interleave in the top-k
+-- with true distances that INVERT under the old mixed units. Tiny deterministic corpus, query at
+-- the origin: id 10 (true dist 1.0, single seed), 13 (2.0), 11 (4.5, pure vector winner),
+-- 12 (5.0, bridge via edge 10->12). k=4, m_seeds=1 -> bridge_cap = k/2 = 2, so bridge 12 is
+-- carried into the merge as a BRIDGE item (its heap key is the bug site). Old code keyed the bridge
+-- on sqrt'd Euclidean (5.0) but vector winners on squared L2 (11 -> 20.25), so it emitted 12 BEFORE
+-- 11 -> {10,13,12,11}. The fix squares the bridge key (25.0 > 20.25) so 12 sorts after 11.
+-- ===========================================================================
+CREATE TABLE ord_paragraphs (id bigint PRIMARY KEY, embedding float8[8]);
+INSERT INTO ord_paragraphs VALUES
+    (10, ARRAY[1.0,0,0,0,0,0,0,0]::float8[]),
+    (11, ARRAY[4.5,0,0,0,0,0,0,0]::float8[]),
+    (12, ARRAY[5.0,0,0,0,0,0,0,0]::float8[]),
+    (13, ARRAY[2.0,0,0,0,0,0,0,0]::float8[]);
+CREATE INDEX ord_paragraphs_hnsw ON ord_paragraphs USING hnsw(embedding)
+    WITH (dimension = 8, distmethod = l2_distance);
+SELECT graph_store.add_edge(10, 12);
+
+DO $$
+DECLARE got bigint[];
+BEGIN
+    WITH r AS (
+        SELECT t.id
+        FROM tjs_open('ord_paragraphs', 4, 0, 1, 1, 'id', '',
+                      'embedding <-> ''{0,0,0,0,0,0,0,0}''') AS t(id bigint)
+    )
+    SELECT array_agg(id) INTO got FROM r;   -- no ORDER BY: preserves emission order
+    RAISE NOTICE 'tjs_open ordering emission = % (expected {10,13,11,12})', got;
+    IF got IS DISTINCT FROM ARRAY[10,13,11,12]::bigint[] THEN
+        RAISE EXCEPTION 'tjs_open ORDERING FAILED: got % (expected {10,13,11,12}; old mixed-unit bug gives {10,13,12,11})', got;
+    END IF;
+    RAISE NOTICE 'PASS unified-metric ordering: bridge 12 emitted after nearer vector winner 11';
+END $$;
+
+-- ===========================================================================
+-- ASSERTION 7: BOUNDED BRIDGE SHARE (blend policy). A hub seed (id 300) has 10 far bridges (edges
+-- 300->310..319), so the bridge set (11 incl. the seed) is >= k. id 301 is the 2nd-nearest vector
+-- winner and is NOT graph-reachable from the seed (no incoming edge, and m_seeds=1 makes only 300 a
+-- seed). Old bridges-take-all filled all k slots with bridges -> 301 evicted (vector modality gone).
+-- The k/2 cap reserves slots for vector winners, so the pure vector winner 301 survives.
+-- ===========================================================================
+CREATE TABLE hub_paragraphs (id bigint PRIMARY KEY, embedding float8[8]);
+INSERT INTO hub_paragraphs VALUES
+    (300, ARRAY[1.0,0,0,0,0,0,0,0]::float8[]),
+    (301, ARRAY[2.0,0,0,0,0,0,0,0]::float8[]);
+INSERT INTO hub_paragraphs
+SELECT g, ARRAY[g::float8,0,0,0,0,0,0,0]::float8[] FROM generate_series(310, 319) AS g;
+CREATE INDEX hub_paragraphs_hnsw ON hub_paragraphs USING hnsw(embedding)
+    WITH (dimension = 8, distmethod = l2_distance);
+SELECT graph_store.add_edge(300, g) FROM generate_series(310, 319) AS g;
+
+DO $$
+DECLARE got bigint[];
+BEGIN
+    SELECT array_agg(id) INTO got FROM (
+        SELECT t.id
+        FROM tjs_open('hub_paragraphs', 6, 0, 1, 1, 'id', '',
+                      'embedding <-> ''{0,0,0,0,0,0,0,0}''') AS t(id bigint)
+    ) q;
+    RAISE NOTICE 'tjs_open hub top-6 = % (11 bridges available, k=6)', got;
+    IF NOT (301 = ANY(got)) THEN
+        RAISE EXCEPTION 'tjs_open BLEND POLICY FAILED: pure vector winner 301 evicted by bridges (got %)', got;
+    END IF;
+    RAISE NOTICE 'PASS bounded bridge share: pure vector winner 301 survived a >= k bridge set';
+END $$;
+
 SELECT 'tjs_open smoke: ALL ASSERTIONS PASSED' AS result;

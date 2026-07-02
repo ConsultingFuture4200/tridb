@@ -47,7 +47,7 @@ new file mode 100644
 index 0000000..9954de7
 --- /dev/null
 +++ b/src/tjs_open_operator.cpp
-@@ -0,0 +1,936 @@
+@@ -0,0 +1,948 @@
 +// Copyright (c) TriDB. Licensed under the MIT License.
 +//
 +// tjs_open_operator.cpp — TriDB `tjs_open` multi-seed open-domain retrieval operator
@@ -464,10 +464,10 @@ index 0000000..9954de7
 +	return vec_winner; // reset drops only on vector progress
 +}
 +
-+// Finalize: merge vec_pq + bridge_pq into the top-k, BRIDGES GUARANTEED. Strategy: take ALL bridges
-+// (up to k, best-by-distance — they are guaranteed), then fill the remaining slots with the nearest
-+// vector winners NOT already chosen as a bridge (dedup by tid). The combined set is then ordered
-+// nearest-first for emission. This realizes "emit top-k vector-ranked WITH the bridges injected".
++// Finalize: merge vec_pq + bridge_pq into the top-k. Policy: bridges guaranteed up to k/2 slots;
++// vector winners keep the rest (ADR-0012 "injected", not "replaced"). Then, only if vector winners
++// run out, remaining bridges backfill. The combined set is ordered nearest-first for emission.
++// bridges-take-all would silently delete the vector modality on dense graphs — hence the k/2 cap.
 +static void finalizeTopKO(TJSOpenState* estate){
 +	uint32_t k = estate->topk;
 +
@@ -498,14 +498,24 @@ index 0000000..9954de7
 +	std::unordered_set<int64> chosen_ids;
 +	std::vector<pq_item_o_t> chosen;  // nearest-first
 +
-+	// 1) bridges first (guaranteed), nearest bridges win when > k bridges exist.
++	// 1) bridges guaranteed up to k/2 slots (nearest bridges win); vector winners keep the rest
++	//    (ADR-0012 "injected", not "replaced"). bridges-take-all would silently delete the vector
++	//    modality on dense graphs, so cap the reserved bridge share at k/2.
++	uint32_t bridge_cap = k / 2;
++	if (bridge_cap == 0 && !bridges_v.empty()) bridge_cap = 1;  // min 1 when any bridge exists
 +	for (const auto& it : bridges_v) {
-+		if (chosen.size() >= k) break;
++		if (chosen.size() >= bridge_cap) break;
 +		if (chosen_ids.insert(id_of(it)).second)
 +			chosen.push_back(it);
 +	}
 +	// 2) fill remaining with vector winners not already chosen.
 +	for (const auto& it : vecs_v) {
++		if (chosen.size() >= k) break;
++		if (chosen_ids.insert(id_of(it)).second)
++			chosen.push_back(it);
++	}
++	// 3) only if vector winners ran out, backfill remaining slots with the rest of the bridges.
++	for (const auto& it : bridges_v) {
 +		if (chosen.size() >= k) break;
 +		if (chosen_ids.insert(id_of(it)).second)
 +			chosen.push_back(it);
@@ -569,7 +579,9 @@ index 0000000..9954de7
 +		HeapTuple src = tt->vals[i];
 +		bool dnull;
 +		Datum dd = SPI_getbinval(src, sd, dcol, &dnull);
-+		float dist = dnull ? std::numeric_limits<float>::infinity() : (float) DatumGetFloat8(dd);
++		// __d is sqrt'd Euclidean (scalar l2_distance); square it so bridge_pq shares vec_pq's squared-L2 unit (xs_orderbyvals[0]).
++		double d8 = dnull ? std::numeric_limits<double>::infinity() : DatumGetFloat8(dd);
++		float dist = (float) (d8 * d8);
 +
 +		// dedup key: the id column value (col idAttno). Not a heap tid (SPI tuples carry no scan tid),
 +		// but the id uniquely identifies a paragraph, so it is a sound dedup key across both heaps —
