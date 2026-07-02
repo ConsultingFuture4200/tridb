@@ -23,6 +23,7 @@ __pycache__/
 # Env / secrets
 .env
 .env.*
+!.env.example
 *.pem
 *.key
 

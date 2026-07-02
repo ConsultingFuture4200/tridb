@@ -549,6 +549,13 @@ harden_dockerfile_downloads() {
     sed -i 's#cmake-3.14.4-Linux-x86_64.tar.gz" -q -O - \\#cmake-3.14.4-Linux-x86_64.tar.gz" -q -O cmake.tgz \&\& \\#' "$df"
     sed -i 's#| tar -xz --strip-components=1 -C /usr/local#echo "'"$CMAKE_3_14_4_X86_64_SHA256"'  cmake.tgz" | sha256sum -c - \&\& tar -xzf cmake.tgz --strip-components=1 -C /usr/local \&\& rm -f cmake.tgz#' "$df"
   fi
+  # post-condition (plan 015): the hardening MUST have landed — a silent sed no-op here would
+  # ship an image with unverified downloads (the exact hole plan 007 closed).
+  grep -q -- '--no-check-certificate' "$df" && \
+    die "harden_dockerfile_downloads: --no-check-certificate still present (upstream drift?) — inspect $df"
+  if grep -q 'boost_1_81_0.tar.gz' "$df" && ! grep -q 'sha256sum -c' "$df"; then
+    die "harden_dockerfile_downloads: Boost/CMake download present without sha256sum -c (upstream drift?) — inspect $df"
+  fi
 }
 
 # Modern GCC (12/13 in the gcc:12.3.0 base) no longer transitively includes <mutex>,

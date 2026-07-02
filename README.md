@@ -157,7 +157,8 @@ The repository has two layers. The hardware-independent layer (design, tooling, 
 
 ```bash
 python3 -m venv .venv && . .venv/bin/activate
-pip install -r requirements.txt
+pip install -r requirements.lock   # pinned, reproducible; requirements.txt holds floors only
+cp .env.example .env               # documents every env var the tooling reads
 make test          # Python + lint layer — fast, no Docker
 make lint
 ```
@@ -170,7 +171,7 @@ make test-all                  # test + lint + smoke + graph engine suites
 make bench-live                # live SM-1/SM-3/SM-4/SM-5 on the real engine
 
 make baseline-up               # stand up Milvus + Neo4j + Postgres baseline
-make sm2                       # fair SM-2 latency head-to-head
+make sm2                       # fair SM-2 latency head-to-head (needs PGPORT=5433 where baseline PG maps to 5433)
 make baseline-down
 ```
 

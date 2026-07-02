@@ -1,4 +1,4 @@
-.PHONY: test lint graph-test smoke-test test-all baseline-up baseline-down seed bench bench-live sweep sm2 fetch-dataset bench-public bench-repro fetch-hotpot graphrag graphrag-live bench-filtered ablation recall-decay tjs-open-ref tjs-open-live graphrag-h2h rabitq-sim gpu-build-index clean
+.PHONY: test lint graph-test smoke-test test-all baseline-up baseline-down seed bench bench-live sweep sm2 fetch-dataset bench-public bench-repro fetch-hotpot graphrag graphrag-live bench-filtered ablation recall-decay tjs-open-ref tjs-open-live graphrag-h2h rabitq-sim gpu-build-index lock clean
 
 PUBLIC_DATASET ?= gist-960-euclidean
 
@@ -17,7 +17,23 @@ test:
 	$(PY) -m pytest tests/ -q
 
 lint:
-	ruff check . && ruff format --check .
+	$(PY) -m ruff check . && $(PY) -m ruff format --check .
+
+# Regenerate the pinned lockfile from the current .venv (deliberate dep bumps: edit the
+# requirements.txt floor, then `make lock`, then commit both). Uses uv if present, else pip.
+lock:
+	@if command -v uv >/dev/null 2>&1; then \
+	  { echo "# Auto-generated pinned lockfile — do NOT edit by hand. Regenerate with: make lock"; \
+	    echo "# Reproducible installs: pip install -r requirements.lock"; \
+	    echo "# Pins the full transitive closure of the validated .venv (advisor plan 015)."; \
+	    VIRTUAL_ENV=.venv uv pip freeze; } > requirements.lock; \
+	else \
+	  { echo "# Auto-generated pinned lockfile — do NOT edit by hand. Regenerate with: make lock"; \
+	    echo "# Reproducible installs: pip install -r requirements.lock"; \
+	    echo "# Pins the full transitive closure of the validated .venv (advisor plan 015)."; \
+	    $(PY) -m pip freeze --exclude-editable; } > requirements.lock; \
+	fi
+	@echo "wrote requirements.lock ($$(wc -l < requirements.lock) lines)"
 
 # Native-AM + fork-regression harnesses — each FAILS LOUD on any error (nonzero make aborts).
 # The graph-store AM harnesses (DEV-1164/1165/1166) PGXS-build src/graph_store in the image; the
