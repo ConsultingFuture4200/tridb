@@ -36,7 +36,7 @@ the real-workload head-to-head (GTM #1) surfaced a finding that should reshape t
 - **Positioning implication — do not launch v1 as a drop-in open GraphRAG retriever.** What v1
   actually wins:
   1. **Source-anchored tri-modal queries** ("given entity X, find vector-similar entities reachable
-     from X, filtered"): SM-2 = 12/12 at ~15× lower latency with exact parity (`benchmark_sm2_v0.1.0`).
+     from X, filtered"): SM-2 = 12/12 at median 15.1× lower latency (2k/dim-32, x86 standin) with exact parity (`benchmark_sm2_v0.1.0`).
   2. **One system, one WAL, transactional across all three stores** (proven on the GB10) — the
      consistency story bolt-on stacks can't tell.
   Lead with those. The open multi-hop retrieval claim needs a **multi-seed retrieval operator (v2)**;
@@ -57,7 +57,7 @@ Two of the blockers this plan named have moved; recorded here (append, not rewri
   recall@10 **96.25% at ~36 ms / 3.3% examined** (`term_cond=20`) → **100% at ~41 ms / 4.4% examined**
   (`term_cond=1000`), every point under the 25% TR-1 ceiling — the real recall/effort/latency curve at
   scale (the "toy scale" rebuttal). **SM-2 fair head-to-head now run** (2k/32, live tuned
-  Milvus+Neo4j+Postgres): TriDB wins **12/12** at **median 11.5× lower latency** (~1 ms vs ~16 ms) with
+  Milvus+Neo4j+Postgres): TriDB wins **12/12** at **median 15.1× lower latency** (2k/dim-32, x86 standin; ~1 ms vs ~16 ms) with
   **exact answer parity** (Jaccard 1.0) — [[benchmark_sm2_v0.1.0]]. (A fair head-to-head at 100k scale
   is the remaining stretch.)
 - **R3 "synthetic-benchmark credibility" — the public-dataset path now exists in tooling.**
@@ -79,7 +79,7 @@ public-dataset run with one-command repro.
 |---|---|---|
 | Architecture (1 Postgres, 1 txn/WAL, global top-k, early term) | Real, lineage-backed (VBASE OSDI'23 / AkasicDB SIGMOD'26 / Chimera) | High — hard to dispute |
 | Builds + engine suite on GX10 (GB10, aarch64) | Done this session (47 PASS) | Medium — "it runs on a Spark" is a story |
-| SM-2 latency, 100k/dim-768, GX10 | 12.6× vs baseline, 12/12 | Medium — speed thesis holds at scale |
+| SM-2 latency, 2k/dim-32, x86 standin | 15.1× vs baseline, 12/12 | Medium — speed thesis at toy scale; 100k+/GX10 head-to-head pending (DEV-1284) |
 | Answer parity vs baseline @ scale | **recall/effort curve: 58.5% → 100% exact across `term_cond`** (see R1) | **Fixed (DEV-1169) — a curve, not a point**; see Risk R1 |
 | Corpus + queries | **Synthetic, self-generated** | **Low** — must be replaced for external credibility |
 

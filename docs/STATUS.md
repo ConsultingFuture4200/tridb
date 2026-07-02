@@ -1,7 +1,22 @@
 # TriDB Build Status — per-issue gating
 
-Updated: 2026-06-27. Legend: 🟢 unblocked here · 🟡 partial (design here,
+Updated: 2026-07-01. Legend: 🟢 unblocked here · 🟡 partial (design here,
 build on GX10) · 🔴 GX10-gated (needs live MSVBASE build).
+
+> **🟡 HNSW INDEX-MAP CACHE INVALIDATION 2026-07-02 (ADR-0014, advisor plan 023) — DESIGN + repro.**
+> The process-global `vector_index_map` (`src/hnswindex_scan.cpp`) is never erased, so a pooled backend
+> serves a STALE (DROP+CREATE same name / REINDEX) or wrong-dimension (→ plan-019 OOB) HNSW graph.
+> ADR-0014 recommends a `CacheRegisterRelcacheCallback` eviction (hot path untouched) with a shared_ptr
+> ownership rule; repro `scripts/hnsw_stale_index_repro.sh` (engine-gated). Implementation deferred to
+> DEV-1259 Phase C.
+
+> **🟡 V1 REWIRE DESIGN (ADR-0013) 2026-07-01 — decision pending maintainer review.** Headline
+> numbers to date (SM-2, SIFT-1M filtered, GraphRAG, neon sweep) measure the **v0 heap-backed graph
+> extension** (`src/graph_store_ext/`), NOT the v1 native access method the thesis is about — both
+> operators and all 9 bench drivers still install v0. ADR-0013 (`docs/decisions/0013-graph-store-v1-rewire.md`,
+> design `docs/graph_rewire_design_v0.1.0.md`, spike `scripts/graph_v0v1_bench.sh`) specifies the
+> staged rewire; the 128 GB headline run should wait for this decision so it measures the right store.
+> See ADR-0013 Context for the coupling facts.
 
 > **🟢 FILTERED VECTOR SEARCH (VectorDBBench IntFilter) 2026-06-27 — LIVE GX10 headline, SIFT-1M.**
 > `tools/filtered_corpus.py` + `scripts/bench_filtered.sh` + `bench/filtered_report.py` (`make bench-filtered`):
@@ -23,6 +38,8 @@ build on GX10) · 🔴 GX10-gated (needs live MSVBASE build).
 > NOT shippable; host `retrieve_graph_inject` adds +15.6pt inject + +2.5pt Codex EM/F1. **(B)** the
 > fused early-terminating C operator (fork patch, GX10-gated) is the only TR-1-pure form — the v2
 > product. NEXT (cold-resume): build the (B) `tjs_open` fork patch on the GX10.
+>
+> **UPDATE 2026-06-29+: (B) SHIPPED as a first-cut engine operator (scripts/patches/tridb_tjs_open_operator.patch, merged 3888d45; live recall@10 0.980). Remaining: the ADR-0012 addendum refinement (PPR+FR+RRF, host 0.987) as the next iteration.**
 
 > **🟢 ONE-WAL CROSS-MODAL CONSISTENCY UNDER CHURN 2026-06-28 — PROVEN LIVE ON THE GB10 (GX10).**
 > The differentiated claim bolt-on Milvus+Neo4j+pg structurally cannot make, now engine-verified:
@@ -217,7 +234,7 @@ build on GX10) · 🔴 GX10-gated (needs live MSVBASE build).
 | DEV-1168 | HNSW relaxed-monotonicity iterator | 2 | 🔴 GX10 | Contract documented; wraps MSVBASE code |
 | DEV-1169 | TJS operator | 2 | 🔴 GX10 | Design in plan-mapping doc; stub |
 | DEV-1170 | Cross-modal join-order heuristic | 2 | 🟡 | **Hardware-independent layer complete + tested here**: `docs/join_order_heuristic_v0.1.0.md` (v0.1.1, C-port interface FROZEN §10) + `src/planner/join_order_ref.py` reference model + `tests/test_join_order.py` (FR-6 acceptance + boundary/edge-case matrix, 21 cases). C port `src/planner/join_order.c` is GX10-gated (not built here) |
-| DEV-1171 | Multi-system baseline harness | 3 | 🟢 | **LIVE multi-system baseline complete + FAIR SM-2 run on the x86 standin.** `baseline/` docker-compose (Milvus+Neo4j+Postgres) + `baseline/sm2.py` (realized-canonical query across all three live systems, merged app-side). `make sm2` (`scripts/bench_sm2.sh` + `tools/bench_sm2_corpus.py` + `bench/sm2_compare.py`) loads the IDENTICAL corpus into both sides (shared deterministic generator, seed 42, 2000 entities/dim 32, 12 queries k=5) and measures both the SAME way (client-side end-to-end wall-clock, warm conns, median of 7 runs, load/index excluded). Result: **SM-2 = 100% (12/12), median latency ratio 12.6×, answer parity 12/12 exact (Jaccard 1.0)**. `bench/results/sm2_metrics.json` + `docs/benchmark_sm2_v0.1.0.md`. Original `baseline/harness.py` merge skeleton retained (unit-tested) |
+| DEV-1171 | Multi-system baseline harness | 3 | 🟢 | **LIVE multi-system baseline complete + FAIR SM-2 run on the x86 standin.** `baseline/` docker-compose (Milvus+Neo4j+Postgres) + `baseline/sm2.py` (realized-canonical query across all three live systems, merged app-side). `make sm2` (`scripts/bench_sm2.sh` + `tools/bench_sm2_corpus.py` + `bench/sm2_compare.py`) loads the IDENTICAL corpus into both sides (shared deterministic generator, seed 42, 2000 entities/dim 32, 12 queries k=5) and measures both the SAME way (client-side end-to-end wall-clock, warm conns, median of 7 runs, load/index excluded). Result: **SM-2 = 100% (12/12), median latency ratio 15.1× (2k/dim-32 corpus, x86 standin, term_cond=0), answer parity 12/12 exact (Jaccard 1.0)**. `bench/results/sm2_metrics.json` + `docs/benchmark_sm2_v0.1.0.md`. Original `baseline/harness.py` merge skeleton retained (unit-tested) |
 | DEV-1172 | TriDB benchmark harness | 3 | 🟢 | **LIVE run done on the x86 standin.** `make bench-live` (`scripts/bench_live.sh` + `tools/bench_corpus.py` + `bench/live_report.py`) drives the canonical query on the REAL `tridb/msvbase:dev` engine over a 2000-entity/dim-32 corpus × 12 queries (k=5), capturing actual `tjs()` answer sets, `tjs_candidates_examined()`, and EXPLAIN ANALYZE latency, vs the in-process baseline model. Stub path (`bench/`, `make bench`) still green + unit-tested. Live TriDB side measured here; SM-2 head-to-head + 128 GB headline stay GX10/stack-gated |
 | DEV-1173 | Benchmark results report | 3 | 🟢 | **Reports REAL live numbers.** `bench/results/{bench_live_metrics.json,report_live.html,bench_live_raw.txt}` + `docs/benchmark_results_v0.1.0.md` from a live run: SM-1 **32.0×**, SM-3 **6.4%**, SM-4 **100%** (12/12 exact, triple-verified vs in-DB oracle + baseline model), SM-5 **100%** — all PASS. SM-2 reported TriDB-side only (mean 1.2 ms) and explicitly GATED; 128 GB headline GX10-only |
 

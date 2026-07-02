@@ -19,6 +19,7 @@ from bench.graphrag_report import (  # noqa: E402
     em_score,
     evidence_scores,
     f1_score,
+    reader_scores,
     retrieve_graph,
     retrieve_graph_inject,
     retrieve_vector,
@@ -143,6 +144,63 @@ def test_graph_rerank_cannot_promote_a_low_similarity_bridge():
     sl.out_adj = {0: [4, 5, 3]}  # bridge 3 competes with vector-similar 4,5
     rer = set(retrieve_graph(sl, 0, k=2, seeds=1, hops=1))  # alias -> rerank
     assert 3 not in rer  # query-cosine re-rank keeps 4/5 over the bridge
+
+
+# --------------------------------------------------------------------------- #
+# Reader-failure accounting (advisor plan 014): a failed reader call is tallied
+# and EXCLUDED from the EM/F1 denominator, not scored 0.
+# --------------------------------------------------------------------------- #
+def _two_question_slice() -> Slice:
+    emb = np.array([[1.0, 0.0], [0.9, 0.1], [0.8, 0.2]], dtype=np.float32)
+    emb /= np.linalg.norm(emb, axis=1, keepdims=True)
+    q = np.array([[1.0, 0.0], [1.0, 0.0]], dtype=np.float32)
+    return Slice(
+        corpus_emb=emb,
+        query_emb=q,
+        paragraphs=[{"id": i, "title": f"p{i}", "text": ""} for i in range(3)],
+        questions=[
+            {
+                "qid": 0,
+                "question": "?",
+                "answer": "a",
+                "type": "bridge",
+                "gold_ids": [0],
+            },
+            {
+                "qid": 1,
+                "question": "?",
+                "answer": "a",
+                "type": "bridge",
+                "gold_ids": [0],
+            },
+        ],
+        out_adj={0: [1]},
+        k=2,
+    )
+
+
+class _RaiseOnceReader:
+    name = "raise-once"
+
+    def __init__(self):
+        self.calls = 0
+
+    def answer(self, question, contexts):
+        self.calls += 1
+        if self.calls == 1:
+            raise RuntimeError("simulated reader timeout")
+        return "a"  # matches both questions' gold answer -> EM 1.0
+
+
+def test_reader_failure_tallied_and_excluded_from_denominator():
+    sl = _two_question_slice()
+    rd = reader_scores(sl, _RaiseOnceReader(), k=2, only=["vector_only"])
+    # one of the two reader calls failed:
+    assert rd["reader_failures"] == 1
+    # denominator shrank to the 1 successful question, which scored EM 1.0.
+    # (had the failure been scored 0 instead of excluded, the mean would be 0.5.)
+    assert rd["vector_only"]["answer_em"] == 1.0
+    assert rd["n_reader_questions"] == 2
 
 
 # --------------------------------------------------------------------------- #

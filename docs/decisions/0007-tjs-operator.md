@@ -170,3 +170,54 @@ scan provably early-terminates rather than blocking.
 | Re-rank survivors with scalar `<->` | Returns 0 outside an index scan (ADR-0006) — would silently produce garbage rankings. |
 | Interleave a graph SPI probe inside the IndexScan drive loop | Nests a second SPI cursor under the executor-driven scan (SPI-stack risk); unnecessary since the reachable set is finite and cacheable. |
 | Invent a new early-termination bound | VBASE's `consecutive_drops` is already validated against the relaxed-monotone stream; a new stop adds risk for no gain. |
+
+## Addendum (advisor plan 022, 2026-07-01): hardening the relaxed-monotonicity executor path
+
+This ADR's relaxed-order approach rides on the inherited MSVBASE executor hunk
+(`patch/Postgres.patch`, files `nodeSort.c` / `nodeIndexscan.c` / `execnodes.h` / `relscan.h`).
+Advisor plan 022 hardens that hunk in place (interim; the eventual fix is the CustomScan migration
+recorded above, which expresses relaxed order as a proper path and drops the global executor bool).
+Shipped as `scripts/patches/tridb_relaxed_order_executor_guard.patch` (last in the fork chain).
+
+**Guard decisions (what the patch changes and why):**
+
+1. **`xs_inorder` is now zero-initialized** in `RelationGetIndexScan` (`genam.c`). The base patch
+   added `bool xs_inorder;` to `IndexScanDescData` but never cleared it, so a stock (non-relaxed)
+   AM held garbage. A bounded `Sort` (LIMIT n) over an ORDINARY btree index scan could read that
+   garbage, arm the `nodeSort.c` early-break (`if (is_index_inorder && tuplesort_heapfull(...))
+   break;`), and truncate its input — wrong top-N for queries unrelated to vector search.
+2. **The Sort early-stop is now gated on `amcanrelaxedorderbyop`.** `nodeIndexscan.c` sets
+   `estate->is_index_inorder = scandesc->xs_inorder && scandesc->indexRelation->rd_indam->
+   amcanrelaxedorderbyop;`, so the early-break can arm ONLY for a genuinely-relaxed (HNSW) scan.
+3. **The wrong-order safety ERROR is restored for NON-relaxed AMs.** The base patch commented out
+   `if (cmp < 0) elog(ERROR, "index returned tuples in wrong order")` for ALL order-by-op scans;
+   it is re-enabled, guarded to fire only when the AM does NOT advertise `amcanrelaxedorderbyop`
+   (relaxed scans legitimately emit approximately-ordered tuples).
+
+**Emission-window constants — DECISION: document, do not parameterize (plan 022 option (b)).**
+`src/hnswindex.cpp` sets the VBASE ORDER BY emission window `scanState->range = 86` and the
+range-scan `distanceThreshold = 3` / `queueThreshold = 50` as literals (all upstream
+`//TODO(Qianxi): set parameter`). Deriving them from `k`/`ef`/reloptions is a HIGH-risk,
+recall-sensitive library change deferred to the CustomScan migration; plan 022 instead adds a code
+comment at the constants (and this note) making the semantics explicit, so no future reader mistakes
+the 86-window for a tuned bound:
+
+- **Emission order is only APPROXIMATELY monotone.** The `xs_inorder` flip is a heuristic ("the
+  86-deep distance window's top is now below the current candidate"), NOT a proof of global order.
+  For `k` larger than the window, or in dense regions, the flip can fire early — matching upstream
+  issue #22 (VBase iterative-search maintains no result heap / no median-window terminator; it emits
+  in raw frontier-pop order).
+- **`term_cond` is the real correctness knob, never this window.** Per the TJS termination fix
+  (DEV-1169 scale defect, corrected in this ADR above and `tridb_tjs_predicate_termination.patch`),
+  the operator's `consecutive_drops`/`term_cond` past-frontier bound decides sufficiency. SM-4 must
+  be reported as a **curve over `term_cond`**, not a bare headline — the 86-window is a fixed
+  heuristic underneath it, not the tuning surface.
+
+**Verification / residual risk.** The guard is validated by `test/relaxed_order_guard.sql` (wired
+into `ENGINE_TESTS`): (a) a bounded Sort over a plain btree index returns the exact top-N; (b) an
+HNSW `ORDER BY <-> LIMIT k` still returns the near set. STOP conditions for the executor: if gating
+the early-stop measurably raises HNSW latency, or HNSW recall drops at the fixed `term_cond`
+operating point, report the numbers — do not revert the correctness gate or tweak the window to
+chase them. The `tuplesort_heapfull` private-`Tuplesortstate`-field coupling
+(`memtupcount >= bound`) is unchanged but now reached only on genuinely-relaxed scans; it remains
+the load-bearing reason a PG re-pin needs full re-validation.

@@ -42,7 +42,7 @@ index 8bd02e7..c605522 100644
 +-- See docs/decisions/0007-tjs-operator.md.
 +CREATE FUNCTION tjs(table_name text, k integer, term_cond integer, src bigint,
 +                    attr_exp text, filter_exp text, orderby_exp text) RETURNS SETOF record
-+	AS 'MODULE_PATHNAME' LANGUAGE C STABLE;
++	AS 'MODULE_PATHNAME' LANGUAGE C STABLE STRICT;
 +
 +COMMENT ON FUNCTION tjs(text, integer, integer, bigint, text, text, text) IS
 +	'TriDB Traversal-Join-Similarity operator (DEV-1169). One Volcano plan composing graph traversal '
@@ -59,7 +59,7 @@ new file mode 100644
 index 0000000..86e9ad2
 --- /dev/null
 +++ b/src/tjs_operator.cpp
-@@ -0,0 +1,685 @@
+@@ -0,0 +1,696 @@
 +// Copyright (c) TriDB. Licensed under the MIT License.
 +//
 +// tjs_operator.cpp — TriDB Traversal-Join-Similarity (TJS) operator (DEV-1169 / FR-4).
@@ -621,6 +621,13 @@ index 0000000..86e9ad2
 +		funcctx = SRF_FIRSTCALL_INIT();
 +		oldcontext = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
 +
++		/* STRICT already rejects NULL args, but guard explicitly per the repo convention
++		 * (join_order.c): PG_GETARG_TEXT_PP on a NULL datum is UB. Belt-and-braces. */
++		for (int _i = 0; _i < PG_NARGS(); _i++)
++			if (PG_ARGISNULL(_i))
++				ereport(ERROR, (errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
++						errmsg("tjs: argument %d must not be NULL", _i + 1)));
++
 +		int argc = 0;
 +		text *tablename = PG_GETARG_TEXT_PP(argc++);
 +		uint32 k = PG_GETARG_UINT32(argc++);
@@ -660,12 +667,16 @@ index 0000000..86e9ad2
 +		// Build the vector leg: a single index-scan SQL with the relational filter in WHERE.
 +		std::string orderby(text_to_cstring(orderby_text));
 +		char sourceText[102400];
++		// table_name is interpolated into the generated SQL; quote it as an identifier so it cannot
++		// break out (SECURITY.md). quote_identifier returns the input unchanged when quoting is
++		// unneeded, so ordinary names are byte-identical — no behavior change for existing callers.
++		const char *qtbl = quote_identifier(text_to_cstring(tablename));
 +		if ( strlen(text_to_cstring(filter_exp_text)) == 0 ){
 +			snprintf(sourceText, sizeof(sourceText), "select %s from %s order by %s",
-+					 text_to_cstring(attr_exp_text), text_to_cstring(tablename), orderby.c_str());
++					 text_to_cstring(attr_exp_text), qtbl, orderby.c_str());
 +		} else {
 +			snprintf(sourceText, sizeof(sourceText), "select %s from %s where %s order by %s",
-+					 text_to_cstring(attr_exp_text), text_to_cstring(tablename),
++					 text_to_cstring(attr_exp_text), qtbl,
 +					 text_to_cstring(filter_exp_text), orderby.c_str());
 +		}
 +		DEBUG_PRINT("TJS vector leg SQL: %s", sourceText);

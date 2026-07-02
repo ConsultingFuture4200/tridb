@@ -1,0 +1,77 @@
+diff --git a/thirdparty/Postgres/src/backend/access/index/genam.c b/thirdparty/Postgres/src/backend/access/index/genam.c
+--- a/thirdparty/Postgres/src/backend/access/index/genam.c
++++ b/thirdparty/Postgres/src/backend/access/index/genam.c
+@@ -125,6 +125,12 @@
+ 	scan->xs_hitup = NULL;
+ 	scan->xs_hitupdesc = NULL;
+ 
++	/* TRIDB: relaxed-order guard (advisor plan 022) — zero-init the VBASE
++	 * relaxed-monotonicity flag so stock (non-relaxed) AMs never read garbage.
++	 * Only the HNSW AM sets it true; nodeSort's bounded early-stop is gated on
++	 * it AND amcanrelaxedorderbyop. See docs/decisions/0007-tjs-operator.md. */
++	scan->xs_inorder = false;
++
+ 	return scan;
+ }
+ 
+diff --git a/thirdparty/Postgres/src/backend/executor/nodeIndexscan.c b/thirdparty/Postgres/src/backend/executor/nodeIndexscan.c
+--- a/thirdparty/Postgres/src/backend/executor/nodeIndexscan.c
++++ b/thirdparty/Postgres/src/backend/executor/nodeIndexscan.c
+@@ -133,7 +133,11 @@
+ 	while (index_getnext_slot(scandesc, direction, slot))
+ 	{
+ 		CHECK_FOR_INTERRUPTS();
+-        estate->is_index_inorder = scandesc->xs_inorder;
++        /* TRIDB plan 022: only trust xs_inorder for an AM that advertises
++         * relaxed order-by-op; otherwise it is stale/garbage and must not arm
++         * nodeSort's bounded early-stop. */
++        estate->is_index_inorder = scandesc->xs_inorder &&
++            scandesc->indexRelation->rd_indam->amcanrelaxedorderbyop;
+         //elog(INFO, "node is in order : %d", estate->is_index_inorder);
+ 		/*
+ 		 * If the index was lossy, we have to recheck the index quals using
+@@ -271,7 +275,9 @@
+ 			node->iss_ReachedEnd = true;
+ 			continue;
+ 		}
+-        estate->is_index_inorder = scandesc->xs_inorder;
++        /* TRIDB plan 022: gate on amcanrelaxedorderbyop (see IndexNext). */
++        estate->is_index_inorder = scandesc->xs_inorder &&
++            scandesc->indexRelation->rd_indam->amcanrelaxedorderbyop;
+         //elog(INFO, "node is in reorder : %d", estate->is_index_inorder);
+ 		/*
+ 		 * If the index was lossy, we have to recheck the index quals and
+@@ -310,9 +316,13 @@
+ 								  scandesc->xs_orderbyvals,
+ 								  scandesc->xs_orderbynulls,
+ 								  node);
+-			//if (cmp < 0)
+-			//	elog(ERROR, "index returned tuples in wrong order");
+-			if (cmp == 0)
++			/* TRIDB plan 022: restore the wrong-order safety net for NON-relaxed
++			 * order-by-op AMs. Relaxed (HNSW/VBASE) scans legitimately emit only
++			 * approximately-ordered tuples, so cmp < 0 is a real bug only when the
++			 * AM does not advertise amcanrelaxedorderbyop. */
++			if (cmp < 0 && !scandesc->indexRelation->rd_indam->amcanrelaxedorderbyop)
++				elog(ERROR, "index returned tuples in wrong order");
++			else if (cmp == 0)
+ 				was_exact = true;
+ 			else
+ 				was_exact = false;
+diff --git a/src/hnswindex.cpp b/src/hnswindex.cpp
+--- a/src/hnswindex.cpp
++++ b/src/hnswindex.cpp
+@@ -353,6 +353,13 @@
+                                     _dim, scanState->workSpace->array.size())));
+             }
+             scanState->hasRangeFilter = false;
++	    /* TRIDB plan 022: `range` is the VBASE ORDER BY emission window (# of
++	     * nearest candidates buffered before xs_inorder may flip to signal
++	     * approximate order). 86 here, and distanceThreshold=3 / queueThreshold=50
++	     * below, are FIXED heuristics (upstream //TODO, issue #22) — NOT tuned
++	     * bounds and NOT derived from k/ef. Emission is only APPROXIMATELY
++	     * monotone, so the TJS operator's term_cond is the real recall knob, never
++	     * this window. See docs/decisions/0007-tjs-operator.md. */
+ 	    scanState->range = 86;
+             scanState->workSpace->resultIterator =
+                        HNSWIndexScan::BeginScan((char *)scanState->workSpace->array.data(),path);

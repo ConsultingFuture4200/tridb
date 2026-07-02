@@ -17,7 +17,7 @@
 <p align="center">
   <a href="#license"><img src="https://img.shields.io/badge/license-MIT-blue?style=flat-square" alt="License"></a>
   <a href="https://github.com/ConsultingFuture4200/tridb/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/ConsultingFuture4200/tridb/ci.yml?style=flat-square&label=CI" alt="CI"></a>
-  <a href="#benchmarks"><img src="https://img.shields.io/badge/SM--2-100%25%20%C2%B7%20~13%C3%97%20faster-brightgreen?style=flat-square" alt="SM-2"></a>
+  <a href="#benchmarks"><img src="https://img.shields.io/badge/SM--2-100%25%20%C2%B7%20~15%C3%97%20faster-brightgreen?style=flat-square" alt="SM-2"></a>
   <a href="spec/tridb_spec_v0.1.0.md"><img src="https://img.shields.io/badge/spec-v0.1.0-informational?style=flat-square" alt="Spec"></a>
 </p>
 
@@ -102,7 +102,7 @@ Head-to-head against the multi-system baseline (Milvus + Neo4j + Postgres, app-s
 | Metric | Meaning | Target | Result |
 |--------|---------|--------|--------|
 | **SM-1** | Intermediate-result reduction vs. baseline | ≥ 5× | **32×** |
-| **SM-2** | Lower end-to-end latency than baseline | ≥ 80% of queries | **100% (12/12), ~13× faster** |
+| **SM-2** | Lower end-to-end latency than baseline | ≥ 80% of queries | **100% (12/12), median 15.1× (2k/dim-32, x86 standin; re-measure at corrected operating point = DEV-1284, pending)** |
 | **SM-3** | Corpus examined (k=5, worst case) | < 25% | **6.4%** |
 | **SM-4** | Answer-set parity vs. exact oracle | ≥ 99% | **curve, not a point** (see note ↓) |
 | **SM-5** | Transaction atomicity across all stores | 100% | **100%** |
@@ -157,7 +157,8 @@ The repository has two layers. The hardware-independent layer (design, tooling, 
 
 ```bash
 python3 -m venv .venv && . .venv/bin/activate
-pip install -r requirements.txt
+pip install -r requirements.lock   # pinned, reproducible; requirements.txt holds floors only
+cp .env.example .env               # documents every env var the tooling reads
 make test          # Python + lint layer — fast, no Docker
 make lint
 ```
@@ -170,7 +171,7 @@ make test-all                  # test + lint + smoke + graph engine suites
 make bench-live                # live SM-1/SM-3/SM-4/SM-5 on the real engine
 
 make baseline-up               # stand up Milvus + Neo4j + Postgres baseline
-make sm2                       # fair SM-2 latency head-to-head
+make sm2                       # fair SM-2 latency head-to-head (needs PGPORT=5433 where baseline PG maps to 5433)
 make baseline-down
 ```
 

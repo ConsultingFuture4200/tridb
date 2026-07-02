@@ -32,6 +32,12 @@ BOOST_1_81_0_SHA256="205666dea9f6a7cfed87c7a6dfbeb52a2c1b9de55712c9c1a87735d7181
 CMAKE_3_14_4_X86_64_SHA256="9f414df8e432c4a143c2d6d81e170581badba8d89df1cf8944735b9122765c50"
 CMAKE_3_27_9_AARCH64_SHA256="11bf3d30697df465cdf43664a9473a586f010c528376a966fd310a3a22082461"
 
+# Base-image digest pin (advisor plan 021, UP-BUILD-02). `FROM gcc:12.3.0` is a floating tag;
+# pinning it by digest makes two builds months apart pull identical base layers. Resolved
+# 2026-07-01 via `docker buildx imagetools inspect gcc:12.3.0 --format '{{.Manifest.Digest}}'`.
+# REFRESH INTENTIONALLY (like the checksums above) when the base image is deliberately bumped.
+GCC_12_3_0_DIGEST="sha256:de5c5093e2ceb5c09901ed541ecab0660d1f01b7fd79587ad0294fa758a1690e"
+
 # Sentinels proving each MSVBASE patch applied. The vendored scripts/patch.sh has no `set -e`
 # and ignores `git apply`'s exit code, so a failed patch yields a clean build of the WRONG
 # database (stock Postgres, no relaxed monotonicity). Verify the end-state and die on any miss.
@@ -92,6 +98,26 @@ verify_patches() {
     || die "TriDB tridb_hnsw_reloptions.patch NOT applied — HNSW m/ef_construction reloptions missing (DEV-1286); drift?"
   grep -q 'DEV-1248' "$root/src/hnswindex.cpp" 2>/dev/null \
     || die "TriDB tridb_hnsw_costestimate_no_orderby.patch NOT applied — HNSW no-ORDER-BY cost penalty missing (DEV-1248); drift?"
+  # advisor plan 019: HNSW AM entry guards. Sentinel on the distinctive marker at the single
+  # choke point (util.cpp) AND the bulkdelete site so a partial/failed apply is caught.
+  grep -q 'TRIDB: HNSW AM entry guards' "$root/src/util.cpp" 2>/dev/null \
+    || die "TriDB tridb_hnsw_am_entry_guards.patch NOT applied in util.cpp — array-content validation missing (advisor plan 019); drift?"
+  grep -q 'TRIDB: HNSW AM entry guards' "$root/src/hnswindex_scan.cpp" 2>/dev/null \
+    || die "TriDB tridb_hnsw_am_entry_guards.patch NOT applied in hnswindex_scan.cpp — BulkDelete NULL-stats/TID guard missing (advisor plan 019); drift?"
+  # advisor plan 018: unused PostgresMain approximate_sum rewriter removed. Assert the sentinel is
+  # present AND the rewriter's active marker `approximate_sum(` is GONE from postgres.c, so a
+  # partial/failed apply (sentinel absent, or block still present) is caught.
+  grep -q 'TRIDB: MSVBASE approximate_sum PostgresMain rewriter removed' "$root/thirdparty/Postgres/src/backend/tcop/postgres.c" 2>/dev/null \
+    || die "TriDB tridb_remove_pgmain_rewriter.patch NOT applied — PostgresMain rewriter sentinel missing (advisor plan 018); drift?"
+  ! grep -q 'approximate_sum(' "$root/thirdparty/Postgres/src/backend/tcop/postgres.c" 2>/dev/null \
+    || die "TriDB tridb_remove_pgmain_rewriter.patch INCOMPLETE — approximate_sum( rewriter still present in postgres.c (advisor plan 018); drift?"
+  # advisor plan 022: relaxed-monotonicity executor guard. Two sentinels on LOAD-BEARING code
+  # tokens (not comment phrases): the xs_inorder zero-init in genam.c AND the amcanrelaxedorderbyop
+  # gate in nodeIndexscan.c — a partial/failed apply misses one and die()s.
+  grep -q 'scan->xs_inorder = false' "$root/thirdparty/Postgres/src/backend/access/index/genam.c" 2>/dev/null \
+    || die "TriDB tridb_relaxed_order_executor_guard.patch NOT applied — xs_inorder zero-init missing in genam.c (advisor plan 022); drift?"
+  grep -q 'amcanrelaxedorderbyop' "$root/thirdparty/Postgres/src/backend/executor/nodeIndexscan.c" 2>/dev/null \
+    || die "TriDB tridb_relaxed_order_executor_guard.patch NOT applied — amcanrelaxedorderbyop gate/guard missing in nodeIndexscan.c (advisor plan 022); drift?"
   log "all MSVBASE + TriDB fork patches verified present"
 }
 
@@ -350,6 +376,83 @@ apply_tridb_fork_patches() {
       || die "tridb_tjs_open_operator.patch did not apply — MSVBASE/tjs-chain drift? re-generate per ADR-0012"
   fi
 
+  #   tridb_hnsw_am_entry_guards.patch (advisor plan 019): defensive validation on the HNSW AM
+  #     entry points an unprivileged SQL query reaches. The insert/build paths validate
+  #     caller-supplied arrays; the scan/vacuum/range paths did not, so a short/empty/mistyped
+  #     vector literal could OOB-read the distance kernel or NULL-deref VACUUM. Four additive
+  #     guards: (1) hnsw_gettuple checks the query-vector length against the index dimension in
+  #     BOTH the ORDER BY (== dim) and range (== dim+1, non-empty) branches; (2) the single
+  #     choke point convert_array_to_vector rejects multi-dim / NULL-containing / non-float8[]
+  #     arrays (mirrors convert_array_to_vector_str), defending build/insert/scan uniformly;
+  #     (3) HNSWIndexScan::BulkDelete palloc0s a NULL stats (ambulkdelete's first call) and builds
+  #     the visibility TID with ItemPointerSet instead of malformed brace-elision; (4)
+  #     range_l2_distance / range_inner_product_distance length-check lhs == rhs-1. Touches four
+  #     already-TriDB-patched files, so it MUST apply LAST (diffed against the full chain above).
+  #     The endscan NULL guard the plan also called for is ALREADY present (added by
+  #     tridb_hnsw_scan_no_orderby.patch, DEV-1236), so it is not duplicated here.
+  local am_guards_patch="${_MSVBASE_LIB_DIR}/../patches/tridb_hnsw_am_entry_guards.patch"
+  [[ -f "$am_guards_patch" ]] || die "missing TriDB fork patch: $am_guards_patch"
+  if grep -q 'TRIDB: HNSW AM entry guards' "$root/src/util.cpp" 2>/dev/null; then
+    log "TriDB fork patch (HNSW AM entry guards, advisor plan 019) already applied"
+  else
+    log "applying TriDB fork patch: HNSW AM entry guards (dim/array validation, bulkdelete, range dist) (advisor plan 019)"
+    ( cd "$root" && git apply "$am_guards_patch" ) \
+      || die "tridb_hnsw_am_entry_guards.patch did not apply — MSVBASE/fork-chain drift? re-generate per advisor plan 019"
+  fi
+
+  #   tridb_remove_pgmain_rewriter.patch (advisor plan 018): MSVBASE's Postgres.patch injects a
+  #     hand-written string rewriter into PostgresMain's simple-query handler that intercepts any
+  #     statement containing approximate_sum(...) and rewrites it to a topk(...) call. TriDB NEVER
+  #     uses this path (its canonical query lowers directly to tjs()/tjs_open(); grep -rn
+  #     approximate_sum src/ test/ tools/ bench/ is empty), yet inherits the whole liability: a
+  #     char* order[100] stack overflow, an unbounded strcat past palloc(strlen*2), '-unescaped SQL
+  #     injection, a pfree(NULL) crash on a WHERE-less query, plus an always-on per-query heap leak
+  #     (lowercase()+palloc freed only inside the taken branch) and an ereport(LOG) that logs the
+  #     full text of EVERY query. Removes the entire rewrite block from PostgresMain (restoring the
+  #     plain query_string/exec_simple_query flow, leaving a one-line sentinel) and its dependent
+  #     pfree(result). Edits thirdparty/Postgres/src/backend/tcop/postgres.c, which ONLY the base
+  #     Postgres.patch touches, so ordering vs the other fork patches is immaterial; it MUST apply
+  #     AFTER the base patch (scripts/patch.sh) that introduced the block. The executor hunks of
+  #     Postgres.patch (nodeSort/nodeIndexscan relaxed monotonicity) are LEFT intact — plan 022.
+  #     Applies inside the Postgres submodule (paths a/src/backend/tcop/...), like upstream patch.sh.
+  local pgmain_patch="${_MSVBASE_LIB_DIR}/../patches/tridb_remove_pgmain_rewriter.patch"
+  [[ -f "$pgmain_patch" ]] || die "missing TriDB fork patch: $pgmain_patch"
+  if grep -q 'TRIDB: MSVBASE approximate_sum PostgresMain rewriter removed' "$root/thirdparty/Postgres/src/backend/tcop/postgres.c" 2>/dev/null; then
+    log "TriDB fork patch (remove PostgresMain approximate_sum rewriter, advisor plan 018) already applied"
+  else
+    log "applying TriDB fork patch: remove unused PostgresMain approximate_sum query rewriter (advisor plan 018)"
+    ( cd "$root/thirdparty/Postgres" && git apply "$pgmain_patch" ) \
+      || die "tridb_remove_pgmain_rewriter.patch did not apply — MSVBASE/Postgres.patch drift? re-generate per advisor plan 018"
+  fi
+
+  #   tridb_relaxed_order_executor_guard.patch (advisor plan 022): harden the VBASE relaxed-
+  #     monotonicity executor path that TR-1 early termination rides on. Three additive changes:
+  #     (1) genam.c RelationGetIndexScan zero-inits scan->xs_inorder (a new, un-zeroed
+  #     IndexScanDescData field the base Postgres.patch added) so a bounded Sort over an ORDINARY
+  #     index can no longer read garbage and truncate its top-N; (2) nodeIndexscan.c gates the
+  #     is_index_inorder EState flag (which arms nodeSort's bounded early-stop) on the driving
+  #     AM's amcanrelaxedorderbyop, so the early-stop fires ONLY for a genuinely-relaxed (HNSW)
+  #     scan; (3) nodeIndexscan.c restores the base patch's removed `index returned tuples in
+  #     wrong order` ERROR, guarded to the NON-relaxed case (relaxed scans legitimately violate
+  #     strict order). Also documents the fixed hnswindex.cpp emission-window heuristics
+  #     (range=86 / distanceThreshold=3 / queueThreshold=50, upstream issue #22) as approximate,
+  #     term_cond-not-window being the real recall knob (ADR-0007 addendum). Spans BOTH the
+  #     Postgres submodule (executor/genam) AND src/hnswindex.cpp, so it applies from $root (NOT
+  #     inside thirdparty/Postgres like the pgmain patch) and MUST come LAST — after the
+  #     hnswindex.cpp fork chain (reloptions/costestimate/scan_no_orderby/am_entry_guards) whose
+  #     line offsets it is diffed against. The executor hunks (genam/nodeIndexscan) are untouched
+  #     by any other fork patch, so their offsets are stable. Interim hardening only; the real fix
+  #     is the ADR-0007 CustomScan migration (relaxed order as a path, no global executor bool).
+  local relaxed_guard_patch="${_MSVBASE_LIB_DIR}/../patches/tridb_relaxed_order_executor_guard.patch"
+  [[ -f "$relaxed_guard_patch" ]] || die "missing TriDB fork patch: $relaxed_guard_patch"
+  if grep -q 'scan->xs_inorder = false' "$root/thirdparty/Postgres/src/backend/access/index/genam.c" 2>/dev/null; then
+    log "TriDB fork patch (relaxed-order executor guard, advisor plan 022) already applied"
+  else
+    log "applying TriDB fork patch: relaxed-monotonicity executor guard (xs_inorder zero-init + amcanrelaxedorderbyop gate + wrong-order ERROR restore) (advisor plan 022)"
+    ( cd "$root" && git apply "$relaxed_guard_patch" ) \
+      || die "tridb_relaxed_order_executor_guard.patch did not apply — MSVBASE/fork-chain drift? re-generate per advisor plan 022"
+  fi
+
   # ----------------------------------------------------------------------------
   # SUPERSEDED / DO NOT ENABLE (DEV-1235 / ADR-0009): original GenericXLog draft.
   # ----------------------------------------------------------------------------
@@ -389,6 +492,13 @@ apply_tridb_fork_patches() {
 patch_upstream_dockerfile() {
   local df="$1"
   [[ -f "$df" ]] || return 0
+  # Digest-pin the floating base image for reproducibility (advisor plan 021 / UP-BUILD-02).
+  # Guard on the exact pristine line ('FROM gcc:12.3.0' with nothing after) so a re-run over an
+  # already-pinned Dockerfile ('FROM gcc:12.3.0@sha256:...') is a no-op.
+  if grep -q '^FROM gcc:12.3.0$' "$df"; then
+    log "digest-pinning base image (FROM gcc:12.3.0 -> gcc:12.3.0@${GCC_12_3_0_DIGEST}) for reproducibility"
+    sed -i "s|^FROM gcc:12.3.0\$|FROM gcc:12.3.0@${GCC_12_3_0_DIGEST}|" "$df"
+  fi
   if grep -q 'boostorg.jfrog.io' "$df"; then
     log "patching dead Boost URL (boostorg.jfrog.io left JFrog in 2024) -> archives.boost.io"
     sed -i 's#https://boostorg.jfrog.io/artifactory/main/release/1.81.0/source/boost_1_81_0.tar.gz#https://archives.boost.io/release/1.81.0/source/boost_1_81_0.tar.gz#g' "$df"
@@ -417,6 +527,14 @@ patch_upstream_dockerfile() {
 harden_dockerfile_downloads() {
   local df="$1"
   [[ -f "$df" ]] || return 0
+  # Remove the global git TLS-off setting (advisor plan 021 / UP-BUILD-01). Upstream bakes
+  # `RUN git config --global http.sslverify false` into the image, disabling cert verification for
+  # ALL git traffic at build AND runtime — the MITM path the tarball hardening below closed,
+  # reopened for git. Delete the whole RUN line (git defaults to sslverify=true). Idempotent.
+  if grep -q 'git config --global http.sslverify false' "$df"; then
+    log "removing global git TLS-off (RUN git config --global http.sslverify false) — restores cert verification for git"
+    sed -i '/git config --global http.sslverify false/d' "$df"
+  fi
   if grep -q -- '--no-check-certificate' "$df"; then
     log "restoring TLS verification on Dockerfile downloads (drop --no-check-certificate)"
     sed -i 's/ --no-check-certificate//g' "$df"
@@ -430,6 +548,13 @@ harden_dockerfile_downloads() {
     log "hardening CMake download (sha256sum -c before extract)"
     sed -i 's#cmake-3.14.4-Linux-x86_64.tar.gz" -q -O - \\#cmake-3.14.4-Linux-x86_64.tar.gz" -q -O cmake.tgz \&\& \\#' "$df"
     sed -i 's#| tar -xz --strip-components=1 -C /usr/local#echo "'"$CMAKE_3_14_4_X86_64_SHA256"'  cmake.tgz" | sha256sum -c - \&\& tar -xzf cmake.tgz --strip-components=1 -C /usr/local \&\& rm -f cmake.tgz#' "$df"
+  fi
+  # post-condition (plan 015): the hardening MUST have landed — a silent sed no-op here would
+  # ship an image with unverified downloads (the exact hole plan 007 closed).
+  grep -q -- '--no-check-certificate' "$df" && \
+    die "harden_dockerfile_downloads: --no-check-certificate still present (upstream drift?) — inspect $df"
+  if grep -q 'boost_1_81_0.tar.gz' "$df" && ! grep -q 'sha256sum -c' "$df"; then
+    die "harden_dockerfile_downloads: Boost/CMake download present without sha256sum -c (upstream drift?) — inspect $df"
   fi
 }
 

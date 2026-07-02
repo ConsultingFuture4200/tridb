@@ -1,0 +1,141 @@
+diff --git a/src/hnswindex.cpp b/src/hnswindex.cpp
+index 6863262..31728ce 100644
+--- a/src/hnswindex.cpp
++++ b/src/hnswindex.cpp
+@@ -316,6 +316,20 @@ bool hnsw_gettuple(IndexScanDesc scan, ScanDirection dir)
+ 
+             Datum value = scan->keyData->sk_argument;
+ 	        scanState->workSpace->array = convert_array_to_vector(value);
++            // TRIDB: HNSW AM entry guards (advisor plan 019). Range scan packs the threshold
++            // in array[0] and the query vector in array.data()+1, so the array must be
++            // non-empty and exactly dim+1 long; hnswlib reads dim floats from data()+1.
++            // Without this a short/empty literal reads out of bounds. dim from the index
++            // reloption, the same source Insert validates against.
++            {
++                int _dim = hnsw_ParaGetDimension(scan->indexRelation);
++                if (scanState->workSpace->array.empty() ||
++                    static_cast<int>(scanState->workSpace->array.size()) != _dim + 1)
++                    ereport(ERROR,
++                            (errcode(ERRCODE_DATA_EXCEPTION),
++                             errmsg("hnsw range scan vector length mismatch, expected %d (range + %d-dim vector), found %zu",
++                                    _dim + 1, _dim, scanState->workSpace->array.size())));
++            }
+             scanState->hasRangeFilter = true;
+             scanState->inRange = false;
+             scanState->range = scanState->workSpace->array[0];
+@@ -327,6 +341,17 @@ bool hnsw_gettuple(IndexScanDesc scan, ScanDirection dir)
+                 return false;
+             Datum value = scan->orderByData->sk_argument;
+ 	        scanState->workSpace->array = convert_array_to_vector(value);
++            // TRIDB: HNSW AM entry guards (advisor plan 019). hnswlib reads exactly dim floats
++            // from array.data(); a short/empty ORDER BY query vector reads out of bounds in the
++            // distance kernel. Insert validates dim == array.size() — the scan path must too.
++            {
++                int _dim = hnsw_ParaGetDimension(scan->indexRelation);
++                if (static_cast<int>(scanState->workSpace->array.size()) != _dim)
++                    ereport(ERROR,
++                            (errcode(ERRCODE_DATA_EXCEPTION),
++                             errmsg("hnsw query vector length mismatch, expected %d, found %zu",
++                                    _dim, scanState->workSpace->array.size())));
++            }
+             scanState->hasRangeFilter = false;
+ 	    scanState->range = 86;
+             scanState->workSpace->resultIterator =
+diff --git a/src/hnswindex_scan.cpp b/src/hnswindex_scan.cpp
+index 5f7da3e..4f694c8 100644
+--- a/src/hnswindex_scan.cpp
++++ b/src/hnswindex_scan.cpp
+@@ -267,6 +267,11 @@ HNSWIndexScan::BulkDelete(const std::string& p_path,
+     IndexBulkDeleteCallback callback,
+     void* callback_state)
+ {
++    // TRIDB: HNSW AM entry guards (advisor plan 019). ambulkdelete passes stats==NULL on the
++    // first VACUUM call; the standard AM contract palloc0s it. Without this the
++    // stats->tuples_removed++ / stats->num_index_tuples++ below NULL-deref crash the VACUUM.
++    if (stats == NULL)
++        stats = (IndexBulkDeleteResult *) palloc0(sizeof(IndexBulkDeleteResult));
+     hnswlib::tableint id = 0;
+     std::uint64_t number;
+     while (true)
+@@ -276,7 +281,11 @@ HNSWIndexScan::BulkDelete(const std::string& p_path,
+         {
+             BlockNumber blkno = (std::uint32_t)(number >> 32);
+             OffsetNumber offset = (std::uint32_t)number;
+-            ItemPointerData tid = {blkno, offset};
++            // TRIDB: HNSW AM entry guards (advisor plan 019). Brace-elision
++            // `{blkno, offset}` left ip_posid=0 (malformed TID) so the visibility callback
++            // tested the wrong row; set the block+offset properly like hnsw_gettuple does.
++            ItemPointerData tid;
++            ItemPointerSet(&tid, blkno, offset);
+             if (callback(&tid, callback_state))
+             {
+                 vector_index_map[p_path]->markDelete(number);
+diff --git a/src/operator.cpp b/src/operator.cpp
+index 84900ef..4be217f 100644
+--- a/src/operator.cpp
++++ b/src/operator.cpp
+@@ -64,7 +64,17 @@ Datum range_l2_distance(PG_FUNCTION_ARGS)
+ {
+     std::vector<float> lhs = convert_array_to_vector(PG_GETARG_DATUM(0));
+     std::vector<float> rhs = convert_array_to_vector(PG_GETARG_DATUM(1));
+-    
++
++    // TRIDB: HNSW AM entry guards (advisor plan 019). rhs packs the range threshold in rhs[0]
++    // and a dim-length vector in rhs.data()+1, so rhs must be non-empty and
++    // lhs.size() == rhs.size()-1, mirroring l2_distance's length check. Otherwise
++    // get_dist_func reads past the end of rhs.
++    if (rhs.empty() || lhs.size() != rhs.size() - 1)
++        ereport(ERROR,
++                (errcode(ERRCODE_DATA_EXCEPTION),
++                 errmsg("inconsistent range array length, expected %ld (range + %ld-dim vector), found %ld",
++                        lhs.size() + 1, lhs.size(), rhs.size())));
++
+     float range = rhs[0];
+ 
+     size_t dim = lhs.size();
+@@ -107,6 +117,16 @@ Datum range_inner_product_distance(PG_FUNCTION_ARGS)
+     std::vector<float> lhs = convert_array_to_vector(PG_GETARG_DATUM(0));
+     std::vector<float> rhs = convert_array_to_vector(PG_GETARG_DATUM(1));
+ 
++    // TRIDB: HNSW AM entry guards (advisor plan 019). rhs packs the range threshold in rhs[0]
++    // and a dim-length vector in rhs.data()+1, so rhs must be non-empty and
++    // lhs.size() == rhs.size()-1, mirroring inner_product_distance's length check. Otherwise
++    // get_dist_func reads past the end of rhs.
++    if (rhs.empty() || lhs.size() != rhs.size() - 1)
++        ereport(ERROR,
++                (errcode(ERRCODE_DATA_EXCEPTION),
++                 errmsg("inconsistent range array length, expected %ld (range + %ld-dim vector), found %ld",
++                        lhs.size() + 1, lhs.size(), rhs.size())));
++
+     float range = rhs[0];
+ 
+     size_t dim = lhs.size();
+diff --git a/src/util.cpp b/src/util.cpp
+index 4c8fc27..bd20f9e 100644
+--- a/src/util.cpp
++++ b/src/util.cpp
+@@ -27,7 +27,24 @@ std::string convert_data_to_string(Datum value)
+ 
+ std::vector<float> convert_array_to_vector(Datum value)
+ {
++    // TRIDB: HNSW AM entry guards (advisor plan 019). This is the single choke point behind
++    // the HNSW query-vector OOB read: build/insert/scan all funnel Datums through here. Mirror
++    // convert_array_to_vector_str's checks so a caller-supplied float4[]/int[], multi-dim, or
++    // NULL-containing literal cannot be reinterpreted as a packed float8[] and read out of
++    // bounds inside the distance kernel.
+     ArrayType *value_array = DatumGetArrayTypeP(value);
++    if (ARR_NDIM(value_array) > 1)
++        ereport(ERROR,
++                (errcode(ERRCODE_DATA_EXCEPTION),
++                 errmsg("vector array must be 1-D")));
++    if (ARR_HASNULL(value_array))
++        ereport(ERROR,
++                (errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
++                 errmsg("vector array must not contain NULLs")));
++    if (ARR_ELEMTYPE(value_array) != FLOAT8OID)
++        ereport(ERROR,
++                (errcode(ERRCODE_DATATYPE_MISMATCH),
++                 errmsg("vector array must be float8[] (double precision[])")));
+     int dim = ArrayGetNItems(ARR_NDIM(value_array), ARR_DIMS(value_array));
+     float8* data = (float8 *) ARR_DATA_PTR(value_array);
+     std::vector<float> result(data, data + dim);

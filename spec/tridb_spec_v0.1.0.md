@@ -1,7 +1,7 @@
 # TriDB Spec v0.1.0
 
-> **Version:** 0.1.0 · **Created:** 2026-06-21 · **Status:** Draft — marker #1 resolved by
-> DEV-1160 desk spike, 2 remaining.
+> **Version:** 0.1.0 · **Created:** 2026-06-21 · **Status:** Draft — markers #1 (GX10/GB10 live
+> build signed off) and #2 (real-corpus repro shipped) resolved, 1 remaining.
 > **Lineage:** Clone of AkasicDB (SIGMOD Companion '26, DOI 10.1145/3788853.3801609),
 > built on Chimera (PVLDB 18(2):279–292) + VBASE (OSDI '23).
 > **Source of truth:** Linear doc `tridb-spec-v010-59ba388c777f`. This is a mirror.
@@ -81,9 +81,11 @@ Every operator honors Open/Next/Close + early termination. Non-negotiable.
 
 ## §12 Open markers
 
-- **#1 RESOLVED (desk) by DEV-1160:** MSVBASE builds on ARM64 with 3 documented deltas
-  (aarch64 CMake, SPTAG excluded, hnswlib portable → HNSW works). GX10 live build TBC.
-- **#2:** benchmark corpus — synthetic LDBC-style vs. real Omni RAG. Owned by DEV-1172.
+- **#1 RESOLVED by DEV-1160/1161:** MSVBASE builds on ARM64 with 3 documented deltas
+  (aarch64 CMake, SPTAG excluded, hnswlib portable → HNSW works); the GX10/GB10 live build +
+  engine suite are now signed off (`docs/STATUS.md`), so the earlier "live build TBC" is closed.
+- **#2 RESOLVED:** benchmark corpus — real public corpora now ship with a one-command repro
+  (`docs/benchmark_public_repro_v0.1.0.md`), settling the synthetic-vs-real question. Owned by DEV-1172.
 - **#3:** edge properties beyond single `:related_to`. Owned by DEV-1163.
 
 ## Build-vs-borrow

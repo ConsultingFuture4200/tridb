@@ -27,6 +27,11 @@ import re
 
 import numpy as np
 
+# Single-source recall@k semantics (identical to the old local _recall: empty
+# oracle -> 1.0 iff nothing returned). Kept under the _recall name so the pinning
+# tests (tests/test_sweep_corpus.py) still exercise the shared function.
+from tools.real_corpus import recall_at_k as _recall  # noqa: F401
+
 
 def _vec_literal(v) -> str:
     return "{" + ",".join(repr(float(x)) for x in v) + "}"
@@ -189,13 +194,9 @@ def build(args) -> tuple[str, dict]:
 # --------------------------------------------------------------------------- #
 # Parsing / grading a captured transcript.
 # --------------------------------------------------------------------------- #
-def _recall(returned: list[int], oracle: list[int]) -> float:
-    if not oracle:
-        return 1.0 if not returned else 0.0
-    return len(set(returned) & set(oracle)) / len(oracle)
-
-
 def report(manifest: dict, raw: str) -> dict:
+    if "#SWEEP DONE" not in raw:
+        raise SystemExit("sweep transcript did not reach '#SWEEP DONE' — incomplete")
     by_q = {q["qid"]: q for q in manifest["queries"]}
     k = manifest["k"]
     # cfg/tc -> {qid -> {ids, examined, ms}}

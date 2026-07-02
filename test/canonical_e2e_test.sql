@@ -160,4 +160,22 @@ BEGIN
         examined, corpus, got;
 END $$;
 
+-- ===========================================================================
+-- ASSERTION 4 (STRICT NULL guard): tjs is STRICT, so a NULL argument yields a clean zero-row
+-- result (the SRF is never entered), not a backend crash (previously: NULL table_name
+-- dereferenced -> segfault, an unprivileged single-statement DoS).
+-- ===========================================================================
+DO $$
+DECLARE n bigint;
+BEGIN
+    -- STRICT: NULL arg returns no rows (previously: backend segfault)
+    SELECT count(*) INTO n
+    FROM tjs(NULL, 2, 0, 1::bigint, 'id', 'ts < 500',
+             'embedding <-> ''{19,0,0,0,0,0,0,0}''') AS t(id bigint);
+    IF n <> 0 THEN
+        RAISE EXCEPTION 'TJS NULL-arg guard FAILED: expected 0 rows, got %', n;
+    END IF;
+    RAISE NOTICE 'PASS STRICT NULL guard: tjs(NULL,...) returned 0 rows (no crash)';
+END $$;
+
 \echo '================ TJS canonical e2e (FR-4): ALL TESTS PASSED ================'

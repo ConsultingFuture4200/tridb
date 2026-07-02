@@ -77,6 +77,10 @@ def emit_sql(
 
 
 def parse(raw: str) -> dict:
+    if "#TJSOPEN DONE" not in raw:
+        raise SystemExit(
+            "tjs_open_live transcript did not reach '#TJSOPEN DONE' — incomplete"
+        )
     res: dict = {}
     cur = None
     for line in raw.splitlines():

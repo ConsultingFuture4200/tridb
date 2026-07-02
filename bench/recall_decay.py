@@ -29,6 +29,7 @@ from pathlib import Path
 import numpy as np
 
 from tools.filtered_corpus import load_sift
+from tools.real_corpus import recall_at_k  # single-source recall@k semantics
 
 
 def _exact_topk(vecs: np.ndarray, active_ids: np.ndarray, queries: np.ndarray, k: int):
@@ -62,10 +63,17 @@ def _recall(index, vecs, active_ids, queries, k: int, ef: int) -> float:
         index.set_ef(max(len(active_ids), k))
         labels, _ = index.knn_query(queries, k=k)
     truth = _exact_topk(vecs, active_ids, queries, k)
-    hits = sum(
-        len(set(labels[i]) & set(int(x) for x in truth[i])) for i in range(len(queries))
+    # Per-query recall@k via the single-source semantics, then averaged. Identical
+    # to the old micro-average hits/(Q*k) because _exact_topk returns exactly k
+    # truth ids per query (active set >> k in every decay config).
+    return float(
+        np.mean(
+            [
+                recall_at_k([int(x) for x in labels[i]], [int(x) for x in truth[i]], k)
+                for i in range(len(queries))
+            ]
+        )
     )
-    return hits / (len(queries) * k)
 
 
 def _build_index(vecs: np.ndarray, ids: np.ndarray, *, dim, capacity, m, efc):

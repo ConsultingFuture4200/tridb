@@ -37,8 +37,9 @@ beyond that use.
   they are fed **exclusively** from the controlled lowering of the single canonical query (ADR-0007,
   DEV-1167), never from end users, which is the mitigation. **Do not expose these operators' expression
   arguments to untrusted callers.** A future multi-query surface must validate/bind these fragments
-  before exposing the operators externally. (The `table_name` argument is *not* part of this surface —
-  it is resolved via the catalog with `RangeVarGetRelid`, not string-interpolated.)
+  before exposing the operators externally. (The `table_name` argument is resolved via the catalog
+  with `RangeVarGetRelid` and then interpolated as a quoted identifier (`quote_identifier`), so it
+  cannot break out of the generated SQL.)
 - **No multi-tenant isolation / row-level security is implemented** beyond what stock PostgreSQL
   provides. TriDB is a single-tenant, local-hardware engine; do not treat it as a hardened multi-user
   service.
@@ -49,6 +50,14 @@ beyond that use.
   comparison stack) uses placeholder credentials (e.g. `testpassword`, `postgres`) read from env with
   local defaults. These are **not** secrets and exist only to stand up the local benchmark; never reuse
   them anywhere real.
+- **The inherited MSVBASE image entrypoint provisions a SUPERUSER open to `0.0.0.0/0`.** The vendored
+  `scripts/pg_scripts/docker-entrypoint.sh` (baked into any TriDB-built image) creates a database
+  superuser and appends a `host all all 0.0.0.0/0` rule to `pg_hba.conf` — appropriate only for a
+  throwaway local dev container. **Any TriDB image published beyond a local dev box MUST** override the
+  entrypoint to: scope `pg_hba.conf` to the container network (not `0.0.0.0/0`), drop SUPERUSER for the
+  application role, and set a rotated, non-default `PGPASSWORD`. This is a publish-time checklist item,
+  not a code change in this repo; TriDB does not use upstream's `dockerrun.sh` (which supplies a weak
+  default password), but the superuser-on-all-interfaces posture is inherited by the image.
 
 ## Out of scope
 

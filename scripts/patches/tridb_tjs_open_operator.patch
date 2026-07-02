@@ -27,7 +27,7 @@ index c605522..29b09a8 100644
 +CREATE FUNCTION tjs_open(table_name text, k integer, term_cond integer, m_seeds integer,
 +                         hops integer, attr_exp text, filter_exp text, orderby_exp text)
 +                RETURNS SETOF record
-+	AS 'MODULE_PATHNAME' LANGUAGE C STABLE;
++	AS 'MODULE_PATHNAME' LANGUAGE C STABLE STRICT;
 +
 +COMMENT ON FUNCTION tjs_open(text, integer, integer, integer, integer, text, text, text) IS
 +	'TriDB tjs_open — seedless multi-seed open-domain retrieval (ADR-0012 realization B). ANN '
@@ -47,7 +47,7 @@ new file mode 100644
 index 0000000..9954de7
 --- /dev/null
 +++ b/src/tjs_open_operator.cpp
-@@ -0,0 +1,924 @@
+@@ -0,0 +1,966 @@
 +// Copyright (c) TriDB. Licensed under the MIT License.
 +//
 +// tjs_open_operator.cpp — TriDB `tjs_open` multi-seed open-domain retrieval operator
@@ -291,8 +291,10 @@ index 0000000..9954de7
 +// Multi-source graph expansion — BFS `hops` deep from the UNION of all seeds.
 +//
 +// Mirrors tjs_operator.cpp's single-source graphReachableT, generalized to: (a) MANY seeds, (b)
-+// multiple hops. Each frontier node's out-neighbors are pulled via graph_store.neighbors (the native
-+// adjacency-list iterator, golden rule 3). Probed inside the SRF's ALREADY-OPEN SPI connection — we
++// multiple hops. Each hop issues ONE SPI call over the WHOLE frontier — a LATERAL join of
++// graph_store.neighbors (the native adjacency-list iterator, golden rule 3) over the unnest'd
++// frontier id array — so parse/plan/execute is paid once per hop, NOT once per frontier node.
++// Probed inside the SRF's ALREADY-OPEN SPI connection — we
 +// do NOT SPI_connect/finish here (graph_store.neighbors does its own nested SPI; a sibling connection
 +// is the fork's crash). The returned bridge set INCLUDES the seeds themselves (a seed is trivially
 +// reachable from itself and should be admitted). Bounded by m_seeds * avg_deg^hops, not |V|.
@@ -307,26 +309,34 @@ index 0000000..9954de7
 +
 +	for (int h = 0; h < hops && !frontier.empty(); h++) {
 +		std::vector<int64> next;
-+		for (int64 u : frontier) {
-+			char cmd[256];
-+			snprintf(cmd, sizeof(cmd),
-+					 "SELECT dst FROM graph_store.neighbors(%lld) AS dst", (long long) u);
-+			int ret = SPI_execute(cmd, true /* read_only */, 0);
-+			if (ret != SPI_OK_SELECT)
-+				elog(ERROR, "tjs_open graph expansion: graph_store.neighbors(%lld) failed (%d)",
-+					 (long long) u, ret);
-+			uint64 proc = SPI_processed;
-+			SPITupleTable *tt = SPI_tuptable;
-+			TupleDesc tupdesc = tt->tupdesc;
-+			for (uint64 i = 0; i < proc; i++) {
-+				bool isnull;
-+				Datum d = SPI_getbinval(tt->vals[i], tupdesc, 1, &isnull);
-+				if (isnull)
-+					continue;
-+				int64 v = DatumGetInt64(d);
-+				if (bridges.insert(v).second)   // newly discovered -> expand next hop
-+					next.push_back(v);
-+			}
++		// ONE SPI round trip for the WHOLE frontier this hop: LATERAL-join graph_store.neighbors
++		// over the unnest'd id array, so parse/plan/execute is paid ONCE per hop instead of once
++		// per frontier node. neighbors' own nested SPI still nests cleanly under the SRF's single
++		// open connection (no sibling SPI_connect — the fork's DEV-1236 crash). BFS order is
++		// irrelevant: `bridges` dedups, so the discovered set is provably identical to per-node.
++		// `cmd` is a heap std::string (frontiers can be large — never a stack buffer).
++		std::string ids;
++		for (size_t i = 0; i < frontier.size(); i++) {
++			if (i) ids += ",";
++			ids += std::to_string((long long) frontier[i]);
++		}
++		std::string cmd = "SELECT n.dst FROM unnest(ARRAY[" + ids +
++						  "]::bigint[]) AS f(src), LATERAL graph_store.neighbors(f.src) AS n(dst)";
++		int ret = SPI_execute(cmd.c_str(), true /* read_only */, 0);
++		if (ret != SPI_OK_SELECT)
++			elog(ERROR, "tjs_open graph expansion: batched neighbors probe failed at hop %d (%d)",
++				 h, ret);
++		uint64 proc = SPI_processed;
++		SPITupleTable *tt = SPI_tuptable;
++		TupleDesc tupdesc = tt->tupdesc;
++		for (uint64 i = 0; i < proc; i++) {
++			bool isnull;
++			Datum d = SPI_getbinval(tt->vals[i], tupdesc, 1, &isnull);
++			if (isnull)
++				continue;
++			int64 v = DatumGetInt64(d);
++			if (bridges.insert(v).second)   // newly discovered -> expand next hop
++				next.push_back(v);
 +		}
 +		frontier.swap(next);
 +	}
@@ -464,10 +474,10 @@ index 0000000..9954de7
 +	return vec_winner; // reset drops only on vector progress
 +}
 +
-+// Finalize: merge vec_pq + bridge_pq into the top-k, BRIDGES GUARANTEED. Strategy: take ALL bridges
-+// (up to k, best-by-distance — they are guaranteed), then fill the remaining slots with the nearest
-+// vector winners NOT already chosen as a bridge (dedup by tid). The combined set is then ordered
-+// nearest-first for emission. This realizes "emit top-k vector-ranked WITH the bridges injected".
++// Finalize: merge vec_pq + bridge_pq into the top-k. Policy: bridges guaranteed up to k/2 slots;
++// vector winners keep the rest (ADR-0012 "injected", not "replaced"). Then, only if vector winners
++// run out, remaining bridges backfill. The combined set is ordered nearest-first for emission.
++// bridges-take-all would silently delete the vector modality on dense graphs — hence the k/2 cap.
 +static void finalizeTopKO(TJSOpenState* estate){
 +	uint32_t k = estate->topk;
 +
@@ -498,14 +508,24 @@ index 0000000..9954de7
 +	std::unordered_set<int64> chosen_ids;
 +	std::vector<pq_item_o_t> chosen;  // nearest-first
 +
-+	// 1) bridges first (guaranteed), nearest bridges win when > k bridges exist.
++	// 1) bridges guaranteed up to k/2 slots (nearest bridges win); vector winners keep the rest
++	//    (ADR-0012 "injected", not "replaced"). bridges-take-all would silently delete the vector
++	//    modality on dense graphs, so cap the reserved bridge share at k/2.
++	uint32_t bridge_cap = k / 2;
++	if (bridge_cap == 0 && !bridges_v.empty()) bridge_cap = 1;  // min 1 when any bridge exists
 +	for (const auto& it : bridges_v) {
-+		if (chosen.size() >= k) break;
++		if (chosen.size() >= bridge_cap) break;
 +		if (chosen_ids.insert(id_of(it)).second)
 +			chosen.push_back(it);
 +	}
 +	// 2) fill remaining with vector winners not already chosen.
 +	for (const auto& it : vecs_v) {
++		if (chosen.size() >= k) break;
++		if (chosen_ids.insert(id_of(it)).second)
++			chosen.push_back(it);
++	}
++	// 3) only if vector winners ran out, backfill remaining slots with the rest of the bridges.
++	for (const auto& it : bridges_v) {
 +		if (chosen.size() >= k) break;
 +		if (chosen_ids.insert(id_of(it)).second)
 +			chosen.push_back(it);
@@ -550,7 +570,8 @@ index 0000000..9954de7
 +	}
 +
 +	std::string sql = "SELECT " + *estate->attr_exp + ", (" + *estate->orderby_exp + ") AS __d FROM " +
-+					  *estate->tbl_name + " WHERE " + *estate->id_col + " = ANY (ARRAY[" + idlist + "])";
++					  quote_identifier(estate->tbl_name->c_str()) + " WHERE " + *estate->id_col +
++					  " = ANY (ARRAY[" + idlist + "])";
 +	if (!estate->filter_exp->empty())
 +		sql += " AND (" + *estate->filter_exp + ")";
 +
@@ -568,7 +589,9 @@ index 0000000..9954de7
 +		HeapTuple src = tt->vals[i];
 +		bool dnull;
 +		Datum dd = SPI_getbinval(src, sd, dcol, &dnull);
-+		float dist = dnull ? std::numeric_limits<float>::infinity() : (float) DatumGetFloat8(dd);
++		// __d is sqrt'd Euclidean (scalar l2_distance); square it so bridge_pq shares vec_pq's squared-L2 unit (xs_orderbyvals[0]).
++		double d8 = dnull ? std::numeric_limits<double>::infinity() : DatumGetFloat8(dd);
++		float dist = (float) (d8 * d8);
 +
 +		// dedup key: the id column value (col idAttno). Not a heap tid (SPI tuples carry no scan tid),
 +		// but the id uniquely identifies a paragraph, so it is a sound dedup key across both heaps —
@@ -836,6 +859,13 @@ index 0000000..9954de7
 +		funcctx = SRF_FIRSTCALL_INIT();
 +		oldcontext = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
 +
++		/* STRICT already rejects NULL args, but guard explicitly per the repo convention
++		 * (join_order.c): PG_GETARG_TEXT_PP on a NULL datum is UB. Belt-and-braces. */
++		for (int _i = 0; _i < PG_NARGS(); _i++)
++			if (PG_ARGISNULL(_i))
++				ereport(ERROR, (errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
++						errmsg("tjs_open: argument %d must not be NULL", _i + 1)));
++
 +		int argc = 0;
 +		text *tablename = PG_GETARG_TEXT_PP(argc++);
 +		uint32 k = PG_GETARG_UINT32(argc++);
@@ -874,13 +904,25 @@ index 0000000..9954de7
 +		// rank both come from this single stream (seedless seeding).
 +		std::string orderby(text_to_cstring(orderby_text));
 +		char sourceText[102400];
++		// table_name is interpolated into the generated SQL; quote it as an identifier so it cannot
++		// break out (SECURITY.md). quote_identifier returns the input unchanged when quoting is
++		// unneeded, so ordinary names are byte-identical — no behavior change for existing callers.
++		const char *qtbl = quote_identifier(text_to_cstring(tablename));
 +		if ( strlen(text_to_cstring(filter_exp_text)) == 0 ){
-+			snprintf(sourceText, sizeof(sourceText), "select %s from %s order by %s",
-+					 text_to_cstring(attr_exp_text), text_to_cstring(tablename), orderby.c_str());
++			int __n = snprintf(sourceText, sizeof(sourceText), "select %s from %s order by %s",
++					 text_to_cstring(attr_exp_text), qtbl, orderby.c_str());
++			if (__n < 0 || (size_t) __n >= sizeof(sourceText))
++				ereport(ERROR, (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
++						errmsg("tjs_open: generated vector-leg SQL exceeds %zu bytes "
++							   "(filter/orderby expression too large)", sizeof(sourceText))));
 +		} else {
-+			snprintf(sourceText, sizeof(sourceText), "select %s from %s where %s order by %s",
-+					 text_to_cstring(attr_exp_text), text_to_cstring(tablename),
++			int __n = snprintf(sourceText, sizeof(sourceText), "select %s from %s where %s order by %s",
++					 text_to_cstring(attr_exp_text), qtbl,
 +					 text_to_cstring(filter_exp_text), orderby.c_str());
++			if (__n < 0 || (size_t) __n >= sizeof(sourceText))
++				ereport(ERROR, (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
++						errmsg("tjs_open: generated vector-leg SQL exceeds %zu bytes "
++							   "(filter/orderby expression too large)", sizeof(sourceText))));
 +		}
 +		DEBUG_PRINT("tjs_open vector leg SQL: %s", sourceText);
 +

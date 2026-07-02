@@ -81,6 +81,8 @@ def emit_sql(m: dict, corpus_emb, query_emb, *, k: int, seeds: int) -> str:
 
 
 def parse(raw: str) -> dict:
+    if "#V2A DONE" not in raw:
+        raise SystemExit("v2a_open transcript did not reach '#V2A DONE' — incomplete")
     res: dict = {}
     cur = None
     for line in raw.splitlines():

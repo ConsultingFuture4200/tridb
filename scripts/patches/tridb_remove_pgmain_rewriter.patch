@@ -1,0 +1,176 @@
+diff --git a/src/backend/tcop/postgres.c b/src/backend/tcop/postgres.c
+index 484a9f4..cd8ccf6 100644
+--- a/src/backend/tcop/postgres.c
++++ b/src/backend/tcop/postgres.c
+@@ -4404,162 +4404,7 @@ PostgresMain(int argc, char *argv[],
+ 
+ 					query_string = pq_getmsgstring(&input_message);
+ 					pq_getmsgend(&input_message);
+-					/* Parse multi topk statement */
+-					//const char* inputSql = "SELECT id FROM table WHERE price>10 
+-					//ORDER    BY approximate_sum(    '0.5 *   vector1<->{1,2,3} + vector2<->{5,6,7} + vector3<->{8,9,0}' ) limit 5;";
+-					char* sql = lowercase(query_string);
+-					ereport(LOG, (errmsg("originial low canse string: %s\n", sql)));
+-
+-					const char* whereDelimiter = "where";
+-					const char* orderByDelimiter = "order by";
+-					const char* selectDelimiter = "select";
+-					const char* fromDelimiter = "from";
+-					const char* approximateSumDelimiter = "approximate_sum(";
+-					const char* endDelimiter = ")";
+-					const char* limitDelimiter = "limit";
+-					const char* semicolonDelimiter = ";";
+-					const char* ef = "50";
+-					const char* termCond = "50";
+-					char* result = (char*)palloc(strlen(sql) * 2);
+-					const char* approximateSumStart = strstr(sql, approximateSumDelimiter);
+-					if (approximateSumStart != NULL)
+-					{
+-						char* select;
+-						char* table;
+-						char* where;
+-						char* order[100];
+-						size_t orderLength = 0;
+-						size_t limit;
+-
+-						ereport(LOG, (errmsg("approximateSumStart: %s\n", approximateSumStart)));
+-						const char* approximateSumEnd = strstr(approximateSumStart, limitDelimiter);
+-						char* orderByString = strndup(approximateSumStart + strlen(approximateSumDelimiter), 
+-								approximateSumEnd - approximateSumStart - strlen(approximateSumDelimiter));
+-						size_t last = strlen(orderByString) - 1;
+-						size_t first = 0;
+-						size_t second = 0;
+-						while (orderByString[first] != '\'')
+-						{
+-							first++;
+-						}
+-						first++;
+-						while (orderByString[first] != '\0')
+-						{
+-							orderByString[second] = orderByString[first];
+-							first++;
+-							second++;
+-						}
+-						orderByString[second] = '\0';
+-						while (orderByString[last] != '\)')
+-						{
+-							last--;
+-						}
+-						while (orderByString[last] != '\'')
+-						{
+-							last--;
+-						}
+-
+-						orderByString[last] = '\0';
+-						removeSpace(orderByString);
+-						ereport(LOG,(errmsg("orderByString: %s\n", orderByString)));
+-
+-						char* orderByItemsString = strndup(orderByString, strlen(orderByString));
+-						char* token = strtok(orderByItemsString, "+");
+-						int i = 0;
+-						while (token != NULL) 
+-						{
+-							orderLength++;
+-							order[i] = strndup(token, strlen(token));
+-							removeSpace(order[i]);
+-							ereport(LOG, (errmsg("order token: %s\n", order[i])));
+-							token = strtok(NULL, "+");
+-							i++;
+-						}
+-
+-						//id
+-						const char* selectStart = strstr(sql, selectDelimiter);
+-						const char* selectEnd = strstr(selectStart, fromDelimiter);
+-						char* selectString = strndup(selectStart + strlen(selectDelimiter), 
+-								selectEnd - selectStart - strlen(selectDelimiter));
+-						removeSpace(selectString);
+-						ereport(LOG, (errmsg("selectString: %s\n", selectString)));
+-
+-						const char* tableDelimiter = orderByDelimiter;
+-						//price > 10
+-						char* whereString = NULL;
+-						const char* whereStart = strstr(sql, whereDelimiter);
+-						if (whereStart != NULL)
+-						{
+-							const char* whereEnd = strstr(whereStart, orderByDelimiter);
+-							whereString = strndup(whereStart + strlen(whereDelimiter), 
+-									whereEnd - whereStart - strlen(whereDelimiter));
+-							removeSpace(whereString);
+-							tableDelimiter = whereDelimiter;
+-							ereport(LOG, (errmsg("whereString: %s\n", whereString)));
+-						}
+-						//limit 5;
+-						const char* limitStart = strstr(sql, limitDelimiter);
+-						const char* limitEnd = strstr(limitStart, semicolonDelimiter);
+-						char* limitString = strndup(limitStart + strlen(limitDelimiter), limitEnd - limitStart - strlen(limitDelimiter));
+-						removeSpace(limitString);
+-						ereport(LOG, (errmsg("limitString: %s\n", limitString)));
+- 
+-						//table
+-						const char* fromStart = strstr(sql, fromDelimiter);
+-						const char* fromEnd = strstr(fromStart, tableDelimiter);
+-						char* fromString = strndup(fromStart + strlen(fromDelimiter), fromEnd - fromStart - strlen(fromDelimiter));
+-						removeSpace(fromString);
+-						ereport(LOG, (errmsg("fromString: %s\n", fromString)));
+-
+-						strcpy(result, "select topk('");
+-						strcat(result, fromString);
+-						strcat(result, "',");
+-						strcat(result, limitString);
+-						strcat(result, ", ");
+-						strcat(result, ef);
+-						strcat(result, ", ");
+-						strcat(result, termCond);
+-						strcat(result, ", ");
+-						strcat(result, "'");
+-						strcat(result, selectString);
+-						strcat(result, "',");
+-						strcat(result, "'");
+-						if (whereStart != NULL)
+-						{
+-							strcat(result, whereString);
+-						}
+-						strcat(result, "',");
+-						strcat(result, "'");
+-						strcat(result, orderByString);
+-						strcat(result, "',");
+- 
+-						for (int i = 0; i < orderLength; i++)
+-						{
+-							strcat(result, "'");
+-							strcat(result, order[i]);
+-							strcat(result, "'");
+-							if (i < orderLength - 1)
+-							{
+-								strcat(result, ",");
+-							}
+-						}
+-						strcat(result, ");");
+- 
+-						ereport(LOG,(errmsg("result: %s\n", result)));
+-						query_string = result;
+-
+-						pfree(orderByString);
+-						pfree(orderByItemsString);
+-						for (int i = 0; i < orderLength; i++)
+-						{
+-							pfree(order[i]);
+-						}
+-						pfree(selectString);
+-						pfree(whereString);
+-						pfree(limitString);
+-						pfree(fromString);
+-						pfree(sql);
+-					}
++					/* TRIDB: MSVBASE approximate_sum PostgresMain rewriter removed (advisor plan 018) */
+ 
+ 					if (am_walsender)
+ 					{
+@@ -4570,7 +4415,6 @@ PostgresMain(int argc, char *argv[],
+ 						exec_simple_query(query_string);
+ 
+ 					send_ready_for_query = true;
+-					pfree(result);
+ 				}
+ 				break;
+ 

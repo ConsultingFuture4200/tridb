@@ -1,4 +1,4 @@
-.PHONY: test lint graph-test smoke-test test-all baseline-up baseline-down seed bench bench-live sweep sm2 fetch-dataset bench-public bench-repro fetch-hotpot graphrag graphrag-live bench-filtered ablation recall-decay tjs-open-ref tjs-open-live graphrag-h2h rabitq-sim gpu-build-index clean
+.PHONY: test lint graph-test smoke-test test-all baseline-up baseline-down seed bench bench-live sweep sm2 fetch-dataset bench-public bench-repro fetch-hotpot graphrag graphrag-live bench-filtered ablation recall-decay tjs-open-ref tjs-open-live graphrag-h2h rabitq-sim gpu-build-index lock clean
 
 PUBLIC_DATASET ?= gist-960-euclidean
 
@@ -9,13 +9,31 @@ IMAGE ?= tridb/msvbase:dev
 ENGINE_TESTS := test/graph_store_test.sql test/trimodal_compose.sql \
                 test/trimodal_early_term.sql test/fork_distance_probe.sql \
                 test/vector_relaxed_mono_test.sql test/canonical_e2e_test.sql \
-                test/parse_canonical.sql test/hnsw_costestimate_unordered_test.sql
+                test/parse_canonical.sql test/hnsw_costestimate_unordered_test.sql \
+                test/tjs_open_smoke.sql test/hnsw_am_guards.sql \
+                test/pgmain_rewriter_removed.sql test/relaxed_order_guard.sql
 
 test:
 	$(PY) -m pytest tests/ -q
 
 lint:
-	ruff check . && ruff format --check .
+	$(PY) -m ruff check . && $(PY) -m ruff format --check .
+
+# Regenerate the pinned lockfile from the current .venv (deliberate dep bumps: edit the
+# requirements.txt floor, then `make lock`, then commit both). Uses uv if present, else pip.
+lock:
+	@if command -v uv >/dev/null 2>&1; then \
+	  { echo "# Auto-generated pinned lockfile — do NOT edit by hand. Regenerate with: make lock"; \
+	    echo "# Reproducible installs: pip install -r requirements.lock"; \
+	    echo "# Pins the full transitive closure of the validated .venv (advisor plan 015)."; \
+	    VIRTUAL_ENV=.venv uv pip freeze; } > requirements.lock; \
+	else \
+	  { echo "# Auto-generated pinned lockfile — do NOT edit by hand. Regenerate with: make lock"; \
+	    echo "# Reproducible installs: pip install -r requirements.lock"; \
+	    echo "# Pins the full transitive closure of the validated .venv (advisor plan 015)."; \
+	    $(PY) -m pip freeze --exclude-editable; } > requirements.lock; \
+	fi
+	@echo "wrote requirements.lock ($$(wc -l < requirements.lock) lines)"
 
 # Native-AM + fork-regression harnesses — each FAILS LOUD on any error (nonzero make aborts).
 # The graph-store AM harnesses (DEV-1164/1165/1166) PGXS-build src/graph_store in the image; the
@@ -27,7 +45,10 @@ AM_TESTS := scripts/graph_am_test.sh \
             scripts/graph_edge_count_test.sh \
             scripts/join_order_test.sh \
             scripts/fork_bug_multicol_test.sh \
-            scripts/hnsw_abort_stress_test.sh
+            scripts/hnsw_abort_stress_test.sh \
+            scripts/crash_recovery_hnsw_test.sh \
+            scripts/crash_recovery_reloptions_test.sh \
+            scripts/fork_bug_tjs_double_scan_test.sh
 
 # Engine test suites — require the tridb/msvbase:dev image (scripts/x86build.sh --docker).
 graph-test:
