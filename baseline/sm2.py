@@ -153,7 +153,9 @@ MILVUS_NPROBE = int(os.environ.get("BASELINE_NPROBE", "64"))
 # must be able to show that row. The exact config used is stamped into the run's report JSON.
 _BASELINE_INDEX = os.environ.get("BASELINE_INDEX", "IVF_FLAT").upper()
 if _BASELINE_INDEX not in ("IVF_FLAT", "HNSW"):
-    raise ValueError(f"BASELINE_INDEX must be IVF_FLAT or HNSW, got {_BASELINE_INDEX!r}")
+    raise ValueError(
+        f"BASELINE_INDEX must be IVF_FLAT or HNSW, got {_BASELINE_INDEX!r}"
+    )
 _MILVUS_HNSW_M = int(os.environ.get("BASELINE_HNSW_M", "16"))
 _MILVUS_HNSW_EFC = int(os.environ.get("BASELINE_HNSW_EFCONSTRUCTION", "200"))
 _MILVUS_HNSW_EF = int(os.environ.get("BASELINE_EF", "128"))
