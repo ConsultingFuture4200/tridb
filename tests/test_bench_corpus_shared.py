@@ -13,6 +13,9 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "tools"))
+# baseline/sm2.py resolves `from harness import ...` relative to its own dir (the
+# same shim its __main__ uses); heavy clients import lazily so this is safe.
+sys.path.insert(0, str(ROOT / "baseline"))
 
 pytest.importorskip("numpy")
 
@@ -54,6 +57,30 @@ def test_shared_entities_match_live_rebuild():
     for eid, ts, emb in man["_entities"]:
         assert corpus.entities[eid]["timestamp"] == ts
         assert corpus.entities[eid]["embedding"] == emb
+
+
+def test_baseline_sm2_rebuild_matches_build_corpus():
+    """baseline/sm2.py:rebuild_corpus is the THIRD generator of the SM-2 corpus
+    (after tools/bench_corpus.py and bench/live_report.py) and the fairness
+    linchpin: the multi-system baseline must load the byte-identical corpus the
+    live TriDB SQL ran. Pin it against build_corpus's private arrays, driving it
+    from the PUBLIC manifest exactly as scripts/bench_sm2.sh does."""
+    from baseline.sm2 import rebuild_corpus as sm2_rebuild
+
+    man = build_corpus(_Args())
+    public = {k: v for k, v in man.items() if not k.startswith("_")}
+    corpus = sm2_rebuild(public, _Args.seed)
+
+    # entities: same ids, and byte-identical timestamps + embedding arrays
+    assert sorted(corpus["entities"].keys()) == [
+        eid for (eid, _, _) in man["_entities"]
+    ]
+    for eid, ts, emb in man["_entities"]:
+        assert corpus["entities"][eid]["timestamp"] == ts
+        assert corpus["entities"][eid]["embedding"] == emb
+
+    # edges: identical pairs in generation order
+    assert corpus["edges"] == [(int(s), int(d)) for (s, d) in man["_edges"]]
 
 
 def _strip_header(sql: str) -> str:
