@@ -245,3 +245,29 @@ built + passed the full native-AM engine suite on the `tridb/msvbase:dev` x86 im
 crash-recovery abort-safety), so Stage 0 is landed, not just designed. The body above is
 unchanged; this addendum carries the delta. Remaining open work: Stage 3, the filter-first
 operator body (DEV-1290), which is still GX10-gated and deliberately not started.
+
+## Addendum 2026-07-02 — Stage 2 landed (call-site decision in the lowering)
+
+The Stage-2 decision is now made and recorded on every `graph_store.graph_query()` call
+(`src/graph_store_ext/graph_store--0.1.0.sql`), with one deliberate deviation from the body's
+sketch: the lowering is **plpgsql**, so instead of exposing `clauselist_selectivity` /
+`tridb_build_legstats` through new C plumbing, `rel_filter_matches` is taken from the
+planner's own row estimate via `EXPLAIN (FORMAT JSON)` on the canonical `WHERE` — the same
+`clauselist_selectivity × reltuples` product, reached through the planner's front door.
+`table_size` comes from `pg_class.reltuples` (0 when never ANALYZEd → the FROZEN
+"selectivity 1.0 → vector_first" safe default), and the FROZEN `tridb_choose_join_order`
+(SQL surface, GUC threshold) makes the call. `join_order_legstats.c` remains the builder for
+the future C call sites (Stage 3/4, DEV-1290).
+
+Observability: `graph_store.last_join_order()` reports the decision for the most recent
+call (session GUC `graph_store.last_join_order`) — the lowering-level half of the Option-B
+EXPLAIN-visibility tax; the operator-level `tjs_last_join_order()` still arrives with
+DEV-1290. Soft dependency: if the `join_order` extension is not installed the lowering
+records `vector_first` (today's only physical path) and proceeds unchanged.
+
+Verified on the `tridb/msvbase:dev` x86 image (`scripts/join_order_lowering_test.sh`,
+wired into `AM_TESTS`): inverted-selectivity windows (~1% vs ~80%) pick opposite orders
+through the FULL lowering; both windows return the pre-Stage-2 vector-first answers (the
+decision is inert on execution, exactly as scoped); the no-decision-core fallback holds.
+GX10 re-validation rides the next `make graph-test` on-target. The decision binds to
+execution only when DEV-1290 lands Stage 3/4.

@@ -69,10 +69,12 @@ LANGUAGE C;
 -- mapped onto the dst `embedding` column (tjs's only ordered stream is the dst HNSW scan; a
 -- single pinned src has a constant embedding that cannot rank). See ADR-0008.
 -- ============================================================================
+-- VOLATILE (not STABLE): the Stage-2 join-order decision below records itself via
+-- set_config (session-local), a side effect a STABLE contract would misdeclare.
 CREATE FUNCTION graph_store.graph_query(canonical_sql text)
 RETURNS SETOF text
 LANGUAGE plpgsql
-STABLE
+VOLATILE
 AS $fn$
 DECLARE
     q            text;
@@ -81,6 +83,10 @@ DECLARE
     k_val        int;
     ts_filter    text;
     query_vec    text;
+    tbl_size     bigint;
+    est_matches  bigint;
+    jorder       text;
+    plan_json    text;
 BEGIN
     -- Normalize: collapse whitespace runs to single spaces, trim. Keeps the matcher a single
     -- fixed template regardless of how the caller line-wrapped the canonical query.
@@ -128,6 +134,30 @@ BEGIN
         RAISE EXCEPTION 'graph_query: LIMIT out of range (got %, allowed 1..10000)', k_val;
     END IF;
 
+    -- JOIN-ORDER DECISION (ADR-0011 Stage 2, DEV-1285/FR-6). Build the LegStats inputs the
+    -- FROZEN decision core needs and record the chosen order BEFORE lowering:
+    --   table_size        = pg_class.reltuples (0 when never ANALYZEd -> the FROZEN
+    --                       "selectivity 1.0 -> vector_first" safe default),
+    --   rel_filter_matches = the planner's own row estimate for the canonical WHERE via
+    --                       EXPLAIN (= clauselist_selectivity x reltuples — the exact
+    --                       estimator ADR-0011 names, reached without planner-C plumbing).
+    -- The decision is recorded via graph_store.last_join_order() (Option B's EXPLAIN-
+    -- visibility companion at the lowering level) but is STILL INERT: tjs() has no
+    -- join_order argument until the filter-first physical path lands (Stage 3, DEV-1290).
+    SELECT reltuples::bigint INTO tbl_size FROM pg_class WHERE oid = 'entities'::regclass;
+
+    EXECUTE 'EXPLAIN (FORMAT JSON) SELECT 1 FROM entities WHERE ' || ts_filter
+        INTO plan_json;
+    est_matches := floor((plan_json::json -> 0 -> 'Plan' ->> 'Plan Rows')::float8)::bigint;
+
+    IF to_regprocedure('tridb_choose_join_order(bigint,bigint,float8)') IS NOT NULL THEN
+        jorder := tridb_choose_join_order(est_matches, tbl_size);
+    ELSE
+        -- decision core (join_order extension) not installed: today's only physical path.
+        jorder := 'vector_first';
+    END IF;
+    PERFORM set_config('graph_store.last_join_order', jorder, false);
+
     -- LOWERING: one tjs(...) call. The vector leg (dst HNSW scan) is the sole rank authority;
     -- the timestamp predicate is pushed into its WHERE; the graph leg is the reachability
     -- predicate on src. attr_exp's first column is `id` (the candidate graph id tjs probes);
@@ -149,3 +179,18 @@ COMMENT ON FUNCTION graph_store.graph_query(text) IS
     'TriDB SQL/PGQ canonical surface (DEV-1167). Lowers the ONE canonical query (spec §5) to a '
     'single tjs() call. Off-template queries RAISE (scope guard: one canonical query for v1). '
     'Requires WHERE to pin src.id = <const> (v1 single-src binding). See ADR-0008.';
+
+-- last_join_order(): what the Stage-2 lowering decided for the MOST RECENT graph_query()
+-- call in this session ('filter_first' / 'vector_first'), or NULL before the first call.
+-- This is the lowering-level half of ADR-0011's Option-B observability tax; the operator-level
+-- tjs_last_join_order() companion arrives with the filter-first body (Stage 4, DEV-1290).
+CREATE FUNCTION graph_store.last_join_order()
+RETURNS text
+LANGUAGE sql
+STABLE
+AS $$ SELECT current_setting('graph_store.last_join_order', true) $$;
+
+COMMENT ON FUNCTION graph_store.last_join_order() IS
+    'Join order chosen by the Stage-2 lowering (ADR-0011/DEV-1285) for the most recent '
+    'graph_store.graph_query() call in this session; NULL before the first call. The decision '
+    'is inert until the tjs() filter-first path lands (DEV-1290).';
