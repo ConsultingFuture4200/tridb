@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import statistics
 import time
 from dataclasses import asdict, dataclass, field
@@ -137,12 +138,17 @@ def rebuild_corpus(manifest: dict, seed: int) -> dict:
 # --------------------------------------------------------------------------- #
 
 
+# nlist follows the ~4·sqrt(N) rule (baseline/TUNING.md); the committed defaults
+# fit the 20k-100k slice. At other scales override via env (e.g. 1M -> nlist=4096,
+# nprobe=128) so the baseline stays tuned rather than strawmanned.
+MILVUS_NLIST = int(os.environ.get("BASELINE_NLIST", "128"))
+MILVUS_NPROBE = int(os.environ.get("BASELINE_NPROBE", "64"))
 MILVUS_INDEX = {
     "index_type": "IVF_FLAT",
     "metric_type": "L2",
-    "params": {"nlist": 128},
+    "params": {"nlist": MILVUS_NLIST},
 }
-MILVUS_SEARCH_PARAM = {"metric_type": "L2", "params": {"nprobe": 64}}
+MILVUS_SEARCH_PARAM = {"metric_type": "L2", "params": {"nprobe": MILVUS_NPROBE}}
 
 
 def load_milvus(conn: Conn, corpus: dict) -> None:
@@ -189,17 +195,22 @@ def load_neo4j(conn: Conn, corpus: dict) -> None:
                 {"id": i, "ts": corpus["entities"][i]["timestamp"]}
                 for i in corpus["entities"]
             ]
-            s.run(
-                "UNWIND $rows AS r CREATE (:entity {id: r.id, timestamp: r.ts})",
-                rows=rows,
-            )
+            # batch the UNWINDs: a single 1M-row transaction blows the default
+            # Neo4j heap; batches keep the load O(batch) memory on the server.
+            batch = 10_000
+            for i in range(0, len(rows), batch):
+                s.run(
+                    "UNWIND $rows AS r CREATE (:entity {id: r.id, timestamp: r.ts})",
+                    rows=rows[i : i + batch],
+                )
             erows = [{"s": s_, "d": d_} for (s_, d_) in corpus["edges"]]
-            s.run(
-                "UNWIND $erows AS e "
-                "MATCH (a:entity {id: e.s}), (b:entity {id: e.d}) "
-                "CREATE (a)-[:related_to]->(b)",
-                erows=erows,
-            )
+            for i in range(0, len(erows), batch):
+                s.run(
+                    "UNWIND $erows AS e "
+                    "MATCH (a:entity {id: e.s}), (b:entity {id: e.d}) "
+                    "CREATE (a)-[:related_to]->(b)",
+                    erows=erows[i : i + batch],
+                )
     finally:
         driver.close()
     print(
