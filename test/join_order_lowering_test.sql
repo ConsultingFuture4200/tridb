@@ -5,9 +5,10 @@
 --   (1) graph_store.last_join_order() is NULL before any graph_query() call,
 --   (2) inverted-selectivity WINDOWS pick OPPOSITE orders through the FULL lowering
 --       (selective ~1% -> filter_first; broad ~80% -> vector_first) — the decision-level
---       half of test/join_order_integration_stub.sql's done-criterion (a),
---   (3) the decision is INERT on execution (Stage 3 / DEV-1290 not landed): both windows
---       return exactly the pre-Stage-2 vector-first answers,
+--       half of test/join_order_integration_test.sql's done-criterion (a),
+--   (3) answers are body-independent: both windows return the canonical results whichever
+--       engine runs this (on DEV-1290 engines the decision selects the physical body; on
+--       older engines it is recorded but the hardwired vector-first body runs),
 --   (4) without the join_order extension the lowering still works and records the
 --       'vector_first' default (soft dependency).
 --
@@ -56,8 +57,8 @@ BEGIN
 END $$;
 
 -- ===========================================================================
--- ASSERTION 2: selective window (~1% of the corpus) -> filter_first, and the
--- answer is the unchanged vector-first result (decision inert until DEV-1290).
+-- ASSERTION 2: selective window (~1% of the corpus) -> filter_first decision recorded, and
+-- the answer is the canonical result regardless of which body the engine ran.
 -- Window IN (10): among reachable {10,20,30,40} only id 10 (ts 10) survives.
 -- ===========================================================================
 DO $$
@@ -78,7 +79,7 @@ BEGIN
                graph_store.last_join_order());
     ASSERT got = ARRAY[10]::bigint[],
         format('selective window answer changed: got %s (expected {10})', got);
-    RAISE NOTICE 'PASS dev-1285 stage2: selective (~1%%) window -> filter_first, answer inert';
+    RAISE NOTICE 'PASS dev-1285 stage2: selective (~1%%) window -> filter_first, canonical answer';
 END $$;
 
 -- ===========================================================================

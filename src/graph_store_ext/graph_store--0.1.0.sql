@@ -142,8 +142,9 @@ BEGIN
     --                       EXPLAIN (= clauselist_selectivity x reltuples — the exact
     --                       estimator ADR-0011 names, reached without planner-C plumbing).
     -- The decision is recorded via graph_store.last_join_order() (Option B's EXPLAIN-
-    -- visibility companion at the lowering level) but is STILL INERT: tjs() has no
-    -- join_order argument until the filter-first physical path lands (Stage 3, DEV-1290).
+    -- visibility companion at the lowering level) and — on a DEV-1290 engine — passed into
+    -- tjs() as the join_order argument at the lowering below, where it selects the physical
+    -- body (assert on the operator-level tjs_last_join_order()).
     SELECT reltuples::bigint INTO tbl_size FROM pg_class WHERE oid = 'entities'::regclass;
 
     EXECUTE 'EXPLAIN (FORMAT JSON) SELECT 1 FROM entities WHERE ' || ts_filter
@@ -158,19 +159,27 @@ BEGIN
     END IF;
     PERFORM set_config('graph_store.last_join_order', jorder, false);
 
-    -- LOWERING: one tjs(...) call. The vector leg (dst HNSW scan) is the sole rank authority;
-    -- the timestamp predicate is pushed into its WHERE; the graph leg is the reachability
-    -- predicate on src. attr_exp's first column is `id` (the candidate graph id tjs probes);
-    -- chunk is the second projected column we return.
-    RETURN QUERY EXECUTE format(
-        'SELECT t.chunk FROM tjs(%L, %s, 0, %s::bigint, %L, %L, %L) AS t(id bigint, chunk text)',
-        'entities',                                   -- table_name
-        k_val,                                        -- k
-        src_id,                                       -- src
-        'id, chunk',                                  -- attr_exp (1st col = candidate id)
-        ts_filter,                                    -- filter_exp (physical ts column)
-        'embedding <-> ''' || query_vec || ''''       -- orderby_exp (dst embedding)
-    );
+    -- LOWERING: one tjs(...) call. attr_exp's first column is `id` (the candidate graph id tjs
+    -- probes); chunk is the second projected column we return. On a DEV-1290 engine the Stage-2
+    -- decision above is PASSED INTO the operator (ADR-0011 Stage 4) and selects the physical
+    -- body: vector_first (dst HNSW scan is the rank authority, timestamp predicate pushed into
+    -- its WHERE, graph as predicate) or filter_first (graph drain drives, exact rank). On an
+    -- older engine (no 8-arg tjs) the decision stays recorded-but-inert and the hardwired
+    -- vector-first body runs — same answers, pre-DEV-1290 behavior.
+    IF to_regprocedure('tjs(text,integer,integer,bigint,text,text,text,text)') IS NOT NULL THEN
+        RETURN QUERY EXECUTE format(
+            'SELECT t.chunk FROM tjs(%L, %s, 0, %s::bigint, %L, %L, %L, %L) AS t(id bigint, chunk text)',
+            'entities', k_val, src_id, 'id, chunk', ts_filter,
+            'embedding <-> ''' || query_vec || '''',
+            jorder                                    -- the Stage-2 FR-6 decision, now binding
+        );
+    ELSE
+        RETURN QUERY EXECUTE format(
+            'SELECT t.chunk FROM tjs(%L, %s, 0, %s::bigint, %L, %L, %L) AS t(id bigint, chunk text)',
+            'entities', k_val, src_id, 'id, chunk', ts_filter,
+            'embedding <-> ''' || query_vec || ''''
+        );
+    END IF;
     RETURN;
 END;
 $fn$;
@@ -183,7 +192,7 @@ COMMENT ON FUNCTION graph_store.graph_query(text) IS
 -- last_join_order(): what the Stage-2 lowering decided for the MOST RECENT graph_query()
 -- call in this session ('filter_first' / 'vector_first'), or NULL before the first call.
 -- This is the lowering-level half of ADR-0011's Option-B observability tax; the operator-level
--- tjs_last_join_order() companion arrives with the filter-first body (Stage 4, DEV-1290).
+-- tjs_last_join_order() companion (DEV-1290 engines) reports which body actually RAN.
 CREATE FUNCTION graph_store.last_join_order()
 RETURNS text
 LANGUAGE sql
@@ -192,5 +201,6 @@ AS $$ SELECT current_setting('graph_store.last_join_order', true) $$;
 
 COMMENT ON FUNCTION graph_store.last_join_order() IS
     'Join order chosen by the Stage-2 lowering (ADR-0011/DEV-1285) for the most recent '
-    'graph_store.graph_query() call in this session; NULL before the first call. The decision '
-    'is inert until the tjs() filter-first path lands (DEV-1290).';
+    'graph_store.graph_query() call in this session; NULL before the first call. On DEV-1290 '
+    'engines the decision is passed into tjs() and selects the physical body (see '
+    'tjs_last_join_order() for what actually ran); on older engines it is recorded but inert.';

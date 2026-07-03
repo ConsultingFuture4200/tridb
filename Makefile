@@ -11,7 +11,8 @@ ENGINE_TESTS := test/graph_store_test.sql test/trimodal_compose.sql \
                 test/vector_relaxed_mono_test.sql test/canonical_e2e_test.sql \
                 test/parse_canonical.sql test/hnsw_costestimate_unordered_test.sql \
                 test/tjs_open_smoke.sql test/hnsw_am_guards.sql \
-                test/pgmain_rewriter_removed.sql test/relaxed_order_guard.sql
+                test/pgmain_rewriter_removed.sql test/relaxed_order_guard.sql \
+                test/tjs_filter_first_test.sql
 
 test:
 	$(PY) -m pytest tests/ -q
@@ -45,6 +46,7 @@ AM_TESTS := scripts/graph_am_test.sh \
             scripts/graph_edge_count_test.sh \
             scripts/join_order_test.sh \
             scripts/join_order_lowering_test.sh \
+            scripts/join_order_integration_test.sh \
             scripts/fork_bug_multicol_test.sh \
             scripts/hnsw_abort_stress_test.sh \
             scripts/crash_recovery_hnsw_test.sh \
