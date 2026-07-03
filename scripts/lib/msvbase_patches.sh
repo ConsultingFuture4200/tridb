@@ -127,6 +127,17 @@ verify_patches() {
     || die "TriDB tridb_tjs_filter_first.patch INCOMPLETE — beginFilterFirstT drain missing in tjs_operator.cpp (DEV-1290); drift?"
   grep -q 'orderby_exp text, join_order text' "$root/sql/vectordb.sql" 2>/dev/null \
     || die "TriDB tridb_tjs_filter_first.patch NOT applied in sql/vectordb.sql — 8-arg tjs()/tjs_last_join_order() not registered (DEV-1290); drift?"
+  # advisor plan 024: operator arg + memory-lifecycle hardening. Sentinels on LOAD-BEARING
+  # tokens in BOTH operator files: the sentinel-marked arg guards, plus the release-callback
+  # registration each file must carry — a partial apply misses one and die()s.
+  grep -q 'TRIDB: operator arg hardening' "$root/src/tjs_operator.cpp" 2>/dev/null \
+    || die "TriDB tridb_operator_arg_hardening.patch NOT applied — tjs() arg guards missing (advisor plan 024); drift?"
+  grep -q 'registerTJSStateRelease' "$root/src/tjs_operator.cpp" 2>/dev/null \
+    || die "TriDB tridb_operator_arg_hardening.patch INCOMPLETE — release callback missing in tjs_operator.cpp (advisor plan 024); drift?"
+  grep -q 'TRIDB: operator arg hardening' "$root/src/tjs_open_operator.cpp" 2>/dev/null \
+    || die "TriDB tridb_operator_arg_hardening.patch NOT applied — tjs_open() arg guards missing (advisor plan 024); drift?"
+  grep -q 'registerTJSOpenStateRelease' "$root/src/tjs_open_operator.cpp" 2>/dev/null \
+    || die "TriDB tridb_operator_arg_hardening.patch INCOMPLETE — release callback missing in tjs_open_operator.cpp (advisor plan 024); drift?"
   log "all MSVBASE + TriDB fork patches verified present"
 }
 
@@ -482,6 +493,26 @@ apply_tridb_fork_patches() {
     log "applying TriDB fork patch: TJS filter-first physical body + join_order arg (DEV-1290)"
     ( cd "$root" && git apply "$ff_patch" ) \
       || die "tridb_tjs_filter_first.patch did not apply — tjs-chain drift? re-generate per DEV-1290"
+  fi
+
+  #   tridb_operator_arg_hardening.patch (advisor plan 024): hardens the tjs()/tjs_open()
+  #     entry points and memory lifecycle. (1) arg range checks (tjs k 1..10000; tjs_open
+  #     k/m_seeds 1..10000, hops 1..8) — k=0 hit top()/pop() on an EMPTY priority queue (UB,
+  #     SQL-reachable backend crash) and a negative k arrived via PG_GETARG_UINT32 as ~4.29e9;
+  #     (2) heap_freetuple on every bounded-PQ eviction (evicted copies leaked into the SRF's
+  #     multi-call context until end of query); (3) a MemoryContextCallback releases the
+  #     malloc'd state + new'd C++ containers on error paths (ereport longjmps past the End*
+  #     teardown, leaking them permanently); (4) snprintf truncation guards at all 4
+  #     previously-unchecked compose sites. Diffed against the post-filter-first tree, so it
+  #     MUST apply after tridb_tjs_filter_first.patch (last in the tjs chain).
+  local ah_patch="${_MSVBASE_LIB_DIR}/../patches/tridb_operator_arg_hardening.patch"
+  [[ -f "$ah_patch" ]] || die "missing TriDB fork patch: $ah_patch"
+  if grep -q 'TRIDB: operator arg hardening' "$root/src/tjs_operator.cpp" 2>/dev/null; then
+    log "TriDB fork patch (operator arg hardening, advisor plan 024) already applied"
+  else
+    log "applying TriDB fork patch: tjs/tjs_open arg + memory-lifecycle hardening (advisor plan 024)"
+    ( cd "$root" && git apply "$ah_patch" ) \
+      || die "tridb_operator_arg_hardening.patch did not apply — tjs-chain drift? re-generate per advisor plan 024"
   fi
 
   # ----------------------------------------------------------------------------
