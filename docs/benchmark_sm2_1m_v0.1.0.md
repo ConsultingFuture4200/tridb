@@ -1,3 +1,5 @@
+> **⚠ SUPERSEDED — and measured on the v0 heap graph store, not the v1 native AM.** The SM-2 numbers in this document were produced with the operators traversing the v0 heap-backed `graph_store` extension (ADR-0013). The v1 native-AM re-measurement is `docs/benchmark_sm2_1m_v0.3.0.md`. Read that for the current, honestly-scoped figures.
+
 # SM-2 at 1M on the GX10 — live head-to-head vs Milvus+Neo4j+Postgres (DEV-1332)
 
 > **Date:** 2026-07-02 (run executed on the GX10 / DGX Spark, `tridb/msvbase:gx10-batch`)

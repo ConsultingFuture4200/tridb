@@ -1,6 +1,6 @@
 # TriDB Build Status — per-issue gating
 
-Updated: 2026-07-01. Legend: 🟢 unblocked here · 🟡 partial (design here,
+Updated: 2026-07-03. Legend: 🟢 unblocked here · 🟡 partial (design here,
 build on GX10) · 🔴 GX10-gated (needs live MSVBASE build).
 
 > **🟡 HNSW INDEX-MAP CACHE INVALIDATION 2026-07-02 (ADR-0014, advisor plan 023) — DESIGN + repro.**
@@ -132,7 +132,7 @@ build on GX10) · 🔴 GX10-gated (needs live MSVBASE build).
 > early-termination bound untouched, preserving TR-1). Delivered: the ADR, a safe additive
 > `src/planner/join_order_legstats.{c,h}` catalog helper (UNBUILT-HERE), and a GX10-gated FR-6 stub test.
 > Surfaced a real gap: the graph metapage has no `avg_out_degree` (needs `gm_edge_count`, graph-store
-> follow-up). The risky operator change (filter-first body) is deliberately NOT started — GX10-gated.
+> follow-up). The filter-first body SHIPPED (DEV-1290, 2026-07-03) and the FR-6 lowering binds the decision to execution (DEV-1285); both x86- and GX10-validated. The operators + benchmarks now run on the v1 native AM (ADR-0013 Stage A/B, plan 025).
 
 > **🟢 REAL-DATASET BENCH HARNESS 2026-06-26 (DEV-1284) — recall measurable on real vectors today.**
 > `tools/real_corpus.py`: loads real embeddings (`.npy/.fvecs/.ivecs/.hdf5`, h5py lazy-imported),

@@ -1,3 +1,5 @@
+> **⚠ SUPERSEDED — and measured on the v0 heap graph store, not the v1 native AM.** The SM-2 numbers in this document were produced with the operators traversing the v0 heap-backed `graph_store` extension (ADR-0013). The v1 native-AM re-measurement is `docs/benchmark_sm2_1m_v0.3.0.md`. Read that for the current, honestly-scoped figures.
+
 # TriDB Benchmark — SM-2 Live Head-to-Head (DEV-1171)
 
 **SM-2 = 100.00%** of 12 queries had TriDB end-to-end latency below the live multi-system baseline (target >= 80% -> **PASS**).
