@@ -1,0 +1,356 @@
+--- a/src/tjs_operator.cpp
++++ b/src/tjs_operator.cpp
+@@ -357,6 +357,13 @@
+ // graph_store.c's graph_visit_counter pattern: per-backend, read via tjs_candidates_examined().
+ static int64 tjs_last_examined = 0;
+ 
++// Process-global record of which physical body the last tjs() in this backend ran
++// ('vector_first' / 'filter_first') — the operator-level half of ADR-0011 Option B's
++// EXPLAIN-visibility tax (DEV-1290). The SRF is opaque to EXPLAIN, so the selected driver is
++// asserted via tjs_last_join_order() rather than a plan-node label. Empty before any call.
++// Marker for the patch sentinel grep (scripts/lib/msvbase_patches.sh): TRIDB: TJS filter-first body.
++static char tjs_last_join_order_val[16] = "";
++
+ // ---------------------------------------------------------------------------
+ // execTJS — the pure operator body. `TupleTableSlot* execTJS(PlanState*)` exactly as the prompt
+ // requires, so a future CustomScan node reuses it without change. On the FIRST call it drains the
+@@ -531,6 +538,214 @@
+ 	return result_slot;
+ }
+ 
++// ---------------------------------------------------------------------------
++// FILTER-FIRST physical body (ADR-0011 Stage 3 / DEV-1290).
++//
++// The SECOND physical strategy the FR-6 join-order decision selects when the joint
++// graph+relational predicate is selective (the at-scale regime — see
++// docs/benchmark_sm2_1m_v0.1.0.md): instead of walking the distance-ordered ANN stream and
++// probing the predicate per candidate (cost ~ 1/selectivity), DRAIN the qualifying set —
++// reachable(src) ∩ relational filter — through one SPI cursor in bounded batches, and rank it
++// EXACTLY (squared L2 in C against the parsed query vector) into the SAME bounded top-k PQ the
++// vector-first body uses.
++//
++// TR-1: Open/Next/Close with NO blocking operator — the cursor is fetched in bounded batches
++// (peak intermediate O(batch + k), matching tridb_estimate_intermediate's filter_first shape),
++// the PQ is size k, and per-batch detoast scratch is reset every fetch. The drain length is the
++// predicate's TRUE cardinality — exactly the quantity the FR-6 heuristic chose this path FOR.
++//
++// EXACTNESS: the drain is exhaustive over the qualifying set, so the ranking has NO ANN
++// approximation (recall 1.0 w.r.t. the predicate set by construction). This is deliberately
++// STRONGER than ADR-0011's original "probe the vector index per seed" sketch: a set we can
++// afford to enumerate does not need an approximate index probe (ADR-0011 addendum 2026-07-02).
++//
++// GOLDEN RULE 3: the qualifying ids come from the SAME graph_store reachability probe the
++// vector-first body uses (native traversal, resolved once at Open); the drain pushes the id set
++// as ONE int8[] parameter — the graph is never modeled as a relational join.
++//
++// The vector-first body (execTJS's merge loop) is UNTOUCHED: this init pre-completes the merge
++// (finish=true, result_stack filled), so execTJS just serves the per-call pops.
++// ---------------------------------------------------------------------------
++
++// Parse orderby_exp of the canonical form "<emb-expr> <-> '{v1,v2,...}'" into the embedding
++// expression and the query vector. Trusted-input contract (same as attr/filter/orderby overall);
++// a shape we cannot parse is an ERROR, never a silent fallback to the other body.
++static bool parseOrderbyExprT(const char* orderby, std::string& emb_expr, std::vector<double>& qvec){
++	const char* arrow = strstr(orderby, "<->");
++	if (!arrow)
++		return false;
++	std::string lhs(orderby, (size_t)(arrow - orderby));
++	size_t b = lhs.find_first_not_of(" \t\r\n");
++	size_t e = lhs.find_last_not_of(" \t\r\n");
++	if (b == std::string::npos)
++		return false;
++	emb_expr = lhs.substr(b, e - b + 1);
++
++	const char* lb = strchr(arrow, '{');
++	const char* rb = lb ? strrchr(arrow, '}') : NULL;
++	if (!lb || !rb || rb <= lb)
++		return false;
++	std::string body(lb + 1, (size_t)(rb - lb - 1));
++	const char* s = body.c_str();
++	char* end = NULL;
++	while (*s) {
++		while (*s == ' ' || *s == ',' || *s == '\t' || *s == '\n')
++			s++;
++		if (!*s)
++			break;
++		double v = strtod(s, &end);
++		if (end == s)
++			return false;
++		qvec.push_back(v);
++		s = end;
++	}
++	return !qvec.empty();
++}
++
++// Build the fully-initialized TJSState for the filter-first body: open the drain cursor, rank the
++// qualifying set into the bounded k-PQ, unspool into result_stack, mark the merge complete.
++// Called INSIDE the SRF's open SPI connection with CurrentMemoryContext == multi_call_memory_ctx.
++static TJSState* beginFilterFirstT(Oid table_oid, const char* tablename, const char* attr_exp,
++								   const char* filter_exp, const char* orderby_exp,
++								   uint32 k, uint32 term_cond,
++								   std::unordered_set<int64> reachable){
++	std::string emb_expr;
++	std::vector<double> qvec;
++	if (!parseOrderbyExprT(orderby_exp, emb_expr, qvec))
++		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
++				errmsg("TJS filter_first: cannot parse orderby_exp \"%s\" — expected \"<col> <-> '{v1,v2,...}'\"",
++					   orderby_exp)));
++
++	// idcol: attr_exp's FIRST column — the candidate graph id, by the existing tjs() contract.
++	std::string attrs(attr_exp);
++	std::string idcol = attrs.substr(0, attrs.find(','));
++	size_t ib = idcol.find_first_not_of(" \t\r\n");
++	size_t ie = idcol.find_last_not_of(" \t\r\n");
++	if (ib == std::string::npos)
++		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
++				errmsg("TJS filter_first: attr_exp \"%s\" has no leading id column", attr_exp)));
++	idcol = idcol.substr(ib, ie - ib + 1);
++
++	// The drain: qualifying = (id ∈ reachable) AND filter. The reachable ids travel as ONE int8[]
++	// parameter ($1) — bounded statement text, no interpolation, planned once.
++	const char *qtbl = quote_identifier(tablename);
++	char sourceText[102400];
++	if (strlen(filter_exp) == 0)
++		snprintf(sourceText, sizeof(sourceText),
++				 "select %s, (%s) from %s where (%s) = any($1)",
++				 attr_exp, emb_expr.c_str(), qtbl, idcol.c_str());
++	else
++		snprintf(sourceText, sizeof(sourceText),
++				 "select %s, (%s) from %s where (%s) = any($1) and (%s)",
++				 attr_exp, emb_expr.c_str(), qtbl, idcol.c_str(), filter_exp);
++	DEBUG_PRINT("TJS filter-first drain SQL: %s", sourceText);
++
++	int nids = (int) reachable.size();
++	Datum* elems = (Datum*) palloc(sizeof(Datum) * Max(nids, 1));
++	int j = 0;
++	for (int64 id : reachable)
++		elems[j++] = Int64GetDatum(id);
++	ArrayType* idarr = construct_array(elems, nids, INT8OID, sizeof(int64), FLOAT8PASSBYVAL, 'd');
++
++	Oid argtypes[1] = { INT8ARRAYOID };
++	SPIPlanPtr plan = SPI_prepare(sourceText, 1, argtypes);
++	if (!plan)
++		elog(ERROR, "TJS filter_first: SPI_prepare failed for drain: %s", sourceText);
++	Datum values[1] = { PointerGetDatum(idarr) };
++	Portal portal = SPI_cursor_open(NULL, plan, values, NULL, true /* read_only */);
++	if (!portal || !portal->tupDesc)
++		elog(ERROR, "TJS filter_first: SPI_cursor_open failed for drain");
++
++	TJSState* state = (TJSState*) malloc(sizeof(TJSState));
++	memset(&(state->ps), 0, sizeof(PlanState));
++	// Drop the trailing embedding column appended for ranking: visible output = attr_exp exactly,
++	// mirroring how the vector-first body drops its trailing ORDER BY resjunk column.
++	state->ps.ps_ResultTupleDesc = copyAndDropLastAttrT(portal->tupDesc, true);
++	state->ps.ps_ResultTupleSlot = MakeTupleTableSlot(state->ps.ps_ResultTupleDesc, &TTSOpsHeapTuple);
++	state->ps.ExecProcNode = execTJS;
++	state->relation        = table_open(table_oid, AccessShareLock);
++	state->finish          = false;
++	state->topk            = k;
++	state->term_cond       = term_cond; // recorded; the exact drain has no ANN stream to bound.
++	state->proc_pq         = new std::priority_queue<pq_item_t, std::vector<pq_item_t>, pq_item_compare_lt_t>();
++	state->seenSet         = new std::unordered_set<uint64_t>();
++	state->result_stack    = new std::stack<pq_item_t>();
++	state->children        = new std::vector<IndexScanState*>(); // no executor children: SPI cursor only.
++	state->qDescs          = new std::vector<QueryDesc*>();
++	state->graphEnabled    = true;
++	state->reachable       = new std::unordered_set<int64>(std::move(reachable));
++	state->idAttno         = 1;
++	state->examined        = 0;
++	state->result_cxt      = CurrentMemoryContext; // the SRF's multi_call_memory_ctx (caller switched).
++	state->children_closed = false;
++	state->query_snapshot  = NULL; // SPI owns the drain's snapshot; nothing to unregister (DEV-1236).
++
++	// Per-batch scratch so detoasted embeddings never accumulate in the multi-call context —
++	// reset every fetch, keeping peak memory O(batch + k) (the TR-1 story in numbers).
++	MemoryContext scratch = AllocSetContextCreate(CurrentMemoryContext, "tjs_ff_scratch",
++												  ALLOCSET_DEFAULT_SIZES);
++	int emb_attno = portal->tupDesc->natts;
++	int dim = (int) qvec.size();
++	auto proc_pq = state->proc_pq;
++	for (;;) {
++		SPI_cursor_fetch(portal, true, 256);
++		uint64 n = SPI_processed;
++		SPITupleTable* tt = SPI_tuptable;
++		if (n == 0)
++			break;
++		MemoryContext oldcxt = MemoryContextSwitchTo(scratch);
++		for (uint64 i = 0; i < n; i++) {
++			bool isnull;
++			Datum d = SPI_getbinval(tt->vals[i], tt->tupdesc, emb_attno, &isnull);
++			state->examined++;
++			if (isnull)
++				continue; // a NULL embedding can never rank (STRICT-NULL guard convention).
++			ArrayType* arr = DatumGetArrayTypeP(d);
++			if (ARR_NDIM(arr) != 1 || ARR_HASNULL(arr) || ARR_ELEMTYPE(arr) != FLOAT8OID)
++				ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
++						errmsg("TJS filter_first: embedding must be a 1-D float8[] with no NULLs")));
++			int nelem = ArrayGetNItems(ARR_NDIM(arr), ARR_DIMS(arr));
++			if (nelem != dim)
++				ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
++						errmsg("TJS filter_first: embedding dimension %d != query vector dimension %d",
++							   nelem, dim)));
++			double* vals = (double*) ARR_DATA_PTR(arr);
++			double acc = 0.0;
++			for (int c = 0; c < dim; c++) {
++				double diff = vals[c] - qvec[c];
++				acc += diff * diff;
++			}
++			// Squared L2 — the same ORDERING as the HNSW l2 stream; the PQ never mixes scores
++			// across bodies (one body per call), so the monotone transform is rank-safe.
++			float rank_score = (float) acc;
++			if ( k > 0 && ( proc_pq->size() < k || proc_pq->top().first > rank_score ) ) {
++				if ( proc_pq->size() == k )
++					proc_pq->pop();
++				// Survivors are copied into the SRF's multi-call context (same lifetime rule as
++				// the vector-first body's copyItemT into result_cxt).
++				MemoryContextSwitchTo(state->result_cxt);
++				proc_pq->push(std::make_pair(rank_score, heap_copytuple(tt->vals[i])));
++				MemoryContextSwitchTo(scratch);
++			}
++		}
++		MemoryContextSwitchTo(oldcxt);
++		MemoryContextReset(scratch);
++		SPI_freetuptable(tt);
++	}
++	MemoryContextDelete(scratch);
++	SPI_cursor_close(portal);
++
++	// Unspool smallest-first and mark the merge complete — execTJS (untouched) then just serves
++	// the per-call pops, exactly as it does after its own vector-first drain.
++	while (!proc_pq->empty()) {
++		state->result_stack->push(proc_pq->top());
++		proc_pq->pop();
++	}
++	state->finish = true;
++	tjs_last_examined = state->examined;
++	return state;
++}
++
+ TJSState* InitTJSState(Relation relation, uint32_t k, uint32_t term_cond,
+ 					   std::vector<IndexScanState*> scans, std::vector<QueryDesc*> qDescs,
+ 					   bool graphEnabled, std::unordered_set<int64> reachable,
+@@ -660,10 +875,29 @@
+ 		text* filter_exp_text = PG_GETARG_TEXT_PP(argc++);
+ 		text* orderby_text    = PG_GETARG_TEXT_PP(argc++);
+ 
+-		DEBUG_PRINT("TJS: table=%s k=%u term=%u src=%lld attr=%s filter=%s orderby=%s",
++		// ADR-0011 Option B (DEV-1290): the OPTIONAL 8th argument selects the physical body.
++		// 7-arg calls (and '' / 'vector_first') run the UNCHANGED vector-first body, so every
++		// existing caller keeps byte-identical behavior. Unknown values are an ERROR, not a
++		// silent default — the lowering is the only intended caller of the 8-arg form.
++		bool filterFirst = false;
++		if (PG_NARGS() >= 8) {
++			const char* jo = text_to_cstring(PG_GETARG_TEXT_PP(7));
++			if (strcmp(jo, "filter_first") == 0)
++				filterFirst = true;
++			else if (jo[0] != '\0' && strcmp(jo, "vector_first") != 0)
++				ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
++						errmsg("tjs: join_order must be 'vector_first' or 'filter_first', got \"%s\"", jo)));
++		}
++		if (filterFirst && !graphEnabled)
++			ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
++					errmsg("tjs: filter_first requires a graph source (src >= 0) — the graph drain "
++						   "IS the driving leg; without it, filter-first over the whole table is "
++						   "exactly the blocking full scan TR-1 forbids")));
++
++		DEBUG_PRINT("TJS: table=%s k=%u term=%u src=%lld attr=%s filter=%s orderby=%s order=%s",
+ 					text_to_cstring(tablename), k, termCond, (long long) src,
+ 					text_to_cstring(attr_exp_text), text_to_cstring(filter_exp_text),
+-					text_to_cstring(orderby_text));
++					text_to_cstring(orderby_text), filterFirst ? "filter_first" : "vector_first");
+ 
+ 		std::vector<IndexScanState*> scannodes;
+ 		std::vector<QueryDesc*> qDescs;
+@@ -672,10 +906,21 @@
+ 		// GRAPH leg: resolve the reachable set ONCE, INSIDE the SRF's single SPI connection (opened
+ 		// just above) and BEFORE building/driving the SPI IndexScan. graph_store.neighbors' own SPI
+ 		// then nests cleanly under ours. (graphReachableT must NOT open its own sibling connection.)
++		// BOTH physical bodies consume this same native-traversal probe (golden rule 3).
+ 		std::unordered_set<int64> reachable;
+ 		if (graphEnabled)
+ 			reachable = graphReachableT(src);
+ 
++		TJSState* top_execNode = NULL;
++		if (filterFirst) {
++			// FILTER-FIRST body (DEV-1290): drain the qualifying set, rank exactly, done.
++			top_execNode = beginFilterFirstT(table_oid, text_to_cstring(tablename),
++											 text_to_cstring(attr_exp_text),
++											 text_to_cstring(filter_exp_text),
++											 text_to_cstring(orderby_text),
++											 k, termCond, std::move(reachable));
++		} else {
++
+ 		// Build the vector leg: a single index-scan SQL with the relational filter in WHERE.
+ 		std::string orderby(text_to_cstring(orderby_text));
+ 		char sourceText[102400];
+@@ -717,10 +962,16 @@
+ 			elog(ERROR, "TJS: no IndexScanState in vector leg plan");
+ 		scannodes.push_back(scannode);
+ 
+-		TJSState* top_execNode = InitTJSState(table_open(table_oid, AccessShareLock),
+-											  k, termCond, scannodes, qDescs,
+-											  graphEnabled, std::move(reachable),
+-											  query_snapshot);
++		top_execNode = InitTJSState(table_open(table_oid, AccessShareLock),
++									k, termCond, scannodes, qDescs,
++									graphEnabled, std::move(reachable),
++									query_snapshot);
++		} // end vector-first body (UNCHANGED merge; see execTJS)
++
++		// Record which physical body this call ran — the operator-level Option-B observability
++		// companion (tjs_last_join_order()). Set for BOTH paths, including 7-arg legacy calls.
++		strncpy(tjs_last_join_order_val, filterFirst ? "filter_first" : "vector_first",
++				sizeof(tjs_last_join_order_val) - 1);
+ 
+ 		funcctx->user_fctx = top_execNode;
+ 		funcctx->max_calls = k;
+@@ -776,3 +1027,20 @@
+ Datum tjs_candidates_examined(PG_FUNCTION_ARGS) {
+ 	PG_RETURN_INT64(tjs_last_examined);
+ }
++
++// ---------------------------------------------------------------------------
++// tjs_last_join_order() — which physical body the last tjs() in this backend ran
++// ('vector_first' / 'filter_first'), NULL before any call. ADR-0011 Option B's operator-level
++// EXPLAIN-visibility companion (DEV-1290): the SRF is opaque to EXPLAIN, so "the decision
++// changes execution" is asserted on this, not on a plan-node label.
++// ---------------------------------------------------------------------------
++extern "C"
++{
++    PGDLLEXPORT PG_FUNCTION_INFO_V1(tjs_last_join_order);
++}
++
++Datum tjs_last_join_order(PG_FUNCTION_ARGS) {
++	if (tjs_last_join_order_val[0] == '\0')
++		PG_RETURN_NULL();
++	PG_RETURN_TEXT_P(cstring_to_text(tjs_last_join_order_val));
++}
+--- a/sql/vectordb.sql
++++ b/sql/vectordb.sql
+@@ -178,3 +178,26 @@
+ -- Bridges admitted past the vector frontier in the last tjs_open scan (the graph contribution).
+ CREATE FUNCTION tjs_open_bridges_injected() RETURNS bigint
+ 	AS 'MODULE_PATHNAME' LANGUAGE C;
++
++-- TRIDB(ADR-0011 Stage 3/4 / DEV-1290): join-order-aware tjs(). The OPTIONAL 8th argument selects
++-- the physical body: 'vector_first' (the validated ANN-stream merge — byte-identical to the 7-arg
++-- form) or 'filter_first' (drain reachable(src) ∩ filter via one bounded-batch SPI cursor, rank
++-- EXACTLY by squared L2 in C — no ANN approximation — into the same bounded top-k PQ). The FR-6
++-- lowering (graph_store.graph_query) passes tridb_choose_join_order's decision here. filter_first
++-- requires src >= 0 (the graph drain IS the driving leg). For filter_first,
++-- tjs_candidates_examined() reports the qualifying-set drain length (the SM-3 probe).
++CREATE FUNCTION tjs(table_name text, k integer, term_cond integer, src bigint,
++                    attr_exp text, filter_exp text, orderby_exp text, join_order text)
++                RETURNS SETOF record
++	AS 'MODULE_PATHNAME', 'tjs' LANGUAGE C STABLE STRICT;
++
++COMMENT ON FUNCTION tjs(text, integer, integer, bigint, text, text, text, text) IS
++	'TriDB TJS with explicit join order (ADR-0011 Option B, DEV-1290). join_order = '
++	'''vector_first''|''filter_first'' selects the physical body; the 7-arg form remains '
++	'vector-first. filter_first drains the qualifying set exactly (graph drain is the driver).';
++
++-- Which physical body the last tjs() in this backend ran ('vector_first'/'filter_first'; NULL
++-- before any call). The SRF is opaque to EXPLAIN, so "the decision changes execution" (DEV-1285
++-- done-criterion) is asserted on this companion, not on a plan-node label.
++CREATE FUNCTION tjs_last_join_order() RETURNS text
++	AS 'MODULE_PATHNAME' LANGUAGE C;

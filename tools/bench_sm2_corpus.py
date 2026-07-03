@@ -42,10 +42,15 @@ import json
 from bench_corpus_shared import build_corpus, vec_literal
 
 
-def build_sql(manifest: dict, runs: int, term_cond: int = 0) -> str:
+def build_sql(
+    manifest: dict, runs: int, term_cond: int = 0, join_order: str = ""
+) -> str:
     n = manifest["entities"]
     dim = manifest["dim"]
     k = manifest["k"]
+    # DEV-1290: optionally emit the 8-arg tjs() form to pin the physical body ('vector_first'
+    # or 'filter_first'); '' keeps the legacy 7-arg emission (engine-default vector-first).
+    jo = f", '{join_order}'" if join_order else ""
     entities = manifest["_entities"]  # [(id, ts, embedding_list)]
     edges = manifest["_edges"]
     queries = manifest["queries"]
@@ -98,7 +103,7 @@ def build_sql(manifest: dict, runs: int, term_cond: int = 0) -> str:
         qvec = vec_literal(q["embedding"])
         w(
             f"SELECT count(*) FROM tjs('entities', {k}, {term_cond}, {src}::bigint, 'id, chunk',"
-            f"'ts IN ({win})', 'embedding <-> ''{qvec}''') AS t(id bigint, chunk text);"
+            f"'ts IN ({win})', 'embedding <-> ''{qvec}'''{jo}) AS t(id bigint, chunk text);"
         )
 
     # ----- MEASURED: \\timing on, N repeated runs of the SAME tjs() per query ---
@@ -113,7 +118,7 @@ def build_sql(manifest: dict, runs: int, term_cond: int = 0) -> str:
             # a `Time: <ms> ms` line after each — the client-side wall-clock.
             w(
                 f"SELECT t.id FROM tjs('entities', {k}, {term_cond}, {src}::bigint, 'id, chunk',"
-                f"'ts IN ({win})', 'embedding <-> ''{qvec}''') AS t(id bigint, chunk text);"
+                f"'ts IN ({win})', 'embedding <-> ''{qvec}'''{jo}) AS t(id bigint, chunk text);"
             )
         # capture the answer ids once (for SM-4 parity vs the baseline).
         w("\\timing off")
@@ -123,7 +128,7 @@ def build_sql(manifest: dict, runs: int, term_cond: int = 0) -> str:
         )
         w(
             f"  SELECT t.id FROM tjs('entities', {k}, {term_cond}, {src}::bigint, 'id, chunk',"
-            f"'ts IN ({win})', 'embedding <-> ''{qvec}''') AS t(id bigint, chunk text)"
+            f"'ts IN ({win})', 'embedding <-> ''{qvec}'''{jo}) AS t(id bigint, chunk text)"
         )
         w(") s;")
         w("\\timing on")
@@ -154,6 +159,12 @@ def main(argv=None) -> int:
         help="tjs() early-termination depth (0 -> engine default 50). The recall/latency "
         "operating point; pin the SAME value for the SM-2 latency and recall claims.",
     )
+    p.add_argument(
+        "--join-order",
+        choices=["", "vector_first", "filter_first"],
+        default="",
+        help="pin the tjs() physical body via the DEV-1290 8-arg form ('' = legacy 7-arg)",
+    )
     p.add_argument("--sql-out", required=True)
     p.add_argument("--manifest-out", required=True)
     args = p.parse_args(argv)
@@ -162,7 +173,10 @@ def main(argv=None) -> int:
     manifest["term_cond"] = (
         args.term_cond
     )  # recorded in the public manifest for sm2_compare
-    sql = build_sql(manifest, args.runs, term_cond=args.term_cond)
+    manifest["join_order"] = args.join_order  # recorded for the report/provenance
+    sql = build_sql(
+        manifest, args.runs, term_cond=args.term_cond, join_order=args.join_order
+    )
 
     # strip the bulky inline corpus arrays before writing the public manifest:
     # the baseline rebuilds them deterministically from the seed (same as the
@@ -176,7 +190,7 @@ def main(argv=None) -> int:
     print(
         f"[bench_sm2_corpus] wrote {args.sql_out} + manifest {args.manifest_out} "
         f"(corpus={args.entities} dim={args.dim} queries={args.queries} k={args.k} "
-        f"runs={args.runs} term_cond={args.term_cond})"
+        f"runs={args.runs} term_cond={args.term_cond} join_order={args.join_order or 'engine-default'})"
     )
     return 0
 

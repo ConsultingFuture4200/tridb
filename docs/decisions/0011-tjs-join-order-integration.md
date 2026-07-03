@@ -1,8 +1,8 @@
 # ADR-0011: Wiring the join-order decision into TJS — pass the order as a parameter, not a CustomScan rewrite
 
-**Status:** Accepted — Stages 0-2 landed; Stage 3 (filter-first body) open as DEV-1290
-(proposed 2026-06-26, accepted 2026-07-01). Design + the SAFE additive `LegStats` builder land here;
-the operator-shaping change is GX10-gated and NOT started (deliberately — see Scope). See Addendum 2026-07-01.
+**Status:** Accepted — ALL stages (0-4) landed; Stage 3/4 (filter-first body + binding, DEV-1290)
+implemented 2026-07-02 as `tridb_tjs_filter_first.patch`, x86-validated; GX10 validation + the
+three-way 1M rerun are the DEV-1290 close-out evidence. See Addenda 2026-07-01 / 2026-07-02.
 **Issue:** DEV-1285 (FR-6 — make the join-order decision actually change execution)
 **Related:** DEV-1170 / `docs/join_order_heuristic_v0.1.0.md` (FROZEN decision core, shipped),
 ADR-0007 / DEV-1169 (TJS operator — SRF now, CustomScan later), ADR-0006 (relaxed-monotonicity
@@ -271,3 +271,43 @@ through the FULL lowering; both windows return the pre-Stage-2 vector-first answ
 decision is inert on execution, exactly as scoped); the no-decision-core fallback holds.
 GX10 re-validation rides the next `make graph-test` on-target. The decision binds to
 execution only when DEV-1290 lands Stage 3/4.
+
+## Addendum 2026-07-02 (later) — Stages 3+4 landed (DEV-1290): the filter-first body
+
+Motivated the same day by the 1M measurement (`docs/benchmark_sm2_1m_v0.1.0.md`): at ~0.12%
+joint selectivity the vector-first body loses 2× to the correctly-configured multi-store
+baseline, and the FROZEN heuristic (via the Stage-2 lowering) already selects `filter_first`
+there. Stage 3/4 land as fork patch `scripts/patches/tridb_tjs_filter_first.patch` (applied
+LAST in the chain, after the termination fix and `tjs_open`):
+
+- **`join_order` as an OPTIONAL 8th `tjs()` argument** (Option B as decided): 7-arg callers
+  are byte-identical (vector-first); `'filter_first'` selects the new body; unknown values
+  ERROR. `filter_first` with `src < 0` ERRORs — without a graph source the "drain" would be
+  the blocking full scan TR-1 forbids.
+- **The filter-first body** (`beginFilterFirstT`): drain the qualifying set —
+  `reachable(src) ∩ relational filter` — through ONE bounded-batch SPI cursor (the reachable
+  ids travel as a single `int8[]` parameter, never interpolated SQL; golden rule 3 holds: the
+  ids come from the same native `graph_store.neighbors` probe both bodies share), ranking each
+  row by **exact squared L2 computed in C** into the SAME bounded top-k PQ. Peak memory is
+  O(batch + k) (per-batch detoast scratch is reset every fetch); the drain length is the
+  predicate's true cardinality — the quantity FR-6 chose this path FOR, reported via
+  `tjs_candidates_examined()`.
+- **Deliberate deviation from the body's sketch:** the sketch said "probe the vector index per
+  seed"; the landed body ranks the drained set EXACTLY instead — a set cheap enough to
+  enumerate does not need an approximate index probe, so filter-first recall w.r.t. the
+  predicate set is 1.0 by construction.
+- **The vector-first body is UNTOUCHED** (the single biggest TR-1 risk, per the Decision):
+  filter-first pre-completes the merge (`finish=true`, `result_stack` filled) and `execTJS`
+  serves the pops unchanged.
+- **Stage 4 observability + binding:** operator-level `tjs_last_join_order()` reports which
+  body RAN (lowering-level `graph_store.last_join_order()` reports what was DECIDED); the
+  lowering now passes its decision into the 8-arg `tjs()` when present, falling back to the
+  7-arg form on older engines.
+
+Tests: `test/tjs_filter_first_test.sql` (ENGINE_TESTS — parity, companion transitions,
+examined divergence, error guards, alternating-body SPI lifecycle) and
+`test/join_order_integration_test.sql` + harness (AM_TESTS — the FULL
+lowering→operator FR-6 end-to-end, superseding the retired `join_order_integration_stub.sql`).
+First live x86 run: identical answers both bodies; on the ~1%-selective window vector-first
+examined 1999 of 2000 candidates, filter-first examined 3. GX10 validation + the three-way 1M
+rerun (TriDB-ff vs TriDB-vf vs correct baseline) are the DEV-1290 close-out evidence.

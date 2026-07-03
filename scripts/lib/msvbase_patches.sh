@@ -118,6 +118,15 @@ verify_patches() {
     || die "TriDB tridb_relaxed_order_executor_guard.patch NOT applied — xs_inorder zero-init missing in genam.c (advisor plan 022); drift?"
   grep -q 'amcanrelaxedorderbyop' "$root/thirdparty/Postgres/src/backend/executor/nodeIndexscan.c" 2>/dev/null \
     || die "TriDB tridb_relaxed_order_executor_guard.patch NOT applied — amcanrelaxedorderbyop gate/guard missing in nodeIndexscan.c (advisor plan 022); drift?"
+  # DEV-1290: TJS filter-first body. Sentinels on LOAD-BEARING tokens in BOTH touched files: the
+  # C body marker + the drain function in tjs_operator.cpp, and the 8-arg registration in
+  # sql/vectordb.sql — a partial apply (C without SQL or vice versa) misses one and die()s.
+  grep -q 'TRIDB: TJS filter-first body' "$root/src/tjs_operator.cpp" 2>/dev/null \
+    || die "TriDB tridb_tjs_filter_first.patch NOT applied — filter-first tjs() body missing (DEV-1290); drift?"
+  grep -q 'beginFilterFirstT' "$root/src/tjs_operator.cpp" 2>/dev/null \
+    || die "TriDB tridb_tjs_filter_first.patch INCOMPLETE — beginFilterFirstT drain missing in tjs_operator.cpp (DEV-1290); drift?"
+  grep -q 'orderby_exp text, join_order text' "$root/sql/vectordb.sql" 2>/dev/null \
+    || die "TriDB tridb_tjs_filter_first.patch NOT applied in sql/vectordb.sql — 8-arg tjs()/tjs_last_join_order() not registered (DEV-1290); drift?"
   log "all MSVBASE + TriDB fork patches verified present"
 }
 
@@ -451,6 +460,28 @@ apply_tridb_fork_patches() {
     log "applying TriDB fork patch: relaxed-monotonicity executor guard (xs_inorder zero-init + amcanrelaxedorderbyop gate + wrong-order ERROR restore) (advisor plan 022)"
     ( cd "$root" && git apply "$relaxed_guard_patch" ) \
       || die "tridb_relaxed_order_executor_guard.patch did not apply — MSVBASE/fork-chain drift? re-generate per advisor plan 022"
+  fi
+
+  #   tridb_tjs_filter_first.patch (ADR-0011 Stage 3/4 / DEV-1290): the SECOND tjs() physical
+  #     body. Adds an OPTIONAL 8th `join_order` argument ('vector_first'|'filter_first'; 7-arg
+  #     callers byte-identical), the filter-first body (drain reachable(src) ∩ relational filter
+  #     through ONE bounded-batch SPI cursor — the id set travels as an int8[] parameter, never
+  #     interpolated SQL — and rank EXACTLY by squared L2 in C into the SAME bounded top-k PQ;
+  #     peak memory O(batch + k), per-batch detoast scratch reset), and the operator-level
+  #     tjs_last_join_order() observability companion (Option B's EXPLAIN-visibility tax). The
+  #     vector-first merge (execTJS) is UNTOUCHED — filter-first pre-completes the merge and
+  #     execTJS just serves the pops. Motivated by the measured 1M regime where vector-first
+  #     loses 2x (docs/benchmark_sm2_1m_v0.1.0.md). Diffed against the post-termination-patch
+  #     tjs_operator.cpp AND the post-tjs_open sql/vectordb.sql tail, so it MUST apply after
+  #     BOTH tridb_tjs_predicate_termination.patch and tridb_tjs_open_operator.patch.
+  local ff_patch="${_MSVBASE_LIB_DIR}/../patches/tridb_tjs_filter_first.patch"
+  [[ -f "$ff_patch" ]] || die "missing TriDB fork patch: $ff_patch"
+  if grep -q 'TRIDB: TJS filter-first body' "$root/src/tjs_operator.cpp" 2>/dev/null; then
+    log "TriDB fork patch (TJS filter-first body + join_order arg, DEV-1290) already applied"
+  else
+    log "applying TriDB fork patch: TJS filter-first physical body + join_order arg (DEV-1290)"
+    ( cd "$root" && git apply "$ff_patch" ) \
+      || die "tridb_tjs_filter_first.patch did not apply — tjs-chain drift? re-generate per DEV-1290"
   fi
 
   # ----------------------------------------------------------------------------
