@@ -183,7 +183,7 @@ def compare(tridb_obs: dict[int, dict], baseline: dict, manifest: dict) -> dict:
 
     # Aggregate tail-latency ratios (baseline/TriDB) over queries where BOTH sides
     # produced the percentile (null below _MIN_SAMPLES_FOR_TAIL runs). QPS is the
-    # single-client reciprocal-of-median throughput — an honest single-thread number;
+    # single-client throughput (reciprocal of the mean per-query median) — honest single-thread;
     # multi-client QPS comes from a --clients run, not from extrapolating this.
     def _ratio_list(key: str) -> list[float]:
         out = []
