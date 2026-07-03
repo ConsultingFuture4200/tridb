@@ -147,12 +147,32 @@ def rebuild_corpus(manifest: dict, seed: int) -> dict:
 # nprobe=128) so the baseline stays tuned rather than strawmanned.
 MILVUS_NLIST = int(os.environ.get("BASELINE_NLIST", "128"))
 MILVUS_NPROBE = int(os.environ.get("BASELINE_NPROBE", "64"))
-MILVUS_INDEX = {
-    "index_type": "IVF_FLAT",
-    "metric_type": "L2",
-    "params": {"nlist": MILVUS_NLIST},
-}
-MILVUS_SEARCH_PARAM = {"metric_type": "L2", "params": {"nprobe": MILVUS_NPROBE}}
+# BASELINE_INDEX selects the Milvus index family (plan 030): IVF_FLAT (default, exact within
+# probed lists) or HNSW. Shipping an IVF-only baseline invites the "you picked the slow index"
+# critique; HNSW is what a competent operator would actually run at scale, so the head-to-head
+# must be able to show that row. The exact config used is stamped into the run's report JSON.
+_BASELINE_INDEX = os.environ.get("BASELINE_INDEX", "IVF_FLAT").upper()
+if _BASELINE_INDEX not in ("IVF_FLAT", "HNSW"):
+    raise ValueError(
+        f"BASELINE_INDEX must be IVF_FLAT or HNSW, got {_BASELINE_INDEX!r}"
+    )
+_MILVUS_HNSW_M = int(os.environ.get("BASELINE_HNSW_M", "16"))
+_MILVUS_HNSW_EFC = int(os.environ.get("BASELINE_HNSW_EFCONSTRUCTION", "200"))
+_MILVUS_HNSW_EF = int(os.environ.get("BASELINE_EF", "128"))
+if _BASELINE_INDEX == "HNSW":
+    MILVUS_INDEX = {
+        "index_type": "HNSW",
+        "metric_type": "L2",
+        "params": {"M": _MILVUS_HNSW_M, "efConstruction": _MILVUS_HNSW_EFC},
+    }
+    MILVUS_SEARCH_PARAM = {"metric_type": "L2", "params": {"ef": _MILVUS_HNSW_EF}}
+else:
+    MILVUS_INDEX = {
+        "index_type": "IVF_FLAT",
+        "metric_type": "L2",
+        "params": {"nlist": MILVUS_NLIST},
+    }
+    MILVUS_SEARCH_PARAM = {"metric_type": "L2", "params": {"nprobe": MILVUS_NPROBE}}
 
 
 def load_milvus(conn: Conn, corpus: dict) -> None:
@@ -512,6 +532,10 @@ def run_baseline(
         "runs": runs,
         "num_queries": len(results),
         "ann_overfetch": BASELINE_ANN_FANOUT,
+        "baseline_index_config": {
+            "index": MILVUS_INDEX,
+            "search": MILVUS_SEARCH_PARAM,
+        },
         "queries": [asdict(r) for r in results],
     }
 

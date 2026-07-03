@@ -26,6 +26,7 @@ value here means changing it there; there is no hidden config.
 | Milvus search | `nprobe=64` (default; `BASELINE_NPROBE` env) | `sm2.py: MILVUS_SEARCH_PARAM` | `nprobe=64` of `nlist=128` probes half the lists — a deliberately HIGH-recall operating point so the baseline is not losing the comparison on missed neighbours. Lowering it would make the baseline faster but lower-recall; we chose recall (a faster wrong answer is worth nothing — GTM metric). At 1M/`nlist=4096` the same high-recall stance is `BASELINE_NPROBE=128` (3% of lists — above typical tuned deployments). The env used for any published run is stamped into the run's report. |
 | ANN over-fetch | `k * 32` (default; `BASELINE_ANN_FANOUT` env) | `sm2.py: BASELINE_ANN_FANOUT` | The baseline CANNOT push the graph/time predicates into the ANN scan, so it over-fetches `k*32` candidates and prunes app-side. This is the intrinsic multi-store penalty (the SM-1 intermediate blowup), not a config we crippled — it is set generously (32×) so the baseline rarely under-fetches and misses a qualifying dst **at the 2k–100k slice**. At 1M with a selective graph predicate the qualifying density collapses (e.g. ~0.12% joint selectivity → E[qualifying in top-160] ≈ 0.2) and `k*32` structurally under-returns (<k answers, measured 2026-07-02). A correct-answer 1M operating point needs the fetch scaled to the joint selectivity (`k*2000` fills k with E≈12 qualifying at 0.12%); the fetch used for any published run is stamped into the run's report. This scaling cost IS the multi-store penalty the comparison exists to measure. |
 | Neo4j | uniqueness constraint on `:entity(id)` | `sm2.py: load_neo4j` | A `CREATE CONSTRAINT ... REQUIRE e.id IS UNIQUE` gives Neo4j a backing index, so the 1-hop `(src)-[:related_to]->(dst)` expansion is an indexed lookup, not a scan. |
+| Milvus index (HNSW option) | `BASELINE_INDEX=HNSW` → M=16, efConstruction=200, ef=128 | `sm2.py: MILVUS_INDEX` | The graph-vector cohort (Qdrant/Weaviate/Milvus) runs HNSW, not IVF, in production; shipping only an IVF_FLAT baseline invites the "you picked the slow index" critique. `BASELINE_INDEX=HNSW` runs the head-to-head against a tuned HNSW baseline; the exact config is stamped into the run's `baseline_index_config`. |
 | Postgres | B-tree index on `entity(timestamp)` | `sm2.py: load_postgres` | The relational leg filters on the timestamp window; `entity_ts_idx` keeps that an index range scan. |
 | Measurement | warm conns, 1 warm-up discarded, **median** of N runs, load+index EXCLUDED | `sm2.py: run_query` | Identical methodology to the TriDB side (warm `psql`, median of N `\timing` runs, load/index out of the timed path) so SM-2 is like-for-like. |
 
@@ -56,3 +57,15 @@ This file documents the tuned baseline *configuration*. It does NOT report any
 latency or recall number — those come from a LIVE run (`make sm2` for the SM-2
 head-to-head, `make bench-public` for the public-dataset recall), which is
 GX10-/stack-gated. No benchmark result is asserted in this document.
+
+## Client/server version alignment (plan 030)
+
+The baseline stack pins **Milvus `v2.4.5`** (`baseline/docker-compose.yml`), **Neo4j 5.20**, and
+**Postgres 16**. The Python clients are pinned in `requirements.lock` (`pymilvus`, `neo4j`,
+`psycopg`). **Known gap:** the pinned client is `pymilvus==2.6.16` (`requirements.lock`) driving a **2.4.5**
+server — a 2-minor version gap (Bolt/gRPC backward-compat, works today but not "aligned"). The
+`requirements.txt` floor `>=2.4,<2.7` only prevents a *future* 2.7 major from silently driving the
+2.4 server; it does NOT close the current gap. TRUE alignment — downgrade the client to 2.4.x, or
+bump the Milvus image to 2.6 — is a **pending maintainer decision** (a client downgrade risks an
+API `baseline/sm2.py` uses; a server bump changes the tuned baseline). The exact versions used for
+any published run are stamped into that run's report JSON (`baseline_index_config` / methodology).

@@ -87,7 +87,7 @@ class Dataset:
 # Canonical ann-benchmarks HDF5 mirror. These URLs are the long-standing public
 # distribution point for the named datasets (the same files the ann-benchmarks
 # project's data loader downloads).
-_BASE = "http://ann-benchmarks.com"
+_BASE = "https://ann-benchmarks.com"  # https closes the passive-MITM window; the sha256 pin is the real guarantee
 
 REGISTRY: dict[str, Dataset] = {
     # DEFAULT — dim 960 (>= 768 headline target), L2 (matches the canonical <-> /
