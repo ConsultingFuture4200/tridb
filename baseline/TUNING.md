@@ -56,3 +56,12 @@ This file documents the tuned baseline *configuration*. It does NOT report any
 latency or recall number — those come from a LIVE run (`make sm2` for the SM-2
 head-to-head, `make bench-public` for the public-dataset recall), which is
 GX10-/stack-gated. No benchmark result is asserted in this document.
+
+## Client/server version alignment (plan 030)
+
+The baseline stack pins **Milvus `v2.4.5`** (`baseline/docker-compose.yml`), **Neo4j 5.20**, and
+**Postgres 16**. The Python clients are pinned in `requirements.lock` (`pymilvus`, `neo4j`,
+`psycopg`). `pymilvus` minor tracks the Milvus server line — `requirements.txt` floors it
+`>=2.4,<2.7` so a future 2.7 major cannot silently drive the 2.4 server. If a published SM-2 run
+uses a different Milvus image, bump the client and this note together. The versions used for any
+published run are stamped into that run's report JSON (`baseline_index_config` / methodology block).
