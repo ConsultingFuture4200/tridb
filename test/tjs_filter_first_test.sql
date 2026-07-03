@@ -117,4 +117,32 @@ BEGIN
     RAISE NOTICE 'PASS 8: 3x alternating filter/vector calls stable (SPI lifecycle clean)';
 END $$;
 
+-- (9) multi-batch drain: >256 qualifying rows forces the SPI_cursor_fetch(…, 256)
+-- loop past its first batch (2nd/3rd iterations + per-batch scratch reset — the
+-- at-scale path, previously uncovered). Hub 2 -> 701 dsts (ids 1000..1700 all exist
+-- in the 2000-row corpus, all ts=100 so 'ts < 500' is always true over the drain).
+SELECT count(*) FROM (
+    SELECT graph_store.add_edge(2, g) FROM generate_series(1000, 1700) AS g
+) AS seeded;
+DO $$ DECLARE ff bigint[]; ff2 bigint[]; vf bigint[]; ex bigint;
+BEGIN
+    SELECT array_agg(t.id) INTO ff FROM tjs('entities', 5, 0, 2::bigint, 'id, chunk',
+        'ts < 500', 'embedding <-> ''{1000,0,0,0,0,0,0,0}''', 'filter_first') AS t(id bigint, chunk text);
+    ex := tjs_candidates_examined();
+    -- (a) full drain: all 701 qualifying rows examined => at least 3 fetch batches
+    ASSERT ex = 701, format('multi-batch drain examined %s (expected 701 = full qualifying set)', ex);
+    -- (b) answer parity with vector_first under a large term_cond
+    SELECT array_agg(t.id) INTO vf FROM tjs('entities', 5, 10000, 2::bigint, 'id, chunk',
+        'ts < 500', 'embedding <-> ''{1000,0,0,0,0,0,0,0}''', 'vector_first') AS t(id bigint, chunk text);
+    ASSERT ff = vf, format('bodies disagree past the batch boundary: ff=%s vf=%s', ff, vf);
+    ASSERT ff = ARRAY[1000,1001,1002,1003,1004]::bigint[],
+        format('multi-batch top-k: %s (expected {1000..1004})', ff);
+    -- (c) scratch-reset stability: identical second call returns identical rows
+    SELECT array_agg(t.id) INTO ff2 FROM tjs('entities', 5, 0, 2::bigint, 'id, chunk',
+        'ts < 500', 'embedding <-> ''{1000,0,0,0,0,0,0,0}''', 'filter_first') AS t(id bigint, chunk text);
+    ASSERT ff2 = ff, format('second drain differs: %s vs %s (scratch reset broken)', ff2, ff);
+    ASSERT tjs_candidates_examined() = 701, 'second drain examined count changed';
+    RAISE NOTICE 'PASS 9: 701-row drain (>2 fetch batches) examined=701, parity + repeat stable';
+END $$;
+
 \echo === DEV-1290 filter-first smoke: ALL PASS ===
