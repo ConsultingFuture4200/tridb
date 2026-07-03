@@ -25,3 +25,11 @@ CREATE FUNCTION tridb_estimate_intermediate(rel_filter_matches bigint, vector_to
 	RETURNS bigint
 	AS 'MODULE_PATHNAME', 'tridb_estimate_intermediate_sql'
 	LANGUAGE C STRICT IMMUTABLE;
+
+-- tridb_choose_join_order_cost (advisor plan 031): graph-leg-aware cost decision.
+-- ADDITIVE; the frozen tridb_choose_join_order above is unchanged. STRICT: a NULL arg -> NULL.
+CREATE FUNCTION tridb_choose_join_order_cost(deg bigint, rel_filter_matches bigint,
+                                             table_size bigint, vector_topk int, term_cond int)
+	RETURNS text
+	AS 'MODULE_PATHNAME', 'tridb_choose_join_order_cost_sql'
+	LANGUAGE C STRICT IMMUTABLE;
