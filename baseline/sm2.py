@@ -55,7 +55,11 @@ from harness import (  # noqa: E402  (sys.path is set by the caller / __main__ b
 # into the vector scan, so it must pull k*fanout ANN candidates and prune app-side.
 # Matches bench.harness.BASELINE_ANN_FANOUT (the in-process model's fanout) so the
 # live baseline and the documented model agree on the over-fetch cost.
-BASELINE_ANN_FANOUT = 32
+# Env-overridable (BASELINE_ANN_FANOUT): the committed 32 fills k at the 2k-100k
+# slice, but at 1M with a selective graph predicate the qualifying density makes
+# k*32 structurally under-fetch (returns <k answers) — the honest correct-answer
+# operating point must scale the fetch with corpus/selectivity (see TUNING.md).
+BASELINE_ANN_FANOUT = int(os.environ.get("BASELINE_ANN_FANOUT", "32"))
 
 
 # --------------------------------------------------------------------------- #
