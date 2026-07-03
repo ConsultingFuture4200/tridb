@@ -1,0 +1,32 @@
+SET
+DROP TABLE
+DROP FUNCTION
+CREATE FUNCTION
+ setseed 
+---------
+ 
+(1 row)
+
+SELECT 20000
+ALTER TABLE
+SELECT 20
+SELECT 20
+CREATE INDEX
+ANALYZE
+CREATE FUNCTION
+=== corpus sanity ===
+ rows  | predicate_rows 
+-------+----------------
+ 20000 |            200
+(1 row)
+
+=== probe: iterative_scan configs vs exact truth (k=10, 1% predicate, 20 queries) ===
+                            config                            | avg_recall_at_10 | avg_index_tuples_scanned | starved_queries_of_20 
+--------------------------------------------------------------+------------------+--------------------------+-----------------------
+ off (ef_search=40 default, starvation baseline)              |            0.040 |                     40.0 |                    20
+ relaxed_order, max_scan_tuples=1000                          |            0.285 |                   1010.6 |                     3
+ relaxed_order, max_scan_tuples=5000                          |            0.825 |                   1110.3 |                     0
+ relaxed_order, max_scan_tuples=20000 (default, = full table) |            0.965 |                   1132.8 |                     0
+ strict_order, max_scan_tuples=20000 (ordering comparison)    |            0.860 |                   1164.0 |                     0
+(5 rows)
+
