@@ -55,13 +55,24 @@ AM_TESTS := scripts/graph_am_test.sh \
             scripts/fork_bug_tjs_double_scan_test.sh
 
 # Engine test suites — require the tridb/msvbase:dev image (scripts/x86build.sh --docker).
+# Default: fail fast (first failing suite aborts). KEEP_GOING=1: run every suite,
+# print a FAILED SUITES summary, and exit nonzero if any failed (run-all mode for
+# expensive full runs where one early failure would hide downstream results).
 graph-test:
 	@docker image inspect $(IMAGE) >/dev/null 2>&1 || \
 	  { echo "image $(IMAGE) not built — run scripts/x86build.sh --docker"; exit 1; }
-	@for t in $(ENGINE_TESTS); do \
-	  echo "=== $$t ==="; bash scripts/graph_test.sh $(IMAGE) $$t || exit 1; done
-	@for h in $(AM_TESTS); do \
-	  echo "=== $$h ==="; bash $$h $(IMAGE) || exit 1; done
+	@FAILED=""; \
+	for t in $(ENGINE_TESTS); do \
+	  echo "=== $$t ==="; \
+	  bash scripts/graph_test.sh $(IMAGE) $$t || \
+	    { [ -n "$$KEEP_GOING" ] && FAILED="$$FAILED $$t" || exit 1; }; \
+	done; \
+	for h in $(AM_TESTS); do \
+	  echo "=== $$h ==="; \
+	  bash $$h $(IMAGE) || \
+	    { [ -n "$$KEEP_GOING" ] && FAILED="$$FAILED $$h" || exit 1; }; \
+	done; \
+	if [ -n "$$FAILED" ]; then echo "=== FAILED SUITES:$$FAILED ==="; exit 1; fi
 
 smoke-test:
 	@docker image inspect $(IMAGE) >/dev/null 2>&1 || \
