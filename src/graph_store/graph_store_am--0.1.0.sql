@@ -46,3 +46,8 @@ CREATE FUNCTION gph_vertex_count() RETURNS bigint
 -- with the page image. Used by the crash-recovery edge-count assertion.
 CREATE FUNCTION gph_edge_count() RETURNS bigint
   AS 'MODULE_PATHNAME' LANGUAGE C VOLATILE;
+
+-- Containment (advisor plan 026): the container holds NON-heap pages; any heap-path access
+-- (SELECT/VACUUM/ANALYZE) misreads them. Deployers grant gph_* EXECUTE to trusted roles only.
+REVOKE ALL ON TABLE gstore FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION gph_insert_vertex(), gph_insert_edge(bigint,bigint) FROM PUBLIC;
