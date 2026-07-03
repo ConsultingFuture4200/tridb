@@ -51,6 +51,10 @@ typedef struct LegStats
  * an earned claim rather than an assumption, including the boundary case selectivity == 0.10.
  */
 static double tridb_join_order_threshold = 0.10;
+/* advisor plan 031 (additive): cost-mode GUCs. mode owned here; cost_ratio in
+ * join_order_cost.c (extern) so the cost impl and its GUC live together. */
+static char *tridb_join_order_mode = NULL;
+extern double tridb_join_order_cost_ratio;
 
 /* ---- frozen decision core (bit-identical to join_order_ref.py) ----------- */
 
@@ -203,6 +207,32 @@ _PG_init(void)
 							 &tridb_join_order_threshold,
 							 0.10,	/* boot */
 							 0.0, 1.0,	/* min, max — PG rejects out-of-range SETs */
+							 PGC_USERSET,
+							 0,
+							 NULL, NULL, NULL);
+
+	/*
+	 * advisor plan 031 (additive; frozen core untouched). Two GUCs for the cost-based
+	 * decision path (join_order_cost.c). Default mode 'threshold' -> ZERO behavior change;
+	 * the lowering only calls the cost function when mode = 'cost'.
+	 */
+	DefineCustomStringVariable("tridb.join_order_mode",
+							   "Cross-modal join-order decision mode: 'threshold' or 'cost'.",
+							   "'threshold' (default) = frozen relational-selectivity rule; "
+							   "'cost' = graph-leg-aware two-cost comparison (join_order_cost.c).",
+							   &tridb_join_order_mode,
+							   "threshold",
+							   PGC_USERSET,
+							   0,
+							   NULL, NULL, NULL);
+
+	DefineCustomRealVariable("tridb.join_order_cost_ratio",
+							 "Cost ratio a_vf/a_ff for the cost-based join-order decision.",
+							 "vector-first per-candidate cost over filter-first per-drained-row; "
+							 "calibrated 4.0 from the 1M GX10 point. Only used when mode = 'cost'.",
+							 &tridb_join_order_cost_ratio,
+							 4.0,	/* boot */
+							 0.0, 1e9,	/* min, max */
 							 PGC_USERSET,
 							 0,
 							 NULL, NULL, NULL);
