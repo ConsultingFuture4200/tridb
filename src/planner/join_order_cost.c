@@ -9,9 +9,11 @@
  * WHY (landscape review F4): the frozen threshold decides on RELATIONAL selectivity alone
  * (rel_matches/table_size) and is blind to the graph leg. At 1M with a broad ts window
  * (rel_sel ~0.6) but a tiny reachable set (deg=2000 of 1M), the JOINT selectivity is ~0.0012 —
- * filter-first is 36x faster — yet the threshold (0.6 > 0.10) picks vector_first. Conversely a
- * selective ts window over a mega-hub src would pick filter_first and drain an enormous set.
- * The fix: price both physical bodies with the graph-leg cardinality (deg) in the estimate.
+ * filter-first is 36x faster — yet the threshold (0.6 > 0.10) picks vector_first. The fix: price
+ * both physical bodies with the graph-leg cardinality (deg) in the estimate. (A BROAD-filter
+ * mega-hub is also correctly sent to vector_first; the SELECTIVE-filter mega-hub — walk deg to
+ * find few survivors — needs an A*deg enumeration term this v0.1 model omits; see the doc's
+ * validity limits + the deferred boundary sweep.)
  *
  * MODEL (docs/join_order_cost_model_v0.1.0.md). Filter-first drains reachable(src) ∩ filter =
  * ~deg*rel_sel rows, each an exact dim-distance. Vector-first examines ~k/joint_sel candidates
@@ -43,9 +45,7 @@ double tridb_join_order_cost_ratio = 4.0;
  *   - rel_sel clamped to [0,1] (stale stats can exceed 1.0).
  *   - joint_sel ~ 0 -> vector-first cannot fill k; examined bounded by the corpus (worst case).
  */
-int tridb_choose_join_order_cost(int64 deg, int64 rel_matches, int64 table_size,
-								 int32 k, int32 term_cond);
-int
+static int
 tridb_choose_join_order_cost(int64 deg, int64 rel_matches, int64 table_size,
 							 int32 k, int32 term_cond)
 {
@@ -55,7 +55,9 @@ tridb_choose_join_order_cost(int64 deg, int64 rel_matches, int64 table_size,
 				examined;
 	const double eps = 1e-12;
 
-	(void) term_cond;			/* bounds `examined`; folded into the table_size clamp below */
+	(void) term_cond;			/* carried-but-unused: reserved for the deferred lowering call
+								 * signature. The plan's min(term_cond_regime_bound, k/joint_sel) is NOT
+								 * modeled yet — examined is clamped to table_size only. Boundary sweep TODO. */
 
 	if (deg <= 0 || table_size <= 0 || k <= 0)
 		return 0;				/* vector_first — no graph leg / unknown (frozen safe default) */

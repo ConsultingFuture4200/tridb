@@ -16,8 +16,10 @@ failure modes follow:
    ~60% (`rel_sel ≈ 0.6`) but only 2000 of 1M rows reachable from `src`. The joint predicate is
    ~0.12% selective and filter-first is 36× faster — yet `0.6 > 0.10`, so the threshold picks
    `vector_first`. (The v0.2.0/v0.3.0 headline runs *forced* filter-first to sidestep this.)
-2. **Selective relational filter + mega-hub `src` → wrong the other way.** A narrow ts window over a
-   `src` reachable to most of the corpus would pick `filter_first` and drain an enormous set.
+2. **Broad relational filter + mega-hub `src` → wrong the other way.** A broad ts window over a
+   `src` reachable to most of the corpus would pick `filter_first` and drain an enormous set. (The
+   related SELECTIVE-filter mega-hub — few survivors but a huge reachable set to walk — is a
+   *validity limit* of this v0.1 model, not something it fixes: see below.)
 
 Both are the same blind spot: the decision must price the **filter-first drain size** (which is a
 graph quantity, `deg(src) · rel_sel`) against the **vector-first examined stream**.
@@ -44,13 +46,31 @@ frozen core uses.
 | Point | deg | rel_sel | N | k | drain | examined | cost decision | threshold decision |
 |---|---:|---:|---:|---:|---:|---:|---|---|
 | 1M GX10 | 2000 | 0.6 | 1e6 | 5 | 1200 | 4167 | **filter_first** ✓ | vector_first ✗ (F4 bug) |
-| mega-hub | 500000 | 0.6 | 1e6 | 5 | 300000 | 17 | **vector_first** ✓ | vector_first |
+| mega-hub (broad) | 500000 | 0.6 | 1e6 | 5 | 300000 | 17 | **vector_first** ✓ | vector_first |
 | 2k selective | 4 | 0.01 | 2000 | 1 | 0.04 | 2000 (clamped) | **filter_first** ✓ | filter_first |
 | 2k broad | 4 | 0.8 | 2000 | 2 | 3.2 | 1250 | **filter_first** ✓* | vector_first |
 
 \* On the 2k broad case the cost model *diverges* from threshold-mode and is correct to: `deg = 4`
 makes the drain trivial regardless of window breadth. The threshold, blind to `deg`, over-picks
 vector-first there. This divergence is the feature.
+
+**The F4 fix does not depend on the precise `R = 4`.** At the 1M point `filter_first` holds for any
+`R > drain/examined = 1200/4167 ≈ 0.29` — robust across ~14× of R uncertainty. The boundary sweep
+tunes the *crossover* location, it is not needed to defend *this* fix.
+
+### Validity limits (what this v0.1 model does NOT price)
+
+- **The `A·deg` enumeration term is dropped.** Filter-first must walk/filter-test ALL `deg`
+  neighbors, not only the `deg·rel_sel` survivors; the model prices only the survivors' distances.
+  So it UNDERSTATES filter-first when `rel_sel ≪ 1` with large `deg` — a **selective-filter
+  mega-hub** (e.g. `deg=500k, rel_sel=0.001`: drain 500, but 500k adjacency reads) is still sent to
+  `filter_first` by this model, which is likely wrong. The 3.9 µs/row calibration was sampled near
+  `rel_sel≈1` so it absorbs the walk only there. Reintroducing `A·deg` (and calibrating its
+  constant) is explicit boundary-sweep work before the default flips.
+- **`term_cond` is carried-but-unused** — the same carried-but-unused trap this doc criticizes the
+  threshold for having with `avg_out_degree`. `term_cond` is TR-1's early-termination knob and is
+  *the* quantity that bounds vector-first's `examined`; the v0.1 model clamps `examined` to
+  `table_size` only. Wiring `term_cond` into the bound is boundary-sweep work.
 
 ## Scope shipped vs deferred
 

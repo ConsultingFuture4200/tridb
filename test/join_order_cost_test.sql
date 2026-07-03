@@ -45,8 +45,15 @@ BEGIN
     -- Guards: no graph leg / unknown table -> the frozen safe default (vector_first).
     ASSERT tridb_choose_join_order_cost(0, 20, 2000, 1, 10000) = 'vector_first', 'deg 0 -> vector_first';
     ASSERT tridb_choose_join_order_cost(4, 20, 0, 1, 10000) = 'vector_first', 'unknown table -> vector_first';
+    ASSERT tridb_choose_join_order_cost(4, 20, 2000, 0, 10000) = 'vector_first', 'k<=0 guard -> vector_first';
+    -- stale-stats: rel_matches > table_size -> rel_sel clamps to 1.0 (does not divide-explode).
+    ASSERT tridb_choose_join_order_cost(500000, 3000000, 2000000, 5, 10000) = 'vector_first',
+        'rel_sel>1 clamp: mega-hub with stale over-count still resolves (vector_first)';
+    -- joint_sel -> 0 (rel_matches 0): examined clamps to table_size; tiny drain -> filter_first.
+    ASSERT tridb_choose_join_order_cost(4, 0, 2000, 1, 10000) = 'filter_first',
+        'joint_sel~0 (0 matches): examined=table_size, drain 0 -> filter_first';
 
-    RAISE NOTICE 'PASS 031: cost decision reproduces all calibration points';
+    RAISE NOTICE 'PASS 031: cost decision reproduces all calibration points + guard branches';
 END $$;
 
 -- (3) Cost ratio GUC steers the crossover; mode defaults to threshold.

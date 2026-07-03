@@ -32,4 +32,8 @@ CREATE FUNCTION tridb_choose_join_order_cost(deg bigint, rel_filter_matches bigi
                                              table_size bigint, vector_topk int, term_cond int)
 	RETURNS text
 	AS 'MODULE_PATHNAME', 'tridb_choose_join_order_cost_sql'
-	LANGUAGE C STRICT IMMUTABLE;
+	-- STABLE not IMMUTABLE: the result depends on the tridb.join_order_cost_ratio GUC, so an
+	-- IMMUTABLE label would let the planner const-fold + cache a stale decision across a later SET
+	-- (Liotta review). Matches the file convention: the frozen GUC-reading choose_join_order is
+	-- likewise not IMMUTABLE; only the pure functions are.
+	LANGUAGE C STRICT STABLE;
