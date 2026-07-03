@@ -3,8 +3,9 @@
 # tjs_test.sh — run the DEV-1169 TJS operator canonical end-to-end test (FR-4) against the built
 # MSVBASE fork image (tridb/msvbase:dev). The TJS operator ships INSIDE vectordb.so (the image), but
 # its GRAPH leg probes the graph_store extension at runtime, so this harness — like graph_test.sh —
-# PGXS-builds + installs src/graph_store_ext into a throwaway cluster, then runs the test SQL (which
-# does CREATE EXTENSION vectordb + graph_store).
+# PGXS-builds + installs src/graph_store (the v1 native AM, graph_store_am — ADR-0013 Stage B) into a
+# throwaway cluster, then runs the test SQL (which
+# does CREATE EXTENSION vectordb + graph_store_am).
 #
 # Requires tridb/msvbase:dev (scripts/x86build.sh --docker).
 # Usage: scripts/tjs_test.sh [image] [sql]
@@ -12,7 +13,7 @@
 set -euo pipefail
 IMAGE="${1:-tridb/msvbase:dev}"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-EXT="$ROOT/src/graph_store_ext"
+EXT="$ROOT/src/graph_store"   # v1 native AM (graph_store_am, ADR-0013 Stage B)
 TEST="$(cd "$ROOT" && realpath "${2:-test/canonical_e2e_test.sql}")"
 
 docker image inspect "$IMAGE" >/dev/null 2>&1 || { echo "image $IMAGE not built — run scripts/x86build.sh --docker" >&2; exit 1; }

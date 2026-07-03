@@ -5,7 +5,7 @@
 -- frontier is admitted into the top-k it would otherwise miss, (4) early termination (<< corpus).
 
 CREATE EXTENSION vectordb;
-CREATE EXTENSION graph_store;
+CREATE EXTENSION graph_store_am;  -- v1 native AM (v0-compat surface, ADR-0013 Stage B)
 
 CREATE TABLE paragraphs (
     id        bigint PRIMARY KEY,

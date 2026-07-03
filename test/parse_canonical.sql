@@ -13,7 +13,7 @@
 -- Runs under psql -v ON_ERROR_STOP=1: any RAISE EXCEPTION fails the suite (nonzero exit).
 
 CREATE EXTENSION vectordb;
-CREATE EXTENSION graph_store;
+CREATE EXTENSION graph_store_am;  -- v1 native AM (v0-compat surface, ADR-0013 Stage B)
 
 -- Identical corpus to canonical_e2e_test.sql. INSERTs precede CREATE INDEX (the MSVBASE fork's
 -- HNSW AM crashes on incremental inserts into a built index — see canonical_e2e_test.sql:33-36).

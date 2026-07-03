@@ -15,7 +15,7 @@
 -- Runs under psql -v ON_ERROR_STOP=1; any failed ASSERT / RAISE aborts the suite.
 
 CREATE EXTENSION vectordb;
-CREATE EXTENSION graph_store;
+CREATE EXTENSION graph_store_am;  -- v1 native AM (v0-compat surface, ADR-0013 Stage B)
 CREATE EXTENSION join_order;
 
 -- Corpus: 2000 entities, ts = k % 100 (uniform, 100 distinct values -> 20 rows per value,

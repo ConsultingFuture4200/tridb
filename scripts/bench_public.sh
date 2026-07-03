@@ -26,9 +26,9 @@
 set -euo pipefail
 IMAGE="${1:-tridb/msvbase:dev}"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-# The SQL does CREATE EXTENSION graph_store, so we PGXS-build the graph_store_ext tree in the image,
+# The SQL does CREATE EXTENSION graph_store_am, so we PGXS-build the src/graph_store tree in the image,
 # exactly as scripts/bench_live.sh / bench_gx10_sweep.sh do.
-EXT="$ROOT/src/graph_store_ext"
+EXT="$ROOT/src/graph_store"   # v1 native AM (graph_store_am, ADR-0013 Stage B)
 # Run real_corpus as `-m tools.real_corpus` from the repo root so its `from tools.bench_corpus
 # import build_sql` (the shared canonical SQL emitter) resolves — running it by path does not.
 cd "$ROOT"

@@ -135,7 +135,9 @@ def build(args) -> tuple[str, dict]:
     w("\\set ON_ERROR_STOP on")
     w("\\timing off")
     w("CREATE EXTENSION vectordb;")
-    w("CREATE EXTENSION graph_store;")
+    w(
+        "CREATE EXTENSION graph_store_am;"
+    )  # v1 native AM, v0-compat surface (ADR-0013 Stage B)
     w(
         "CREATE TABLE entities (id bigint PRIMARY KEY, chunk text, ts int, "
         f"embedding float8[{dim}]);"
@@ -147,6 +149,26 @@ def build(args) -> tuple[str, dict]:
             for j in range(i, min(i + batch, n))
         )
         w(f"INSERT INTO entities (id,chunk,ts,embedding) VALUES {vals};")
+    # ADR-0013 Stage B: vertex materialization pass — every edge endpoint's dense vid
+    # is created up front through the ext-id map (gph_upsert_vertex) in FIRST-APPEARANCE
+    # order, the exact vid assignment add_edge alone would produce, so entity ids, edges,
+    # and manifests stay byte-identical to the v0-era corpus. add_edge (the v0-compat
+    # shim hosted in graph_store_am) then routes each edge through the map:
+    # gph_insert_edge(gph_upsert_vertex(s), gph_upsert_vertex(d)).
+    _seen: set = set()
+    _verts: list = []
+    for s, d in edges:
+        for v in (s, d):
+            if v not in _seen:
+                _seen.add(v)
+                _verts.append(v)
+    w("-- vertex materialization pass (ADR-0013 Stage B): ext ids -> dense vids")
+    for i in range(0, len(_verts), 500):
+        arr = ",".join(str(v) for v in _verts[i : i + 500])
+        w(
+            f"SELECT graph_store.gph_upsert_vertex(v) "
+            f"FROM unnest(ARRAY[{arr}]::bigint[]) v;"
+        )
     for s, d in edges:
         w(f"SELECT graph_store.add_edge({s}, {d});")
     w("SET enable_seqscan = off;")

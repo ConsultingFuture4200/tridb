@@ -10,7 +10,7 @@
 # baseline materialization model on the SAME corpus and renders the HTML report.
 #
 # Structure mirrors scripts/tjs_test.sh: in the image, PGXS-build + install
-# src/graph_store_ext into a throwaway cluster, initdb, run the generated SQL.
+# src/graph_store (the v1 native AM, graph_store_am — ADR-0013 Stage B) into a throwaway cluster, initdb, run the generated SQL.
 #
 # Requires tridb/msvbase:dev (scripts/x86build.sh --docker) and a host Python with
 # numpy (the repo .venv). The TriDB side is 100% live-measured here; the baseline
@@ -25,7 +25,7 @@
 set -euo pipefail
 IMAGE="${1:-tridb/msvbase:dev}"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-EXT="$ROOT/src/graph_store_ext"
+EXT="$ROOT/src/graph_store"   # v1 native AM (graph_store_am, ADR-0013 Stage B)
 
 ENTITIES="${BENCH_ENTITIES:-2000}"
 DIM="${BENCH_DIM:-32}"

@@ -1,0 +1,144 @@
+tridb_graph_v1_rewire.patch — advisor plan 025 / ADR-0013 Stage A: rewire both operators'
+graph probe from the v0 heap-backed extension (graph_store.neighbors, src/graph_store_ext/)
+to the v1 NATIVE adjacency-list access method's external-id traversal
+(graph_store.gph_neighbors_ext, src/graph_store/ + the gph_upsert_vertex id-mapping layer).
+Applies LAST in the chain, after tridb_operator_arg_hardening.patch.
+
+  * tjs_operator.cpp   graphReachableT:   SELECT dst FROM graph_store.gph_neighbors_ext(%lld)
+  * tjs_open_operator.cpp expandMultiSeedO: LATERAL graph_store.gph_neighbors_ext(f.src)
+
+The SPI shape, caching (probe ONCE at Open), single-connection nesting discipline (DEV-1236),
+and golden rule 3 (native traversal, never a relational join) are all unchanged — only the
+substrate is now the native 32KB-page AM the thesis is about. The SQL-side mapping layer +
+v0-compat front door (add_edge/neighbors/visits/graph_query) live in the repo-owned
+src/graph_store/graph_store_am--0.1.0.sql, NOT in this vendor patch.
+
+Parity oracle: test/graph_v0v1_parity_test.sql (asserting; byte-identical neighbor sets).
+Sentinel (both files): TRIDB: graph v1 rewire
+--- a/src/tjs_operator.cpp
++++ b/src/tjs_operator.cpp
+@@ -24,7 +24,8 @@
+ //                  builds `select ... from <t> where <filter> order by <orderby>`), so the index
+ //                  scan never even emits filtered-out rows.
+ //   GRAPH        — a reachability PREDICATE on each vector candidate: is candidate dst reachable
+-//                  (src)-[:related_to]->(dst)? We probe graph_store.neighbors(src) via SPI ONCE at
++//                  (src)-[:related_to]->(dst)? We probe graph_store.gph_neighbors_ext(src) — the v1
++//                  native AM's external-id traversal (ADR-0013 Stage A) — via SPI ONCE at
+ //                  init and cache the reachable-id set, then test membership at the seen-set point
+ //                  in the merge. Probing once (not interleaved with the SPI-driven IndexScan) avoids
+ //                  nesting a second SPI cursor inside the executor-driven scan — the reachable set is
+@@ -271,31 +272,34 @@
+ // ---------------------------------------------------------------------------
+ // The graph reachability predicate.
+ //
+-// graphReachableT(src) probes graph_store.neighbors(src) — the v0 native graph store's
+-// adjacency-list traversal iterator (src/graph_store_ext/graph_store.c) — via SPI and returns the
+-// set of reachable destination ids. We resolve this ONCE at init (TJS Open) and cache it, rather
+-// than interleaving a graph SPI probe inside the SPI-driven IndexScan loop: nesting a second SPI
+-// cursor under the executor-driven scan risks SPI-stack confusion, and the reachable set is finite
+-// so caching it is exact. Membership is then an O(1) hash lookup per vector candidate.
++// TRIDB: graph v1 rewire (ADR-0013 Stage A, advisor plan 025) — patch sentinel.
++// graphReachableT(src) probes graph_store.gph_neighbors_ext(src) — the v1 NATIVE graph access
++// method's external-id traversal (src/graph_store/graph_am.c through the ADR-0013 Stage-A id map)
++// — via SPI and returns the set of reachable destination ids. We resolve this ONCE at init (TJS
++// Open) and cache it, rather than interleaving a graph SPI probe inside the SPI-driven IndexScan
++// loop: nesting a second SPI cursor under the executor-driven scan risks SPI-stack confusion, and
++// the reachable set is finite so caching it is exact. Membership is then an O(1) hash lookup per
++// vector candidate.
+ //
+ // This honors golden rule 3 (graph is native traversal, NOT a relational join): we call the graph
+-// store's own iterator, not a join over an edge table.
++// store's own iterator — native 32KB adjacency pages via the shared buffer manager — not a join
++// over an edge table.
+ // ---------------------------------------------------------------------------
+ // Probe the graph store for src's reachable set. MUST be called while ALREADY inside an SPI
+-// connection the caller opened (we do NOT SPI_connect/finish here): graph_store.neighbors is itself
+-// an SRF that does its own nested SPI_connect/finish, and bracketing THAT with a second, sibling
++// connection the caller opened (we do NOT SPI_connect/finish here): a second, sibling
+ // SPI_connect/finish in the same C call left the SPI stack in a state that crashed the *next* tjs()
+ // in the session. Running this probe inside the SRF's single, already-open SPI connection keeps the
+-// SPI nesting strictly hierarchical (graph_neighbors' SPI nests cleanly under ours) and balanced.
++// SPI nesting strictly hierarchical (the map lookup's executor work nests cleanly under ours) and
++// balanced.
+ static std::unordered_set<int64> graphReachableT(int64 src){
+ 	std::unordered_set<int64> reachable;
+ 	char cmd[256];
+ 	snprintf(cmd, sizeof(cmd),
+-			 "SELECT dst FROM graph_store.neighbors(%lld) AS dst", (long long) src);
++			 "SELECT dst FROM graph_store.gph_neighbors_ext(%lld) AS dst", (long long) src);
+ 
+ 	int ret = SPI_execute(cmd, true /* read_only */, 0);
+ 	if (ret != SPI_OK_SELECT)
+-		elog(ERROR, "TJS graph predicate: graph_store.neighbors(%lld) probe failed (%d)",
++		elog(ERROR, "TJS graph predicate: graph_store.gph_neighbors_ext(%lld) probe failed (%d)",
+ 			 (long long) src, ret);
+ 
+ 	uint64 proc = SPI_processed;
+@@ -986,7 +990,7 @@
+ 		SPI_connect();
+ 
+ 		// GRAPH leg: resolve the reachable set ONCE, INSIDE the SRF's single SPI connection (opened
+-		// just above) and BEFORE building/driving the SPI IndexScan. graph_store.neighbors' own SPI
++		// just above) and BEFORE building/driving the SPI IndexScan. The gph_neighbors_ext probe
+ 		// then nests cleanly under ours. (graphReachableT must NOT open its own sibling connection.)
+ 		// BOTH physical bodies consume this same native-traversal probe (golden rule 3).
+ 		std::unordered_set<int64> reachable;
+--- a/src/tjs_open_operator.cpp
++++ b/src/tjs_open_operator.cpp
+@@ -23,7 +23,8 @@
+ //      like tjs()'s vector leg). Pull the first `m_seeds` candidates off that ANN stream; their
+ //      graph ids (attr's first column, by contract) are the personalization seeds. No caller `src`.
+ //   2. MULTI-SOURCE GRAPH EXPANSION. BFS `hops` deep from the UNION of all seeds via
+-//      graph_store.neighbors (the native adjacency-list iterator, golden rule 3 — never a relational
++//      graph_store.gph_neighbors_ext (the v1 native AM's external-id adjacency iterator, ADR-0013
++//      Stage A; golden rule 3 — never a relational
+ //      join). The reachable union is the "bridge set": graph-relevant nodes that the pure vector
+ //      ranking may rank far down or miss. Bounded by m_seeds * avg_deg^hops, NOT |V| — so caching it
+ //      is a bounded buffer, not a full-corpus materialization (TR-1 holds; this is NOT realization A
+@@ -48,7 +49,7 @@
+ //
+ // The SPI / snapshot / SRF lifecycle is forked verbatim from tjs_operator.cpp (DEV-1236): one SPI
+ // connection, one RegisterSnapshot pinned for the whole multi-call SRF, children torn down at the
+-// finish label. The graph BFS reuses the SAME single SPI connection (graph_store.neighbors' own SPI
++// finish label. The graph BFS reuses the SAME single SPI connection (the gph_neighbors_ext probe
+ // nests cleanly under ours) — never a sibling SPI_connect, the fork's signature crash.
+ 
+ #include "util.hpp"
+@@ -240,12 +241,14 @@
+ // ---------------------------------------------------------------------------
+ // Multi-source graph expansion — BFS `hops` deep from the UNION of all seeds.
+ //
++// TRIDB: graph v1 rewire (ADR-0013 Stage A, advisor plan 025) — patch sentinel.
+ // Mirrors tjs_operator.cpp's single-source graphReachableT, generalized to: (a) MANY seeds, (b)
+ // multiple hops. Each hop issues ONE SPI call over the WHOLE frontier — a LATERAL join of
+-// graph_store.neighbors (the native adjacency-list iterator, golden rule 3) over the unnest'd
++// graph_store.gph_neighbors_ext (the v1 native AM's external-id adjacency iterator, ADR-0013
++// Stage A; golden rule 3) over the unnest'd
+ // frontier id array — so parse/plan/execute is paid once per hop, NOT once per frontier node.
+ // Probed inside the SRF's ALREADY-OPEN SPI connection — we
+-// do NOT SPI_connect/finish here (graph_store.neighbors does its own nested SPI; a sibling connection
++// do NOT SPI_connect/finish here (a sibling connection
+ // is the fork's crash). The returned bridge set INCLUDES the seeds themselves (a seed is trivially
+ // reachable from itself and should be admitted). Bounded by m_seeds * avg_deg^hops, not |V|.
+ // ---------------------------------------------------------------------------
+@@ -259,9 +262,9 @@
+ 
+ 	for (int h = 0; h < hops && !frontier.empty(); h++) {
+ 		std::vector<int64> next;
+-		// ONE SPI round trip for the WHOLE frontier this hop: LATERAL-join graph_store.neighbors
++		// ONE SPI round trip for the WHOLE frontier this hop: LATERAL-join gph_neighbors_ext
+ 		// over the unnest'd id array, so parse/plan/execute is paid ONCE per hop instead of once
+-		// per frontier node. neighbors' own nested SPI still nests cleanly under the SRF's single
++		// per frontier node. The probe's executor work still nests cleanly under the SRF's single
+ 		// open connection (no sibling SPI_connect — the fork's DEV-1236 crash). BFS order is
+ 		// irrelevant: `bridges` dedups, so the discovered set is provably identical to per-node.
+ 		// `cmd` is a heap std::string (frontiers can be large — never a stack buffer).
+@@ -271,7 +274,7 @@
+ 			ids += std::to_string((long long) frontier[i]);
+ 		}
+ 		std::string cmd = "SELECT n.dst FROM unnest(ARRAY[" + ids +
+-						  "]::bigint[]) AS f(src), LATERAL graph_store.neighbors(f.src) AS n(dst)";
++						  "]::bigint[]) AS f(src), LATERAL graph_store.gph_neighbors_ext(f.src) AS n(dst)";
+ 		int ret = SPI_execute(cmd.c_str(), true /* read_only */, 0);
+ 		if (ret != SPI_OK_SELECT)
+ 			elog(ERROR, "tjs_open graph expansion: batched neighbors probe failed at hop %d (%d)",

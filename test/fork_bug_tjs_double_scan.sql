@@ -14,7 +14,7 @@
 -- passing regression in test/fork_bug_multicol_double_scan.sql.
 
 CREATE EXTENSION vectordb;
-CREATE EXTENSION graph_store;
+CREATE EXTENSION graph_store_am;  -- v1 native AM (v0-compat surface, ADR-0013 Stage B)
 
 CREATE TABLE entities (id bigint PRIMARY KEY, chunk text, ts int, embedding float8[8]);
 INSERT INTO entities

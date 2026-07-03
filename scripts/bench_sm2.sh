@@ -33,7 +33,7 @@
 set -euo pipefail
 IMAGE="${1:-tridb/msvbase:dev}"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-EXT="$ROOT/src/graph_store_ext"
+EXT="$ROOT/src/graph_store"   # v1 native AM (graph_store_am, ADR-0013 Stage B)
 
 ENTITIES="${BENCH_ENTITIES:-2000}"
 DIM="${BENCH_DIM:-32}"

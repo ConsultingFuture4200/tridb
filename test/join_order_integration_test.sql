@@ -14,7 +14,7 @@
 -- (scripts/join_order_integration_test.sh). Runs under psql -v ON_ERROR_STOP=1.
 
 CREATE EXTENSION vectordb;
-CREATE EXTENSION graph_store;
+CREATE EXTENSION graph_store_am;  -- v1 native AM (v0-compat surface, ADR-0013 Stage B)
 CREATE EXTENSION join_order;
 
 -- Same corpus shape as test/join_order_lowering_test.sql: 2000 entities, ts = k % 100

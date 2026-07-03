@@ -138,6 +138,15 @@ verify_patches() {
     || die "TriDB tridb_operator_arg_hardening.patch NOT applied — tjs_open() arg guards missing (advisor plan 024); drift?"
   grep -q 'registerTJSOpenStateRelease' "$root/src/tjs_open_operator.cpp" 2>/dev/null \
     || die "TriDB tridb_operator_arg_hardening.patch INCOMPLETE — release callback missing in tjs_open_operator.cpp (advisor plan 024); drift?"
+  # advisor plan 025 / ADR-0013 Stage A: operators probe the v1 native AM. Sentinels on the
+  # LOAD-BEARING SPI text (gph_neighbors_ext) in BOTH operator files, and the v0 probe text
+  # must be GONE — a partial apply (one file swapped, one still on v0) misses one and die()s.
+  grep -q 'graph_store.gph_neighbors_ext' "$root/src/tjs_operator.cpp" 2>/dev/null \
+    || die "TriDB tridb_graph_v1_rewire.patch NOT applied — tjs() still probes the v0 graph ext (ADR-0013 Stage A); drift?"
+  grep -q 'graph_store.gph_neighbors_ext' "$root/src/tjs_open_operator.cpp" 2>/dev/null \
+    || die "TriDB tridb_graph_v1_rewire.patch NOT applied — tjs_open() still probes the v0 graph ext (ADR-0013 Stage A); drift?"
+  ! grep -q 'graph_store\.neighbors' "$root/src/tjs_operator.cpp" "$root/src/tjs_open_operator.cpp" 2>/dev/null \
+    || die "TriDB tridb_graph_v1_rewire.patch INCOMPLETE — a graph_store.neighbors probe remains in an operator (ADR-0013 Stage A); drift?"
   log "all MSVBASE + TriDB fork patches verified present"
 }
 
@@ -513,6 +522,23 @@ apply_tridb_fork_patches() {
     log "applying TriDB fork patch: tjs/tjs_open arg + memory-lifecycle hardening (advisor plan 024)"
     ( cd "$root" && git apply "$ah_patch" ) \
       || die "tridb_operator_arg_hardening.patch did not apply — tjs-chain drift? re-generate per advisor plan 024"
+  fi
+
+  #   tridb_graph_v1_rewire.patch (advisor plan 025 / ADR-0013 Stage A): both operators'
+  #     graph probe moves off the v0 heap-backed extension onto the v1 NATIVE access method:
+  #     graphReachableT and expandMultiSeedO now SPI-call graph_store.gph_neighbors_ext
+  #     (external-id traversal over the gph_upsert_vertex id map hosted in
+  #     src/graph_store/graph_store_am--0.1.0.sql). Probe shape/caching/SPI nesting unchanged.
+  #     Diffed against the post-arg-hardening tree, so it MUST apply after
+  #     tridb_operator_arg_hardening.patch (last in the tjs chain).
+  local v1rw_patch="${_MSVBASE_LIB_DIR}/../patches/tridb_graph_v1_rewire.patch"
+  [[ -f "$v1rw_patch" ]] || die "missing TriDB fork patch: $v1rw_patch"
+  if grep -q 'TRIDB: graph v1 rewire' "$root/src/tjs_operator.cpp" 2>/dev/null; then
+    log "TriDB fork patch (graph v1 rewire, advisor plan 025) already applied"
+  else
+    log "applying TriDB fork patch: operator graph probe -> v1 native AM (advisor plan 025 / ADR-0013 Stage A)"
+    ( cd "$root" && git apply "$v1rw_patch" ) \
+      || die "tridb_graph_v1_rewire.patch did not apply — tjs-chain drift? re-generate per advisor plan 025"
   fi
 
   # ----------------------------------------------------------------------------

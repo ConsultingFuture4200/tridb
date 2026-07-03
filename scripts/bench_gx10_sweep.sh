@@ -28,9 +28,9 @@
 set -euo pipefail
 IMAGE="${1:-tridb/msvbase:dev}"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-# The sweep SQL does CREATE EXTENSION graph_store, so we need the graph_store_ext source tree
+# The sweep SQL does CREATE EXTENSION graph_store_am, so we need the src/graph_store source tree
 # (extension name "graph_store") — the same tree scripts/bench_live.sh PGXS-builds in the image.
-EXT="$ROOT/src/graph_store_ext"
+EXT="$ROOT/src/graph_store"   # v1 native AM (graph_store_am, ADR-0013 Stage B)
 
 ENTITIES="${SWEEP_ENTITIES:-20000}"
 DIM="${SWEEP_DIM:-128}"
@@ -100,9 +100,9 @@ docker run --rm --entrypoint bash \
     echo "#SWEEP NOTE using image vectordb.so as built (committed patch chain; no rebuild)"
   fi
 
-  # --- graph_store_ext: the image ships vectordb but NOT graph_store; PGXS-build+install it -----
+  # --- graph_store_am: the image ships vectordb but NOT the graph store; PGXS-build+install it ---
   # Same `make PG_CONFIG=$PGC [install]` pattern as scripts/bench_live.sh / crash_recovery_test.sh.
-  echo "#SWEEP NOTE building graph_store_ext (PGXS)"
+  echo "#SWEEP NOTE building graph_store_am (PGXS)"
   cp -r /tmp/ext /tmp/build && cd /tmp/build
   if ! make PG_CONFIG=$PGC >/tmp/make.log 2>&1; then echo "BUILD FAILED:"; tail -40 /tmp/make.log; exit 1; fi
   if ! make PG_CONFIG=$PGC install >/tmp/install.log 2>&1; then echo "INSTALL FAILED:"; tail -40 /tmp/install.log; exit 1; fi

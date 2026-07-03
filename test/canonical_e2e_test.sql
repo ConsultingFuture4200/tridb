@@ -17,7 +17,7 @@
 -- TJS reads exactly that; this test never re-ranks in SQL.
 
 CREATE EXTENSION vectordb;
-CREATE EXTENSION graph_store;
+CREATE EXTENSION graph_store_am;  -- v1 native AM (v0-compat surface, ADR-0013 Stage B)
 
 -- Identical corpus to trimodal_compose.sql: entity k has embedding [k,0,...]; entity 40 is stale.
 CREATE TABLE entities (

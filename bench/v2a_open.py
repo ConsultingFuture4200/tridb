@@ -36,7 +36,9 @@ def emit_sql(m: dict, corpus_emb, query_emb, *, k: int, seeds: int) -> str:
     w = out.append
     w("\\set ON_ERROR_STOP on")
     w("CREATE EXTENSION vectordb;")
-    w("CREATE EXTENSION graph_store;")
+    w(
+        "CREATE EXTENSION graph_store_am;"
+    )  # v1 native AM, v0-compat surface (ADR-0013 Stage B)
     w(
         f"CREATE TABLE entities (id bigint PRIMARY KEY, ts int, embedding float8[{dim}]);"
     )
