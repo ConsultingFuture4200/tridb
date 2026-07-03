@@ -1,0 +1,420 @@
+tridb_operator_arg_hardening.patch — advisor plan 024: harden tjs()/tjs_open() entry points
+and memory lifecycle. Applies LAST in the chain, after tridb_tjs_filter_first.patch.
+
+  (1) Argument validation: tjs k 1..10000; tjs_open k/m_seeds 1..10000, hops 1..8 (the old
+      silent 0->default coercions for m_seeds/hops are now ERRORs). k=0 previously hit
+      top()/pop() on an EMPTY std::priority_queue (UB/SIGSEGV); negative k arrived through
+      PG_GETARG_UINT32 as ~4.29e9 (unbounded "bounded" heap).
+  (2) Eviction frees: every bounded-PQ eviction heap_freetuple's the evicted copy (and
+      fetchBridgeRowsO frees a rejected new copy), making the O(batch + k) peak-memory
+      comment true. Result tuples (final unspool / finalizeTopKO chosen set) are NEVER freed.
+  (3) Error-path memory release: a MemoryContextCallback on the SRF's multi-call context
+      releases the malloc'd state + new'd C++ containers on abort (ereport longjmps past
+      EndTJSState/EndTJSOpenState). free(state) happens ONLY in the callback — the callback
+      node is embedded in the struct, so freeing earlier would dangle the context's
+      reset-callback list. The callback never touches executor/SPI/relation teardown.
+  (4) snprintf truncation guards at all 4 previously-unchecked compose sites (silent
+      truncation could drop a trailing `and (<filter>)` — wrong rows).
+
+FUTURE OPERATORS MUST COPY the arg-guard + release-callback pattern.
+Sentinel (both files): TRIDB: operator arg hardening
+--- a/src/tjs_operator.cpp
++++ b/src/tjs_operator.cpp
+@@ -351,6 +351,10 @@
+ 	// Registered at first-call (RegisterSnapshot), unregistered in EndTJSState (after ExecutorEnd).
+ 	// Never borrowed from the caller's active-snapshot stack.
+ 	Snapshot query_snapshot;
++
++	// TRIDB: operator arg hardening (advisor plan 024): error-path memory release.
++	bool released;              // C++ containers already deleted (releaseTJSStateMemory ran)?
++	MemoryContextCallback cb;   // reset callback registered on the SRF's multi-call context.
+ } TJSState;
+ 
+ // Process-global examined counter for the last TJS scan in this backend (TR-1 probe, SM-3). Mirrors
+@@ -365,6 +369,51 @@
+ static char tjs_last_join_order_val[16] = "";
+ 
+ // ---------------------------------------------------------------------------
++// TRIDB: operator arg hardening (advisor plan 024) — error-path memory release.
++//
++// The TJSState struct is malloc'd and its containers new'd: an ereport(ERROR) after state init
++// longjmps past EndTJSState, leaking them PERMANENTLY (palloc memory is reclaimed by the aborting
++// transaction; malloc/new memory is not). Fix: a MemoryContextCallback registered on the SRF's
++// multi-call context releases the malloc/new memory if not already released. The callback must
++// NOT touch executor/SPI/relation teardown — abort cleanup owns those via resource owners; it
++// only deletes the C++ containers and free()s the struct.
++//
++// free(state) happens ONLY in the callback (never in EndTJSState): the registered
++// MemoryContextCallback node is EMBEDDED in the struct, so freeing the struct before the context
++// resets would leave a dangling node on the context's reset-callback list (use-after-free when
++// MemoryContextDelete walks it at query end). The callback fires exactly once per context
++// reset/delete — normal completion and abort alike — so the struct is always reclaimed.
++// Future operators must copy this arg-guard + release-callback pattern.
++// ---------------------------------------------------------------------------
++static void releaseTJSStateMemory(TJSState* state){
++	if (!state || state->released)
++		return;
++	state->released = true;
++	// Containers only. HeapTuples inside them live in the SRF's multi-call context and are
++	// reclaimed by the context machinery itself — never pfree'd here.
++	delete(state->proc_pq);
++	delete(state->seenSet);
++	delete(state->result_stack);
++	delete(state->reachable);
++	delete(state->qDescs);
++	delete(state->children);
++}
++
++static void tjsStateResetCB(void* arg){
++	TJSState* state = (TJSState*) arg;
++	releaseTJSStateMemory(state);   // no-op if EndTJSState already released the containers
++	free(state);
++}
++
++// Register the release callback; call ONLY once the state's container members are all set.
++static void registerTJSStateRelease(TJSState* state, MemoryContext cxt){
++	state->released = false;
++	state->cb.func = tjsStateResetCB;
++	state->cb.arg  = state;
++	MemoryContextRegisterResetCallback(cxt, &state->cb);
++}
++
++// ---------------------------------------------------------------------------
+ // execTJS — the pure operator body. `TupleTableSlot* execTJS(PlanState*)` exactly as the prompt
+ // requires, so a future CustomScan node reuses it without change. On the FIRST call it drains the
+ // ANN stream (early-terminating) into the bounded priority queue and unspools it into result_stack;
+@@ -480,8 +529,15 @@
+ 				// conservative choice and keeps insert/drop mutually exclusive and exhaustive.
+ 				if ( graph_ok && kth > rank_score ){
+ 					// Qualifying AND improves the top-k -> insert, and reset the drop run.
+-					if ( pq_full )
++					// TRIDB: operator arg hardening — free the evicted tuple. Evicted copies
++					// otherwise pile up in the SRF's multi-call context until end of query
++					// (~6KB each at dim-768), falsifying the O(batch + k) peak-memory story.
++					// Result tuples (the final unspool into result_stack) are NEVER freed here.
++					if ( pq_full ) {
++						HeapTuple evicted = proc_pq->top().second;
+ 						proc_pq->pop();
++						heap_freetuple(evicted);
++					}
+ 					// Copy the surviving tuple into the SRF's multi-call context (result_cxt ==
+ 					// multi_call_memory_ctx), NOT the child's es_query_cxt which EndTJSState frees at
+ 					// teardown — so the tuple outlives the children and stays valid across the SRF's
+@@ -630,14 +686,25 @@
+ 	// parameter ($1) — bounded statement text, no interpolation, planned once.
+ 	const char *qtbl = quote_identifier(tablename);
+ 	char sourceText[102400];
+-	if (strlen(filter_exp) == 0)
+-		snprintf(sourceText, sizeof(sourceText),
++	// TRIDB: operator arg hardening — reject truncated compose instead of running silently
++	// truncated SQL (worst case: a dropped trailing `and (<filter>)` returns WRONG rows).
++	if (strlen(filter_exp) == 0) {
++		int __n = snprintf(sourceText, sizeof(sourceText),
+ 				 "select %s, (%s) from %s where (%s) = any($1)",
+ 				 attr_exp, emb_expr.c_str(), qtbl, idcol.c_str());
+-	else
+-		snprintf(sourceText, sizeof(sourceText),
++		if (__n < 0 || (size_t) __n >= sizeof(sourceText))
++			ereport(ERROR, (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
++					errmsg("tjs filter_first: generated drain SQL exceeds %zu bytes "
++						   "(attr/orderby expression too large)", sizeof(sourceText))));
++	} else {
++		int __n = snprintf(sourceText, sizeof(sourceText),
+ 				 "select %s, (%s) from %s where (%s) = any($1) and (%s)",
+ 				 attr_exp, emb_expr.c_str(), qtbl, idcol.c_str(), filter_exp);
++		if (__n < 0 || (size_t) __n >= sizeof(sourceText))
++			ereport(ERROR, (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
++					errmsg("tjs filter_first: generated drain SQL exceeds %zu bytes "
++						   "(filter/orderby expression too large)", sizeof(sourceText))));
++	}
+ 	DEBUG_PRINT("TJS filter-first drain SQL: %s", sourceText);
+ 
+ 	int nids = (int) reachable.size();
+@@ -680,6 +747,10 @@
+ 	state->children_closed = false;
+ 	state->query_snapshot  = NULL; // SPI owns the drain's snapshot; nothing to unregister (DEV-1236).
+ 
++	// TRIDB: operator arg hardening — register the error-path release BEFORE the drain below,
++	// which can ereport (dim mismatch, malformed embedding) after the malloc/new init.
++	registerTJSStateRelease(state, state->result_cxt);
++
+ 	// Per-batch scratch so detoasted embeddings never accumulate in the multi-call context —
+ 	// reset every fetch, keeping peak memory O(batch + k) (the TR-1 story in numbers).
+ 	MemoryContext scratch = AllocSetContextCreate(CurrentMemoryContext, "tjs_ff_scratch",
+@@ -719,8 +790,13 @@
+ 			// across bodies (one body per call), so the monotone transform is rank-safe.
+ 			float rank_score = (float) acc;
+ 			if ( k > 0 && ( proc_pq->size() < k || proc_pq->top().first > rank_score ) ) {
+-				if ( proc_pq->size() == k )
++				// TRIDB: operator arg hardening — free the evicted tuple (see execTJS's
++				// eviction site); keeps the O(batch + k) comment above TRUE.
++				if ( proc_pq->size() == k ) {
++					HeapTuple evicted = proc_pq->top().second;
+ 					proc_pq->pop();
++					heap_freetuple(evicted);
++				}
+ 				// Survivors are copied into the SRF's multi-call context (same lifetime rule as
+ 				// the vector-first body's copyItemT into result_cxt).
+ 				MemoryContextSwitchTo(state->result_cxt);
+@@ -781,6 +857,9 @@
+ 	// DEV-1236 Part A: stash the pinned snapshot on the state for use by execTJS and teardown.
+ 	state->query_snapshot   = query_snapshot;
+ 
++	// TRIDB: operator arg hardening — error-path release callback (see releaseTJSStateMemory).
++	registerTJSStateRelease(state, state->result_cxt);
++
+ 	return state;
+ }
+ 
+@@ -809,15 +888,10 @@
+ 	// consumer of it). EndTJSChildren is called first above so the snapshot is still valid when freed.
+ 	if (state->query_snapshot)
+ 		UnregisterSnapshot(state->query_snapshot);
+-	// Delete EVERY C++ member BEFORE free(state); free(state) is the LAST statement (no read of
+-	// state-> after it). qDescs/children/etc. are heap-owned vectors/sets allocated in InitTJSState.
+-	delete(state->proc_pq);
+-	delete(state->seenSet);
+-	delete(state->result_stack);
+-	delete(state->reachable);
+-	delete(state->qDescs);
+-	delete(state->children);
+-	free(state);
++	// TRIDB: operator arg hardening — containers released here (eager, normal path) or by the
++	// reset callback (error path), whichever runs first; the struct itself is freed ONLY by the
++	// callback (it hosts the registered callback node — see releaseTJSStateMemory).
++	releaseTJSStateMemory(state);
+ }
+ 
+ 
+@@ -858,6 +932,14 @@
+ 		int argc = 0;
+ 		text *tablename = PG_GETARG_TEXT_PP(argc++);
+ 		uint32 k = PG_GETARG_UINT32(argc++);
++		/* TRIDB: operator arg hardening (advisor plan 024). k = 0 makes the bounded-PQ
++		 * "full" test true on an EMPTY queue (top()/pop() on empty std::priority_queue is
++		 * UB — backend crash); a negative SQL int arrives through PG_GETARG_UINT32 as a
++		 * huge uint32 (~4.29e9), making the "bounded" heap unbounded. One range check
++		 * covers both. Future operators must copy this arg-guard pattern. */
++		if (k < 1 || k > 10000)
++			ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
++					errmsg("tjs: k must be 1..10000 (got %u)", k)));
+ 		Oid table_oid = getrelidT(std::string(text_to_cstring(tablename)));
+ 		if (!OidIsValid(table_oid))
+ 			ereport(ERROR,
+@@ -928,13 +1010,23 @@
+ 		// break out (SECURITY.md). quote_identifier returns the input unchanged when quoting is
+ 		// unneeded, so ordinary names are byte-identical — no behavior change for existing callers.
+ 		const char *qtbl = quote_identifier(text_to_cstring(tablename));
++		// TRIDB: operator arg hardening — reject truncated compose instead of running silently
++		// truncated SQL (worst case: a dropped trailing clause returns WRONG rows).
+ 		if ( strlen(text_to_cstring(filter_exp_text)) == 0 ){
+-			snprintf(sourceText, sizeof(sourceText), "select %s from %s order by %s",
++			int __n = snprintf(sourceText, sizeof(sourceText), "select %s from %s order by %s",
+ 					 text_to_cstring(attr_exp_text), qtbl, orderby.c_str());
++			if (__n < 0 || (size_t) __n >= sizeof(sourceText))
++				ereport(ERROR, (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
++						errmsg("tjs: generated vector-leg SQL exceeds %zu bytes "
++							   "(attr/orderby expression too large)", sizeof(sourceText))));
+ 		} else {
+-			snprintf(sourceText, sizeof(sourceText), "select %s from %s where %s order by %s",
++			int __n = snprintf(sourceText, sizeof(sourceText), "select %s from %s where %s order by %s",
+ 					 text_to_cstring(attr_exp_text), qtbl,
+ 					 text_to_cstring(filter_exp_text), orderby.c_str());
++			if (__n < 0 || (size_t) __n >= sizeof(sourceText))
++				ereport(ERROR, (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
++						errmsg("tjs: generated vector-leg SQL exceeds %zu bytes "
++							   "(filter/orderby expression too large)", sizeof(sourceText))));
+ 		}
+ 		DEBUG_PRINT("TJS vector leg SQL: %s", sourceText);
+ 
+--- a/src/tjs_open_operator.cpp
++++ b/src/tjs_open_operator.cpp
+@@ -343,6 +343,10 @@
+ 
+ 	bool children_closed;
+ 	Snapshot query_snapshot;   // DEV-1236: pinned for the SRF's whole lifetime.
++
++	// TRIDB: operator arg hardening (advisor plan 024): error-path memory release.
++	bool released;              // C++ containers already deleted (releaseTJSOpenStateMemory ran)?
++	MemoryContextCallback cb;   // reset callback registered on the SRF's multi-call context.
+ } TJSOpenState;
+ 
+ // Per-backend instrumentation for the last tjs_open scan (read via tjs_open_candidates_examined()).
+@@ -350,6 +354,48 @@
+ static int64 tjs_open_last_bridges  = 0;
+ 
+ // ---------------------------------------------------------------------------
++// TRIDB: operator arg hardening (advisor plan 024) — error-path memory release, the exact twin
++// of tjs_operator.cpp's releaseTJSStateMemory: an ereport(ERROR) after state init longjmps past
++// EndTJSOpenState, permanently leaking the malloc'd struct + new'd containers. A
++// MemoryContextCallback on the SRF's multi-call context releases them if not already released.
++// The callback must NOT touch executor/SPI/relation teardown (abort cleanup owns those).
++// free(state) happens ONLY in the callback: the callback node is embedded in the struct, so
++// freeing earlier would dangle the context's reset-callback list. See tjs_operator.cpp.
++// ---------------------------------------------------------------------------
++static void releaseTJSOpenStateMemory(TJSOpenState* state){
++	if (!state || state->released)
++		return;
++	state->released = true;
++	// Containers only; HeapTuples inside them live in the multi-call context (never pfree'd here).
++	delete(state->vec_pq);
++	delete(state->bridge_pq);
++	delete(state->seenSet);
++	delete(state->result_stack);
++	delete(state->bridges);
++	delete(state->qDescs);
++	delete(state->children);
++	delete(state->tbl_name);
++	delete(state->attr_exp);
++	delete(state->filter_exp);
++	delete(state->orderby_exp);
++	delete(state->id_col);
++}
++
++static void tjsOpenStateResetCB(void* arg){
++	TJSOpenState* state = (TJSOpenState*) arg;
++	releaseTJSOpenStateMemory(state);   // no-op if EndTJSOpenState already released them
++	free(state);
++}
++
++// Register the release callback; call ONLY once the state's container members are all set.
++static void registerTJSOpenStateRelease(TJSOpenState* state, MemoryContext cxt){
++	state->released = false;
++	state->cb.func = tjsOpenStateResetCB;
++	state->cb.arg  = state;
++	MemoryContextRegisterResetCallback(cxt, &state->cb);
++}
++
++// ---------------------------------------------------------------------------
+ // pullOneCandidateO — advance the vector leg by ONE tuple. Returns the slot (or NULL at stream end),
+ // sets *rank_score to the TRUE HNSW distance (xs_orderbyvals[0] — the sole rank authority), and
+ // *cand_id to the candidate's graph id. Increments examined. Skips already-seen tids transparently
+@@ -388,7 +434,13 @@
+ 		pq->push(pq_item_o_t(rank_score, copyItemO(slot), tid));
+ 		MemoryContextSwitchTo(old);
+ 	} else if (pq->top().first > rank_score) {
++		// TRIDB: operator arg hardening — free the evicted tuple; evicted copies otherwise
++		// accumulate in the SRF's multi-call context until end of query. Each heap holds its
++		// OWN tuple copies (copyItemO / heap_copytuple), so a cross-heap dangling pointer is
++		// impossible. Result tuples (finalizeTopKO's chosen set) are never freed here.
++		HeapTuple evicted = pq->top().second;
+ 		pq->pop();
++		heap_freetuple(evicted);
+ 		MemoryContext old = MemoryContextSwitchTo(estate->result_cxt);
+ 		pq->push(pq_item_o_t(rank_score, copyItemO(slot), tid));
+ 		MemoryContextSwitchTo(old);
+@@ -566,8 +618,15 @@
+ 		if (estate->bridge_pq->size() < k)
+ 			estate->bridge_pq->push(pq_item_o_t(dist, tcopy, bkey));
+ 		else if (estate->bridge_pq->top().first > dist) {
++			// TRIDB: operator arg hardening — free the evicted bridge tuple (own copy).
++			HeapTuple evicted = estate->bridge_pq->top().second;
+ 			estate->bridge_pq->pop();
++			heap_freetuple(evicted);
+ 			estate->bridge_pq->push(pq_item_o_t(dist, tcopy, bkey));
++		} else {
++			// TRIDB: operator arg hardening — the new copy lost to the current worst and was
++			// never stored; free it instead of leaking it into the multi-call context.
++			heap_freetuple(tcopy);
+ 		}
+ 		estate->bridges_injected++;
+ 	}
+@@ -654,7 +713,13 @@
+ 				bool vec_not_full = (estate->vec_pq->size() < k);
+ 				bool vec_winner = vec_not_full || (estate->vec_pq->top().first > sb.score);
+ 				if (vec_winner) {
+-					if (estate->vec_pq->size() == k) estate->vec_pq->pop();
++					// TRIDB: operator arg hardening — free the evicted tuple (own copy;
++					// seed_buf is not read after this loop, so no dangling use).
++					if (estate->vec_pq->size() == k) {
++						HeapTuple evicted = estate->vec_pq->top().second;
++						estate->vec_pq->pop();
++						heap_freetuple(evicted);
++					}
+ 					estate->vec_pq->push(pq_item_o_t(sb.score, sb.tup, sb.tid));
+ 					consecutive_drops = 0;
+ 				}
+@@ -749,6 +814,9 @@
+ 	state->children_closed  = false;
+ 	state->query_snapshot   = query_snapshot;
+ 
++	// TRIDB: operator arg hardening — error-path release callback (see releaseTJSOpenStateMemory).
++	registerTJSOpenStateRelease(state, state->result_cxt);
++
+ 	return state;
+ }
+ 
+@@ -769,19 +837,10 @@
+ 	ExecDropSingleTupleTableSlot(state->ps.ps_ResultTupleSlot);
+ 	if (state->query_snapshot)
+ 		UnregisterSnapshot(state->query_snapshot);
+-	delete(state->vec_pq);
+-	delete(state->bridge_pq);
+-	delete(state->seenSet);
+-	delete(state->result_stack);
+-	delete(state->bridges);
+-	delete(state->qDescs);
+-	delete(state->children);
+-	delete(state->tbl_name);
+-	delete(state->attr_exp);
+-	delete(state->filter_exp);
+-	delete(state->orderby_exp);
+-	delete(state->id_col);
+-	free(state);
++	// TRIDB: operator arg hardening — containers released here (eager, normal path) or by the
++	// reset callback (error path), whichever runs first; the struct itself is freed ONLY by the
++	// callback (it hosts the registered callback node — see releaseTJSOpenStateMemory).
++	releaseTJSOpenStateMemory(state);
+ }
+ 
+ // ---------------------------------------------------------------------------
+@@ -790,8 +849,8 @@
+ //   table_name  — the relational+vector table (e.g. 'paragraphs').
+ //   k           — global top-k.
+ //   term_cond   — VBASE consecutive-drops early-termination bound (0 -> default 50).
+-//   m_seeds     — number of ANN seeds drawn from the vector leg (0 -> default 5). NO caller src.
+-//   hops        — graph-expansion depth from the seeds (0 -> default 2).
++//   m_seeds     — number of ANN seeds drawn from the vector leg (1..10000). NO caller src.
++//   hops        — graph-expansion depth from the seeds (1..8).
+ //   attr_exp    — output columns; the FIRST must be the candidate's graph id. e.g. 'id'.
+ //   filter_exp  — RELATIONAL leg: pushed into the vector leg's SQL WHERE. '' = none.
+ //   orderby_exp — VECTOR leg: the HNSW orderby AND the seed/personalization vector.
+@@ -819,6 +878,14 @@
+ 		int argc = 0;
+ 		text *tablename = PG_GETARG_TEXT_PP(argc++);
+ 		uint32 k = PG_GETARG_UINT32(argc++);
++		/* TRIDB: operator arg hardening (advisor plan 024). k = 0 makes the bounded-heap
++		 * "full" test true on an EMPTY heap (top()/pop() on empty std::priority_queue is
++		 * UB — backend crash); a negative SQL int arrives through PG_GETARG_UINT32 as a
++		 * huge uint32 (~4.29e9), making the "bounded" heap unbounded. One range check
++		 * covers both. Future operators must copy this arg-guard pattern. */
++		if (k < 1 || k > 10000)
++			ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
++					errmsg("tjs_open: k must be 1..10000 (got %u)", k)));
+ 		Oid table_oid = getrelidO(std::string(text_to_cstring(tablename)));
+ 		if (!OidIsValid(table_oid))
+ 			ereport(ERROR,
+@@ -829,13 +896,19 @@
+ 		if (termCond == 0)
+ 			termCond = 50;
+ 
++		/* TRIDB: operator arg hardening (advisor plan 024): m_seeds/hops range checks
++		 * replace the old silent 0->default coercions — out-of-range values (including a
++		 * negative m_seeds arriving as a huge uint32) are now an ERROR, never a surprise
++		 * seed window or an unbounded BFS. */
+ 		uint32 mSeeds = PG_GETARG_UINT32(argc++);
+-		if (mSeeds == 0)
+-			mSeeds = 5;
++		if (mSeeds < 1 || mSeeds > 10000)
++			ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
++					errmsg("tjs_open: m_seeds must be 1..10000 (got %u)", mSeeds)));
+ 
+ 		int32 hops = PG_GETARG_INT32(argc++);
+-		if (hops <= 0)
+-			hops = 2;
++		if (hops < 1 || hops > 8)
++			ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
++					errmsg("tjs_open: hops must be 1..8 (got %d)", hops)));
+ 
+ 		text* attr_exp_text   = PG_GETARG_TEXT_PP(argc++);
+ 		text* filter_exp_text = PG_GETARG_TEXT_PP(argc++);
