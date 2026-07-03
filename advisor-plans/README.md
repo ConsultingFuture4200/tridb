@@ -19,14 +19,14 @@ never improvise.
 
 | Plan | Title | Priority | Effort | Risk | Depends on | Status |
 |------|-------|----------|--------|------|------------|--------|
-| 024 | Operator arg hardening + memory lifecycle (crash/leak class + lowering regression) | P1 | M | MED | — | TODO |
-| 025 | ADR-0013 Stage A+B: operators+benches onto the v1 native AM + docs truth pass | P1 | L | MED-HIGH | 024 | TODO |
-| 026 | Graph-store safety riders: ACLs, VACUUM/wraparound docs, freeze design note | P1 | S | LOW | — (file-coord w/ 025) | TODO |
-| 027 | CI nightly engine gate + KEEP_GOING + 4 missing high-value tests | P1 | M | LOW | — | TODO |
-| 028 | PG17 platform feasibility spike + public "why a fork" ADR | P1 | M | LOW | — (parallel) | TODO |
-| 029 | Hot-path perf: O(D) graph loads, SIMD drain distance, hash-join membership | P2 | M | MED | 024 (rebase over 025) | TODO |
-| 030 | Benchmark credibility: p95/p99, multi-client, HNSW row, pins, dep hygiene | P2 | M-L | LOW-MED | soft 025 | TODO |
-| 031 | FR-6 calibrated two-cost decision + graph-leg cardinality + boundary sweep | P2 | M | MED | 025 | TODO |
+| 024 | Operator arg hardening + memory lifecycle (crash/leak class + lowering regression) | P1 | M | MED | — | **MERGED** (`0d3a2d4`, persona 3/3) |
+| 025 | ADR-0013 Stage A+B: operators+benches onto the v1 native AM + docs truth pass | P1 | L | MED-HIGH | 024 | **MERGED** (`18696cb`, persona 3/3; 1M v1 recall 1.0 / 13.4×) |
+| 026 | Graph-store safety riders: ACLs, VACUUM/wraparound docs, freeze design note | P1 | S | LOW | — | **MERGED** (`64116cc`, persona 3/3) |
+| 027 | CI nightly engine gate + KEEP_GOING + 4 missing high-value tests | P1 | M | LOW | — | **MERGED** (`bcf3610`, persona 3/3) |
+| 028 | PG17 platform feasibility spike + public "why a fork" ADR | P1 | M | LOW | — | **MERGED** (`9a855aa`, persona 3/3; ADR-0015: zero PG17 API drift, only 32KB-page bind) |
+| 029 | Hot-path perf: SIMD drain distance, hash-join membership (O(D) loads moot post-025 v1 native ingest) | P2 | M | MED | 024/025 merged | TODO — engine-patch cycle |
+| 030 | Benchmark credibility: p95/p99, HNSW row, dep hygiene (steps 2/4 deferred) | P2 | M-L | LOW-MED | — | **MERGED** (`7031c8d`, persona 3/3; steps 2 multi-client + 4 dataset-pin deferred) |
+| 031 | FR-6 calibrated two-cost decision + graph-leg cardinality + boundary sweep | P2 | M | MED | 025 (now merged) | TODO — unblocked |
 
 Recommended order: **024 → (026, 027, 028 in parallel) → 025 → (029, 030, 031)**. Engine-image
 builds and `make graph-test` runs are serialized (one docker-heavy plan at a time); 026/027/028
