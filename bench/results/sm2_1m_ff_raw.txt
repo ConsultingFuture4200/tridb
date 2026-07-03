@@ -1,0 +1,241 @@
+#SM2 QSTART qid=0 src=0 k=5
+Time: 10.794 ms
+Time: 5.527 ms
+Time: 4.721 ms
+Time: 4.627 ms
+Time: 4.559 ms
+Time: 4.533 ms
+Time: 4.757 ms
+ #SM2 RESULT qid=0 ids=125381,680665,169537,901120,415953
+#SM2 QEND qid=0
+#SM2 QSTART qid=1 src=1 k=5
+Time: 10.755 ms
+Time: 10.793 ms
+Time: 8.279 ms
+Time: 4.549 ms
+Time: 4.643 ms
+Time: 4.132 ms
+Time: 3.765 ms
+ #SM2 RESULT qid=1 ids=203582,769,142638,139135,846237
+#SM2 QEND qid=1
+#SM2 QSTART qid=2 src=2 k=5
+Time: 10.485 ms
+Time: 10.529 ms
+Time: 8.832 ms
+Time: 5.093 ms
+Time: 4.277 ms
+Time: 4.782 ms
+Time: 4.115 ms
+ #SM2 RESULT qid=2 ids=945492,406963,426138,727070,253828
+#SM2 QEND qid=2
+#SM2 QSTART qid=3 src=3 k=5
+Time: 10.497 ms
+Time: 10.992 ms
+Time: 8.930 ms
+Time: 4.756 ms
+Time: 4.041 ms
+Time: 3.705 ms
+Time: 3.595 ms
+ #SM2 RESULT qid=3 ids=676701,219411,363313,45556,672800
+#SM2 QEND qid=3
+#SM2 QSTART qid=4 src=4 k=5
+Time: 10.199 ms
+Time: 10.415 ms
+Time: 9.136 ms
+Time: 4.738 ms
+Time: 4.629 ms
+Time: 4.497 ms
+Time: 4.379 ms
+ #SM2 RESULT qid=4 ids=484412,321319,223813,648228,912608
+#SM2 QEND qid=4
+#SM2 QSTART qid=5 src=5 k=5
+Time: 10.499 ms
+Time: 10.955 ms
+Time: 8.470 ms
+Time: 5.098 ms
+Time: 4.241 ms
+Time: 3.695 ms
+Time: 3.661 ms
+ #SM2 RESULT qid=5 ids=146501,913934,82818,169078,212154
+#SM2 QEND qid=5
+#SM2 QSTART qid=6 src=6 k=5
+Time: 10.469 ms
+Time: 10.482 ms
+Time: 8.181 ms
+Time: 4.446 ms
+Time: 3.928 ms
+Time: 3.676 ms
+Time: 3.583 ms
+ #SM2 RESULT qid=6 ids=888376,413358,436419,118977,504688
+#SM2 QEND qid=6
+#SM2 QSTART qid=7 src=7 k=5
+Time: 10.475 ms
+Time: 10.468 ms
+Time: 8.998 ms
+Time: 5.148 ms
+Time: 4.222 ms
+Time: 3.802 ms
+Time: 3.641 ms
+ #SM2 RESULT qid=7 ids=806907,543902,430789,134446,381103
+#SM2 QEND qid=7
+#SM2 QSTART qid=8 src=8 k=5
+Time: 10.236 ms
+Time: 10.430 ms
+Time: 8.275 ms
+Time: 4.493 ms
+Time: 4.635 ms
+Time: 4.111 ms
+Time: 3.745 ms
+ #SM2 RESULT qid=8 ids=118505,630637,896240,830586,603877
+#SM2 QEND qid=8
+#SM2 QSTART qid=9 src=9 k=5
+Time: 10.347 ms
+Time: 10.394 ms
+Time: 8.881 ms
+Time: 4.672 ms
+Time: 4.015 ms
+Time: 3.663 ms
+Time: 3.555 ms
+ #SM2 RESULT qid=9 ids=603892,48635,212012,550149,840536
+#SM2 QEND qid=9
+#SM2 QSTART qid=10 src=10 k=5
+Time: 10.591 ms
+Time: 10.472 ms
+Time: 8.814 ms
+Time: 5.120 ms
+Time: 5.221 ms
+Time: 4.516 ms
+Time: 4.471 ms
+ #SM2 RESULT qid=10 ids=657714,93076,981336,570512,502531
+#SM2 QEND qid=10
+#SM2 QSTART qid=11 src=11 k=5
+Time: 10.484 ms
+Time: 10.876 ms
+Time: 8.340 ms
+Time: 4.571 ms
+Time: 4.623 ms
+Time: 4.536 ms
+Time: 4.002 ms
+ #SM2 RESULT qid=11 ids=309215,927754,329440,254215,1003
+#SM2 QEND qid=11
+#SM2 QSTART qid=12 src=12 k=5
+Time: 10.574 ms
+Time: 10.501 ms
+Time: 8.190 ms
+Time: 5.053 ms
+Time: 4.601 ms
+Time: 4.066 ms
+Time: 3.675 ms
+ #SM2 RESULT qid=12 ids=922826,775183,948305,925801,963836
+#SM2 QEND qid=12
+#SM2 QSTART qid=13 src=13 k=5
+Time: 10.453 ms
+Time: 11.005 ms
+Time: 8.736 ms
+Time: 4.644 ms
+Time: 4.048 ms
+Time: 3.734 ms
+Time: 3.807 ms
+ #SM2 RESULT qid=13 ids=860710,321072,492046,901438,900280
+#SM2 QEND qid=13
+#SM2 QSTART qid=14 src=14 k=5
+Time: 10.443 ms
+Time: 10.525 ms
+Time: 8.144 ms
+Time: 4.426 ms
+Time: 4.591 ms
+Time: 4.065 ms
+Time: 4.319 ms
+ #SM2 RESULT qid=14 ids=478683,818569,954731,741123,683250
+#SM2 QEND qid=14
+#SM2 QSTART qid=15 src=15 k=5
+Time: 10.398 ms
+Time: 10.467 ms
+Time: 8.213 ms
+Time: 5.495 ms
+Time: 4.256 ms
+Time: 3.744 ms
+Time: 3.612 ms
+ #SM2 RESULT qid=15 ids=262761,713934,87242,950981,643327
+#SM2 QEND qid=15
+#SM2 QSTART qid=16 src=16 k=5
+Time: 10.430 ms
+Time: 10.532 ms
+Time: 8.095 ms
+Time: 4.403 ms
+Time: 4.457 ms
+Time: 3.952 ms
+Time: 4.421 ms
+ #SM2 RESULT qid=16 ids=41204,805207,505856,841495,936206
+#SM2 QEND qid=16
+#SM2 QSTART qid=17 src=17 k=5
+Time: 10.578 ms
+Time: 10.459 ms
+Time: 8.609 ms
+Time: 4.995 ms
+Time: 4.403 ms
+Time: 4.476 ms
+Time: 3.969 ms
+ #SM2 RESULT qid=17 ids=345652,648116,538991,983208,803123
+#SM2 QEND qid=17
+#SM2 QSTART qid=18 src=18 k=5
+Time: 10.787 ms
+Time: 11.093 ms
+Time: 8.344 ms
+Time: 4.545 ms
+Time: 3.956 ms
+Time: 3.693 ms
+Time: 3.594 ms
+ #SM2 RESULT qid=18 ids=592379,447809,865930,670764,951660
+#SM2 QEND qid=18
+#SM2 QSTART qid=19 src=19 k=5
+Time: 10.469 ms
+Time: 10.507 ms
+Time: 8.303 ms
+Time: 5.159 ms
+Time: 4.724 ms
+Time: 4.589 ms
+Time: 4.493 ms
+ #SM2 RESULT qid=19 ids=802024,606684,800247,547654,353372
+#SM2 QEND qid=19
+#SM2 QSTART qid=20 src=20 k=5
+Time: 10.592 ms
+Time: 10.726 ms
+Time: 8.231 ms
+Time: 4.369 ms
+Time: 3.930 ms
+Time: 4.457 ms
+Time: 4.364 ms
+ #SM2 RESULT qid=20 ids=93033,843586,256671,799770,57926
+#SM2 QEND qid=20
+#SM2 QSTART qid=21 src=21 k=5
+Time: 10.829 ms
+Time: 10.978 ms
+Time: 8.611 ms
+Time: 5.196 ms
+Time: 3.971 ms
+Time: 3.897 ms
+Time: 3.592 ms
+ #SM2 RESULT qid=21 ids=899061,242272,463201,30427,100289
+#SM2 QEND qid=21
+#SM2 QSTART qid=22 src=22 k=5
+Time: 10.894 ms
+Time: 10.500 ms
+Time: 8.800 ms
+Time: 5.084 ms
+Time: 4.698 ms
+Time: 4.077 ms
+Time: 3.676 ms
+ #SM2 RESULT qid=22 ids=24486,964390,41250,113019,415702
+#SM2 QEND qid=22
+#SM2 QSTART qid=23 src=23 k=5
+Time: 10.706 ms
+Time: 11.190 ms
+Time: 8.717 ms
+Time: 5.070 ms
+Time: 4.654 ms
+Time: 4.576 ms
+Time: 4.696 ms
+ #SM2 RESULT qid=23 ids=710194,623414,335674,489429,159968
+#SM2 QEND qid=23
+#SM2 DONE
