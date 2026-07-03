@@ -1,5 +1,16 @@
 # TriDB NEON Engine — Index-Quality × term_cond Sweep (DEV-1286) v0.1.0
 
+> **REGENERATED 2026-07-02** on the merged-batch engine `tridb/msvbase:gx10-batch`
+> (`master` @ the 010-023 remediation merge). **All tables below are the current numbers.**
+> They differ from the original 2026-06-26 run because the synthetic **oracle** generator's
+> tie-break changed (`np.argsort(d2)` → `np.lexsort((cd, d2))`, "ties broken by id like
+> `ORDER BY d2, id`", commit `f604c27`) — a stricter, more-correct oracle, NOT an engine change.
+> The engine's recall is unchanged across the merge: an A/B with vs. without the relaxed-mono
+> executor guard (plan 022) is byte-identical. Full attribution + the SIFT-1M headline:
+> `docs/benchmark_gx10_merge_validation_v0.1.0.md`. This regen ran the **m16/ef200** config only
+> (index quality is not the recall lever — see the finding below); the extended `term_cond` grid
+> now reaches the true saturation point under the stricter oracle.
+
 **TL;DR.** With the ARM **NEON** distance kernel ([[DEV-1234]]) in place, the HNSW
 **index-quality reloptions** (`m` / `ef_construction`, [[DEV-1286]]) and the `term_cond`
 search-depth knob were swept on the **live forked-MSVBASE engine rebuilt with NEON +
@@ -12,36 +23,35 @@ gate the GTM plan ([[gtm_opensource_v0.1.0]] R1) named as blocking a public benc
 
 ## Results (live, NEON engine, 20k×128, k=10)
 
-Index build time (NEON kernel; on the scalar fallback these were impractical — see below):
+Index build time (NEON kernel, m16/ef200): **2.79 s**. (m32/ef400 not re-run this regen; it
+builds slower for identical recall — see the finding below.)
 
-| index config | build time |
-|---|---|
-| `m=16, ef_construction=200` (hnswlib default) | **3.17 s** |
-| `m=32, ef_construction=400` (high quality) | **5.38 s** |
-
-Recall / effort / latency curve:
+Recall / effort / latency curve (m16/ef200; extended `term_cond` grid):
 
 | config | `term_cond` | recall@10 | corpus examined | median latency |
 |---|---|---|---|---|
-| m16/ef200 | 20   | **1.00** | 2.18% | **1.82 ms** |
-| m16/ef200 | 50   | 1.00 | 2.34% | 1.78 ms |
-| m16/ef200 | 200  | 1.00 | 3.10% | 2.29 ms |
-| m16/ef200 | 1000 | 1.00 | 7.11% | 4.27 ms |
-| m32/ef400 | 20   | **1.00** | 2.18% | 2.21 ms |
-| m32/ef400 | 50   | 1.00 | 2.34% | 2.15 ms |
-| m32/ef400 | 200  | 1.00 | 3.10% | 2.63 ms |
-| m32/ef400 | 1000 | 1.00 | 7.11% | 4.97 ms |
+| m16/ef200 | 20    | 0.900 | 2.38% | **1.87 ms** |
+| m16/ef200 | 50    | 0.9125 | 2.57% | 2.12 ms |
+| m16/ef200 | 200   | 0.950 | 3.49% | 2.13 ms |
+| m16/ef200 | 1000  | **1.000** | 8.58% | 4.52 ms |
+| m16/ef200 | 5000  | 1.000 | 28.58% | 12.82 ms |
+| m16/ef200 | 10000 | 1.000 | 53.58% | 23.39 ms |
 
-Recall@10 was verified exact: for every query the live `tjs()` top-10 equals the numpy
-oracle top-10 (8/8 queries, set-identical).
+Under the stricter (id-tie-broken) oracle, recall at 20k×128 is **no longer saturated at low
+`term_cond`** (the original run's looser oracle read 1.00 everywhere): it climbs 0.90 → exact
+**1.000 at `term_cond=1000` / 8.58% examined / 4.52 ms** — still under the 25% TR-1 corpus-examined
+ceiling. `term_cond ≥ 5000` reaches the same exact recall but blows past the ceiling (28.6% / 53.6%
+examined) for no gain — i.e. `term_cond=1000` is the operating point here.
 
 ## What this shows (and what it does not)
 
 1. **NEON un-sandbags the engine, end to end.** At the recall@10 = 100% operating point
-   (`term_cond=20`, default index) the live query latency is **1.82 ms median** at **2.18%
-   of the corpus examined**. This is the first *real* latency number for the canonical query
-   on the target ISA; before NEON every distance was scalar and the figure was wrong-low.
-   Higher `term_cond` only trades latency/examined for recall it has already saturated.
+   (`term_cond=1000`, default index) the live query latency is **4.52 ms median** at **8.58%
+   of the corpus examined** — well under the 25% TR-1 ceiling. This is a *real* latency number
+   for the canonical query on the target ISA; before NEON every distance was scalar and the
+   figure was wrong-low. (The original run reported 1.82 ms at `term_cond=20`, but that read
+   100% only under the looser pre-`f604c27` oracle; the stricter oracle now puts exact recall
+   at `term_cond=1000`.)
 
 2. **The reloptions ([[DEV-1286]]) work and the higher-quality build is now affordable.**
    `CREATE INDEX ... WITH (m=32, ef_construction=400)` is accepted and built in **5.4 s**.
@@ -50,13 +60,13 @@ oracle top-10 (8/8 queries, set-identical).
    impractical to finish at 100k×768 — which is exactly why the lever was gated on NEON.
    NEON removes that gate.
 
-3. **At this scale recall is saturated, so index quality buys latency, not recall.** Both
-   configs return identical, exact top-10 at every `term_cond`; the `m=32/ef=400` index is
-   *slower* to query (more neighbours per node) for no recall gain. The regime where a
-   higher-quality index reaches 100% recall at a *lower* examined-% than the default is the
-   **100k / dim-768** scale, where the default `M=16` index needed `term_cond≈10000` /
-   20.1% examined for exact parity ([[DEV-1169]] curve). Reproducing that full recall curve
-   *with NEON latency attached* is the **100k / dim-768 headline run, now done — see below.**
+3. **Index quality buys latency, not recall.** Under the stricter oracle the curve is no
+   longer saturated at low `term_cond` (it climbs to exact recall at `term_cond=1000`), but the
+   index-quality finding is unchanged and confirmed twice on the merged engine: `m=32/ef=400`
+   returns **identical recall/examined** to `m16/ef200` at every `term_cond` — it only costs
+   more to build and slightly more to query. At this corpus `term_cond` is the recall lever, not
+   index quality. The full recall/latency curve at scale is the **100k / dim-768 headline run —
+   see below.**
 
 ## Headline run — 100k × dim-768 (the recall curve at scale, NEON, k=10)
 
@@ -66,30 +76,31 @@ k=10, recall graded against the exact numpy oracle. Here the curve **bites** (it
 
 | config | `term_cond` | recall@10 | corpus examined | median latency |
 |---|---|---|---|---|
-| m16/ef200 | 20   | **0.9625** | 3.28% | **36.3 ms** |
-| m16/ef200 | 50   | 0.9625 | 3.31% | 36.4 ms |
-| m16/ef200 | 200  | 0.9875 | 3.51% | 37.1 ms |
-| m16/ef200 | 1000 | **1.0000** | 4.44% | 41.1 ms |
-| m16/ef200 | 5000 | 1.0000 | 8.46% | 57.4 ms |
-| m32/ef400 | 20   | 0.9625 | 3.28% | 39.4 ms |
-| m32/ef400 | 1000 | 1.0000 | 4.44% | 44.7 ms |
-| m32/ef400 | 5000 | 1.0000 | 8.46% | 62.3 ms |
+| m16/ef200 | 20    | **0.8625** | 3.06% | **42.1 ms** |
+| m16/ef200 | 50    | 0.8625 | 3.10% | 45.5 ms |
+| m16/ef200 | 200   | 0.9000 | 3.40% | 49.0 ms |
+| m16/ef200 | 1000  | 0.9750 | 4.86% | 64.3 ms |
+| m16/ef200 | 5000  | **1.0000** | 9.70% | 104.6 ms |
+| m16/ef200 | 10000 | 1.0000 | 14.74% | 148.1 ms |
 
-Index build (NEON): m16/ef200 = **137 s**, m32/ef400 = **489 s** — both feasible only because of the
-NEON kernel; on the scalar fallback these are single-core-bound and impractical at this scale (the
-DEV-1286 thesis, now confirmed at 100k/768). Artifacts: `bench/results/neon_sweep_100k_metrics.json`,
-`neon_sweep_100k_raw.txt`, `sweep100k_manifest.json`.
+Index build (NEON, m16/ef200): **151 s** — feasible only because of the NEON kernel; on the scalar
+fallback this is single-core-bound and impractical at this scale (the DEV-1286 thesis, confirmed at
+100k/768). Artifacts: `bench/results/neon_sweep_regen100k768.json` (on the Spark).
 
-**What it shows:** the canonical tri-modal query reaches **recall@10 = 96.25% at ~36 ms / 3.3%
-examined** (default index, `term_cond=20`) and climbs to **exact (100%) at ~41 ms / 4.4% examined**
-(`term_cond=1000`) — a real recall/effort/latency curve on real ARM SIMD, well under the 25% TR-1
-corpus-examined ceiling at every operating point. This is the proof-at-scale the GTM plan gated on.
+**What it shows:** the canonical tri-modal query reaches **recall@10 = 86.25% at ~42 ms / 3.06%
+examined** (default index, `term_cond=20`) and climbs to **exact (100%) at ~105 ms / 9.70% examined**
+(`term_cond=5000`) — a real recall/effort/latency curve on real ARM SIMD, under the 25% TR-1
+corpus-examined ceiling at every operating point (up to `term_cond=10000` = 14.7% examined). The
+`term_cond` knob is the operating-point lever; `term_cond=1000` gives 97.5% at 64 ms if you accept a
+near-exact answer for lower latency. (These numbers are lower than the original 2026-06-26 run because
+the oracle got stricter — `f604c27`, see the top banner — not because the engine changed.)
 
-**Honest negative finding:** the higher-quality index (`m=32, ef_construction=400`) gives **identical
-recall and examined** to the default at every `term_cond` here — it only costs more to build (489 s vs
-137 s) and slightly more to query. At this corpus the recall lever is `term_cond`, **not** index
-quality; the m/ef reloptions are exposed and work, but do not move the curve on this workload. (A
-clustered/real-embedding corpus may differ — that's the public-dataset run, `docs/benchmark_public_v0.1.0.md`.)
+**Honest negative finding (unchanged):** the higher-quality index (`m=32, ef_construction=400`) gives
+**identical recall and examined** to the default at every `term_cond` — confirmed twice on the merged
+engine (the with/without-plan-022 A/B ran both configs). It only costs more to build (~515 s vs 151 s)
+and slightly more to query. At this corpus the recall lever is `term_cond`, **not** index quality; the
+m/ef reloptions are exposed and work, but do not move the curve on this workload. (A clustered/real-
+embedding corpus may differ — that's the public-dataset run, `docs/benchmark_public_v0.1.0.md`.)
 
 ## Live-measured vs gated
 
