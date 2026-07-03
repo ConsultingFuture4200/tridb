@@ -96,6 +96,30 @@ pass:
 | `shmem_request_hook` (PG 15+ requirement for RequestAddinShmemSpace) | none of the three | n/a — none uses shared memory |
 | `MemoryContext` API deltas (PG 17 `MemoryContextReset` behavior, bump allocator) | none directly | additive in 17; no source change required |
 
+## E. Measured compile results (Step 2, PG 17.10 / Debian, gcc 14.2, stock 8KB BLCKSZ)
+
+| Extension | Errors | Warnings | Log |
+|---|---|---|---|
+| `src/graph_store_ext` | **0** | 0 | `compile_ext.log` — builds `graph_store.so` clean, unmodified |
+| `src/graph_store` | **1** | 0 | `compile_graph_store.log` — the single error is `gph_page.h:27` `static assertion failed: "graph store requires --with-blocksize=32 (BLCKSZ 32768)"` |
+| `src/planner` | **1** | 0 | `compile_planner.log` — same single error (inherits `gph_page.h` via `join_order_legstats.c`) |
+| `src/graph_store` (assert neutralized, spike-only) | **0** | **0** | `compile_graph_store_noassert.log` — builds `graph_store_am.so` clean |
+| `src/planner` (assert neutralized, spike-only) | **0** | **0** | `compile_planner_noassert.log` — builds clean |
+
+Measured conclusion: PG 13 → 17 API drift for the three extensions is **zero** — every server API
+they use (`GenericXLog*`, `ReadBufferExtended`, `PageInit`, SRF/SPI/fmgr, `relation_open`) compiles
+unchanged and warning-free against PG 17 headers. The ONLY bind is the 32KB block size, and it is
+an intentional compile-time gate (our own `StaticAssertDecl`), not an API incompatibility.
+
+Compile vs runtime consequences of 8KB stock pages (assert removed): all page math is
+BLCKSZ-derived, so the AM would RUN on 8KB pages, but capacity drops 4x — edge slots/page
+`(BLCKSZ - SizeOfPageHeaderData - GPH_SPECIAL_SIZE)/32` goes from ~1022 (32KB) to ~254 (8KB),
+quadrupling adjacency-chain page reads for high-degree vertices (the exact I/O the 32KB choice in
+ADR-0002 exists to avoid). A stock-compatible port therefore either (a) accepts 8KB pages with a
+measured traversal-I/O regression, or (b) requires a self-built PG 17 `--with-blocksize=32` — which
+forfeits managed-Postgres compatibility, the main strategic reason to leave the fork (recorded per
+the plan's STOP condition instead of performing the source build here).
+
 **Bottom line (reading pass):** the three PGXS extensions have no fork-symbol dependency at all;
 their only hard bind is `BLCKSZ == 32768`. Everything that is genuinely fork-only lives in (a) the
 executor/AM-API relaxed-monotonicity mechanism and (b) the MSVBASE vectordb module hosting the HNSW

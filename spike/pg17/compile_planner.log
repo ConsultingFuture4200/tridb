@@ -1,0 +1,11 @@
+gcc -Wall -Wmissing-prototypes -Wpointer-arith -Wdeclaration-after-statement -Werror=vla -Wendif-labels -Wmissing-format-attribute -Wimplicit-fallthrough=3 -Wcast-function-type -Wshadow=compatible-local -Wformat-security -fno-strict-aliasing -fwrapv -fexcess-precision=standard -Wno-format-truncation -Wno-stringop-truncation -g -g -O2 -Werror=implicit-function-declaration -fstack-protector-strong -fstack-clash-protection -Wformat -Werror=format-security -fcf-protection -fno-omit-frame-pointer -fPIC -fvisibility=hidden -I.//../graph_store -I. -I./ -I/usr/include/postgresql/17/server -I/usr/include/postgresql/internal -Wdate-time -D_FORTIFY_SOURCE=2 -D_GNU_SOURCE  -I/usr/include/libxml2   -c -o join_order.o join_order.c
+gcc -Wall -Wmissing-prototypes -Wpointer-arith -Wdeclaration-after-statement -Werror=vla -Wendif-labels -Wmissing-format-attribute -Wimplicit-fallthrough=3 -Wcast-function-type -Wshadow=compatible-local -Wformat-security -fno-strict-aliasing -fwrapv -fexcess-precision=standard -Wno-format-truncation -Wno-stringop-truncation -g -g -O2 -Werror=implicit-function-declaration -fstack-protector-strong -fstack-clash-protection -Wformat -Werror=format-security -fcf-protection -fno-omit-frame-pointer -fPIC -fvisibility=hidden -I.//../graph_store -I. -I./ -I/usr/include/postgresql/17/server -I/usr/include/postgresql/internal -Wdate-time -D_FORTIFY_SOURCE=2 -D_GNU_SOURCE  -I/usr/include/libxml2   -c -o join_order_legstats.o join_order_legstats.c
+In file included from /usr/include/postgresql/17/server/postgres.h:45,
+                 from join_order_legstats.c:23:
+/usr/include/postgresql/17/server/c.h:940:9: error: static assertion failed: "graph store requires --with-blocksize=32 (BLCKSZ 32768)"
+  940 |         _Static_assert(condition, errmessage)
+      |         ^~~~~~~~~~~~~~
+.//../graph_store/gph_page.h:27:1: note: in expansion of macro ‘StaticAssertDecl’
+   27 | StaticAssertDecl(BLCKSZ == 32768, "graph store requires --with-blocksize=32 (BLCKSZ 32768)");
+      | ^~~~~~~~~~~~~~~~
+make: *** [<builtin>: join_order_legstats.o] Error 1
