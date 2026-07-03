@@ -89,3 +89,7 @@ Artifacts: `bench/results/sm2_1m_v1_raw.txt` (this run's transcript), scored aga
 3. Follow-ups: archive v0 (ADR-0013 Stage C) after a release cycle on v1; re-run the public-dataset
    and filtered-SIFT headlines on v1 for full provenance consistency; the ~2 ms indirection is a
    candidate for a cached-vid fast path if it ever matters (it does not at these margins).
+4. **Framing note:** the headline multiplier over the correct baseline moves from the v0.2.0
+   figure of 18.3× to **13.4×** here — the same ~2 ms id-mapping tax, stated as a multiplier so
+   no reader is surprised. 13.4× on the native AM is the number to quote publicly; the 18.3× was
+   the v0 heap store the thesis does not sell.

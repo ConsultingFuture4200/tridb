@@ -89,8 +89,12 @@ BEGIN
     v := graph_store.gph_insert_vertex();
     INSERT INTO graph_store.gph_vid_map (ext_id, vid) VALUES (p_ext, v)
         ON CONFLICT (ext_id) DO NOTHING;
-    -- lost a (contract-violating) concurrent race: return the winner's vid;
-    -- our freshly allocated vid stays unmapped and edge-less (harmless orphan).
+    -- lost a (contract-violating) concurrent race: return the winner's vid; our freshly
+    -- allocated vid stays unmapped and edge-less (harmless orphan). SHARPER EDGE (Linus
+    -- review): under REPEATABLE READ the re-SELECT runs on the txn snapshot and could MISS
+    -- a concurrent winner committed after our snapshot -> returns NULL. Both cases are
+    -- excluded by the v1 single-writer contract (graph_am.c) and deferred to DIRECTION-04
+    -- (concurrent/incremental ingest); disclosed in benchmark_sm2_1m_v0.3.0.md honesty box.
     SELECT m.vid INTO v FROM graph_store.gph_vid_map m WHERE m.ext_id = p_ext;
     RETURN v;
 END

@@ -126,3 +126,44 @@ v1 *now* and inherit CSR-lite later — the value (measuring the real thesis com
 run) is worth one extra format bump. If the spike shows v1 reads still lag v0, CSR-lite's contiguity
 win becomes a prerequisite and the order flips to CSR-then-rewire. This ADR does not resolve plan
 009's go/no-go — it defers to plan 009 and only fixes the *ordering* relative to it.
+
+## Addendum 2026-07-03 — Stage A/B executed and validated (advisor plan 025)
+
+Stages A and B are DONE and measured; the Status line above is discharged here.
+
+**Stage A (operators onto v1).** The `gph_upsert_vertex(ext_id) RETURNS bigint` id-mapping layer
+(Option A, chosen over vid-as-argument) + a `gph_vid_map` dictionary side-table + a
+`gph_neighbors_ext(ext_id)` external-id traversal landed in `src/graph_store/graph_store_am--0.1.0.sql`,
+with drop-in v0-compat shims (`add_edge`/`neighbors`/`visits`/`graph_query`, byte-identical
+signatures). Both operators' SPI probe swapped `graph_store.neighbors` → `gph_neighbors_ext` via
+`scripts/patches/tridb_graph_v1_rewire.patch` (last in the chain, sentinel-verified in both operator
+files + a negative guard on the stale symbol). The single-SPI-connection / no-sibling-connect
+discipline (DEV-1236) is preserved — strengthened, since `gph_neighbors_ext` reads native pages
+directly rather than nesting a v0 SRF's own SPI. Golden rule 3 is now genuinely satisfied: topology
+traversal runs on the 32KB native adjacency pages; `gph_vid_map` is an id **dictionary**, not the edge
+set.
+
+**Stage B (benches + corpus onto v1).** All 9 drivers flipped to `CREATE EXTENSION graph_store_am`;
+the 3 corpus emitters materialize vertices through the map (corpus determinism preserved —
+entity ids/edges/manifests byte-identical, verified).
+
+**Validation.** `test/graph_v0v1_parity_test.sql` (differential oracle: dense-native vs
+sparse-ext-id-via-compat, digested over every probe vertex) PASSES — v0 and v1 traversals are
+byte-identical. All 4 operator suites + FR-7 (txn_atomicity C1/C2, crash_recovery both scenarios)
+PASS on `tridb/msvbase:gx10-v1`. The 1M filter-first headline re-measured on v1:
+**median 6.66 ms, recall@5 1.000 vs the exact oracle, SM-2 24/24, 13.4× over the correct baseline**,
+answers byte-identical to v0 — `docs/benchmark_sm2_1m_v0.3.0.md`. The ~2 ms over v0 (4.7→6.66) is the
+id-mapping indirection, a constant per-query tax with a named future fix (a C-level dense vid cache,
+DIRECTION-04).
+
+**Riders NOT discharged (tracked, gate concurrent-writer work).** This ADR's substrate-hardening
+riders remain open and must land BEFORE any concurrent-writer / incremental-ingest work makes v1 the
+write floor: rider 1 (O(1) arithmetic vid addressing — an *ingest/open* cost, distinct from the read
+tax above), rider 2/3 (traversal snapshot stability without a pinned per-Next snapshot;
+`gph_upsert_vertex`'s `ON CONFLICT` re-SELECT can return NULL under REPEATABLE READ + a concurrent
+committed winner). Both are bounded to near-zero for THIS launch by the append-only, single-writer
+contract the probe already assumes, and are disclosed in the v0.3.0 honesty box — but they are the
+explicit precondition for DIRECTION-04.
+
+**Stage C (archive v0) deliberately deferred** one release cycle: v0 is the parity oracle's
+counterparty and the rollback safety net (golden rule 9 exception with an explicit contract).
