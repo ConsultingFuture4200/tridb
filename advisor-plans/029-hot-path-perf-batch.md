@@ -140,3 +140,25 @@ When 025's Stage B replaces the v0 loader entirely, Step 1's grouped v0 path bec
 it still serves any v0-comparative bench. The unnest-join drain shape is also the right substrate if
 plan 031 later feeds a cardinality hint. Reviewer focus: exact-ordering preservation in Step 2 and
 the no-dupes argument in Step 3.
+
+---
+
+## Status addendum 2026-07-03 — DEFERRED (post-025 re-scope)
+
+Not executed this batch. Re-scoped after plan 025 (v0→v1 native AM rewire) merged:
+
+- **Step 1 (O(D) emitter loads) is now largely MOOT.** The hot path no longer uses the v0
+  `add_edge` array-concat upsert — v1 routes edges through the native `gph_insert_edge`
+  (page append, not O(D²) array rewrite). The v0 emitter grouping would only help any
+  remaining v0-comparative bench, which is low value.
+- **Steps 2 (SIMD drain distance) + 3 (hash-join membership) remain valid** — they live in
+  the store-independent filter-first `tjs()` body — but each requires a **full engine image
+  rebuild** (a new fork patch to `tjs_operator.cpp`) plus a **1M re-measurement**, which risks
+  the just-verified 025 filter-first path (recall 1.0 / 6.66 ms) for a P2 latency win on a path
+  already well inside its SM-2 margin (13.4×).
+
+**Recommendation:** execute Steps 2+3 as a focused engine-patch cycle in a future session when
+an engine rebuild is already planned (e.g. alongside DEV-1259 Phase B or the 031 boundary sweep),
+so the rebuild cost is shared. Re-verify the 025 filter-first answers are byte-identical after.
+Deferred deliberately, not skipped — the plan body above is ready to execute as written (apply
+Step 1's batching only to any surviving v0 path).

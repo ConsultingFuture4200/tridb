@@ -24,9 +24,9 @@ never improvise.
 | 026 | Graph-store safety riders: ACLs, VACUUM/wraparound docs, freeze design note | P1 | S | LOW | — | **MERGED** (`64116cc`, persona 3/3) |
 | 027 | CI nightly engine gate + KEEP_GOING + 4 missing high-value tests | P1 | M | LOW | — | **MERGED** (`bcf3610`, persona 3/3) |
 | 028 | PG17 platform feasibility spike + public "why a fork" ADR | P1 | M | LOW | — | **MERGED** (`9a855aa`, persona 3/3; ADR-0015: zero PG17 API drift, only 32KB-page bind) |
-| 029 | Hot-path perf: SIMD drain distance, hash-join membership (O(D) loads moot post-025 v1 native ingest) | P2 | M | MED | 024/025 merged | TODO — engine-patch cycle |
+| 029 | Hot-path perf: SIMD drain distance, hash-join membership (O(D) loads moot post-025) | P2 | M | MED | 024/025 merged | **DEFERRED** — needs engine cycle; share with a future rebuild (see plan addendum) |
 | 030 | Benchmark credibility: p95/p99, HNSW row, dep hygiene (steps 2/4 deferred) | P2 | M-L | LOW-MED | — | **MERGED** (`7031c8d`, persona 3/3; steps 2 multi-client + 4 dataset-pin deferred) |
-| 031 | FR-6 calibrated two-cost decision + graph-leg cardinality + boundary sweep | P2 | M | MED | 025 (now merged) | TODO — unblocked |
+| 031 | FR-6 calibrated cost decision core (wire-up + boundary sweep deferred) | P2 | M | MED | 025 | **MERGED** (`7954622`, persona 3/3; core only, default-off, wire-up gated on deg(src) accessor + sweep) |
 
 Recommended order: **024 → (026, 027, 028 in parallel) → 025 → (029, 030, 031)**. Engine-image
 builds and `make graph-test` runs are serialized (one docker-heavy plan at a time); 026/027/028
