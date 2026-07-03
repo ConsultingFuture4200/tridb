@@ -1,0 +1,1276 @@
+{
+  "sm": "SM-2",
+  "methodology": "Like-for-like client-side END-TO-END wall-clock per query on BOTH sides, over WARM connections, one warm-up discarded, MEDIAN of 7 measured runs; one-time load+index build EXCLUDED. TriDB = psql \\timing round-trip of the canonical tjs() query in the tridb/msvbase:dev throwaway cluster. Baseline = Python perf_counter around the realized canonical query across the live Milvus+Neo4j+Postgres stack, merged app-side. IDENTICAL corpus + queries + k on both sides (shared deterministic generator, same seed=42).",
+  "k": 5,
+  "seed": 42,
+  "term_cond": 10000,
+  "corpus_entities": 1000000,
+  "corpus_edges": 48000,
+  "num_queries": 24,
+  "runs": 7,
+  "sm2_target": 0.8,
+  "sm2_fraction": 0.0,
+  "sm2_passed": false,
+  "tridb_wins": 0,
+  "median_ratio_baseline_over_tridb": 0.271,
+  "mean_ratio_baseline_over_tridb": 0.28,
+  "answer_parity_exact_set": "0/24",
+  "answer_mean_jaccard": 0.2139,
+  "queries": [
+    {
+      "qid": 0,
+      "src": 0,
+      "k": 5,
+      "tridb_median_ms": 274.989,
+      "tridb_samples_ms": [
+        275.273,
+        275.214,
+        274.351,
+        274.576,
+        274.242,
+        275.253,
+        274.989
+      ],
+      "baseline_median_ms": 61.9734,
+      "baseline_samples_ms": [
+        62.931,
+        63.0462,
+        64.2866,
+        60.4147,
+        61.9734,
+        59.879,
+        60.7172
+      ],
+      "baseline_legs_ms": {
+        "graph": 41.1745,
+        "vector": 8.824,
+        "relational": 11.1882,
+        "merge": 0.1413
+      },
+      "tridb_faster": false,
+      "ratio_baseline_over_tridb": 0.225,
+      "tridb_result_ids": [
+        125381,
+        680665,
+        169537,
+        901120,
+        415953
+      ],
+      "baseline_result_ids": [
+        125381
+      ],
+      "answer_jaccard": 0.2,
+      "answer_exact_set_match": false,
+      "baseline_intermediate": {
+        "graph_reached_dst": 2000,
+        "vector_candidates": 160,
+        "relational_filtered": 1227,
+        "merged_candidates": 1,
+        "final_results": 1
+      }
+    },
+    {
+      "qid": 1,
+      "src": 1,
+      "k": 5,
+      "tridb_median_ms": 190.669,
+      "tridb_samples_ms": [
+        190.166,
+        190.669,
+        190.12,
+        191.703,
+        191.613,
+        190.971,
+        190.308
+      ],
+      "baseline_median_ms": 60.6065,
+      "baseline_samples_ms": [
+        61.9061,
+        65.8544,
+        59.659,
+        62.4075,
+        60.6065,
+        59.5923,
+        58.6745
+      ],
+      "baseline_legs_ms": {
+        "graph": 40.6678,
+        "vector": 8.94,
+        "relational": 10.9728,
+        "merge": 0.1395
+      },
+      "tridb_faster": false,
+      "ratio_baseline_over_tridb": 0.318,
+      "tridb_result_ids": [
+        203582,
+        769,
+        142638,
+        139135,
+        846237
+      ],
+      "baseline_result_ids": [
+        769
+      ],
+      "answer_jaccard": 0.2,
+      "answer_exact_set_match": false,
+      "baseline_intermediate": {
+        "graph_reached_dst": 2000,
+        "vector_candidates": 160,
+        "relational_filtered": 1203,
+        "merged_candidates": 1,
+        "final_results": 1
+      }
+    },
+    {
+      "qid": 2,
+      "src": 2,
+      "k": 5,
+      "tridb_median_ms": 175.781,
+      "tridb_samples_ms": [
+        176.316,
+        176.392,
+        175.585,
+        175.913,
+        175.69,
+        175.738,
+        175.781
+      ],
+      "baseline_median_ms": 56.0446,
+      "baseline_samples_ms": [
+        55.3272,
+        51.4478,
+        57.6222,
+        61.0978,
+        56.0446,
+        55.9586,
+        57.4858
+      ],
+      "baseline_legs_ms": {
+        "graph": 39.1774,
+        "vector": 7.0761,
+        "relational": 10.275,
+        "merge": 0.1335
+      },
+      "tridb_faster": false,
+      "ratio_baseline_over_tridb": 0.319,
+      "tridb_result_ids": [
+        945492,
+        406963,
+        727070,
+        253828,
+        399782
+      ],
+      "baseline_result_ids": [
+        426138
+      ],
+      "answer_jaccard": 0.0,
+      "answer_exact_set_match": false,
+      "baseline_intermediate": {
+        "graph_reached_dst": 2000,
+        "vector_candidates": 160,
+        "relational_filtered": 1199,
+        "merged_candidates": 1,
+        "final_results": 1
+      }
+    },
+    {
+      "qid": 3,
+      "src": 3,
+      "k": 5,
+      "tridb_median_ms": 150.317,
+      "tridb_samples_ms": [
+        150.317,
+        150.486,
+        150.175,
+        150.385,
+        150.803,
+        150.265,
+        150.175
+      ],
+      "baseline_median_ms": 54.7077,
+      "baseline_samples_ms": [
+        55.9467,
+        53.5622,
+        55.0161,
+        54.7077,
+        54.2427,
+        55.6371,
+        53.3475
+      ],
+      "baseline_legs_ms": {
+        "graph": 36.5429,
+        "vector": 7.5433,
+        "relational": 10.1937,
+        "merge": 0.1313
+      },
+      "tridb_faster": false,
+      "ratio_baseline_over_tridb": 0.364,
+      "tridb_result_ids": [
+        219411,
+        363313,
+        45556,
+        672800,
+        735853
+      ],
+      "baseline_result_ids": [],
+      "answer_jaccard": 0.0,
+      "answer_exact_set_match": false,
+      "baseline_intermediate": {
+        "graph_reached_dst": 2000,
+        "vector_candidates": 160,
+        "relational_filtered": 1181,
+        "merged_candidates": 0,
+        "final_results": 0
+      }
+    },
+    {
+      "qid": 4,
+      "src": 4,
+      "k": 5,
+      "tridb_median_ms": 166.404,
+      "tridb_samples_ms": [
+        166.459,
+        166.434,
+        166.871,
+        166.404,
+        166.109,
+        166.278,
+        165.964
+      ],
+      "baseline_median_ms": 40.1638,
+      "baseline_samples_ms": [
+        55.5734,
+        57.8126,
+        53.8808,
+        40.1638,
+        39.0765,
+        37.1972,
+        37.2635
+      ],
+      "baseline_legs_ms": {
+        "graph": 22.6126,
+        "vector": 7.7318,
+        "relational": 9.1805,
+        "merge": 0.0904
+      },
+      "tridb_faster": false,
+      "ratio_baseline_over_tridb": 0.241,
+      "tridb_result_ids": [
+        484412,
+        321319,
+        223813,
+        648228,
+        912608
+      ],
+      "baseline_result_ids": [
+        484412
+      ],
+      "answer_jaccard": 0.2,
+      "answer_exact_set_match": false,
+      "baseline_intermediate": {
+        "graph_reached_dst": 2000,
+        "vector_candidates": 160,
+        "relational_filtered": 1217,
+        "merged_candidates": 1,
+        "final_results": 1
+      }
+    },
+    {
+      "qid": 5,
+      "src": 5,
+      "k": 5,
+      "tridb_median_ms": 150.367,
+      "tridb_samples_ms": [
+        150.945,
+        150.367,
+        150.485,
+        150.027,
+        149.996,
+        150.492,
+        150.252
+      ],
+      "baseline_median_ms": 41.2452,
+      "baseline_samples_ms": [
+        40.6407,
+        39.492,
+        42.6961,
+        40.595,
+        41.2452,
+        49.0921,
+        42.6813
+      ],
+      "baseline_legs_ms": {
+        "graph": 23.1653,
+        "vector": 8.442,
+        "relational": 9.5624,
+        "merge": 0.0862
+      },
+      "tridb_faster": false,
+      "ratio_baseline_over_tridb": 0.274,
+      "tridb_result_ids": [
+        146501,
+        913934,
+        82818,
+        169078,
+        212154
+      ],
+      "baseline_result_ids": [
+        146501,
+        298856
+      ],
+      "answer_jaccard": 0.1667,
+      "answer_exact_set_match": false,
+      "baseline_intermediate": {
+        "graph_reached_dst": 2000,
+        "vector_candidates": 160,
+        "relational_filtered": 1191,
+        "merged_candidates": 2,
+        "final_results": 2
+      }
+    },
+    {
+      "qid": 6,
+      "src": 6,
+      "k": 5,
+      "tridb_median_ms": 199.328,
+      "tridb_samples_ms": [
+        199.005,
+        199.212,
+        199.633,
+        199.328,
+        198.747,
+        199.36,
+        199.648
+      ],
+      "baseline_median_ms": 38.9952,
+      "baseline_samples_ms": [
+        38.8307,
+        38.9614,
+        38.2312,
+        38.9952,
+        41.8966,
+        40.1785,
+        42.0588
+      ],
+      "baseline_legs_ms": {
+        "graph": 22.6589,
+        "vector": 7.9546,
+        "relational": 9.2081,
+        "merge": 0.0873
+      },
+      "tridb_faster": false,
+      "ratio_baseline_over_tridb": 0.196,
+      "tridb_result_ids": [
+        888376,
+        413358,
+        118977,
+        504688,
+        383166
+      ],
+      "baseline_result_ids": [],
+      "answer_jaccard": 0.0,
+      "answer_exact_set_match": false,
+      "baseline_intermediate": {
+        "graph_reached_dst": 2000,
+        "vector_candidates": 160,
+        "relational_filtered": 1186,
+        "merged_candidates": 0,
+        "final_results": 0
+      }
+    },
+    {
+      "qid": 7,
+      "src": 7,
+      "k": 5,
+      "tridb_median_ms": 146.314,
+      "tridb_samples_ms": [
+        147.672,
+        146.427,
+        146.643,
+        146.267,
+        146.314,
+        146.086,
+        145.986
+      ],
+      "baseline_median_ms": 41.368,
+      "baseline_samples_ms": [
+        44.2765,
+        40.7052,
+        40.2166,
+        42.521,
+        41.368,
+        42.7643,
+        36.7143
+      ],
+      "baseline_legs_ms": {
+        "graph": 23.5769,
+        "vector": 7.9041,
+        "relational": 9.4918,
+        "merge": 0.0883
+      },
+      "tridb_faster": false,
+      "ratio_baseline_over_tridb": 0.283,
+      "tridb_result_ids": [
+        806907,
+        543902,
+        430789,
+        134446,
+        381103
+      ],
+      "baseline_result_ids": [
+        543902,
+        381103,
+        231150
+      ],
+      "answer_jaccard": 0.3333,
+      "answer_exact_set_match": false,
+      "baseline_intermediate": {
+        "graph_reached_dst": 2000,
+        "vector_candidates": 160,
+        "relational_filtered": 1213,
+        "merged_candidates": 3,
+        "final_results": 3
+      }
+    },
+    {
+      "qid": 8,
+      "src": 8,
+      "k": 5,
+      "tridb_median_ms": 164.277,
+      "tridb_samples_ms": [
+        164.42,
+        163.802,
+        164.135,
+        164.209,
+        164.277,
+        164.932,
+        164.389
+      ],
+      "baseline_median_ms": 40.4072,
+      "baseline_samples_ms": [
+        37.1025,
+        40.4072,
+        40.4325,
+        40.8567,
+        40.9979,
+        39.964,
+        39.207
+      ],
+      "baseline_legs_ms": {
+        "graph": 22.66,
+        "vector": 8.2978,
+        "relational": 9.2169,
+        "merge": 0.0883
+      },
+      "tridb_faster": false,
+      "ratio_baseline_over_tridb": 0.246,
+      "tridb_result_ids": [
+        118505,
+        630637,
+        896240,
+        830586,
+        603877
+      ],
+      "baseline_result_ids": [
+        630637,
+        369426
+      ],
+      "answer_jaccard": 0.1667,
+      "answer_exact_set_match": false,
+      "baseline_intermediate": {
+        "graph_reached_dst": 2000,
+        "vector_candidates": 160,
+        "relational_filtered": 1202,
+        "merged_candidates": 2,
+        "final_results": 2
+      }
+    },
+    {
+      "qid": 9,
+      "src": 9,
+      "k": 5,
+      "tridb_median_ms": 207.387,
+      "tridb_samples_ms": [
+        206.905,
+        207.387,
+        207.629,
+        208.383,
+        207.342,
+        207.49,
+        207.186
+      ],
+      "baseline_median_ms": 55.6836,
+      "baseline_samples_ms": [
+        42.4824,
+        51.6333,
+        59.7281,
+        55.6836,
+        54.9878,
+        59.9975,
+        58.089
+      ],
+      "baseline_legs_ms": {
+        "graph": 38.7228,
+        "vector": 9.2756,
+        "relational": 10.6995,
+        "merge": 0.1387
+      },
+      "tridb_faster": false,
+      "ratio_baseline_over_tridb": 0.269,
+      "tridb_result_ids": [
+        603892,
+        48635,
+        212012,
+        550149,
+        840536
+      ],
+      "baseline_result_ids": [
+        48635
+      ],
+      "answer_jaccard": 0.2,
+      "answer_exact_set_match": false,
+      "baseline_intermediate": {
+        "graph_reached_dst": 2000,
+        "vector_candidates": 160,
+        "relational_filtered": 1222,
+        "merged_candidates": 1,
+        "final_results": 1
+      }
+    },
+    {
+      "qid": 10,
+      "src": 10,
+      "k": 5,
+      "tridb_median_ms": 144.698,
+      "tridb_samples_ms": [
+        144.916,
+        144.986,
+        144.39,
+        144.698,
+        144.541,
+        144.804,
+        144.452
+      ],
+      "baseline_median_ms": 58.3961,
+      "baseline_samples_ms": [
+        59.3051,
+        59.3451,
+        57.4226,
+        56.852,
+        58.1813,
+        61.2143,
+        58.3961
+      ],
+      "baseline_legs_ms": {
+        "graph": 38.6517,
+        "vector": 8.6604,
+        "relational": 10.9364,
+        "merge": 0.1417
+      },
+      "tridb_faster": false,
+      "ratio_baseline_over_tridb": 0.404,
+      "tridb_result_ids": [
+        657714,
+        93076,
+        981336,
+        502531,
+        131430
+      ],
+      "baseline_result_ids": [
+        657714
+      ],
+      "answer_jaccard": 0.2,
+      "answer_exact_set_match": false,
+      "baseline_intermediate": {
+        "graph_reached_dst": 2000,
+        "vector_candidates": 160,
+        "relational_filtered": 1239,
+        "merged_candidates": 1,
+        "final_results": 1
+      }
+    },
+    {
+      "qid": 11,
+      "src": 11,
+      "k": 5,
+      "tridb_median_ms": 257.903,
+      "tridb_samples_ms": [
+        258.865,
+        258.228,
+        257.689,
+        257.699,
+        257.535,
+        257.96,
+        257.903
+      ],
+      "baseline_median_ms": 57.1322,
+      "baseline_samples_ms": [
+        57.1322,
+        57.4184,
+        58.7384,
+        58.445,
+        54.4912,
+        55.1035,
+        55.2749
+      ],
+      "baseline_legs_ms": {
+        "graph": 38.8848,
+        "vector": 8.0596,
+        "relational": 10.8087,
+        "merge": 0.1384
+      },
+      "tridb_faster": false,
+      "ratio_baseline_over_tridb": 0.222,
+      "tridb_result_ids": [
+        309215,
+        927754,
+        329440,
+        254215,
+        1003
+      ],
+      "baseline_result_ids": [
+        927754,
+        254215
+      ],
+      "answer_jaccard": 0.4,
+      "answer_exact_set_match": false,
+      "baseline_intermediate": {
+        "graph_reached_dst": 2000,
+        "vector_candidates": 160,
+        "relational_filtered": 1199,
+        "merged_candidates": 2,
+        "final_results": 2
+      }
+    },
+    {
+      "qid": 12,
+      "src": 12,
+      "k": 5,
+      "tridb_median_ms": 227.97,
+      "tridb_samples_ms": [
+        226.765,
+        228.201,
+        228.331,
+        227.97,
+        226.354,
+        227.708,
+        228.702
+      ],
+      "baseline_median_ms": 55.6858,
+      "baseline_samples_ms": [
+        54.6102,
+        53.2367,
+        48.3146,
+        56.0613,
+        56.114,
+        56.421,
+        55.6858
+      ],
+      "baseline_legs_ms": {
+        "graph": 38.3736,
+        "vector": 8.3771,
+        "relational": 7.8396,
+        "merge": 0.1401
+      },
+      "tridb_faster": false,
+      "ratio_baseline_over_tridb": 0.244,
+      "tridb_result_ids": [
+        922826,
+        775183,
+        948305,
+        925801,
+        963836
+      ],
+      "baseline_result_ids": [
+        775183
+      ],
+      "answer_jaccard": 0.2,
+      "answer_exact_set_match": false,
+      "baseline_intermediate": {
+        "graph_reached_dst": 2000,
+        "vector_candidates": 160,
+        "relational_filtered": 1221,
+        "merged_candidates": 1,
+        "final_results": 1
+      }
+    },
+    {
+      "qid": 13,
+      "src": 13,
+      "k": 5,
+      "tridb_median_ms": 158.846,
+      "tridb_samples_ms": [
+        158.755,
+        158.684,
+        158.846,
+        159.546,
+        159.171,
+        158.689,
+        159.084
+      ],
+      "baseline_median_ms": 55.0504,
+      "baseline_samples_ms": [
+        55.4173,
+        53.3282,
+        41.9667,
+        55.5941,
+        55.0504,
+        55.3341,
+        41.8174
+      ],
+      "baseline_legs_ms": {
+        "graph": 38.4919,
+        "vector": 8.3033,
+        "relational": 7.6715,
+        "merge": 0.1411
+      },
+      "tridb_faster": false,
+      "ratio_baseline_over_tridb": 0.347,
+      "tridb_result_ids": [
+        860710,
+        321072,
+        492046,
+        901438,
+        900280
+      ],
+      "baseline_result_ids": [
+        860710,
+        900280,
+        578
+      ],
+      "answer_jaccard": 0.3333,
+      "answer_exact_set_match": false,
+      "baseline_intermediate": {
+        "graph_reached_dst": 2000,
+        "vector_candidates": 160,
+        "relational_filtered": 1215,
+        "merged_candidates": 3,
+        "final_results": 3
+      }
+    },
+    {
+      "qid": 14,
+      "src": 14,
+      "k": 5,
+      "tridb_median_ms": 239.185,
+      "tridb_samples_ms": [
+        239.329,
+        238.896,
+        238.099,
+        239.413,
+        239.166,
+        239.746,
+        239.185
+      ],
+      "baseline_median_ms": 41.2229,
+      "baseline_samples_ms": [
+        40.7014,
+        41.7301,
+        40.7027,
+        41.2761,
+        41.6547,
+        41.2229,
+        40.1019
+      ],
+      "baseline_legs_ms": {
+        "graph": 25.6967,
+        "vector": 8.5011,
+        "relational": 6.7662,
+        "merge": 0.0909
+      },
+      "tridb_faster": false,
+      "ratio_baseline_over_tridb": 0.172,
+      "tridb_result_ids": [
+        478683,
+        818569,
+        954731,
+        741123,
+        683250
+      ],
+      "baseline_result_ids": [
+        478683,
+        818569
+      ],
+      "answer_jaccard": 0.4,
+      "answer_exact_set_match": false,
+      "baseline_intermediate": {
+        "graph_reached_dst": 2000,
+        "vector_candidates": 160,
+        "relational_filtered": 1214,
+        "merged_candidates": 2,
+        "final_results": 2
+      }
+    },
+    {
+      "qid": 15,
+      "src": 15,
+      "k": 5,
+      "tridb_median_ms": 193.283,
+      "tridb_samples_ms": [
+        194.091,
+        193.227,
+        193.024,
+        193.065,
+        193.81,
+        193.464,
+        193.283
+      ],
+      "baseline_median_ms": 40.7345,
+      "baseline_samples_ms": [
+        40.1479,
+        41.766,
+        42.1409,
+        39.9276,
+        40.7345,
+        40.2221,
+        41.4571
+      ],
+      "baseline_legs_ms": {
+        "graph": 25.8477,
+        "vector": 8.2292,
+        "relational": 6.9256,
+        "merge": 0.0911
+      },
+      "tridb_faster": false,
+      "ratio_baseline_over_tridb": 0.211,
+      "tridb_result_ids": [
+        262761,
+        713934,
+        87242,
+        950981,
+        643327
+      ],
+      "baseline_result_ids": [
+        262761,
+        713934,
+        87242
+      ],
+      "answer_jaccard": 0.6,
+      "answer_exact_set_match": false,
+      "baseline_intermediate": {
+        "graph_reached_dst": 2000,
+        "vector_candidates": 160,
+        "relational_filtered": 1219,
+        "merged_candidates": 3,
+        "final_results": 3
+      }
+    },
+    {
+      "qid": 16,
+      "src": 16,
+      "k": 5,
+      "tridb_median_ms": 173.7,
+      "tridb_samples_ms": [
+        174.019,
+        173.7,
+        174.145,
+        173.915,
+        173.297,
+        173.394,
+        173.253
+      ],
+      "baseline_median_ms": 54.5297,
+      "baseline_samples_ms": [
+        42.0195,
+        41.5499,
+        54.7261,
+        53.9214,
+        56.259,
+        54.6825,
+        54.5297
+      ],
+      "baseline_legs_ms": {
+        "graph": 38.1031,
+        "vector": 8.0608,
+        "relational": 7.759,
+        "merge": 0.1413
+      },
+      "tridb_faster": false,
+      "ratio_baseline_over_tridb": 0.314,
+      "tridb_result_ids": [
+        41204,
+        805207,
+        505856,
+        841495,
+        936206
+      ],
+      "baseline_result_ids": [
+        505856,
+        841495
+      ],
+      "answer_jaccard": 0.4,
+      "answer_exact_set_match": false,
+      "baseline_intermediate": {
+        "graph_reached_dst": 2000,
+        "vector_candidates": 160,
+        "relational_filtered": 1223,
+        "merged_candidates": 2,
+        "final_results": 2
+      }
+    },
+    {
+      "qid": 17,
+      "src": 17,
+      "k": 5,
+      "tridb_median_ms": 213.273,
+      "tridb_samples_ms": [
+        212.37,
+        212.85,
+        213.501,
+        213.577,
+        213.273,
+        213.398,
+        213.108
+      ],
+      "baseline_median_ms": 54.8488,
+      "baseline_samples_ms": [
+        55.885,
+        54.457,
+        55.6104,
+        54.5434,
+        54.8488,
+        56.5542,
+        54.6091
+      ],
+      "baseline_legs_ms": {
+        "graph": 38.6203,
+        "vector": 8.3019,
+        "relational": 7.6291,
+        "merge": 0.1396
+      },
+      "tridb_faster": false,
+      "ratio_baseline_over_tridb": 0.257,
+      "tridb_result_ids": [
+        345652,
+        538991,
+        983208,
+        803123,
+        935351
+      ],
+      "baseline_result_ids": [],
+      "answer_jaccard": 0.0,
+      "answer_exact_set_match": false,
+      "baseline_intermediate": {
+        "graph_reached_dst": 2000,
+        "vector_candidates": 160,
+        "relational_filtered": 1203,
+        "merged_candidates": 0,
+        "final_results": 0
+      }
+    },
+    {
+      "qid": 18,
+      "src": 18,
+      "k": 5,
+      "tridb_median_ms": 166.331,
+      "tridb_samples_ms": [
+        166.258,
+        167.008,
+        166.88,
+        164.91,
+        166.331,
+        166.5,
+        166.168
+      ],
+      "baseline_median_ms": 54.6376,
+      "baseline_samples_ms": [
+        54.6376,
+        54.3354,
+        52.9389,
+        54.9865,
+        55.3717,
+        54.425,
+        55.6138
+      ],
+      "baseline_legs_ms": {
+        "graph": 38.7692,
+        "vector": 8.1313,
+        "relational": 7.6205,
+        "merge": 0.1404
+      },
+      "tridb_faster": false,
+      "ratio_baseline_over_tridb": 0.328,
+      "tridb_result_ids": [
+        592379,
+        447809,
+        865930,
+        670764,
+        951660
+      ],
+      "baseline_result_ids": [
+        415480,
+        872538
+      ],
+      "answer_jaccard": 0.0,
+      "answer_exact_set_match": false,
+      "baseline_intermediate": {
+        "graph_reached_dst": 2000,
+        "vector_candidates": 160,
+        "relational_filtered": 1211,
+        "merged_candidates": 2,
+        "final_results": 2
+      }
+    },
+    {
+      "qid": 19,
+      "src": 19,
+      "k": 5,
+      "tridb_median_ms": 165.013,
+      "tridb_samples_ms": [
+        165.136,
+        164.677,
+        165.056,
+        164.593,
+        164.301,
+        165.013,
+        165.036
+      ],
+      "baseline_median_ms": 54.9062,
+      "baseline_samples_ms": [
+        54.9062,
+        54.937,
+        54.0732,
+        56.3295,
+        53.7073,
+        55.7296,
+        52.9921
+      ],
+      "baseline_legs_ms": {
+        "graph": 38.3235,
+        "vector": 8.6744,
+        "relational": 7.621,
+        "merge": 0.1403
+      },
+      "tridb_faster": false,
+      "ratio_baseline_over_tridb": 0.333,
+      "tridb_result_ids": [
+        802024,
+        606684,
+        800247,
+        547654,
+        353372
+      ],
+      "baseline_result_ids": [
+        547654,
+        353372,
+        190276
+      ],
+      "answer_jaccard": 0.3333,
+      "answer_exact_set_match": false,
+      "baseline_intermediate": {
+        "graph_reached_dst": 2000,
+        "vector_candidates": 160,
+        "relational_filtered": 1207,
+        "merged_candidates": 3,
+        "final_results": 3
+      }
+    },
+    {
+      "qid": 20,
+      "src": 20,
+      "k": 5,
+      "tridb_median_ms": 187.662,
+      "tridb_samples_ms": [
+        187.41,
+        187.915,
+        187.752,
+        187.571,
+        187.863,
+        187.414,
+        187.662
+      ],
+      "baseline_median_ms": 47.8037,
+      "baseline_samples_ms": [
+        55.5349,
+        54.3602,
+        47.8037,
+        44.0041,
+        40.741,
+        55.5457,
+        38.6443
+      ],
+      "baseline_legs_ms": {
+        "graph": 31.1307,
+        "vector": 9.1808,
+        "relational": 6.6924,
+        "merge": 0.0905
+      },
+      "tridb_faster": false,
+      "ratio_baseline_over_tridb": 0.255,
+      "tridb_result_ids": [
+        93033,
+        843586,
+        256671,
+        799770,
+        57926
+      ],
+      "baseline_result_ids": [],
+      "answer_jaccard": 0.0,
+      "answer_exact_set_match": false,
+      "baseline_intermediate": {
+        "graph_reached_dst": 2000,
+        "vector_candidates": 160,
+        "relational_filtered": 1220,
+        "merged_candidates": 0,
+        "final_results": 0
+      }
+    },
+    {
+      "qid": 21,
+      "src": 21,
+      "k": 5,
+      "tridb_median_ms": 167.584,
+      "tridb_samples_ms": [
+        167.231,
+        167.712,
+        167.399,
+        167.672,
+        167.584,
+        167.507,
+        168.312
+      ],
+      "baseline_median_ms": 41.9863,
+      "baseline_samples_ms": [
+        41.0363,
+        40.438,
+        42.5305,
+        43.3287,
+        41.346,
+        41.9863,
+        43.1648
+      ],
+      "baseline_legs_ms": {
+        "graph": 25.3165,
+        "vector": 9.4241,
+        "relational": 6.7993,
+        "merge": 0.0935
+      },
+      "tridb_faster": false,
+      "ratio_baseline_over_tridb": 0.251,
+      "tridb_result_ids": [
+        899061,
+        242272,
+        463201,
+        30427,
+        100289
+      ],
+      "baseline_result_ids": [
+        100289
+      ],
+      "answer_jaccard": 0.2,
+      "answer_exact_set_match": false,
+      "baseline_intermediate": {
+        "graph_reached_dst": 2000,
+        "vector_candidates": 160,
+        "relational_filtered": 1177,
+        "merged_candidates": 1,
+        "final_results": 1
+      }
+    },
+    {
+      "qid": 22,
+      "src": 22,
+      "k": 5,
+      "tridb_median_ms": 156.14,
+      "tridb_samples_ms": [
+        156.195,
+        156.275,
+        155.613,
+        155.977,
+        156.945,
+        156.14,
+        155.789
+      ],
+      "baseline_median_ms": 51.5873,
+      "baseline_samples_ms": [
+        51.5873,
+        51.0984,
+        52.1109,
+        50.2574,
+        52.2984,
+        52.0035,
+        39.861
+      ],
+      "baseline_legs_ms": {
+        "graph": 35.8551,
+        "vector": 7.8928,
+        "relational": 7.659,
+        "merge": 0.139
+      },
+      "tridb_faster": false,
+      "ratio_baseline_over_tridb": 0.33,
+      "tridb_result_ids": [
+        24486,
+        964390,
+        41250,
+        113019,
+        415702
+      ],
+      "baseline_result_ids": [
+        964390
+      ],
+      "answer_jaccard": 0.2,
+      "answer_exact_set_match": false,
+      "baseline_intermediate": {
+        "graph_reached_dst": 2000,
+        "vector_candidates": 160,
+        "relational_filtered": 1224,
+        "merged_candidates": 1,
+        "final_results": 1
+      }
+    },
+    {
+      "qid": 23,
+      "src": 23,
+      "k": 5,
+      "tridb_median_ms": 131.566,
+      "tridb_samples_ms": [
+        131.221,
+        131.788,
+        131.116,
+        131.661,
+        131.566,
+        131.705,
+        131.562
+      ],
+      "baseline_median_ms": 42.7765,
+      "baseline_samples_ms": [
+        41.4152,
+        39.8717,
+        40.6091,
+        59.4085,
+        48.2502,
+        42.7765,
+        57.7544
+      ],
+      "baseline_legs_ms": {
+        "graph": 24.6927,
+        "vector": 8.497,
+        "relational": 10.1497,
+        "merge": 0.1418
+      },
+      "tridb_faster": false,
+      "ratio_baseline_over_tridb": 0.325,
+      "tridb_result_ids": [
+        710194,
+        623414,
+        335674,
+        489429,
+        159968
+      ],
+      "baseline_result_ids": [
+        623414,
+        335674
+      ],
+      "answer_jaccard": 0.4,
+      "answer_exact_set_match": false,
+      "baseline_intermediate": {
+        "graph_reached_dst": 2000,
+        "vector_candidates": 160,
+        "relational_filtered": 1188,
+        "merged_candidates": 2,
+        "final_results": 2
+      }
+    }
+  ]
+}
