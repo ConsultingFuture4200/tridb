@@ -59,6 +59,36 @@ beyond that use.
   not a code change in this repo; TriDB does not use upstream's `dockerrun.sh` (which supplies a weak
   default password), but the superuser-on-all-interfaces posture is inherited by the image.
 
+## Graph store container (`gstore`) hazards
+
+The native graph store keeps its pages in `graph_store.gstore`, a container relation whose 32KB
+blocks hold **non-heap page formats** (metapage, vertex pages, adjacency pages) managed by the
+`gph_*` C functions. Treating it as a heap corrupts or crashes. Operators of anything longer-lived
+than a benchmark must know:
+
+- **Never `VACUUM`, `ANALYZE`, or `SELECT` the container directly.** Any heap-path access misreads
+  the native pages — garbage line pointers, likely crash or corruption. The extension script
+  REVOKEs PUBLIC access to `gstore` and PUBLIC EXECUTE on the mutators (`gph_insert_vertex`,
+  `gph_insert_edge`) as containment; deployers grant mutator EXECUTE to trusted roles only. The
+  read/traversal surface (`gph_neighbors`, `gph_traverse`, counters) stays PUBLIC-executable, but
+  note the extension's `graph_store` schema itself carries no PUBLIC `USAGE` by default — grant
+  schema `USAGE` to roles meant to query the graph.
+- **Anti-wraparound autovacuum LIMITATION.** `gstore` is created with `autovacuum_enabled = false`,
+  but that reloption does **not** exempt a relation from the forced anti-wraparound vacuum: once
+  `age(relfrozenxid)` for `gstore` approaches `autovacuum_freeze_max_age`, PostgreSQL will vacuum
+  it as a heap regardless — with the corruption consequences above. Long-lived deployments MUST
+  monitor `age(relfrozenxid)` for `gstore` and treat approach to `autovacuum_freeze_max_age` as an
+  operational stop-the-world event (dump/rebuild the graph, or halt writes) until the graph-store
+  freeze pass ships.
+- **Raw-xid visibility horizon.** Graph records store raw `xmin` values and visibility checks call
+  `TransactionIdDidCommit` with no freeze path. Once the clog horizon passes a stored xid, lookups
+  error (`could not access status of transaction`); past 2^31 xids, visibility comparisons flip.
+  Same monitoring applies: `age(relfrozenxid)` growth on `gstore` tracks this exposure too.
+- **Design note:** the specified fix (a `gph_freeze()` maintenance pass) is
+  `docs/graph_store_freeze_design_v0.1.0.md`. Until it ships, TriDB's graph store is safe for
+  benchmark- and research-lifetime workloads, not for deployments that burn through xids for
+  months.
+
 ## Out of scope
 
 - The vendored MSVBASE source under `vendor/` (re-cloned + patched at build time) — report upstream
