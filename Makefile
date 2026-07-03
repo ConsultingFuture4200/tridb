@@ -40,6 +40,7 @@ lock:
 # The graph-store AM harnesses (DEV-1164/1165/1166) PGXS-build src/graph_store in the image; the
 # HNSW / fork-bug oracle harnesses are no-build and may pipe output through grep.
 AM_TESTS := scripts/graph_am_test.sh \
+            scripts/graph_am_acl_test.sh \
             scripts/txn_atomicity_test.sh \
             scripts/crash_recovery_test.sh \
             scripts/graph_concurrency_test.sh \
