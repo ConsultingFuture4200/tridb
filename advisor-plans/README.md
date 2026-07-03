@@ -9,6 +9,32 @@ conditions, update your row when done. The repo builds in two layers: the **Pyth
 native graph AM) builds only via Docker and the GX10 — plans touching `vendor/MSVBASE` or `src/graph_store`
 C are **GX10-gated** (author + review here, build/verify on the GX10).
 
+## 2026-07-03 batch — post-DEV-1290 deep audit + persona review + landscape research (planned against `e345998`)
+
+Sources: 7-category deep `/improve` audit + Fabio/Linus/Liotta persona reviews + 4-angle landscape
+research (`docs/landscape_review_v0.1.0.md`, appendix has all findings/sources). All findings vetted
+against the code by the advisor before planning. Execution authorized to run autonomously with
+per-plan persona verification (Fabio/Linus/Liotta) — plans that hit STOP conditions report BLOCKED,
+never improvise.
+
+| Plan | Title | Priority | Effort | Risk | Depends on | Status |
+|------|-------|----------|--------|------|------------|--------|
+| 024 | Operator arg hardening + memory lifecycle (crash/leak class + lowering regression) | P1 | M | MED | — | TODO |
+| 025 | ADR-0013 Stage A+B: operators+benches onto the v1 native AM + docs truth pass | P1 | L | MED-HIGH | 024 | TODO |
+| 026 | Graph-store safety riders: ACLs, VACUUM/wraparound docs, freeze design note | P1 | S | LOW | — (file-coord w/ 025) | TODO |
+| 027 | CI nightly engine gate + KEEP_GOING + 4 missing high-value tests | P1 | M | LOW | — | TODO |
+| 028 | PG17 platform feasibility spike + public "why a fork" ADR | P1 | M | LOW | — (parallel) | TODO |
+| 029 | Hot-path perf: O(D) graph loads, SIMD drain distance, hash-join membership | P2 | M | MED | 024 (rebase over 025) | TODO |
+| 030 | Benchmark credibility: p95/p99, multi-client, HNSW row, pins, dep hygiene | P2 | M-L | LOW-MED | soft 025 | TODO |
+| 031 | FR-6 calibrated two-cost decision + graph-leg cardinality + boundary sweep | P2 | M | MED | 025 | TODO |
+
+Recommended order: **024 → (026, 027, 028 in parallel) → 025 → (029, 030, 031)**. Engine-image
+builds and `make graph-test` runs are serialized (one docker-heavy plan at a time); 026/027/028
+are parallel-safe (disjoint files; 026 coordinates with 025 on `graph_store_am--0.1.0.sql`).
+Publication freeze on external benchmark numbers until 025 lands (F1).
+
+---
+
 ## Execution order & status
 
 | Plan | Title | Priority | Effort | Risk | Depends on | Verify here? | Status |
