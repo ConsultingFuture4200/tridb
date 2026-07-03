@@ -1,6 +1,6 @@
 # ADR-0013: rewire the operators and benchmarks onto the v1 native graph access method
 
-Status: **Proposed** — decision pending maintainer review. 2026-07-01 (advisor plan 016).
+Status: **Accepted** (2026-07-03, maintainer session; executed by advisor plan 025 — Stage A/B addendum below). Proposed 2026-07-01 (advisor plan 016).
 Design detail: [[graph_rewire_design_v0.1.0]] (`docs/graph_rewire_design_v0.1.0.md`).
 Measured evidence: `scripts/graph_v0v1_bench.sh` + `test/graph_v0v1_bench.sql` (engine-gated).
 
