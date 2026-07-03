@@ -106,7 +106,11 @@ BEGIN
         ||     'dst\.chunk\s+AS\s+chunk\s*,\s*'
         ||     'dst\.timestamp\s+AS\s+timestamp\s*'
         ||   '\)\s*\)\s+'
-        || 'WHERE\s+src\.id\s*=\s*(-?\d+)\s+AND\s+timestamp\s+IN\s*\((\d+(?:\s*,\s*\d+)*)\)\s+'
+        -- src_id capture is (\d+): real entity ids are non-negative, and a negative src would
+        -- make FR-6's filter_first body reject it AFTER lowering (ANALYZE-dependent errors).
+        -- The graph-disabled src=-1 parity case stays available via DIRECT tjs() calls only
+        -- (advisor plan 024).
+        || 'WHERE\s+src\.id\s*=\s*(\d+)\s+AND\s+timestamp\s+IN\s*\((\d+(?:\s*,\s*\d+)*)\)\s+'
         || 'ORDER\s+BY\s+src_embedding\s*<->\s*''(\{[^'']+\})''\s+'
         || 'LIMIT\s+(\d+)\s*;?\s*$',
         'i'

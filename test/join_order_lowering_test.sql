@@ -110,6 +110,33 @@ BEGIN
 END $$;
 
 -- ===========================================================================
+-- ASSERTION 3b (advisor plan 024): a canonical query with src.id = -1 is REJECTED by the
+-- scope guard (off-template RAISE). Real entity ids are non-negative; since Stage-4 binding,
+-- a negative src with a selective window would make FR-6 pick filter_first, which ERRORs on
+-- negative src — so the guard rejects it up front instead of erroring ANALYZE-dependently.
+-- The graph-disabled src=-1 parity case remains available via DIRECT tjs() calls only.
+-- ===========================================================================
+DO $$
+BEGIN
+    BEGIN
+        PERFORM graph_store.graph_query($q$
+            SELECT chunk
+            FROM GRAPH_TABLE ( MATCH (src:entity)-[:related_to]->(dst:entity)
+              COLUMNS ( src.embedding AS src_embedding, dst.chunk AS chunk, dst.timestamp AS timestamp ) )
+            WHERE src.id = -1 AND timestamp IN (10)
+            ORDER BY src_embedding <-> '{9,0,0,0,0,0,0,0}'
+            LIMIT 1
+        $q$);
+        RAISE EXCEPTION 'src.id = -1 was accepted by the scope guard';
+    EXCEPTION WHEN raise_exception THEN
+        IF SQLERRM NOT LIKE '%off-template%' THEN
+            RAISE EXCEPTION 'src.id = -1 rejected but not by the scope guard: %', SQLERRM;
+        END IF;
+    END;
+    RAISE NOTICE 'PASS advisor-024: negative src.id rejected by the scope guard (off-template)';
+END $$;
+
+-- ===========================================================================
 -- ASSERTION 4: soft dependency — without the decision core the lowering still
 -- runs and records the 'vector_first' default (today's only physical path).
 -- ===========================================================================
