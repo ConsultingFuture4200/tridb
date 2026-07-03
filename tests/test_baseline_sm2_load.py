@@ -207,3 +207,27 @@ def test_fanout_env_parse_error_raises_valueerror(monkeypatch):
     monkeypatch.delenv("BASELINE_ANN_FANOUT")
     importlib.reload(sm2)  # restore a clean module for other tests
     assert sm2.BASELINE_ANN_FANOUT == 32
+
+
+def test_baseline_index_config_selection(monkeypatch):
+    """BASELINE_INDEX selects IVF_FLAT (default) or HNSW; the config is what gets
+    stamped into the run payload (plan 030 step 3 / Fabio review)."""
+    import importlib
+    import sys
+
+    sys.path.insert(0, str(ROOT / "baseline"))
+
+    monkeypatch.setenv("BASELINE_INDEX", "HNSW")
+    monkeypatch.setenv("BASELINE_HNSW_M", "16")
+    monkeypatch.setenv("BASELINE_EF", "128")
+    import sm2
+
+    importlib.reload(sm2)
+    assert sm2.MILVUS_INDEX["index_type"] == "HNSW"
+    assert sm2.MILVUS_INDEX["params"] == {"M": 16, "efConstruction": 200}
+    assert sm2.MILVUS_SEARCH_PARAM["params"] == {"ef": 128}
+
+    monkeypatch.delenv("BASELINE_INDEX", raising=False)
+    importlib.reload(sm2)
+    assert sm2.MILVUS_INDEX["index_type"] == "IVF_FLAT"
+    assert "nlist" in sm2.MILVUS_INDEX["params"]
