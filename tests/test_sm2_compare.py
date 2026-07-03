@@ -124,3 +124,42 @@ def test_render_md_contains_headline_and_tables():
     assert "intermediate-result sizes" in md
     # plan 012: the markdown names the operating point so latency/recall claims are tied to it
     assert "term_cond=10000" in md
+
+
+def test_pct_interpolation_and_tail_guard():
+    # p50 always available; single sample returns itself.
+    assert sm2_compare._pct([5.0], 50.0) == 5.0
+    # linear interpolation on a known set (0..100 step 10, 11 samples >= tail min).
+    s = [float(x) for x in range(0, 101, 10)]  # 11 samples
+    assert sm2_compare._pct(s, 50.0) == 50.0
+    # p95/p99 require >= _MIN_SAMPLES_FOR_TAIL samples; below that -> None.
+    assert sm2_compare._pct([1.0, 2.0, 3.0], 95.0) is None
+    assert sm2_compare._pct([1.0, 2.0, 3.0], 50.0) == 2.0
+    big = [float(x) for x in range(100)]  # 100 samples
+    assert sm2_compare._pct(big, 95.0) is not None
+    assert sm2_compare._pct([], 50.0) is None
+
+
+def test_compare_emits_percentiles_and_qps_null_guarded_for_small_n():
+    # 3 samples/side -> p50 present, p95/p99 null (below the tail threshold).
+    manifest = {"k": 5, "seed": 42, "queries": [{"qid": 0, "src": 3}]}
+    tridb_obs = {
+        0: {"src": 3, "k": 5, "samples_ms": [1.2, 1.0, 1.1], "result_ids": [10]}
+    }
+    baseline = {
+        "runs": 3,
+        "queries": [
+            {
+                "qid": 0,
+                "latency_total_ms": 5.0,
+                "latency_samples_ms": [5.0, 5.5, 5.2],
+                "result_ids": [10],
+            }
+        ],
+    }
+    res = sm2_compare.compare(tridb_obs, baseline, manifest)
+    pq = res["queries"][0]
+    assert pq["tridb_p95_ms"] is None and pq["baseline_p95_ms"] is None
+    assert res["p95_ratio_baseline_over_tridb"] is None
+    assert res["qps_singleclient_tridb"] is not None  # median-based, always available
+    assert res["tail_latency_note"] is not None  # explains the nulls
