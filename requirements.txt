@@ -4,7 +4,7 @@ pytest>=9
 ruff~=0.15.18
 # Baseline harness clients (DEV-1171)
 neo4j>=6
-pymilvus>=2.4,<2.7  # track the Milvus server line (baseline: v2.4.5); see baseline/TUNING.md
+pymilvus>=2.4,<2.7  # caps below a 2.7 major; the 2.6-client/2.4.5-server gap is a pending decision (baseline/TUNING.md)
 psycopg[binary]>=3.1
 # GraphRAG QA benchmark embedder (Plan 015) — BGE-768 via onnxruntime, no torch
 fastembed>=0.8

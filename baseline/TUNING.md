@@ -62,7 +62,10 @@ GX10-/stack-gated. No benchmark result is asserted in this document.
 
 The baseline stack pins **Milvus `v2.4.5`** (`baseline/docker-compose.yml`), **Neo4j 5.20**, and
 **Postgres 16**. The Python clients are pinned in `requirements.lock` (`pymilvus`, `neo4j`,
-`psycopg`). `pymilvus` minor tracks the Milvus server line — `requirements.txt` floors it
-`>=2.4,<2.7` so a future 2.7 major cannot silently drive the 2.4 server. If a published SM-2 run
-uses a different Milvus image, bump the client and this note together. The versions used for any
-published run are stamped into that run's report JSON (`baseline_index_config` / methodology block).
+`psycopg`). **Known gap:** the pinned client is `pymilvus==2.6.16` (`requirements.lock`) driving a **2.4.5**
+server — a 2-minor version gap (Bolt/gRPC backward-compat, works today but not "aligned"). The
+`requirements.txt` floor `>=2.4,<2.7` only prevents a *future* 2.7 major from silently driving the
+2.4 server; it does NOT close the current gap. TRUE alignment — downgrade the client to 2.4.x, or
+bump the Milvus image to 2.6 — is a **pending maintainer decision** (a client downgrade risks an
+API `baseline/sm2.py` uses; a server bump changes the tuned baseline). The exact versions used for
+any published run are stamped into that run's report JSON (`baseline_index_config` / methodology).
