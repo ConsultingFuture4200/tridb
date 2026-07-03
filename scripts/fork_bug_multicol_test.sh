@@ -40,9 +40,21 @@ fail() { echo "[fork_bug_multicol_test] FAIL — $1" >&2; exit 1; }
 echo "$OUT" | grep -qiE 'server (closed the connection|process was terminated)|connection to server was lost|terminated by signal|server crashed' \
   && fail "backend crashed (DEV-1236 regression — SIGSEGV not fixed)"
 
-# Required: the clean, descriptive ERROR replaced the crash.
-echo "$OUT" | grep -qiE 'ERROR:.*ORDER BY' \
-  || fail "did not see the expected clean ERROR mentioning ORDER BY <-> distance"
+# Required: ONE of the two defense layers handled the unordered scan:
+#   (a) post-DEV-1248 planner avoidance — the costestimate disable_cost steers the planner to a
+#       non-HNSW plan and count(*) returns the CORRECT 2000 (the pre-fix silent-0 wrong answer
+#       and the SIGSEGV are both impossible), or
+#   (b) the DEV-1236 runtime guard — the HNSW path was still chosen and raised the clean
+#       "requires an ORDER BY <-> distance" ERROR instead of crashing.
+# Which layer fires depends on plan choice (pkey bitmap scan availability, cost ties), so the
+# harness accepts either; hnsw_costestimate_unordered_test.sql pins (a) and hnsw_am_guards.sql
+# pins the guard directly.
+if echo "$OUT" | grep -qiE 'ERROR:.*ORDER BY'; then
+  : # (b) runtime-guard path
+else
+  echo "$OUT" | grep -qE '(^| )2000( |$)' \
+    || fail "neither defense fired: no clean ORDER BY ERROR and count(*) did not return the correct 2000 (silent-wrong-answer regression?)"
+fi
 
 # Required: the backend survived the ERROR (the liveness probe ran and returned 1).
 echo "$OUT" | grep -qE 'backend_alive' \

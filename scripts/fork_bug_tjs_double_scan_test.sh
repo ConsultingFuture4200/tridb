@@ -23,9 +23,17 @@ SQL="$ROOT/test/fork_bug_tjs_double_scan.sql"
 [[ -f "$SQL" ]] || { echo "test sql not found: $SQL" >&2; exit 1; }
 docker image inspect "$IMAGE" >/dev/null 2>&1 || { echo "image $IMAGE not built — run scripts/x86build.sh --docker" >&2; exit 1; }
 
-OUT="$(docker run --rm --entrypoint bash -v "${SQL}:/tmp/fork_bug.sql:ro" "$IMAGE" -c '
+EXT="$ROOT/src/graph_store_ext"
+
+OUT="$(docker run --rm --entrypoint bash -v "${EXT}:/tmp/ext:ro" -v "${SQL}:/tmp/fork_bug.sql:ro" "$IMAGE" -c '
   set -e
   B=/u01/app/postgres/product/13.4/bin
+  PGC=$B/pg_config
+  # The test SQL does CREATE EXTENSION graph_store (tjs graph leg + sibling scan), so PGXS-build
+  # and install it exactly like scripts/graph_test.sh — the image does not ship it preinstalled.
+  cp -r /tmp/ext /tmp/build_ext && cd /tmp/build_ext
+  make PG_CONFIG=$PGC >/tmp/me.log 2>&1 || { tail -20 /tmp/me.log; echo "EXT BUILD FAILED"; exit 1; }
+  make PG_CONFIG=$PGC install >>/tmp/me.log 2>&1 || { tail -20 /tmp/me.log; echo "EXT INSTALL FAILED"; exit 1; }
   D=/tmp/pg; rm -rf "$D"; mkdir -p "$D"
   "$B/initdb" -A trust -D "$D" >/tmp/i.log 2>&1
   "$B/pg_ctl" -D "$D" -o "-p 5432" -w start >/tmp/s.log 2>&1
