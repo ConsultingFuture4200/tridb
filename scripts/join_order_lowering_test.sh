@@ -3,7 +3,7 @@
 # join_order_lowering_test.sh — ADR-0011 Stage 2 (DEV-1285): the graph_query() lowering
 # makes the FR-6 join-order decision at the call site and records it.
 #
-# Builds BOTH extensions the lowering path spans — graph_store_ext (the canonical surface)
+# Builds BOTH extensions the lowering path spans — graph_store_am (the v1 native AM hosting the canonical surface, ADR-0013 Stage B)
 # and src/planner (the FROZEN decision core) — against the fork image, then runs
 # test/join_order_lowering_test.sql: inverted-selectivity windows pick opposite orders
 # through the full lowering, the decision is inert on execution (Stage 3 = DEV-1290), and
@@ -14,7 +14,7 @@
 set -euo pipefail
 IMAGE="${1:-tridb/msvbase:dev}"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-SURFACE="$ROOT/src/graph_store_ext"
+SURFACE="$ROOT/src/graph_store"   # v1 native AM hosts the canonical surface (ADR-0013 Stage B)
 PLANNER="$ROOT/src/planner"
 # join_order_legstats.c #includes src/graph_store/gph_page.h via `-I$(srcdir)/../graph_store`
 # (see scripts/join_order_test.sh) — mount the headers where that resolves from /tmp/planner.
@@ -33,7 +33,7 @@ docker run --rm --entrypoint bash \
   PGC=$B/pg_config
   # PGXS-build both extensions in writable copies (mounts are read-only). Fail LOUD.
   cp -r /tmp/surface /tmp/build_surface && cd /tmp/build_surface
-  echo "=== make (graph_store_ext) ==="
+  echo "=== make (graph_store_am) ==="
   make PG_CONFIG=$PGC >/tmp/make_s.log 2>&1 || { tail -30 /tmp/make_s.log; echo "BUILD FAILED"; exit 1; }
   make PG_CONFIG=$PGC install >/tmp/inst_s.log 2>&1 || { tail -20 /tmp/inst_s.log; echo "INSTALL FAILED"; exit 1; }
   cp -r /tmp/planner /tmp/build_planner && cd /tmp/build_planner

@@ -17,7 +17,7 @@
 <p align="center">
   <a href="#license"><img src="https://img.shields.io/badge/license-MIT-blue?style=flat-square" alt="License"></a>
   <a href="https://github.com/ConsultingFuture4200/tridb/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/ConsultingFuture4200/tridb/ci.yml?style=flat-square&label=CI" alt="CI"></a>
-  <a href="#benchmarks"><img src="https://img.shields.io/badge/SM--2-100%25%20%C2%B7%20~15%C3%97%20faster-brightgreen?style=flat-square" alt="SM-2"></a>
+  <a href="#benchmarks"><img src="https://img.shields.io/badge/SM--2-1M%20filter--first%20%C2%B7%20recall%201.0-brightgreen?style=flat-square" alt="SM-2"></a>
   <a href="spec/tridb_spec_v0.1.0.md"><img src="https://img.shields.io/badge/spec-v0.1.0-informational?style=flat-square" alt="Spec"></a>
 </p>
 
@@ -64,9 +64,11 @@ TriDB collapses all three into **one query plan, in one PostgreSQL process, unde
 > seeding + multi-source graph expansion + bridge injection past the vector frontier (TR-1-preserving),
 > at **recall@10 0.980 on real HotpotQA** (vs 0.967 vector-only). It uses reachability-bridge injection +
 > VBASE early termination; the PPR-graded + rank-join-fusion refinement (host-validated at 0.987,
-> `bench/tjs_open_ref.py`) is the next iteration. The cross-modal join-order heuristic ships but is
-> **inert** until the filter-first operator body lands (a v1.1 unlock). Lead with the source-anchored +
-> consistency wins; the open-retrieval operator is real but first-cut.
+> `bench/tjs_open_ref.py`) is the next iteration. The cross-modal join-order heuristic is **live**: the
+> filter-first physical body shipped (DEV-1290) and the FR-6 lowering binds the decision to execution
+> (DEV-1285), so a selective predicate at scale runs filter-first — at 1M this drops the canonical
+> query from ~171 ms (vector-first) to single-digit ms at recall 1.0 (see benchmarks). Lead with the
+> source-anchored + consistency wins; the open-retrieval operator is real but first-cut.
 
 ## Features
 
@@ -197,7 +199,7 @@ tests/       Python unit tests (harness, planner, corpus)
 
 ## Status
 
-Active development, tracked in Linear project **TriDB**. The **v1 tri-modal core** — native graph store, single-source TJS operator, SQL/PGQ surface, HNSW vector durability, one-WAL atomicity — is built and the **GX10 ARM64 build + engine suite are signed off** (the fork builds and the full suite passes on the DGX Spark; the first at-scale run found and fixed a TJS early-termination scale defect — see the SM-4 curve above). **Honestly scoped:** the seedless `tjs_open` multi-seed operator (ADR-0012, the open-GraphRAG retriever) now **ships as a first-cut engine operator** — recall@10 0.980 on real HotpotQA (beating vector-only 0.967) via reachability-bridge injection + VBASE early termination; the PPR-graded + rank-join-fusion refinement (host-validated at 0.987) is the next iteration. The cross-modal join-order heuristic is shipped but **inert** until the filter-first operator lands (v1.1); the **128 GB headline benchmark** and the honest SM-2 re-measurement at the corrected operating point (DEV-1284) are pending. See [`docs/STATUS.md`](docs/STATUS.md) for the per-issue breakdown and [`advisor-plans/`](advisor-plans/) for the current improvement roadmap.
+Active development, tracked in Linear project **TriDB**. The **v1 tri-modal core** — native graph store, single-source TJS operator, SQL/PGQ surface, HNSW vector durability, one-WAL atomicity — is built and the **GX10 ARM64 build + engine suite are signed off** (the fork builds and the full suite passes on the DGX Spark; the first at-scale run found and fixed a TJS early-termination scale defect — see the SM-4 curve above). **Honestly scoped:** the seedless `tjs_open` multi-seed operator (ADR-0012, the open-GraphRAG retriever) now **ships as a first-cut engine operator** — recall@10 0.980 on real HotpotQA (beating vector-only 0.967) via reachability-bridge injection + VBASE early termination; the PPR-graded + rank-join-fusion refinement (host-validated at 0.987) is the next iteration. The cross-modal join-order heuristic is now **live** — the filter-first physical body shipped (DEV-1290) and the FR-6 lowering binds it to execution (DEV-1285); the **128 GB headline benchmark** and the honest SM-2 re-measurement at the corrected operating point (DEV-1284) are pending. See [`docs/STATUS.md`](docs/STATUS.md) for the per-issue breakdown and [`advisor-plans/`](advisor-plans/) for the current improvement roadmap.
 
 ## License
 

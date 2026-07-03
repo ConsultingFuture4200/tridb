@@ -18,7 +18,7 @@
 --     << corpus). Exact-ranking verification is deferred to DEV-1168.
 
 CREATE EXTENSION vectordb;
-CREATE EXTENSION graph_store;
+CREATE EXTENSION graph_store_am;  -- v1 native AM (v0-compat surface, ADR-0013 Stage B)
 
 CREATE TABLE entities (id bigint PRIMARY KEY, chunk text, ts int, embedding float8[8]);
 

@@ -1,3 +1,5 @@
+> **⚠ Measured on the v0 heap graph store (ADR-0013), not the v1 native AM.** The v1 native-AM re-measurement is `docs/benchmark_sm2_1m_v0.3.0.md`; this doc's analysis of vector-first vs filter-first at 1M remains valid (the operator bodies are store-independent) but the absolute numbers ran on v0.
+
 # SM-2 at 1M on the GX10, v0.2.0 — the three-way point: filter-first lands (DEV-1290)
 
 > **Date:** 2026-07-02 (same corpus, queries, seed, box, and methodology as v0.1.0)

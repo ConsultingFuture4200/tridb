@@ -14,7 +14,7 @@
 -- The backend staying alive is asserted implicitly: psql runs with ON_ERROR_STOP=1, so a
 -- crashed backend kills the session and every later statement fails the suite.
 CREATE EXTENSION vectordb;
-CREATE EXTENSION graph_store;
+CREATE EXTENSION graph_store_am;  -- v1 native AM (v0-compat surface, ADR-0013 Stage B)
 
 CREATE TABLE entities (
     id bigint PRIMARY KEY, chunk text, ts int, embedding float8[8]

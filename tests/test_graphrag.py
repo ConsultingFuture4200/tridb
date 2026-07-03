@@ -226,6 +226,9 @@ def test_manifest_and_bench_sql_dropin():
         assert field in m
     assert m["dim"] == 768 and m["entities"] == n
     sql = emit_bench_sql(m, corpus_emb, query_emb, k=5)
-    assert "CREATE EXTENSION graph_store;" in sql
-    assert "SELECT graph_store.add_edge(" in sql
+    assert "CREATE EXTENSION graph_store_am;" in sql  # v1 native AM (ADR-0013 Stage B)
+    assert (
+        "SELECT graph_store.gph_upsert_vertex(v)" in sql
+    )  # vertex materialization pass
+    assert "SELECT graph_store.add_edge(" in sql  # edges through the ext-id map
     assert "tjs(" in sql

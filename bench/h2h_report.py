@@ -54,7 +54,9 @@ def emit_tridb_sql(
     w("\\set ON_ERROR_STOP on")
     w("\\timing off")
     w("CREATE EXTENSION vectordb;")
-    w("CREATE EXTENSION graph_store;")
+    w(
+        "CREATE EXTENSION graph_store_am;"
+    )  # v1 native AM, v0-compat surface (ADR-0013 Stage B)
     w(
         f"CREATE TABLE entities (id bigint PRIMARY KEY, chunk text, ts int, embedding float8[{dim}]);"
     )

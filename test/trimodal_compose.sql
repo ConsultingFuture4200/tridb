@@ -8,7 +8,7 @@
 -- orders the survivors — "filter-first".
 
 CREATE EXTENSION vectordb;
-CREATE EXTENSION graph_store;
+CREATE EXTENSION graph_store_am;  -- v1 native AM (v0-compat surface, ADR-0013 Stage B)
 
 -- relational + vector store: entities with an embedding and a timestamp.
 CREATE TABLE entities (

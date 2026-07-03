@@ -22,7 +22,7 @@
 --   scripts/smoke_test.sh tridb/msvbase:dev test/_fork_bug_tjs_double_scan.sql
 
 CREATE EXTENSION IF NOT EXISTS vectordb;
-CREATE EXTENSION IF NOT EXISTS graph_store;
+CREATE EXTENSION IF NOT EXISTS graph_store_am;  -- v1 native AM (v0-compat surface, ADR-0013 Stage B)
 
 CREATE TABLE entities (id bigint PRIMARY KEY, chunk text, ts int, embedding float8[8]);
 INSERT INTO entities
