@@ -3,6 +3,21 @@
 Updated: 2026-07-03. Legend: 🟢 unblocked here · 🟡 partial (design here,
 build on GX10) · 🔴 GX10-gated (needs live MSVBASE build).
 
+> **🟢 ADVISOR BATCH 024–031 LANDED 2026-07-03 — 7 of 8 plans merged, each persona-reviewed 3/3
+> (Fabio + Linus + Liotta) before merge.** From the deep audit + persona review + landscape research
+> (`docs/landscape_review_v0.1.0.md`): **024** operator hardening (SQL-reachable k=0 crash, PQ-eviction
+> leak, error-path release); **025** the v0→v1 native graph AM rewire (ADR-0013 Stage A/B) — operators
+> + all benches now traverse the native adjacency AM, headline re-measured on v1 at recall 1.0 / 13.4×
+> / SM-2 24/24 (`docs/benchmark_sm2_1m_v0.3.0.md`), **closing the "every headline measured v0" gap**;
+> **026** graph-store ACLs + wraparound-hazard docs + freeze design note; **027** CI nightly engine
+> gate + run-all mode + 4 new tests; **028** PG17 platform spike + ADR-0015 (**measured zero PG13→17
+> API drift; only bind is the 32KB block size** — the fork is escapable); **030** benchmark credibility
+> (p95/p99, Milvus-HNSW baseline row, dep hygiene; steps 2/4 deferred); **031** FR-6 graph-leg-aware
+> cost decision core (default-off; fixes the F4 blind spot; wire-up + boundary sweep deferred).
+> **029** (perf batch) deliberately DEFERRED — post-025 its top item is moot; the rest needs a shared
+> engine-rebuild cycle. Two persona rejections (030 false pymilvus claim; 031 IMMUTABLE-vs-GUC) were
+> caught and fixed — the gate worked.
+
 > **🟡 HNSW INDEX-MAP CACHE INVALIDATION 2026-07-02 (ADR-0014, advisor plan 023) — DESIGN + repro.**
 > The process-global `vector_index_map` (`src/hnswindex_scan.cpp`) is never erased, so a pooled backend
 > serves a STALE (DROP+CREATE same name / REINDEX) or wrong-dimension (→ plan-019 OOB) HNSW graph.
