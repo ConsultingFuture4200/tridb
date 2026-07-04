@@ -48,6 +48,7 @@ AM_TESTS := scripts/graph_am_test.sh \
             scripts/graph_concurrency_test.sh \
             scripts/graph_edge_count_test.sh \
             scripts/graph_delete_test.sh \
+            scripts/graph_typed_traversal_test.sh \
             scripts/join_order_test.sh \
             scripts/join_order_cost_test.sh \
             scripts/join_order_lowering_test.sh \

@@ -17,6 +17,53 @@ CREATE FUNCTION gph_insert_vertex() RETURNS bigint
 CREATE FUNCTION gph_insert_edge(bigint, bigint) RETURNS void
   AS 'MODULE_PATHNAME' LANGUAGE C VOLATILE STRICT;
 
+-- Typed edge insert (advisor plan 038 / DEV-1350): the 3-arg overload writes the caller's edge
+-- type id into the existing es_edge_type_id slot field (NO page-layout change). Same C symbol as
+-- the 2-arg form (PG_NARGS branches); the 2-arg form is unchanged and defaults the type to
+-- GPH_EDGE_TYPE_RELATED_TO (id 1), so every existing caller/bench is byte-identical.
+CREATE FUNCTION gph_insert_edge(bigint, bigint, integer) RETURNS void
+  AS 'MODULE_PATHNAME', 'gph_insert_edge' LANGUAGE C VOLATILE STRICT;
+
+-- ----------------------------------------------------------------------------
+-- Edge type dictionary (advisor plan 038): gBrain's typed link model (founded/
+-- founded_by, works_at/employs, mentions, attended, ...) maps link-type NAMES to
+-- the small integer ids stored natively in es_edge_type_id. The name<->id mapping
+-- is RELATIONAL metadata (golden rule 3: topology is native, properties/dictionary
+-- are relational side-tables); only the id lives in the native slot. Rides the SAME
+-- WAL + host txn as the native pages (golden rule 2), so a rolled-back registration
+-- rolls back with its edges. Built-in id 1 = related_to (GPH_EDGE_TYPE_RELATED_TO).
+CREATE TABLE edge_type (
+    id   int  PRIMARY KEY,
+    name text NOT NULL UNIQUE
+);
+INSERT INTO edge_type (id, name) VALUES (1, 'related_to');
+GRANT SELECT ON edge_type TO PUBLIC;
+
+-- register_edge_type(name) RETURNS int — idempotent: returns the existing id if the name is
+-- already registered, else allocates the next id (max+1) and inserts it. Owner-guarded
+-- (REVOKEd from PUBLIC like the other mutators, plan 026 discipline). The loader/gBrain adapter
+-- calls this once per link_type, then passes the returned id to gph_insert_edge(src, dst, id).
+CREATE FUNCTION register_edge_type(p_name text) RETURNS int
+LANGUAGE plpgsql VOLATILE STRICT
+AS $$
+DECLARE
+    v_id int;
+BEGIN
+    SELECT id INTO v_id FROM graph_store.edge_type WHERE name = p_name;
+    IF FOUND THEN
+        RETURN v_id;
+    END IF;
+    SELECT COALESCE(max(id), 0) + 1 INTO v_id FROM graph_store.edge_type;
+    INSERT INTO graph_store.edge_type (id, name) VALUES (v_id, p_name)
+        ON CONFLICT (name) DO NOTHING;
+    -- Re-read: a concurrent registration of the SAME name (contract-violating under the v1
+    -- single-writer model) would have won the unique index; return the winner's id.
+    SELECT id INTO v_id FROM graph_store.edge_type WHERE name = p_name;
+    RETURN v_id;
+END
+$$;
+REVOKE EXECUTE ON FUNCTION register_edge_type(text) FROM PUBLIC;
+
 CREATE FUNCTION gph_neighbors(bigint) RETURNS SETOF bigint
   AS 'MODULE_PATHNAME' LANGUAGE C VOLATILE STRICT;
 
@@ -26,6 +73,18 @@ CREATE FUNCTION gph_neighbors(bigint) RETURNS SETOF bigint
 -- FROM-clause FunctionScan, or early termination under LIMIT is lost. v1 edge slots carry no
 -- stored edge id, so only (src, dst) are surfaced.
 CREATE FUNCTION gph_traverse(bigint, OUT src bigint, OUT dst bigint) RETURNS SETOF record
+  AS 'MODULE_PATHNAME' LANGUAGE C VOLATILE STRICT;
+
+-- Typed + directional + source-scoped traversal (advisor plan 038 / DEV-1350; gBrain traversePaths).
+-- Same one-edge-per-Next() TR-1 engine as gph_traverse; only the inline gs_getnext filters differ:
+--   type_id   = dictionary edge type id, or 0 (GPH_EDGE_TYPE_ANY) for any type;
+--   direction = 0 out (v1); in/both RAISE (reverse adjacency deferred — docs/decisions/0016);
+--   source_id = source vid to scope to, or -1 for unscoped.
+-- gph_traverse_typed(src, 1, 0, -1) is byte-identical to gph_traverse(src) (parity oracle). Read
+-- surface stays open (matches gph_traverse). Use in a target-list / ProjectSet position, not a
+-- FROM-clause FunctionScan, or early termination under LIMIT is lost.
+CREATE FUNCTION gph_traverse_typed(bigint, integer, integer, bigint,
+                                   OUT src bigint, OUT dst bigint) RETURNS SETOF record
   AS 'MODULE_PATHNAME' LANGUAGE C VOLATILE STRICT;
 
 CREATE FUNCTION gph_visits() RETURNS bigint
@@ -88,6 +147,7 @@ REVOKE EXECUTE ON FUNCTION gph_insert_vertex(), gph_insert_edge(bigint,bigint) F
 -- gph_freeze is a maintenance mutator (superuser/owner only, plan 026 discipline).
 REVOKE EXECUTE ON FUNCTION gph_freeze(xid) FROM PUBLIC;
 REVOKE EXECUTE ON FUNCTION gph_tombstone_edge(bigint,bigint), gph_tombstone_vertex(bigint) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION gph_insert_edge(bigint,bigint,integer) FROM PUBLIC;
 
 -- ============================================================================
 -- ADR-0013 Stage A (advisor plan 025): the external-id mapping layer + the v0
