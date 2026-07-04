@@ -59,11 +59,19 @@ typedef struct GphMeta
 	uint32		gm_version;		/* GPH_VERSION */
 	uint64		gm_next_vid;	/* next vertex id to assign (dense, monotone) */
 	uint32		gm_vertex_count;
-	uint32		gm_reserved;
+	TransactionId gm_frozen_horizon;	/* highest completed gph_freeze() horizon; 0 (== Invalid)
+										 * = never frozen. Repurposes the former uint32 gm_reserved
+										 * slot — TransactionId is uint32 on PG 13, so NO page-layout
+										 * change and no GPH_VERSION bump; old stores read as 0
+										 * (advisor plan 036 / DEV-1347). */
 	uint64		gm_edge_count;	/* store-wide directed-edge count (FR-6 avg_out_degree source) */
 	BlockNumber	gm_first_vertex_blk;	/* head of the vertex-page chain (Invalid if none) */
 	BlockNumber	gm_last_vertex_blk;		/* tail of the vertex-page chain (append target) */
 } GphMeta;
+
+/* gm_frozen_horizon must reuse gm_reserved's slot with NO layout change (advisor 036). */
+StaticAssertDecl(sizeof(GphMeta) == 40,
+				 "GphMeta size must be unchanged (gm_frozen_horizon repurposes gm_reserved)");
 
 /*
  * Vertex record. Dense uint64 vid; points at the head/tail of this vertex's adjacency-page

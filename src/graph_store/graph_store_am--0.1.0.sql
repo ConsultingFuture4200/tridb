@@ -47,10 +47,33 @@ CREATE FUNCTION gph_vertex_count() RETURNS bigint
 CREATE FUNCTION gph_edge_count() RETURNS bigint
   AS 'MODULE_PATHNAME' LANGUAGE C VOLATILE;
 
+-- gph_freeze(horizon) RETURNS bigint — manual anti-wraparound freeze pass (advisor plan 036 /
+-- DEV-1347; design docs/graph_store_freeze_design_v0.1.0.md). Rewrites every stored inserting xid
+-- that PRECEDES `horizon` to a permanent one (committed -> frozen/visible, aborted -> invalid/
+-- invisible) WHILE it is still resolvable in clog, records gm_frozen_horizon, and advances the
+-- container's relfrozenxid. Visibility is byte-identical before and after (pure storage rewrite).
+-- Every page rewrite is GenericXLog'd in the caller's txn (one WAL, FR-7); the pass is idempotent
+-- and returns the number of records frozen.
+--
+-- OPERATIONS — this is the v1 MANUAL freeze (the auto-freeze / table-AM stage is deferred, design
+-- §3 "Later"). PostgreSQL's forced anti-wraparound autovacuum IGNORES autovacuum_enabled=false and
+-- would eventually walk gstore's NON-heap pages as a heap; there is NO reliable way to make it SKIP
+-- a heap-typed relation short of the full table-AM handler. The disarm is therefore INDIRECT: run
+-- gph_freeze() to keep age(relfrozenxid) on gstore low so the forced vacuum never triggers. Monitor:
+--     SELECT age(relfrozenxid) FROM pg_class WHERE oid = 'graph_store.gstore'::regclass;
+-- and run  SELECT graph_store.gph_freeze(<a committed past xid>::xid);  well before it approaches
+-- autovacuum_freeze_max_age. Run it in AUTOCOMMIT (its own transaction), exactly like VACUUM: the
+-- relfrozenxid advance is vacuum's in-place (non-transactional) update, so a rolled-back freeze
+-- would leave relfrozenxid advanced past un-frozen pages.
+CREATE FUNCTION gph_freeze(horizon xid) RETURNS bigint
+  AS 'MODULE_PATHNAME' LANGUAGE C VOLATILE STRICT;
+
 -- Containment (advisor plan 026): the container holds NON-heap pages; any heap-path access
 -- (SELECT/VACUUM/ANALYZE) misreads them. Deployers grant gph_* EXECUTE to trusted roles only.
 REVOKE ALL ON TABLE gstore FROM PUBLIC;
 REVOKE EXECUTE ON FUNCTION gph_insert_vertex(), gph_insert_edge(bigint,bigint) FROM PUBLIC;
+-- gph_freeze is a maintenance mutator (superuser/owner only, plan 026 discipline).
+REVOKE EXECUTE ON FUNCTION gph_freeze(xid) FROM PUBLIC;
 
 -- ============================================================================
 -- ADR-0013 Stage A (advisor plan 025): the external-id mapping layer + the v0

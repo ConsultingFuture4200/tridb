@@ -42,6 +42,7 @@ lock:
 # HNSW / fork-bug oracle harnesses are no-build and may pipe output through grep.
 AM_TESTS := scripts/graph_am_test.sh \
             scripts/graph_am_acl_test.sh \
+            scripts/graph_freeze_test.sh \
             scripts/txn_atomicity_test.sh \
             scripts/crash_recovery_test.sh \
             scripts/graph_concurrency_test.sh \

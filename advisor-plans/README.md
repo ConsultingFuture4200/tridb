@@ -67,7 +67,7 @@ identical, zero engine change) with true-IP riding PERF-01 as a follow-on.
 
 | Plan | Title | Priority | Effort | Risk | Depends on | Linear | Status |
 |------|-------|----------|--------|------|------------|--------|--------|
-| 036 | `gph_freeze()` + disarm forced anti-wraparound autovacuum (long-lived-store gate) | P1 | M | MED | 026 (design) | DEV-1347 | PLANNED |
+| 036 | `gph_freeze()` + disarm forced anti-wraparound autovacuum (long-lived-store gate) | P1 | M | MED | 026 (design) | DEV-1347 | **IMPLEMENTED-pending-GX10** — branch `advisor/036-gph-freeze`; `gm_reserved`→`gm_frozen_horizon` (size-assert, no layout change), `gph_freeze(horizon xid)` GenericXLog page-walk (committed→Frozen / aborted→Invalid, relfrozenxid advance, idempotent) + `test/graph_freeze_test.sql` wired into AM_TESTS; x86 pytest+ruff green; C unbuilt here (needs PG 13.4 image); STOP #3 hit — forced-autovacuum disarm is INDIRECT (keep age low) + auto-freeze table-AM stage deferred |
 | 037 | native graph delete via `gph_tombstone_edge/vertex` | P1 | S–M | LOW | — | DEV-1349 | PLANNED |
 | 038 | typed + directional + source-scoped native traversal | P1 | M | MED | — | DEV-1350 | PLANNED |
 
