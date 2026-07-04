@@ -56,6 +56,28 @@ Engine-image rebuilds stay serialized; 035 and the 033/034 SQL work touch disjoi
 
 ---
 
+## 2026-07-04 batch — gBrain backend hardening, critical path (planned against `cb3eb0a`)
+
+The additive engine hardening that makes TriDB a viable backend for **gBrain** (AgentBOX memory, now on
+the Spark) — spec `docs/gbrain_backend_hardening_v0.1.0.md`. All three are **native graph-store C**
+(GX10-gated build): author + persona-review + static-verify here, engine build + FR-7 re-run on the GX10.
+All are **additive** — no frozen-core edit, no golden-rule break (TR-1, native AM, one-WAL/FR-7, one
+canonical surface, three stores preserved). Cosine (B4) decided: **normalize-at-write first** (order-
+identical, zero engine change) with true-IP riding PERF-01 as a follow-on.
+
+| Plan | Title | Priority | Effort | Risk | Depends on | Linear | Status |
+|------|-------|----------|--------|------|------------|--------|--------|
+| 036 | `gph_freeze()` + disarm forced anti-wraparound autovacuum (long-lived-store gate) | P1 | M | MED | 026 (design) | DEV-1347 | PLANNED |
+| 037 | native graph delete via `gph_tombstone_edge/vertex` | P1 | S–M | LOW | — | DEV-1349 | PLANNED |
+| 038 | typed + directional + source-scoped native traversal | P1 | M | MED | — | DEV-1350 | PLANNED |
+
+Recommended order: **036 (correctness gate — nothing long-lived is safe without it) → 037 → 038**. 037
+and 038 touch the same `graph_am.c` traversal region, so serialize or merge carefully. Deferred (tracked,
+not planned here): A2 HNSW abort-durability (DEV-1348), B3 edge-property side-table, B4 true-IP cosine
+(B4-interim = normalize, no plan needed), B5 multi-dim vectors, C1 the `BrainEngine` adapter (cross-repo).
+
+---
+
 ## Execution order & status
 
 | Plan | Title | Priority | Effort | Risk | Depends on | Verify here? | Status |
