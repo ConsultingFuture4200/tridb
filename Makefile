@@ -13,7 +13,7 @@ ENGINE_TESTS := test/graph_store_test.sql test/trimodal_compose.sql \
                 test/tjs_open_smoke.sql test/hnsw_am_guards.sql \
                 test/pgmain_rewriter_removed.sql test/relaxed_order_guard.sql \
                 test/tjs_filter_first_test.sql test/tjs_arg_guards_test.sql \
-                test/graph_v0v1_parity_test.sql
+                test/graph_v0v1_parity_test.sql test/graph_vid_cache_test.sql
 
 test:
 	$(PY) -m pytest tests/ -q

@@ -36,12 +36,16 @@
 #include "access/transam.h"
 #include "access/xact.h"
 #include "catalog/namespace.h"
+#include "executor/spi.h"
 #include "funcapi.h"
 #include "miscadmin.h"
 #include "nodes/makefuncs.h"
 #include "storage/bufmgr.h"
 #include "storage/lmgr.h"
 #include "utils/builtins.h"
+#include "utils/hsearch.h"
+#include "utils/inval.h"
+#include "utils/memutils.h"
 #include "utils/rel.h"
 
 #include "gph_page.h"
@@ -729,6 +733,227 @@ gph_neighbors(PG_FUNCTION_ARGS)
 	{
 		relation_close(rel, AccessShareLock);
 		SRF_RETURN_NEXT(funcctx, Int64GetDatum((int64) elem.edge_dst));
+	}
+	relation_close(rel, AccessShareLock);	/* === Close === */
+	gs_close(scan);
+	SRF_RETURN_DONE(funcctx);
+}
+
+/* ------------------------------------------------------------------ */
+/* Backend-local reverse id cache (plan 034 / DEV-1345, PERF-03)       */
+/* ------------------------------------------------------------------ */
+
+/*
+ * gph_neighbors_ext (graph_store_am--0.1.0.sql) reverse-translates every emitted neighbor vid back
+ * to its external id with a correlated per-row subquery over gph_vid_map (btree + SPI, ~1us/neighbor
+ * => ~2ms at fanout 2000). This backend-local hash does the SAME reverse map in ~50ns/neighbor: on
+ * first probe it loads the WHOLE gph_vid_map (vid -> ext_id) once into a session-lifetime hash, then
+ * every translation is an O(1) lookup. gph_neighbors_ext_cached() below is the drop-in the TJS
+ * operator's reachable-set resolution (graphReachableT) probes instead of the correlated shim.
+ *
+ * Correctness contract (documented deliberately — plan 034 Step 2):
+ *   - Freshness is guaranteed by the v1 SINGLE-WRITER, bulk-load-THEN-query contract (graph_am.c
+ *     header): the map is fully populated before the first query builds the cache and is not mutated
+ *     mid-query, so the cache can never serve a stale id today.
+ *   - gph_vid_cache_invalidate (registered via CacheRegisterRelcacheCallback, mirroring ADR-0014's
+ *     HNSW index-map eviction) flushes the whole hash whenever gph_vid_map receives a relcache
+ *     invalidation (TRUNCATE / DROP / rewrite / an explicit CacheInvalidateRelcacheByRelid). This is
+ *     a NO-OP under today's contract, but it is what makes the cache safe by construction once
+ *     DIRECTION-04 incremental ingest lands: that writer must emit an explicit relcache invalidation
+ *     on gph_vid_map after inserting a mapping (a plain heap INSERT alone does NOT invalidate the
+ *     relcache), and the reader cache then rebuilds on the next probe.
+ *   - Memory: one (vid, ext_id) pair per mapped vertex per backend (~16B + hash overhead). At very
+ *     large V this is a real per-session cost (plan 034 STOP #3) — bound it or prefer the PERF-02
+ *     identity path there; unbounded is acceptable at the benchmark's V and disclosed here.
+ */
+typedef struct GphVidCacheEntry
+{
+	int64		vid;			/* hash key: the dense v1 vid */
+	int64		ext_id;			/* the mapped external id */
+} GphVidCacheEntry;
+
+static HTAB *gph_vid_cache = NULL;			/* vid -> ext_id, in CacheMemoryContext; NULL = unbuilt */
+static Oid	gph_vid_map_oid = InvalidOid;	/* resolved when the cache is built */
+static bool gph_vid_cache_cb_done = false;	/* relcache callback registered once per backend */
+
+/*
+ * Flush the whole reverse cache when gph_vid_map is invalidated. Registered process-lifetime, so it
+ * must be cheap and must NOT ereport (it runs in invalidation-processing context). relid ==
+ * InvalidOid is a global reset; otherwise flush only on our map's relid.
+ */
+static void
+gph_vid_cache_invalidate(Datum arg, Oid relid)
+{
+	if (gph_vid_cache == NULL)
+		return;
+	if (relid != InvalidOid && relid != gph_vid_map_oid)
+		return;
+	hash_destroy(gph_vid_cache);	/* deletes the dynahash child context under CacheMemoryContext */
+	gph_vid_cache = NULL;			/* next probe rebuilds from the live map */
+}
+
+/*
+ * Build the reverse cache from a single sequential pass over gph_vid_map, into CacheMemoryContext
+ * (session lifetime). No-op if already built. Uses SPI, so it must run inside a transaction — the
+ * SRF's first call is. Registers the invalidation callback exactly once per backend.
+ */
+static void
+gph_vid_cache_ensure(void)
+{
+	HASHCTL		ctl;
+	HTAB	   *h;
+	uint64		i;
+
+	if (gph_vid_cache != NULL)
+		return;
+
+	gph_vid_map_oid = RangeVarGetRelid(makeRangeVar(GPH_SCHEMA, "gph_vid_map", -1),
+									   NoLock, false);
+
+	memset(&ctl, 0, sizeof(ctl));
+	ctl.keysize = sizeof(int64);
+	ctl.entrysize = sizeof(GphVidCacheEntry);
+	ctl.hcxt = CacheMemoryContext;
+	/*
+	 * Build into a LOCAL handle and publish to gph_vid_cache only once fully populated: an
+	 * invalidation that fires mid-build (SPI acquires a lock, which processes pending inval
+	 * messages) sees gph_vid_cache still NULL and no-ops, so it can never hash_destroy the table
+	 * out from under this loop.
+	 */
+	h = hash_create("graph_store vid reverse cache", 4096, &ctl,
+					HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+
+	if (SPI_connect() != SPI_OK_CONNECT)
+		elog(ERROR, "graph_store vid cache: SPI_connect failed");
+	if (SPI_execute("SELECT vid, ext_id FROM graph_store.gph_vid_map", true, 0) != SPI_OK_SELECT)
+		elog(ERROR, "graph_store vid cache: gph_vid_map scan failed");
+
+	for (i = 0; i < SPI_processed; i++)
+	{
+		HeapTuple	tup = SPI_tuptable->vals[i];
+		TupleDesc	desc = SPI_tuptable->tupdesc;
+		bool		vnull;
+		bool		enull;
+		int64		vid = DatumGetInt64(SPI_getbinval(tup, desc, 1, &vnull));
+		int64		ext = DatumGetInt64(SPI_getbinval(tup, desc, 2, &enull));
+		GphVidCacheEntry *e;
+		bool		found;
+
+		if (vnull || enull)
+			continue;			/* NOT NULL columns; defensive */
+		e = (GphVidCacheEntry *) hash_search(h, &vid, HASH_ENTER, &found);
+		e->ext_id = ext;
+	}
+	SPI_finish();
+
+	if (!gph_vid_cache_cb_done)
+	{
+		CacheRegisterRelcacheCallback(gph_vid_cache_invalidate, (Datum) 0);
+		gph_vid_cache_cb_done = true;
+	}
+	gph_vid_cache = h;			/* publish the fully-built table */
+}
+
+PG_FUNCTION_INFO_V1(gph_neighbors_ext_cached);
+
+/*
+ * gph_neighbors_ext_cached(src bigint) RETURNS SETOF bigint — the cached-translation twin of the
+ * SQL gph_neighbors_ext: same external-id traversal (translate src -> vid, walk the native adjacency
+ * chain, translate each neighbor vid -> ext_id), same storage emission order, same lenient contract
+ * (absent src => empty set; an unmapped neighbor vid => a NULL row, matching the shim's scalar
+ * subquery) — but the per-neighbor reverse translation hits the backend-local hash instead of a
+ * correlated btree + SPI subquery. Byte-identical to gph_neighbors_ext (parity oracle).
+ */
+Datum
+gph_neighbors_ext_cached(PG_FUNCTION_ARGS)
+{
+	FuncCallContext *funcctx;
+	GraphScanDesc  *scan;
+	Relation		rel;
+	GraphElement	elem;
+
+	if (SRF_IS_FIRSTCALL())		/* === Open === */
+	{
+		MemoryContext	oldctx;
+		int64			ext_src = PG_GETARG_INT64(0);
+		int64			vid = 0;
+		bool			have_vid = false;
+
+		funcctx = SRF_FIRSTCALL_INIT();
+		oldctx = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
+
+		scan = (GraphScanDesc *) palloc0(sizeof(GraphScanDesc));
+
+		/* Warm the reverse cache (also registers the invalidation hook). */
+		gph_vid_cache_ensure();
+
+		/*
+		 * Forward ext_id -> vid: ONE scalar probe per call (the reverse per-neighbor direction is
+		 * what the cache accelerates, not this). ext_src is a bigint from PG_GETARG, so the %lld
+		 * interpolation carries no injection risk (same pattern the TJS operator's SPI probe uses).
+		 */
+		if (SPI_connect() != SPI_OK_CONNECT)
+			elog(ERROR, "graph_store vid cache: SPI_connect failed");
+		{
+			char	cmd[128];
+
+			snprintf(cmd, sizeof(cmd),
+					 "SELECT vid FROM graph_store.gph_vid_map WHERE ext_id = %lld",
+					 (long long) ext_src);
+			if (SPI_execute(cmd, true, 1) == SPI_OK_SELECT && SPI_processed == 1)
+			{
+				bool	isnull;
+				int64	v = DatumGetInt64(SPI_getbinval(SPI_tuptable->vals[0],
+													   SPI_tuptable->tupdesc, 1, &isnull));
+
+				if (!isnull)
+				{
+					vid = v;
+					have_vid = true;
+				}
+			}
+		}
+		SPI_finish();
+
+		if (have_vid)
+		{
+			rel = gph_open_store(AccessShareLock);
+			(void) gs_open(scan, rel, (GraphVertexId) vid, GRAPH_SCAN_OUTGOING);
+			relation_close(rel, AccessShareLock);
+		}
+		else
+		{
+			/*
+			 * Unknown ext_id => empty set. Leave the scan in the exhausted state gs_open sets for an
+			 * absent vertex (page_buf allocated, cur_blk Invalid) so gs_getnext returns false — do
+			 * NOT rely on palloc0's zeroed cur_blk (block 0 is the metapage, not "no pages").
+			 */
+			scan->page_buf = (GphEdgeSlot *) palloc(sizeof(GphEdgeSlot) * GphEdgeSlotsPerPage());
+			scan->cur_blk = InvalidBlockNumber;
+			scan->page_n = 0;
+			scan->page_i = 0;
+		}
+
+		funcctx->user_fctx = scan;
+		MemoryContextSwitchTo(oldctx);
+	}
+
+	funcctx = SRF_PERCALL_SETUP();	/* === Next === */
+	scan = (GraphScanDesc *) funcctx->user_fctx;
+
+	rel = gph_open_store(AccessShareLock);
+	if (gs_getnext(rel, scan, &elem))
+	{
+		int64		nvid = (int64) elem.edge_dst;
+		GphVidCacheEntry *e;
+		bool		found;
+
+		relation_close(rel, AccessShareLock);
+		gph_vid_cache_ensure();		/* re-warm if an invalidation flushed it between Next() calls */
+		e = (GphVidCacheEntry *) hash_search(gph_vid_cache, &nvid, HASH_FIND, &found);
+		if (found)
+			SRF_RETURN_NEXT(funcctx, Int64GetDatum(e->ext_id));
+		SRF_RETURN_NEXT_NULL(funcctx);	/* unmapped vid => NULL (shim parity) */
 	}
 	relation_close(rel, AccessShareLock);	/* === Close === */
 	gs_close(scan);

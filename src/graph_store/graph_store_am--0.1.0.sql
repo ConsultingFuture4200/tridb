@@ -115,6 +115,17 @@ AS $$
          ) AS n(nvid)
 $$;
 
+-- gph_neighbors_ext_cached(ext_id) RETURNS SETOF bigint — byte-identical twin of
+-- gph_neighbors_ext (same traversal, order, and lenient absent/unmapped contract),
+-- but the per-neighbor reverse vid -> ext_id translation hits a backend-local hash
+-- (~50ns) instead of a correlated btree + SPI subquery (~1us). The cache is loaded
+-- lazily on first probe from gph_vid_map and flushed by a relcache-invalidation hook;
+-- correct under the v1 single-writer bulk-load-then-query contract (plan 034 / DEV-1345,
+-- PERF-03; see the header comment in graph_am.c). This is the probe the TJS operator's
+-- reachable-set resolution (graphReachableT) SPI-calls instead of gph_neighbors_ext.
+CREATE FUNCTION gph_neighbors_ext_cached(bigint) RETURNS SETOF bigint
+  AS 'MODULE_PATHNAME' LANGUAGE C VOLATILE STRICT;
+
 -- ----------------------------------------------------------------------------
 -- v0-compat front door (identical SQL signatures to src/graph_store_ext), so
 -- every existing consumer keeps working with ONLY its CREATE EXTENSION line

@@ -1,0 +1,37 @@
+tridb_graph_vid_cache.patch — advisor plan 034 / DEV-1345 (PERF-03): point the TJS operator's
+graph reachable-set resolution at the backend-local CACHED reverse translator.
+
+graphReachableT (tjs_operator.cpp) now SPI-probes graph_store.gph_neighbors_ext_cached(%lld)
+instead of graph_store.gph_neighbors_ext(%lld). The cached function (repo-owned
+src/graph_store/graph_am.c + graph_store_am--0.1.0.sql) is byte-identical to the shim but
+reverse-translates each neighbor vid -> ext_id through a session-lifetime hash (~50ns) instead
+of a correlated btree + SPI subquery (~1us/neighbor, ~2ms at fanout 2000). SPI shape, probe-ONCE-
+at-Open caching, and the single-connection nesting discipline (DEV-1236) are unchanged — only the
+translator behind the probe changes.
+
+Applies LAST in the chain, after tridb_graph_v1_rewire.patch (advisor plan 025), whose
+graph_store.gph_neighbors_ext probe string this rewrites.
+
+Test: test/graph_vid_cache_test.sql (cached == uncached parity + relcache-invalidation hook fires).
+Sentinel: gph_neighbors_ext_cached in src/tjs_operator.cpp.
+--- a/src/tjs_operator.cpp
++++ b/src/tjs_operator.cpp
+@@ -294,12 +294,16 @@
+ static std::unordered_set<int64> graphReachableT(int64 src){
+ 	std::unordered_set<int64> reachable;
+ 	char cmd[256];
++	// TRIDB: graph vid cache (plan 034 / DEV-1345, PERF-03) — probe the backend-local CACHED
++	// reverse translator (byte-identical to gph_neighbors_ext; the vid -> ext_id map is a
++	// session-lifetime hash, ~50ns vs the shim's ~1us per neighbor). The reachable set is still
++	// resolved ONCE at Open under the SRF's single SPI connection (nesting/caching unchanged).
+ 	snprintf(cmd, sizeof(cmd),
+-			 "SELECT dst FROM graph_store.gph_neighbors_ext(%lld) AS dst", (long long) src);
++			 "SELECT dst FROM graph_store.gph_neighbors_ext_cached(%lld) AS dst", (long long) src);
+ 
+ 	int ret = SPI_execute(cmd, true /* read_only */, 0);
+ 	if (ret != SPI_OK_SELECT)
+-		elog(ERROR, "TJS graph predicate: graph_store.gph_neighbors_ext(%lld) probe failed (%d)",
++		elog(ERROR, "TJS graph predicate: graph_store.gph_neighbors_ext_cached(%lld) probe failed (%d)",
+ 			 (long long) src, ret);
+ 
+ 	uint64 proc = SPI_processed;
