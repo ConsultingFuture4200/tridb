@@ -2,15 +2,28 @@
 
 **TL;DR.** The ONE canonical query (spec §5) was driven on the **LIVE forked-MSVBASE
 engine** (`tridb/msvbase:dev`, x86 standin) over a **2000-entity / dim-32** corpus
-across **12 queries** at **k=5**. Four of the five spec §7 success metrics are
-**live-measured and PASS** on real numbers; SM-2 (latency head-to-head) is reported
-TriDB-side only and is explicitly gated. Answer correctness is triple-verified: the
-live `tjs()` result equals the exact in-DB SQL oracle on **12/12** queries AND the
-in-process baseline model.
+across **12 queries** at **k=5**. Three of the five spec §7 success metrics are
+**live-measured and PASS** (SM-3/4/5); SM-2 (latency head-to-head) is reported
+TriDB-side only and is explicitly gated; **SM-1 FAILS on this standin corpus (1.07×
+vs the ≥5× target)** under the corrected `max(k, reached)` accounting — see the note
+below. Answer correctness is triple-verified: the live `tjs()` result equals the exact
+in-DB SQL oracle on **12/12** queries AND the in-process baseline model.
+
+> [!WARNING]
+> **SM-1 correction (2026-07-03).** An earlier revision of this report headlined SM-1 =
+> **32.0×** (PASS). That figure recorded TriDB's peak intermediate as `k` (~60 rows). The
+> current harness (`live_report.py`) uses the honest peak `max(k, reached)` — the top-k heap
+> PLUS the reachable-id set the SRF TJS precomputes at Open — which is **~1799 rows → 1.07×,
+> a FAIL** on this 2k/dim-32 corpus. **SM-1 is a deterministic row-count ratio, not a timing:
+> it is hardware-independent, so the GX10 does NOT restore 32×.** The ratio at the 128 GB / 1M
+> headline scale is genuinely unmeasured and may differ (selectivity-dependent), but under the
+> corrected accounting, not the retired `k` rule. A real ≥5× reduction requires the *streaming
+> graph predicate* redesign (drop the reachable-set precompute), which is an engineering item,
+> not a hardware one.
 
 | SM | Metric | Target (spec §7) | LIVE result | Verdict | Basis |
 |----|--------|------------------|-------------|---------|-------|
-| SM-1 | Intermediate-result reduction | ≥ 5× | **32.0×** (baseline 1920 rows vs TriDB 60) | PASS | live (TriDB) vs in-process baseline model |
+| SM-1 | Intermediate-result reduction | ≥ 5× | **1.07×** (baseline 1920 rows vs TriDB 1799) | **FAIL** (standin corpus) | live (TriDB) vs in-process baseline model; corrected `max(k, reached)` accounting |
 | SM-2 | Latency vs multi-system baseline | lower on ≥ 80% | **1.199 ms mean** (TriDB-side only) | GATED | live TriDB EXPLAIN ANALYZE; no fair baseline runtime here |
 | SM-3 | Corpus examined (k=5, worst case) | < 25% | **6.4%** (max 128 / 2000) | PASS | live `tjs_candidates_examined()` |
 | SM-4 | Answer-set parity | ≥ 99% | **100.0%** (12/12 exact) | PASS | live `tjs()` vs exact in-DB oracle vs baseline model |

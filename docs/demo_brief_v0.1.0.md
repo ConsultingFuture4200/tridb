@@ -74,8 +74,15 @@ Works on the x86 standin — build the image once, then:
 ```bash
 scripts/x86build.sh --docker        # build the fork image (one time)
 make test-all                       # test + lint + smoke + engine suites — show it's green
-make bench-live                     # live SM-1/SM-3/SM-4/SM-5 on the REAL engine
 ```
+
+> [!WARNING]
+> **Do NOT run `make bench-live` live in front of an audience.** It exits non-zero because
+> **SM-1 FAILS on the standin corpus** (1.07× vs ≥5× target, honest `max(k, reached)` accounting
+> — this is expected, not a regression). SM-2/3/4/5 pass. If you want to show benchmark numbers,
+> quote the committed real-data results (SIFT-1M recall 1.0, HotpotQA +15.6pt) — do not run the
+> live SM-1 command on stage. SM-1 is a hardware-independent row-count ratio; the Spark does not
+> fix it (a streaming-graph-predicate redesign would).
 
 The money shot for a technical audience — the canonical query's plan:
 ```bash
