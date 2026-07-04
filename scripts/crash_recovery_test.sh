@@ -94,7 +94,7 @@ SQL
   seed_cluster $D2
   # Open a txn in a BACKGROUND psql that writes all three stores then BLOCKS (never commits),
   # holding the txn open. We crash the postmaster while that txn is in flight.
-  ( $PSQL >/dev/null 2>&1 <<SQL
+  ( PGAPPNAME=tridb_doomed $PSQL >/dev/null 2>&1 <<SQL
 SET search_path TO graph_store, public;
 BEGIN;
   INSERT INTO entities VALUES (6000, '"'"'doomed'"'"', ARRAY[6000,0,0,0,0,0,0,0]::float8[]);
@@ -126,7 +126,9 @@ SQL
       $B/pg_ctl -D $D2 -m immediate -w stop >/dev/null 2>&1 || true
       exit 1
     fi
-    n=$($PSQL -tA -c "SELECT count(*) FROM pg_stat_activity WHERE query LIKE '"'"'%pg_sleep%'"'"' AND state='"'"'active'"'"';" 2>/dev/null || echo 0)
+    # Scope to the tagged doomed session (PGAPPNAME=tridb_doomed) so the poller cannot match its OWN
+    # query text (which also contains 'pg_sleep') — the old unscoped count was ambiguous (DEV-1331).
+    n=$($PSQL -tA -c "SELECT count(*) FROM pg_stat_activity WHERE application_name='"'"'tridb_doomed'"'"' AND state='"'"'active'"'"' AND query LIKE '"'"'%pg_sleep%'"'"';" 2>/dev/null || echo 0)
     if [ "$n" = "1" ]; then sentinel=1; break; fi
     sleep 0.5
   done
@@ -134,6 +136,7 @@ SQL
   # never ran, so crashing now would trivially "pass" scenario 2 with no in-flight tri-store state.
   if [ "$sentinel" != "1" ]; then
     echo "FAIL (uncommitted): doomed txn never reached its in-flight state (pg_sleep sentinel not observed after ~180s) — poll timeout"
+    echo "--- doomed session diagnostic (what is it stuck on?) ---"; $PSQL -c "SELECT pid,state,wait_event_type,wait_event,left(query,90) AS q FROM pg_stat_activity WHERE application_name='"'"'tridb_doomed'"'"';" 2>/dev/null || true
     kill $BGPID >/dev/null 2>&1 || true; $B/pg_ctl -D $D2 -m immediate -w stop >/dev/null 2>&1 || true
     exit 1
   fi
@@ -181,7 +184,7 @@ SET search_path TO graph_store, public;
 SELECT gph_insert_edge(0, 1);
 CHECKPOINT;                     -- edge 0->1 durable on disk
 SQL
-  ( $PSQL >/dev/null 2>&1 <<SQL
+  ( PGAPPNAME=tridb_doomed $PSQL >/dev/null 2>&1 <<SQL
 SET search_path TO graph_store, public;
 BEGIN;
   SELECT gph_tombstone_edge(0, 1);   -- doomed tombstone; deleting xid never commits
@@ -199,12 +202,15 @@ SQL
       $B/pg_ctl -D $D4 -m immediate -w stop >/dev/null 2>&1 || true
       exit 1
     fi
-    n=$($PSQL -tA -c "SELECT count(*) FROM pg_stat_activity WHERE query LIKE '"'"'%pg_sleep%'"'"' AND state='"'"'active'"'"';" 2>/dev/null || echo 0)
+    # Scope to the tagged doomed session (PGAPPNAME=tridb_doomed) so the poller cannot match its OWN
+    # query text (which also contains 'pg_sleep') — the old unscoped count was ambiguous (DEV-1331).
+    n=$($PSQL -tA -c "SELECT count(*) FROM pg_stat_activity WHERE application_name='"'"'tridb_doomed'"'"' AND state='"'"'active'"'"' AND query LIKE '"'"'%pg_sleep%'"'"';" 2>/dev/null || echo 0)
     if [ "$n" = "1" ]; then sentinel=1; break; fi
     sleep 0.5
   done
   if [ "$sentinel" != "1" ]; then
     echo "FAIL (uncommitted_tombstone): doomed txn never reached its in-flight state (pg_sleep sentinel not observed after ~180s) — poll timeout"
+    echo "--- doomed session diagnostic (what is it stuck on?) ---"; $PSQL -c "SELECT pid,state,wait_event_type,wait_event,left(query,90) AS q FROM pg_stat_activity WHERE application_name='"'"'tridb_doomed'"'"';" 2>/dev/null || true
     kill $BGPID >/dev/null 2>&1 || true; $B/pg_ctl -D $D4 -m immediate -w stop >/dev/null 2>&1 || true
     exit 1
   fi
