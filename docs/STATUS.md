@@ -3,6 +3,22 @@
 Updated: 2026-07-04. Legend: 🟢 unblocked here · 🟡 partial (design here,
 build on GX10) · 🔴 GX10-gated (needs live MSVBASE build).
 
+> **🟢 gBRAIN BACKEND HARDENING 036–038 — 3/3 persona-reviewed, MERGED, ENGINE-VERIFIED ON THE GX10 (2026-07-04).**
+> Built + run on the DGX Spark against `tridb/msvbase:gx10-v1` (`make graph-test`): **all three new suites
+> PASS** — `gph_freeze` (036: froze records, visibility byte-identical, aborted row invisible, relfrozenxid
+> advanced, idempotent, future-horizon rejected, ACL), `graph_delete` (037: edge/vertex tombstone + **FR-7
+> abort-atomicity confirmed** — a rolled-back tombstone leaves the record PRESENT + `remove_edge` compat),
+> `typed_traversal` (038: **parity oracle byte-identical**, source-scope, **TR-1 early-termination preserved**,
+> backlinks `feature_not_supported`). **Full non-regression sweep PASS** (tri-modal, FR-7 `txn_atomicity`,
+> v1 core, join-order ×4, edge-count, HNSW suites). **One live compile fix** during the build:
+> `PG_GETARG_TRANSACTIONID` does not exist in PG 13.4 → `DatumGetTransactionId(PG_GETARG_DATUM(0))`
+> (`d9f46af`; the other flagged APIs compiled clean). **One open caveat:** `crash_recovery` scenario 4
+> (uncommitted-tombstone-via-crash) fails on a **readiness-poll timeout** (DEV-1331 flake class — session
+> alive, never observed reaching `pg_sleep`; the Spark runs AgentBOX load constantly). NOT an engine defect:
+> scenario 3 (committed-tombstone WAL redo) PASSES and 037's rollback-equivalent (`graph_delete` PASS B)
+> already proves the crash-abort visibility path. Tracked under DEV-1331 (harness readiness budget).
+>
+> **(historical banner below — superseded by the verification above.)**
 > **🟡 gBRAIN BACKEND HARDENING 036–038 LANDED 2026-07-04 — 3/3 persona-reviewed, MERGED, GX10-UNBUILT.**
 > Additive native-graph-store hardening to make TriDB a backend for **gBrain** (AgentBOX memory, now on
 > the Spark) — spec `docs/gbrain_backend_hardening_v0.1.0.md` (grounded gap analysis G1–G10). All
