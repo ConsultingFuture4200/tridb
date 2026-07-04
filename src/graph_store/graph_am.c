@@ -32,16 +32,19 @@
 #include "postgres.h"
 
 #include "access/generic_xlog.h"
+#include "access/multixact.h"
 #include "access/relation.h"
 #include "access/transam.h"
 #include "access/xact.h"
 #include "catalog/namespace.h"
+#include "commands/vacuum.h"
 #include "executor/spi.h"
 #include "funcapi.h"
 #include "miscadmin.h"
 #include "nodes/makefuncs.h"
 #include "storage/bufmgr.h"
 #include "storage/lmgr.h"
+#include "storage/procarray.h"
 #include "utils/builtins.h"
 #include "utils/hsearch.h"
 #include "utils/inval.h"
@@ -167,7 +170,7 @@ gph_ensure_meta(Relation rel)
 	meta->gm_version = GPH_VERSION;
 	meta->gm_next_vid = 0;
 	meta->gm_vertex_count = 0;
-	meta->gm_reserved = 0;
+	meta->gm_frozen_horizon = InvalidTransactionId;	/* never frozen (advisor 036) */
 	meta->gm_edge_count = 0;
 	meta->gm_first_vertex_blk = InvalidBlockNumber;
 	meta->gm_last_vertex_blk = InvalidBlockNumber;
@@ -522,6 +525,258 @@ gph_insert_edge(PG_FUNCTION_ARGS)
 	UnlockReleaseBuffer(metabuf);
 	relation_close(rel, RowExclusiveLock);
 	PG_RETURN_VOID();
+}
+
+/* ------------------------------------------------------------------ */
+/* Maintenance: gph_freeze() — long-lived-store anti-wraparound gate    */
+/* (advisor plan 036 / DEV-1347; docs/graph_store_freeze_design_v0.1.0.md) */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Freeze ONE stored inserting xid in place if it precedes `horizon`. The store keeps raw xids on
+ * its pages (vr_xmin / es_xmin) with no undo, so without a freeze pass every stored xid runs two
+ * clocks (clog truncation + 2^31 wraparound). This rewrites a pre-horizon xid to a PERMANENT one
+ * WHILE it is still resolvable in clog:
+ *   committed -> FrozenTransactionId   (gph_xmin_visible stays TRUE — TransactionIdDidCommit
+ *                                       short-circuits Frozen to committed without touching clog)
+ *   aborted   -> InvalidTransactionId  (gph_xmin_visible stays FALSE)
+ * so visibility is byte-identical before and after: freeze is purely a storage rewrite and the
+ * read path (gph_xmin_visible) is untouched. Already-permanent xids (Invalid/Frozen/Bootstrap:
+ * !TransactionIdIsNormal) and post-horizon xids are left alone. Returns true iff it rewrote.
+ * Caller holds the page registered in an open GenericXLog record.
+ */
+static bool
+gph_freeze_xid(TransactionId *xid, TransactionId horizon)
+{
+	TransactionId x = *xid;
+
+	if (!TransactionIdIsNormal(x))
+		return false;			/* Invalid/Frozen/Bootstrap: already permanent */
+	if (!TransactionIdPrecedes(x, horizon))
+		return false;			/* at/after horizon: still needs its real clog entry */
+	if (TransactionIdDidCommit(x))
+		*xid = FrozenTransactionId;
+	else
+		*xid = InvalidTransactionId;	/* aborted / crashed-uncommitted => invisible */
+	return true;
+}
+
+/*
+ * Freeze every edge slot on ONE adjacency-page chain, one page per GenericXLog record (a chain can
+ * exceed GenericXLog's 4-buffer/record cap, so pages are NOT batched). Returns the number of slots
+ * frozen. A page with nothing to freeze is GenericXLogAbort'd (no WAL churn), so a re-run over an
+ * already-frozen store is cheap (idempotency).
+ */
+static int64
+gph_freeze_adj_chain(Relation rel, BlockNumber head, TransactionId horizon)
+{
+	BlockNumber	ablk = head;
+	int64		frozen = 0;
+
+	while (ablk != InvalidBlockNumber)
+	{
+		Buffer		abuf;
+		Page		apage;
+		GenericXLogState *state;
+		uint32		count,
+					j,
+					frozen_here = 0;
+		BlockNumber	next;
+
+		CHECK_FOR_INTERRUPTS();
+		abuf = ReadBufferExtended(rel, MAIN_FORKNUM, ablk, RBM_NORMAL, NULL);
+		LockBuffer(abuf, BUFFER_LOCK_EXCLUSIVE);
+
+		state = GenericXLogStart(rel);
+		apage = GenericXLogRegisterBuffer(state, abuf, 0);
+		count = GphPageRecordCount(apage, sizeof(GphEdgeSlot));
+		for (j = 0; j < count; j++)
+		{
+			GphEdgeSlot *es = GphPageGetRecord(apage, j, sizeof(GphEdgeSlot));
+
+			if (gph_freeze_xid(&es->es_xmin, horizon))
+				frozen_here++;
+		}
+		next = GphPageSpecialPtr(apage)->gph_next_pageno;
+
+		if (frozen_here > 0)
+			GenericXLogFinish(state);
+		else
+			GenericXLogAbort(state);
+		UnlockReleaseBuffer(abuf);
+
+		frozen += frozen_here;
+		ablk = next;
+	}
+	return frozen;
+}
+
+PG_FUNCTION_INFO_V1(gph_freeze);
+
+/*
+ * gph_freeze(horizon xid) RETURNS bigint — the manual anti-wraparound freeze pass (design:
+ * docs/graph_store_freeze_design_v0.1.0.md, advisor 026). Walks the vertex-page chain and, for
+ * every vertex, its adjacency-page chain, rewriting each stored xid that PRECEDES `horizon` to a
+ * permanent one (committed -> Frozen, aborted -> Invalid) while it is still resolvable in clog,
+ * records gm_frozen_horizon on the metapage, and advances the container's relfrozenxid. Returns the
+ * number of records frozen.
+ *
+ * WAL / atomicity: every page is rewritten under GenericXLog in the CALLER's transaction (one WAL,
+ * one txn manager — golden rule 2), so a crash mid-pass replays only the completed page diffs and
+ * the pass is idempotent (re-run it). The per-record rewrite rolls back with the page on ABORT just
+ * like every other graph mutation, so FR-7 visibility is preserved.
+ *
+ * The relfrozenxid advance uses vac_update_relstats (vacuum's own in-place, only-advance path).
+ * That catalog update is NON-transactional, so gph_freeze MUST be run in AUTOCOMMIT (its own
+ * transaction), exactly like VACUUM: wrapping it in a BEGIN you then ROLLBACK would leave
+ * relfrozenxid advanced past pages the rollback un-froze. (Restated in graph_store_am--0.1.0.sql.)
+ *
+ * Concurrency: ShareUpdateExclusiveLock (vacuum's level — self-exclusive so two freezes serialize;
+ * readers and gph_* writers proceed). Correct under the v1 single-writer bulk-load-then-query
+ * contract (graph_am.c header); the concurrent-writer interaction is argued in design §5 and gated
+ * on graph_concurrency_probe, not this issue.
+ *
+ * SCOPE (plan 036 STOP #3 — reported honestly, not shipped as a false "safe"): this is the MANUAL
+ * freeze. It disarms the forced anti-wraparound autovacuum only INDIRECTLY — by keeping
+ * age(relfrozenxid) low so the forced vacuum never triggers. There is no reliable way to make the
+ * forced anti-wraparound autovacuum SKIP a heap-typed relation without the full table-AM handler
+ * (deferred, design §3 "Later"); the operator MUST monitor age(relfrozenxid) on gstore and run
+ * gph_freeze before autovacuum_freeze_max_age.
+ */
+Datum
+gph_freeze(PG_FUNCTION_ARGS)
+{
+	TransactionId horizon = PG_GETARG_TRANSACTIONID(0);
+	Relation	rel;
+	GphMeta		meta;
+	TransactionId oldest;
+	BlockNumber	vblk;
+	int64		frozen = 0;
+
+	if (!TransactionIdIsNormal(horizon))
+		ereport(ERROR,
+				(errmsg("graph_store: freeze horizon must be a normal transaction id (got %u)",
+						horizon)));
+
+	/* Serialize freezes; readers + gph_* writers proceed (design §5). */
+	rel = gph_open_store(ShareUpdateExclusiveLock);
+
+	if (RelationGetNumberOfBlocks(rel) == 0)
+	{
+		relation_close(rel, ShareUpdateExclusiveLock);
+		PG_RETURN_INT64(0);		/* store never initialized => nothing to freeze */
+	}
+
+	/*
+	 * Horizon validation: it MUST precede the cluster's oldest running xmin. Freezing an
+	 * in-progress xid into FrozenTransactionId would make an uncommitted (or to-be-aborted) write
+	 * permanently, falsely visible — validation makes that unreachable rather than a caller
+	 * contract (design §1 "Horizon validation").
+	 */
+	oldest = GetOldestXmin(rel, PROCARRAY_FLAGS_VACUUM);
+	if (!TransactionIdPrecedes(horizon, oldest))
+		ereport(ERROR,
+				(errmsg("graph_store: freeze horizon %u does not precede the oldest running xmin %u",
+						horizon, oldest)));
+
+	/* Monotonicity guard + idempotent early-out: never regress gm_frozen_horizon (design §2). */
+	gph_read_meta(rel, &meta);
+	if (TransactionIdIsValid(meta.gm_frozen_horizon) &&
+		TransactionIdFollowsOrEquals(meta.gm_frozen_horizon, horizon))
+	{
+		relation_close(rel, ShareUpdateExclusiveLock);
+		PG_RETURN_INT64(0);		/* already frozen at/past this horizon */
+	}
+
+	/* Walk the vertex-page chain: freeze vertex records, then descend each vertex's adj chain. */
+	vblk = meta.gm_first_vertex_blk;
+	while (vblk != InvalidBlockNumber)
+	{
+		Buffer		vbuf;
+		Page		vpage;
+		GenericXLogState *state;
+		uint32		count,
+					i,
+					frozen_here = 0,
+					nheads = 0;
+		BlockNumber	vnext;
+		BlockNumber *heads;
+
+		CHECK_FOR_INTERRUPTS();
+		vbuf = ReadBufferExtended(rel, MAIN_FORKNUM, vblk, RBM_NORMAL, NULL);
+		LockBuffer(vbuf, BUFFER_LOCK_EXCLUSIVE);
+
+		state = GenericXLogStart(rel);
+		vpage = GenericXLogRegisterBuffer(state, vbuf, 0);
+		count = GphPageRecordCount(vpage, sizeof(GphVertexRecord));
+		heads = (BlockNumber *) palloc(sizeof(BlockNumber) * Max(count, 1));
+		for (i = 0; i < count; i++)
+		{
+			GphVertexRecord *vr = GphPageGetRecord(vpage, i, sizeof(GphVertexRecord));
+
+			if (gph_freeze_xid(&vr->vr_xmin, horizon))
+				frozen_here++;
+			/* Descend EVERY vertex's adjacency chain — including a now-frozen aborted vertex,
+			 * whose adj pages carry the SAME old xids and must be frozen too. vr_adj_head is not
+			 * touched by the freeze, so reading it from the scratch page copy is exact. */
+			if (vr->vr_adj_head != InvalidBlockNumber)
+				heads[nheads++] = vr->vr_adj_head;
+		}
+		vnext = GphPageSpecialPtr(vpage)->gph_next_pageno;
+
+		if (frozen_here > 0)
+			GenericXLogFinish(state);
+		else
+			GenericXLogAbort(state);	/* nothing changed on this page (idempotent re-run) */
+		UnlockReleaseBuffer(vbuf);
+
+		frozen += frozen_here;
+
+		/* Adjacency chains are walked AFTER releasing the vertex page: each page needs its own
+		 * GenericXLog record and a vertex's chain can exceed the 4-buffer/record cap. */
+		for (i = 0; i < nheads; i++)
+			frozen += gph_freeze_adj_chain(rel, heads[i], horizon);
+		pfree(heads);
+
+		vblk = vnext;
+	}
+
+	/* Record the completed horizon in the metapage (repurposed gm_reserved slot, no layout
+	 * change), under its own GenericXLog record. */
+	{
+		Buffer		metabuf;
+		Page		metapage;
+		GenericXLogState *mstate;
+		GphMeta    *m;
+
+		metabuf = ReadBufferExtended(rel, MAIN_FORKNUM, GPH_META_BLKNO, RBM_NORMAL, NULL);
+		LockBuffer(metabuf, BUFFER_LOCK_EXCLUSIVE);
+		mstate = GenericXLogStart(rel);
+		metapage = GenericXLogRegisterBuffer(mstate, metabuf, 0);
+		m = (GphMeta *) GphPageRecordBase(metapage);
+		m->gm_frozen_horizon = horizon;
+		GenericXLogFinish(mstate);
+		UnlockReleaseBuffer(metabuf);
+	}
+
+	/*
+	 * Advance the container's relfrozenxid to the horizon (as VACUUM would) — this is what actually
+	 * resets age(relfrozenxid) and keeps the forced anti-wraparound autovacuum from ever triggering
+	 * on gstore. vac_update_relstats only-advances (never regresses) and is non-transactional (see
+	 * the autocommit note above). num_pages/num_tuples pass the current values through unchanged
+	 * (the container is never planned/ANALYZEd — access is gph_* only); hasindex=false.
+	 */
+	vac_update_relstats(rel,
+						RelationGetNumberOfBlocks(rel),
+						rel->rd_rel->reltuples,
+						0,
+						false,
+						horizon,
+						InvalidMultiXactId,
+						false);
+
+	relation_close(rel, ShareUpdateExclusiveLock);
+	PG_RETURN_INT64(frozen);
 }
 
 /* ------------------------------------------------------------------ */
