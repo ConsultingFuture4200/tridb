@@ -251,27 +251,21 @@ def load_postgres(conn: Conn, corpus: dict) -> None:
             cur.execute(
                 "CREATE TABLE entity (id INT PRIMARY KEY, timestamp INT, chunk TEXT)"
             )
-            # PGlite (the baseline PG image) does NOT support COPY FROM STDIN, so
-            # load with batched multi-row INSERTs.
+            # Baseline PG is stock Postgres 16 (docker-compose.yml) — COPY FROM STDIN
+            # streams the rows in one pass (client holds one row at a time), the
+            # symmetric analog of the TriDB side's COPY load so neither side's ingest
+            # strawmans the other at scale. Same rows as the old batched-INSERT path;
+            # answer parity is unchanged (plan 035 / DEV-1346).
             ids = sorted(corpus["entities"].keys())
-            batch = 500
-            for i in range(0, len(ids), batch):
-                chunk_ids = ids[i : i + batch]
-                vals: list = []
-                ph: list[str] = []
-                for eid in chunk_ids:
+            with cur.copy("COPY entity (id,timestamp,chunk) FROM STDIN") as copy:
+                for eid in ids:
                     e = corpus["entities"][eid]
-                    ph.append("(%s,%s,%s)")
-                    vals.extend([eid, e["timestamp"], e["chunk"]])
-                cur.execute(
-                    "INSERT INTO entity (id,timestamp,chunk) VALUES " + ",".join(ph),
-                    vals,
-                )
+                    copy.write_row((eid, e["timestamp"], e["chunk"]))
             cur.execute("CREATE INDEX entity_ts_idx ON entity (timestamp)")
         pg.commit()
     finally:
         pg.close()
-    print(f"[load] postgres: {len(corpus['entities'])} entity rows + ts index")
+    print(f"[load] postgres: {len(corpus['entities'])} entity rows + ts index (COPY)")
 
 
 def load_all(conn: Conn, corpus: dict) -> None:

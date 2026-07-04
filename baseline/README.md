@@ -142,9 +142,10 @@ Artifacts: `bench/results/sm2_metrics.json`, `bench/results/sm2_tridb_raw.txt`,
 > round-trips are inherent to out-of-DB integration, which is the architectural
 > cost this benchmark measures.
 
-> **Postgres note.** `baseline/sm2.py` loads via batched multi-row `INSERT`
-> (not `COPY FROM STDIN`) so it works against PGlite-style PG shims as well as
-> stock Postgres 16. Point it at a non-5432 port with `PGPORT`.
+> **Postgres note.** `baseline/sm2.py` loads via `COPY FROM STDIN` against the
+> stock Postgres 16 image (`docker-compose.yml`) — the symmetric analog of the
+> TriDB side's COPY load, so neither side's ingest strawmans the other at scale
+> (plan 035 / DEV-1346). Point it at a non-5432 port with `PGPORT`.
 
 ## Connection params
 
