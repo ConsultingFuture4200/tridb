@@ -375,12 +375,23 @@ gph_insert_vertex(PG_FUNCTION_ARGS)
 
 PG_FUNCTION_INFO_V1(gph_insert_edge);
 
-/* gph_insert_edge(src bigint, dst bigint) — append one directed :related_to edge. */
+/*
+ * gph_insert_edge(src bigint, dst bigint [, type_id integer]) — append one directed edge.
+ *
+ * Backs BOTH SQL declarations (the original 2-arg and the plan-038 3-arg overload) at the same C
+ * symbol; PG_NARGS() selects the path. The 2-arg form is byte-identical to the pre-038 body: no
+ * third arg => type defaults to GPH_EDGE_TYPE_RELATED_TO, the exact constant the code hardcoded
+ * before. The 3-arg form writes the caller's dictionary type id into the existing es_edge_type_id
+ * field (no slot-layout change). Type ids are validated by the graph_store.edge_type dictionary at
+ * registration time; the native store trusts the id it is handed (topology is native, the type
+ * name<->id mapping is relational — golden rule 3).
+ */
 Datum
 gph_insert_edge(PG_FUNCTION_ARGS)
 {
 	uint64		src = (uint64) PG_GETARG_INT64(0);
 	uint64		dst = (uint64) PG_GETARG_INT64(1);
+	uint32		type_id = GPH_EDGE_TYPE_RELATED_TO;
 	Relation	rel = gph_open_store(RowExclusiveLock);
 	GenericXLogState *state;
 	Buffer		metabuf,
@@ -400,6 +411,12 @@ gph_insert_edge(PG_FUNCTION_ARGS)
 			   *vr;
 	GphEdgeSlot	es;
 
+	/* Optional 3rd arg (plan 038): the dictionary edge type id. Absent => default RELATED_TO
+	 * (2-arg overload => byte-identical to the pre-038 hardcode). The 3-arg overload is STRICT,
+	 * so a passed arg is never NULL. */
+	if (PG_NARGS() >= 3)
+		type_id = (uint32) PG_GETARG_INT32(2);
+
 	/* Both endpoints must exist. Locate dst first (validate only), src last so
 	 * vblk/vslot/src_rec describe the source vertex we are about to update. The
 	 * ereport(ERROR) aborts the txn before any page is locked or mutated, so a
@@ -414,7 +431,7 @@ gph_insert_edge(PG_FUNCTION_ARGS)
 	memset(&es, 0, sizeof(es));
 	es.es_src_vid = src;
 	es.es_dst_vid = dst;
-	es.es_edge_type_id = GPH_EDGE_TYPE_RELATED_TO;
+	es.es_edge_type_id = type_id;	/* default RELATED_TO (2-arg) or the caller's dictionary id (3-arg) */
 	es.es_flags = 0;
 	es.es_xmin = GetCurrentTransactionId();
 
@@ -545,6 +562,15 @@ struct GraphScanDescData
 	BlockNumber			cur_blk;	/* NEXT adjacency page to read; Invalid = no more pages */
 
 	/*
+	 * Inline filters applied per-slot in gs_getnext (plan 038) — NEVER pre-collected, so TR-1
+	 * early termination is preserved (a LIMIT still stops before later chain pages are read).
+	 * Defaults reproduce the pre-038 behavior byte-identically: type_filter = RELATED_TO (the old
+	 * hardcoded filter), source_scope = GRAPHSTORE_INVALID_ID (unscoped, no source check).
+	 */
+	uint32				type_filter;	/* match es_edge_type_id; GPH_EDGE_TYPE_ANY = no type filter */
+	GraphVertexId		source_scope;	/* match es_src_vid; GRAPHSTORE_INVALID_ID = unscoped */
+
+	/*
 	 * Bounded per-page in-memory slot buffer: the current page's edge slots, read once and drained
 	 * one per Next(). Sized to slots_per_page (~1022 * 32B ~= 32KB); exactly one page is ever
 	 * buffered (streaming). Refilled from cur_blk only when page_i reaches page_n AND another
@@ -561,9 +587,16 @@ struct GraphScanDescData
  * (scan positioned, possibly over an empty adjacency list); false if `src` is absent. Policy is
  * the caller's: the SQL SRFs treat an absent source as an empty result, while a direct C consumer
  * (e.g. the TJS operator) may raise. v1 supports GRAPH_SCAN_OUTGOING only.
+ *
+ * plan 038: `type_filter` (GPH_EDGE_TYPE_ANY = any; else a dictionary type id) and `source_scope`
+ * (GRAPHSTORE_INVALID_ID = unscoped; else a source vid) are threaded to gs_getnext and applied
+ * inline. Callers that want the pre-038 behavior pass (GPH_EDGE_TYPE_RELATED_TO, GRAPHSTORE_INVALID_ID).
+ * GRAPH_SCAN_INCOMING / GRAPH_SCAN_BOTH still raise: the adjacency list is out-edges only, so a
+ * reverse (dst->src) lookup needs a new index / metapage field — deferred (see docs/decisions/0016).
  */
 static bool
-gs_open(GraphScanDesc *scan, Relation rel, GraphVertexId start, GraphScanDirection direction)
+gs_open(GraphScanDesc *scan, Relation rel, GraphVertexId start, GraphScanDirection direction,
+		uint32 type_filter, GraphVertexId source_scope)
 {
 	GphVertexRecord src_rec;
 	BlockNumber		vblk;
@@ -571,12 +604,17 @@ gs_open(GraphScanDesc *scan, Relation rel, GraphVertexId start, GraphScanDirecti
 
 	if (direction != GRAPH_SCAN_OUTGOING)
 		ereport(ERROR,
-				(errmsg("graph_store: only GRAPH_SCAN_OUTGOING is supported in v1 (got %d)",
-						(int) direction)));
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("graph_store: only GRAPH_SCAN_OUTGOING is supported (got %d)",
+						(int) direction),
+				 errdetail("direction=in/both (getBacklinks) needs a reverse adjacency index — "
+						   "a follow-on, format-touching plan (docs/decisions/0016).")));
 
 	scan->src = start;
 	scan->direction = direction;
 	scan->cur_blk = InvalidBlockNumber;
+	scan->type_filter = type_filter;
+	scan->source_scope = source_scope;
 	/* Bounded per-page slot buffer (read each page once; one page buffered = streaming). */
 	scan->page_buf = (GphEdgeSlot *) palloc(sizeof(GphEdgeSlot) * GphEdgeSlotsPerPage());
 	scan->page_n = 0;
@@ -650,7 +688,19 @@ gs_getnext(Relation rel, GraphScanDesc *scan, GraphElement *out)
 
 			if (slot->es_flags & GPH_FLAG_DELETED)
 				continue;
-			if (slot->es_edge_type_id != GPH_EDGE_TYPE_RELATED_TO)
+			/*
+			 * Typed + source-scoped filters (plan 038), applied INLINE per slot — no pre-collected
+			 * neighbor set, so a LIMIT above still stops before later chain pages are read (TR-1).
+			 * Defaults reproduce the old single line exactly: type_filter=RELATED_TO makes the type
+			 * clause `es_edge_type_id != RELATED_TO`, and source_scope=INVALID disables the source
+			 * clause. Skipped (filtered-out) slots do NOT bump gph_visit_counter — only EMITTED
+			 * edges count as traversal work.
+			 */
+			if (scan->type_filter != GPH_EDGE_TYPE_ANY &&
+				slot->es_edge_type_id != scan->type_filter)
+				continue;
+			if (scan->source_scope != (GraphVertexId) GRAPHSTORE_INVALID_ID &&
+				slot->es_src_vid != scan->source_scope)
 				continue;
 			if (!gph_xmin_visible(slot->es_xmin))
 				continue;		/* edge from an aborted/uncommitted txn */
@@ -718,7 +768,9 @@ gph_neighbors(PG_FUNCTION_ARGS)
 
 		scan = (GraphScanDesc *) palloc0(sizeof(GraphScanDesc));
 		rel = gph_open_store(AccessShareLock);
-		(void) gs_open(scan, rel, src, GRAPH_SCAN_OUTGOING);	/* absent src => empty (lenient SRF) */
+		/* Default filters (plan 038): RELATED_TO + unscoped => byte-identical to pre-038. */
+		(void) gs_open(scan, rel, src, GRAPH_SCAN_OUTGOING,
+					   GPH_EDGE_TYPE_RELATED_TO, (GraphVertexId) GRAPHSTORE_INVALID_ID);	/* absent src => empty (lenient SRF) */
 		relation_close(rel, AccessShareLock);
 
 		funcctx->user_fctx = scan;
@@ -918,7 +970,8 @@ gph_neighbors_ext_cached(PG_FUNCTION_ARGS)
 		if (have_vid)
 		{
 			rel = gph_open_store(AccessShareLock);
-			(void) gs_open(scan, rel, (GraphVertexId) vid, GRAPH_SCAN_OUTGOING);
+			(void) gs_open(scan, rel, (GraphVertexId) vid, GRAPH_SCAN_OUTGOING,
+						   GPH_EDGE_TYPE_RELATED_TO, (GraphVertexId) GRAPHSTORE_INVALID_ID);
 			relation_close(rel, AccessShareLock);
 		}
 		else
@@ -930,6 +983,8 @@ gph_neighbors_ext_cached(PG_FUNCTION_ARGS)
 			 */
 			scan->page_buf = (GphEdgeSlot *) palloc(sizeof(GphEdgeSlot) * GphEdgeSlotsPerPage());
 			scan->cur_blk = InvalidBlockNumber;
+			scan->type_filter = GPH_EDGE_TYPE_RELATED_TO;
+			scan->source_scope = (GraphVertexId) GRAPHSTORE_INVALID_ID;
 			scan->page_n = 0;
 			scan->page_i = 0;
 		}
@@ -997,7 +1052,84 @@ gph_traverse(PG_FUNCTION_ARGS)
 
 		scan = (GraphScanDesc *) palloc0(sizeof(GraphScanDesc));
 		rel = gph_open_store(AccessShareLock);
-		(void) gs_open(scan, rel, src, GRAPH_SCAN_OUTGOING);	/* absent src => empty (lenient SRF) */
+		/* Default filters (plan 038): RELATED_TO + unscoped => byte-identical to pre-038. */
+		(void) gs_open(scan, rel, src, GRAPH_SCAN_OUTGOING,
+					   GPH_EDGE_TYPE_RELATED_TO, (GraphVertexId) GRAPHSTORE_INVALID_ID);	/* absent src => empty (lenient SRF) */
+		relation_close(rel, AccessShareLock);
+
+		funcctx->user_fctx = scan;
+		MemoryContextSwitchTo(oldctx);
+	}
+
+	funcctx = SRF_PERCALL_SETUP();	/* === Next === */
+	scan = (GraphScanDesc *) funcctx->user_fctx;
+
+	rel = gph_open_store(AccessShareLock);
+	if (gs_getnext(rel, scan, &elem))
+	{
+		Datum		values[2];
+		bool		nulls[2] = {false, false};
+		HeapTuple	tup;
+
+		relation_close(rel, AccessShareLock);
+		values[0] = Int64GetDatum((int64) elem.edge_src);
+		values[1] = Int64GetDatum((int64) elem.edge_dst);
+		tup = heap_form_tuple(funcctx->tuple_desc, values, nulls);
+		SRF_RETURN_NEXT(funcctx, HeapTupleGetDatum(tup));
+	}
+	relation_close(rel, AccessShareLock);	/* === Close === */
+	gs_close(scan);
+	SRF_RETURN_DONE(funcctx);
+}
+
+PG_FUNCTION_INFO_V1(gph_traverse_typed);
+
+/*
+ * gph_traverse_typed(src bigint, type_id integer, direction integer, source_id bigint)
+ *   RETURNS TABLE(src bigint, dst bigint) — the typed + directional + source-scoped twin of
+ * gph_traverse (plan 038 / gBrain traversePaths). Same shared gs_* engine, same one-edge-per-Next()
+ * TR-1 early termination; only the inline gs_getnext filters differ:
+ *   - type_id     : dictionary edge type id, or 0 (GPH_EDGE_TYPE_ANY) to match any type.
+ *   - direction   : 0 = out (v1); in/both raise (reverse adjacency deferred — docs/decisions/0016).
+ *   - source_id   : source vid to scope to, or -1 for unscoped (-1 => (uint64) UINT64_MAX =
+ *                   GRAPHSTORE_INVALID_ID). Since adjacency chains are per-vertex, es_src_vid is
+ *                   uniform per scan, so this is a defensive scope assertion at the single-vertex
+ *                   level; tenant-grouped (multi-vertex) scoping needs the relational vertex->source
+ *                   side-table (B3), not the native slot.
+ * gph_traverse_typed(src, GPH_EDGE_TYPE_RELATED_TO, 0, -1) is byte-identical to gph_traverse(src)
+ * (parity oracle). Must be used in a target-list / ProjectSet position, like gph_traverse.
+ */
+Datum
+gph_traverse_typed(PG_FUNCTION_ARGS)
+{
+	FuncCallContext *funcctx;
+	GraphScanDesc  *scan;
+	Relation		rel;
+	GraphElement	elem;
+
+	if (SRF_IS_FIRSTCALL())		/* === Open === */
+	{
+		MemoryContext oldctx;
+		TupleDesc	tupdesc;
+		GraphVertexId src = (GraphVertexId) PG_GETARG_INT64(0);
+		uint32		type_filter = (uint32) PG_GETARG_INT32(1);
+		int			dir = PG_GETARG_INT32(2);
+		GraphVertexId source_scope = (GraphVertexId) PG_GETARG_INT64(3);
+
+		funcctx = SRF_FIRSTCALL_INIT();
+		oldctx = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
+
+		if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("gph_traverse_typed must be called in a context that expects a record")));
+		funcctx->tuple_desc = BlessTupleDesc(tupdesc);
+
+		scan = (GraphScanDesc *) palloc0(sizeof(GraphScanDesc));
+		rel = gph_open_store(AccessShareLock);
+		/* gs_open raises on direction != OUTGOING (in/both deferred, docs/decisions/0016). */
+		(void) gs_open(scan, rel, src, (GraphScanDirection) dir,
+					   type_filter, source_scope);	/* absent src => empty (lenient SRF) */
 		relation_close(rel, AccessShareLock);
 
 		funcctx->user_fctx = scan;

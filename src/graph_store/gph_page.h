@@ -29,7 +29,14 @@ StaticAssertDecl(BLCKSZ == 32768, "graph store requires --with-blocksize=32 (BLC
 #define GPH_MAGIC        0x47504831   /* "GPH1" */
 #define GPH_VERSION      1
 #define GPH_META_BLKNO   0            /* block 0 is always the metapage */
-#define GPH_EDGE_TYPE_RELATED_TO  1  /* v1: the single edge label :related_to */
+#define GPH_EDGE_TYPE_RELATED_TO  1  /* v1: the built-in edge label :related_to (edge_type dictionary id 1) */
+/*
+ * Traversal-only sentinel for "match any edge type" (plan 038). NOT a stored value: real edge
+ * type ids come from the graph_store.edge_type dictionary and start at 1 (RELATED_TO), so 0 is a
+ * safe "no type filter" marker. Used only in the in-memory scan descriptor (type_filter); the
+ * on-disk es_edge_type_id is never 0. No page-layout change; the 32-byte slot asserts are untouched.
+ */
+#define GPH_EDGE_TYPE_ANY  0
 
 /* Page types (stored in the special area). */
 #define GPH_PAGE_META    0x0000

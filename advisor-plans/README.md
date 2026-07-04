@@ -69,7 +69,7 @@ identical, zero engine change) with true-IP riding PERF-01 as a follow-on.
 |------|-------|----------|--------|------|------------|--------|--------|
 | 036 | `gph_freeze()` + disarm forced anti-wraparound autovacuum (long-lived-store gate) | P1 | M | MED | 026 (design) | DEV-1347 | PLANNED |
 | 037 | native graph delete via `gph_tombstone_edge/vertex` | P1 | S–M | LOW | — | DEV-1349 | PLANNED |
-| 038 | typed + directional + source-scoped native traversal | P1 | M | MED | — | DEV-1350 | PLANNED |
+| 038 | typed + directional + source-scoped native traversal | P1 | M | MED | — | DEV-1350 | **IMPLEMENTED-pending-GX10** (typed insert+dict, typed/source-scoped out-traversal, `gph_traverse_typed`; direction=in/both deferred to ADR-0016 reverse index; C authored-unbuilt) |
 
 Recommended order: **036 (correctness gate — nothing long-lived is safe without it) → 037 → 038**. 037
 and 038 touch the same `graph_am.c` traversal region, so serialize or merge carefully. Deferred (tracked,
