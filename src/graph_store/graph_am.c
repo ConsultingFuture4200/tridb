@@ -684,7 +684,7 @@ PG_FUNCTION_INFO_V1(gph_freeze);
 Datum
 gph_freeze(PG_FUNCTION_ARGS)
 {
-	TransactionId horizon = PG_GETARG_TRANSACTIONID(0);
+	TransactionId horizon = DatumGetTransactionId(PG_GETARG_DATUM(0));
 	Relation	rel;
 	GphMeta		meta;
 	TransactionId oldest;
