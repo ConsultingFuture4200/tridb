@@ -1,0 +1,94 @@
+diff --git a/hnswlib/space_ip.h b/hnswlib/space_ip.h
+index 02258d4..9d2ac7f 100644
+--- a/hnswlib/space_ip.h
++++ b/hnswlib/space_ip.h
+@@ -1,5 +1,10 @@
+ #pragma once
+ #include "hnswlib.h"
++
++#if defined(__ARM_NEON)
++#include <arm_neon.h>  // TRIDB DEV-1343: AArch64 NEON intrinsics (must be included at global scope)
++#endif
++
+ namespace hnswlib {
+ 
+     static float
+@@ -314,6 +319,62 @@ namespace hnswlib {
+     }
+ #endif
+ 
++#if defined(__ARM_NEON)
++    // TRIDB (DEV-1343): native AArch64 NEON inner-product kernel. Sibling of the DEV-1234 NEON L2
++    // kernel in space_l2.h. inner_product is the DEFAULT metric (hnsw_ParaGetDistmethod returns
++    // hnsw_Inner_Product when distmethod is unset -- src/hnswindex.cpp), yet space_ip.h had NO NEON
++    // path: only x86 SSE/AVX/AVX512, all dead on aarch64 (the MSVBASE build strips x86 ISA flags,
++    // scripts/lib/msvbase_patches.sh: patch_cmake_arm_isa_flags). So any cosine/angular index built
++    // without distmethod=l2_distance ran the scalar InnerProduct on the GX10, sandbagging its
++    // latency exactly as DEV-1234 did for L2. 16 floats/iteration over 4 independent 128-bit FMA
++    // accumulators (hide FMA latency) + AArch64 horizontal add. Verified equal to scalar within
++    // 1e-4 rel err by tools/neon_ip_bench.c. Returns the raw dot (like InnerProductSIMD16Ext*); the
++    // Distance wrappers below apply the fork's 1 - dot convention (match InnerProductDistance).
++    static float
++    InnerProductSIMD16ExtNEON(const void *pVect1v, const void *pVect2v, const void *qty_ptr) {
++        float *pVect1 = (float *) pVect1v;
++        float *pVect2 = (float *) pVect2v;
++        size_t qty = *((size_t *) qty_ptr);
++        size_t qty16 = qty >> 4;
++        const float *pEnd1 = pVect1 + (qty16 << 4);
++
++        float32x4_t sum0 = vdupq_n_f32(0.0f);
++        float32x4_t sum1 = vdupq_n_f32(0.0f);
++        float32x4_t sum2 = vdupq_n_f32(0.0f);
++        float32x4_t sum3 = vdupq_n_f32(0.0f);
++
++        while (pVect1 < pEnd1) {
++            sum0 = vfmaq_f32(sum0, vld1q_f32(pVect1),      vld1q_f32(pVect2));
++            sum1 = vfmaq_f32(sum1, vld1q_f32(pVect1 + 4),  vld1q_f32(pVect2 + 4));
++            sum2 = vfmaq_f32(sum2, vld1q_f32(pVect1 + 8),  vld1q_f32(pVect2 + 8));
++            sum3 = vfmaq_f32(sum3, vld1q_f32(pVect1 + 12), vld1q_f32(pVect2 + 12));
++            pVect1 += 16;
++            pVect2 += 16;
++        }
++        float32x4_t sum = vaddq_f32(vaddq_f32(sum0, sum1), vaddq_f32(sum2, sum3));
++        return vaddvq_f32(sum);
++    }
++
++    static float
++    InnerProductDistanceSIMD16ExtNEON(const void *pVect1v, const void *pVect2v, const void *qty_ptr) {
++        return 1.0f - InnerProductSIMD16ExtNEON(pVect1v, pVect2v, qty_ptr);
++    }
++
++    // dim > 16 and not a multiple of 16: NEON over the aligned prefix + scalar tail (mirrors
++    // InnerProductDistanceSIMD16ExtResiduals). The 1 - (...) is applied once at the end.
++    static float
++    InnerProductDistanceNEON(const void *pVect1v, const void *pVect2v, const void *qty_ptr) {
++        size_t qty = *((size_t *) qty_ptr);
++        size_t qty16 = (qty >> 4) << 4;
++        float res = InnerProductSIMD16ExtNEON(pVect1v, pVect2v, &qty16);
++        size_t qty_left = qty - qty16;
++        float *pVect1 = (float *) pVect1v + qty16;
++        float *pVect2 = (float *) pVect2v + qty16;
++        float res_tail = InnerProduct(pVect1, pVect2, &qty_left);
++        return 1.0f - (res + res_tail);
++    }
++#endif
++
+     class InnerProductSpace : public SpaceInterface<float> {
+ 
+         DISTFUNC<float> fstdistfunc_;
+@@ -352,6 +413,15 @@ namespace hnswlib {
+                 fstdistfunc_ = InnerProductDistanceSIMD16ExtResiduals;
+             else if (dim > 4)
+                 fstdistfunc_ = InnerProductDistanceSIMD4ExtResiduals;
++    #endif
++    #if defined(__ARM_NEON)
++            // TRIDB (DEV-1343): the USE_SSE/AVX block above is dead on aarch64 (ISA flags stripped),
++            // so fstdistfunc_ would remain the scalar InnerProductDistance for the DEFAULT metric.
++            // Select the NEON kernel instead. dim<=16 non-multiples keep scalar (no full 16-block).
++            if (dim % 16 == 0)
++                fstdistfunc_ = InnerProductDistanceSIMD16ExtNEON;
++            else if (dim > 16)
++                fstdistfunc_ = InnerProductDistanceNEON;
+     #endif
+             dim_ = dim;
+             data_size_ = dim * sizeof(float);
