@@ -94,6 +94,10 @@ verify_patches() {
     || die "TriDB tridb_tjs_open_operator.patch NOT applied in sql/vectordb.sql — tjs_open() not registered (ADR-0012 B); drift?"
   grep -q 'L2SqrSIMD16ExtNEON' "$root/thirdparty/hnsw/hnswlib/space_l2.h" 2>/dev/null \
     || die "TriDB tridb_neon_l2_distance.patch NOT applied — ARM NEON L2 kernel missing, scalar fallback sandbags latency (DEV-1234); drift?"
+  # Sentinel on the load-bearing NEON IP function name (mirrors the L2 sentinel above). The default
+  # metric (inner_product) falls back to scalar on aarch64 without this — a wrong-low-latency bug.
+  grep -q 'InnerProductSIMD16ExtNEON' "$root/thirdparty/hnsw/hnswlib/space_ip.h" 2>/dev/null \
+    || die "TriDB tridb_neon_ip_distance.patch NOT applied — ARM NEON inner-product kernel missing, default metric runs scalar (DEV-1343); drift?"
   grep -q 'offsetof(hnsw_ParaOptions, ef_construction)' "$root/src/hnswindex.cpp" 2>/dev/null \
     || die "TriDB tridb_hnsw_reloptions.patch NOT applied — HNSW m/ef_construction reloptions missing (DEV-1286); drift?"
   grep -q 'DEV-1248' "$root/src/hnswindex.cpp" 2>/dev/null \
@@ -337,6 +341,25 @@ apply_tridb_fork_patches() {
     log "applying TriDB fork patch: AArch64 NEON L2 distance kernel (DEV-1234)"
     ( cd "$root/thirdparty/hnsw" && git apply "$neon_patch" ) \
       || die "tridb_neon_l2_distance.patch did not apply — hnswlib drift? re-generate from thirdparty/hnsw/hnswlib/space_l2.h"
+  fi
+
+  # tridb_neon_ip_distance.patch (DEV-1343): sibling of the DEV-1234 NEON L2 kernel, for INNER
+  #   PRODUCT — the DEFAULT metric (hnsw_ParaGetDistmethod returns hnsw_Inner_Product when distmethod
+  #   is unset, src/hnswindex.cpp). space_ip.h had NO NEON path (only x86 SSE/AVX/AVX512, dead on
+  #   aarch64 once patch_cmake_arm_isa_flags strips the x86 ISA flags), so any cosine/angular index
+  #   built without distmethod=l2_distance ran the scalar InnerProduct on the GX10 — the same
+  #   wrong-low-latency bug DEV-1234 fixed for L2, still live for the default metric. Adds a NEON
+  #   kernel gated on __ARM_NEON (inert on x86, no build-flag change), selected in the
+  #   InnerProductSpace ctor. Preserves the fork's 1 - dot distance convention. Applies INSIDE the
+  #   hnsw submodule (paths a/hnswlib/...), like the L2 patch; disjoint from it (space_ip.h only).
+  local neon_ip_patch="${_MSVBASE_LIB_DIR}/../patches/tridb_neon_ip_distance.patch"
+  [[ -f "$neon_ip_patch" ]] || die "missing TriDB fork patch: $neon_ip_patch"
+  if grep -q 'InnerProductSIMD16ExtNEON' "$root/thirdparty/hnsw/hnswlib/space_ip.h" 2>/dev/null; then
+    log "TriDB fork patch (NEON inner-product kernel, DEV-1343) already applied"
+  else
+    log "applying TriDB fork patch: AArch64 NEON inner-product distance kernel (DEV-1343)"
+    ( cd "$root/thirdparty/hnsw" && git apply "$neon_ip_patch" ) \
+      || die "tridb_neon_ip_distance.patch did not apply — hnswlib drift? re-generate from thirdparty/hnsw/hnswlib/space_ip.h"
   fi
 
   # tridb_hnsw_reloptions.patch (DEV-1286): expose per-index HNSW build quality as reloptions
