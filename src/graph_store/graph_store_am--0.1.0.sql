@@ -47,10 +47,24 @@ CREATE FUNCTION gph_vertex_count() RETURNS bigint
 CREATE FUNCTION gph_edge_count() RETURNS bigint
   AS 'MODULE_PATHNAME' LANGUAGE C VOLATILE;
 
+-- Native delete (plan 037 / DEV-1349). Soft-delete (tombstone) by setting GPH_FLAG_DELETED +
+-- the deleting xid under GenericXLog, atomic with the host txn (FR-7); the read path already
+-- filters visible tombstones so traversal stops emitting immediately. Idempotent (re-deleting or
+-- deleting an absent edge/vertex is a no-op). Physical slot reclamation is deferred to plan 036's
+-- freeze pass, so gm_edge_count is NOT decremented (raw monotone counter). gph_tombstone_vertex
+-- also tombstones the vertex's OUT-edges; dangling IN-edges are filtered at read time (no reverse
+-- index in v1 — full reverse-sweep is plan 038).
+CREATE FUNCTION gph_tombstone_edge(bigint, bigint) RETURNS void
+  AS 'MODULE_PATHNAME' LANGUAGE C VOLATILE STRICT;
+
+CREATE FUNCTION gph_tombstone_vertex(bigint) RETURNS void
+  AS 'MODULE_PATHNAME' LANGUAGE C VOLATILE STRICT;
+
 -- Containment (advisor plan 026): the container holds NON-heap pages; any heap-path access
 -- (SELECT/VACUUM/ANALYZE) misreads them. Deployers grant gph_* EXECUTE to trusted roles only.
 REVOKE ALL ON TABLE gstore FROM PUBLIC;
 REVOKE EXECUTE ON FUNCTION gph_insert_vertex(), gph_insert_edge(bigint,bigint) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION gph_tombstone_edge(bigint,bigint), gph_tombstone_vertex(bigint) FROM PUBLIC;
 
 -- ============================================================================
 -- ADR-0013 Stage A (advisor plan 025): the external-id mapping layer + the v0
@@ -183,6 +197,23 @@ AS $$
                                        graph_store.gph_upsert_vertex(dst));
 $$;
 
+-- remove_edge(src, dst): v0-ergonomic tombstone of the src->dst edge over EXTERNAL ids (the
+-- removeLink twin of add_edge; plan 037). Translates both endpoints through the id map — but does
+-- NOT auto-create: a remove naming an unmapped endpoint yields NULL, and the STRICT
+-- gph_tombstone_edge then no-ops (removing an absent edge is a no-op). Honors the plan-033 identity
+-- fast-path exactly like gph_neighbors_ext (the paired read surface): when identity_mode is ON,
+-- ext_id == vid so src/dst pass straight through. Rides the SAME host txn/WAL (golden rule 2), so a
+-- rolled-back remove rolls the tombstone back with it (FR-7).
+CREATE FUNCTION remove_edge(src bigint, dst bigint) RETURNS void
+LANGUAGE sql VOLATILE
+AS $$
+    SELECT graph_store.gph_tombstone_edge(
+        CASE WHEN (SELECT identity_mode FROM graph_store.gph_am_meta)
+             THEN src ELSE (SELECT m.vid FROM graph_store.gph_vid_map m WHERE m.ext_id = src) END,
+        CASE WHEN (SELECT identity_mode FROM graph_store.gph_am_meta)
+             THEN dst ELSE (SELECT m.vid FROM graph_store.gph_vid_map m WHERE m.ext_id = dst) END);
+$$;
+
 -- neighbors(src): v0-compat name for the external-id traversal.
 CREATE FUNCTION neighbors(src bigint) RETURNS SETOF bigint
 LANGUAGE sql VOLATILE STRICT
@@ -195,6 +226,7 @@ AS $$ SELECT graph_store.gph_visits() $$;
 
 -- Mutator containment (plan 026 discipline).
 REVOKE EXECUTE ON FUNCTION gph_upsert_vertex(bigint), add_edge(bigint, bigint) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION remove_edge(bigint, bigint) FROM PUBLIC;
 
 -- ============================================================================
 -- SQL/PGQ canonical surface (DEV-1167 / FR-4 "one plan"). The FRONT DOOR that lowers
