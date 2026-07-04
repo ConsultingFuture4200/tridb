@@ -114,6 +114,20 @@ class _FakeNeo4jDriver:
         pass
 
 
+class _FakeCopy:
+    def __init__(self, store: dict):
+        self._store = store
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def write_row(self, row):
+        self._store["copy_rows"].append(tuple(row))
+
+
 class _FakePgCursor:
     def __init__(self, store: dict):
         self._store = store
@@ -125,8 +139,11 @@ class _FakePgCursor:
         return False
 
     def execute(self, sql, vals=None):
-        if sql.startswith("INSERT INTO entity"):
-            self._store["insert_batches"].append(list(vals))
+        pass
+
+    def copy(self, sql):
+        self._store.setdefault("copy_rows", [])
+        return _FakeCopy(self._store)
 
 
 class _FakePg:
@@ -179,17 +196,17 @@ def test_load_neo4j_slicing(monkeypatch, n):
 
 
 @pytest.mark.parametrize("n", _sizes(POSTGRES_BATCH))
-def test_load_postgres_slicing(monkeypatch, n):
-    store: dict = {"insert_batches": []}
+def test_load_postgres_copy_streams_all_ids(monkeypatch, n):
+    # baseline/sm2.py now loads via COPY FROM STDIN (plan 035): every entity is
+    # streamed once, in id order, as an (id, timestamp, chunk) row — no batching,
+    # no omission/duplication.
+    store: dict = {"copy_rows": []}
     monkeypatch.setattr(sm2, "connect_postgres", lambda conn: _FakePg(store))
     corpus = _corpus(n)
     sm2.load_postgres(sm2.Conn(), corpus)
-    got_ids: list[int] = []
-    for vals in store["insert_batches"]:
-        assert len(vals) % 3 == 0  # (id, timestamp, chunk) triples
-        ids = vals[0::3]
-        assert 1 <= len(ids) <= POSTGRES_BATCH
-        got_ids.extend(ids)
+    for row in store["copy_rows"]:
+        assert len(row) == 3  # (id, timestamp, chunk)
+    got_ids = [row[0] for row in store["copy_rows"]]
     assert got_ids == sorted(corpus["entities"].keys())
 
 

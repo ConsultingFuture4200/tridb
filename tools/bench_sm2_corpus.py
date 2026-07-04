@@ -80,16 +80,16 @@ def build_sql(
     w(f"    embedding float8[{dim}]")
     w(");")
     w("-- all rows BEFORE the index (HNSW fork limitation: no incremental insert).")
-    batch = 500
-    for i in range(0, n, batch):
-        vals = []
-        for eid, ts, emb in entities[i : i + batch]:
-            vals.append(f"({eid},'chunk {eid}',{ts},'{vec_literal(emb)}'::float8[])")
-        w(
-            "INSERT INTO entities (id,chunk,ts,embedding) VALUES\n"
-            + ",\n".join(vals)
-            + ";"
-        )
+    # COPY (text format) instead of multi-row INSERT batches: one bulk stream, no
+    # per-batch statement parse/plan, and the client holds one row at a time. Rows
+    # are byte-identical to the INSERT path (same ids/chunks/ts/vector literals) —
+    # this changes HOW rows load, never WHICH rows (plan 035 / DEV-1346).
+    w("COPY entities (id,chunk,ts,embedding) FROM STDIN;")
+    for eid, ts, emb in entities:
+        # text format is TAB-delimited: the float8[] literal '{...}' carries its
+        # commas harmlessly, and no field holds a tab/newline/backslash.
+        w(f"{eid}\tchunk {eid}\t{ts}\t{vec_literal(emb)}")
+    w("\\.")
     w("CREATE INDEX entities_hnsw ON entities USING hnsw(embedding)")
     w(f"    WITH (dimension = {dim}, distmethod = l2_distance);")
     # ADR-0013 Stage B: vertex materialization pass — every edge endpoint's dense vid
@@ -115,8 +115,20 @@ def build_sql(
     w(
         "-- native adjacency graph: hub -> dst (add_edge -> gph_insert_edge via the map)."
     )
-    for s, d in edges:
-        w(f"SELECT graph_store.add_edge({s}, {d});")
+    # COPY the edges into a staging relation, then ONE set-based pass calls add_edge
+    # per row ORDER BY ord — the SAME order (hence the SAME adjacency-list layout and
+    # vid routing) as the old per-edge SELECT loop, but two round-trips instead of
+    # len(edges). Every vid is already materialized above, so add_edge only inserts
+    # edges here; the ord key keeps the result byte-identical to the v0-era emission.
+    # (Residual per-edge C stays inside add_edge — the fork exposes no batched edge
+    # insert; this removes the SQL round-trip ceiling, not the per-edge C cost.)
+    w("CREATE TEMP TABLE _edge_load (ord bigint, src bigint, dst bigint);")
+    w("COPY _edge_load (ord, src, dst) FROM STDIN;")
+    for ord_, (s, d) in enumerate(edges):
+        w(f"{ord_}\t{s}\t{d}")
+    w("\\.")
+    w("SELECT graph_store.add_edge(src, dst) FROM _edge_load ORDER BY ord;")
+    w("DROP TABLE _edge_load;")
     w("SET enable_seqscan = off;   -- force the HNSW ANN scan for tjs's vector leg")
 
     # ----- WARM-UP: run each query once UNTIMED so caches/plan are primed -------
