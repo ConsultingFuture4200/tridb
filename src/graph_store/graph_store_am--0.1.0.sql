@@ -74,6 +74,33 @@ CREATE TABLE gph_vid_map (
 -- gph_upsert_vertex, which is REVOKEd below like the other mutators (plan 026).
 GRANT SELECT ON gph_vid_map TO PUBLIC;
 
+-- ----------------------------------------------------------------------------
+-- Identity fast-path flag (advisor plan 033 / PERF-02). One-row metadata table
+-- recording whether the id-map is currently the identity function: the vertices
+-- were loaded DENSE and IN ID ORDER, so ext_id == vid for every mapped vertex
+-- (native vids are dense/monotone from 0 — gph_page.h gm_next_vid). When ON,
+-- gph_neighbors_ext skips BOTH map probes (forward ext->vid and per-neighbor
+-- reverse vid->ext) and treats src/dst vids as external ids directly — turning
+-- the O(out-degree) reverse-probe cost into O(0). OFF by default: sparse/real
+-- ids break the identity and fall back to the map (the general case is plan 034).
+-- Rides the SAME WAL/host txn as gph_vid_map (golden rule 2): a rolled-back load
+-- rolls the flag back with it.
+CREATE TABLE gph_am_meta (
+    only_row      boolean PRIMARY KEY DEFAULT true CHECK (only_row),
+    identity_mode boolean NOT NULL DEFAULT false
+);
+INSERT INTO gph_am_meta (only_row, identity_mode) VALUES (true, false);
+GRANT SELECT ON gph_am_meta TO PUBLIC;
+
+-- gph_set_identity_mode(bool): the loader calls this ONLY after a VERIFIED
+-- dense-in-order load (ext ids 0..N-1 materialized in id order). Setting it ON
+-- when ext_id != vid would make gph_neighbors_ext return wrong ids — hence it is
+-- REVOKEd from PUBLIC like the other mutators (plan 026 discipline).
+CREATE FUNCTION gph_set_identity_mode(p_on boolean) RETURNS void
+LANGUAGE sql VOLATILE STRICT
+AS $$ UPDATE graph_store.gph_am_meta SET identity_mode = p_on WHERE only_row $$;
+REVOKE EXECUTE ON FUNCTION gph_set_identity_mode(boolean) FROM PUBLIC;
+
 -- gph_upsert_vertex(ext_id) RETURNS bigint — THE id-mapping layer (ADR-0013).
 -- Returns the dense vid mapped to ext_id, creating the vertex + mapping on first use.
 CREATE FUNCTION gph_upsert_vertex(p_ext bigint) RETURNS bigint
@@ -106,12 +133,27 @@ $$;
 -- operators SPI-call (Stage A). STRICT + unknown ext_id => empty set (matches
 -- the v0 neighbors() contract for absent vertices). The per-row scalar lookup
 -- preserves the storage emission order.
+--
+-- IDENTITY FAST-PATH (plan 033): when gph_am_meta.identity_mode is ON the CASE
+-- guards short-circuit BOTH the forward probe (src is already the vid) and the
+-- per-neighbor reverse probe (nvid is already the ext id), so a degree-D hub costs
+-- 0 map descents instead of D. gph_neighbors stays the driving row source in BOTH
+-- modes, so the storage emission order is byte-identical (the map path is the exact
+-- pre-033 body under the ELSE). meta is a single row: the implicit-lateral cross
+-- join yields gph_neighbors's rows in gph_neighbors's order. OFF is a no-op.
 CREATE FUNCTION gph_neighbors_ext(src bigint) RETURNS SETOF bigint
 LANGUAGE sql VOLATILE STRICT
 AS $$
-    SELECT (SELECT m.ext_id FROM graph_store.gph_vid_map m WHERE m.vid = n.nvid)
-    FROM graph_store.gph_neighbors(
-             (SELECT m2.vid FROM graph_store.gph_vid_map m2 WHERE m2.ext_id = src)
+    SELECT CASE WHEN meta.identity_mode
+                THEN n.nvid
+                ELSE (SELECT m.ext_id FROM graph_store.gph_vid_map m WHERE m.vid = n.nvid)
+           END
+    FROM graph_store.gph_am_meta meta,
+         graph_store.gph_neighbors(
+             CASE WHEN meta.identity_mode
+                  THEN src
+                  ELSE (SELECT m2.vid FROM graph_store.gph_vid_map m2 WHERE m2.ext_id = src)
+             END
          ) AS n(nvid)
 $$;
 
