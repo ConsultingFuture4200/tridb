@@ -12,11 +12,11 @@ build on GX10) · 🔴 GX10-gated (needs live MSVBASE build).
 > backlinks `feature_not_supported`). **Full non-regression sweep PASS** (tri-modal, FR-7 `txn_atomicity`,
 > v1 core, join-order ×4, edge-count, HNSW suites). **One live compile fix** during the build:
 > `PG_GETARG_TRANSACTIONID` does not exist in PG 13.4 → `DatumGetTransactionId(PG_GETARG_DATUM(0))`
-> (`d9f46af`; the other flagged APIs compiled clean). **One open caveat:** `crash_recovery` scenario 4
-> (uncommitted-tombstone-via-crash) fails on a **readiness-poll timeout** (DEV-1331 flake class — session
-> alive, never observed reaching `pg_sleep`; the Spark runs AgentBOX load constantly). NOT an engine defect:
-> scenario 3 (committed-tombstone WAL redo) PASSES and 037's rollback-equivalent (`graph_delete` PASS B)
-> already proves the crash-abort visibility path. Tracked under DEV-1331 (harness readiness budget).
+> (`d9f46af`; the other flagged APIs compiled clean). **crash_recovery now FULLY GREEN (DEV-1331 closed,
+> `3933f3c`):** all 4 scenarios pass incl. scenario 4 (uncommitted-tombstone-via-crash → edge reads LIVE
+> after recovery via xid-visibility — the strongest confirmation of 037's crash-abort path). The prior
+> "scenario 4 timeout" was a readiness-sentinel self-match (the unscoped `%pg_sleep%` poll matched the
+> poller's own query); fixed by tagging the doomed session `PGAPPNAME=tridb_doomed` + scoping the poll.
 >
 > **(historical banner below — superseded by the verification above.)**
 > **🟡 gBRAIN BACKEND HARDENING 036–038 LANDED 2026-07-04 — 3/3 persona-reviewed, MERGED, GX10-UNBUILT.**
