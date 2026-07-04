@@ -92,22 +92,19 @@ def build_sql(
         )
     w("CREATE INDEX entities_hnsw ON entities USING hnsw(embedding)")
     w(f"    WITH (dimension = {dim}, distmethod = l2_distance);")
-    # ADR-0013 Stage B: vertex materialization pass — every edge endpoint's dense vid
-    # is created up front through the ext-id map (gph_upsert_vertex) in FIRST-APPEARANCE
-    # order, the exact vid assignment add_edge alone would produce, so entity ids, edges,
-    # and manifests stay byte-identical to the v0-era corpus. add_edge (the v0-compat
-    # shim hosted in graph_store_am) then routes each edge through the map:
+    # ADR-0013 Stage B + plan 033 (PERF-02): materialize EVERY entity vertex through
+    # the ext-id map (gph_upsert_vertex) in STRICT ID ORDER (0..n-1). Native vids are
+    # dense/monotone from 0 (gph_page.h gm_next_vid), so an in-id-order load makes
+    # ext_id == vid for every vertex — the identity precondition the fast-path needs.
+    # Non-edge-endpoint vertices are created edgeless (harmless); entity ids, edges, and
+    # the manifest stay byte-identical (vids are internal). add_edge (the v0-compat shim
+    # hosted in graph_store_am) then routes each edge through the now-populated map:
     # gph_insert_edge(gph_upsert_vertex(s), gph_upsert_vertex(d)).
-    _seen: set = set()
-    _verts: list = []
-    for s, d in edges:
-        for v in (s, d):
-            if v not in _seen:
-                _seen.add(v)
-                _verts.append(v)
-    w("-- vertex materialization pass (ADR-0013 Stage B): ext ids -> dense vids")
-    for i in range(0, len(_verts), 500):
-        arr = ",".join(str(v) for v in _verts[i : i + 500])
+    w(
+        "-- vertex materialization pass (plan 033): dense ext ids 0..n-1 IN ID ORDER -> vid == ext_id"
+    )
+    for i in range(0, n, 500):
+        arr = ",".join(str(v) for v in range(i, min(i + 500, n)))
         w(
             f"SELECT graph_store.gph_upsert_vertex(v) "
             f"FROM unnest(ARRAY[{arr}]::bigint[]) v;"
@@ -117,6 +114,12 @@ def build_sql(
     )
     for s, d in edges:
         w(f"SELECT graph_store.add_edge({s}, {d});")
+    # plan 033: the load above is dense (ids 0..n-1) and in id order, so ext_id == vid.
+    # Flip the id-map into identity mode: gph_neighbors_ext now skips both map probes.
+    w(
+        "SELECT graph_store.gph_set_identity_mode(true);  "
+        "-- plan 033: dense in-order load -> identity fast-path"
+    )
     w("SET enable_seqscan = off;   -- force the HNSW ANN scan for tjs's vector leg")
 
     # ----- WARM-UP: run each query once UNTIMED so caches/plan are primed -------

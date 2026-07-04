@@ -46,7 +46,7 @@ has a Linear issue. The heavier GX10 build-cycle batch (PERF-04/05/06/07) and st
 | Plan | Title | Priority | Effort | Risk | Depends on | Linear | Status |
 |------|-------|----------|--------|------|------------|--------|--------|
 | 032 | NEON inner-product/cosine kernel (default metric runs scalar on ARM) | P1 | S | LOW | — (sibling DEV-1288) | DEV-1343 | PLANNED |
-| 033 | Dense-id identity fast-path for the v1 graph id-map (~2ms) | P2 | S–M | LOW | 025 | DEV-1344 | PLANNED |
+| 033 | Dense-id identity fast-path for the v1 graph id-map (~2ms) | P2 | S–M | LOW | 025 | DEV-1344 | IMPLEMENTED — branch `advisor/033-dense-id-fastpath`; x86 pytest+ruff green; parity oracle + graph-leg ms pending GX10/engine build |
 | 034 | Backend-local cached vid map (general sparse-id ~2ms) | P2 | M | LOW–MED | 025 | DEV-1345 | PLANNED |
 | 035 | COPY bulk load — unblock 128GB saturation + fair at-scale SM-2 | P2 | M | LOW | 025 | DEV-1346 | PLANNED |
 
