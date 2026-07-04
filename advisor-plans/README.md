@@ -47,7 +47,7 @@ has a Linear issue. The heavier GX10 build-cycle batch (PERF-04/05/06/07) and st
 |------|-------|----------|--------|------|------------|--------|--------|
 | 032 | NEON inner-product/cosine kernel (default metric runs scalar on ARM) | P1 | S | LOW | — (sibling DEV-1288) | DEV-1343 | **IMPLEMENTED** — branch `advisor/032-neon-ip-kernel`; patch `tridb_neon_ip_distance.patch` registered + sentinel, applies+reverses clean vs live vendored hnsw; `neon_ip_bench.c` compiles+correct on x86; pending GX10/engine build (NEON compile, per-call speedup, IP-index build-time drop) |
 | 033 | Dense-id identity fast-path for the v1 graph id-map (~2ms) | P2 | S–M | LOW | 025 | DEV-1344 | PLANNED |
-| 034 | Backend-local cached vid map (general sparse-id ~2ms) | P2 | M | LOW–MED | 025 | DEV-1345 | PLANNED |
+| 034 | Backend-local cached vid map (general sparse-id ~2ms) | P2 | M | LOW–MED | 025 | DEV-1345 | IMPLEMENTED — branch advisor/034-vid-cache, pending GX10/engine build |
 | 035 | COPY bulk load — unblock 128GB saturation + fair at-scale SM-2 | P2 | M | LOW | 025 | DEV-1346 | PLANNED |
 
 Recommended order: **032 (highest leverage — latent cosine-workload bug) → 035 (unblocks at-scale

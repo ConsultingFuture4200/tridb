@@ -151,6 +151,10 @@ verify_patches() {
     || die "TriDB tridb_graph_v1_rewire.patch NOT applied — tjs_open() still probes the v0 graph ext (ADR-0013 Stage A); drift?"
   ! grep -q 'graph_store\.neighbors' "$root/src/tjs_operator.cpp" "$root/src/tjs_open_operator.cpp" 2>/dev/null \
     || die "TriDB tridb_graph_v1_rewire.patch INCOMPLETE — a graph_store.neighbors probe remains in an operator (ADR-0013 Stage A); drift?"
+  # advisor plan 034 / DEV-1345 (PERF-03): the TJS graph probe uses the backend-cached reverse
+  # translator. Sentinel on the LOAD-BEARING SPI token (gph_neighbors_ext_cached) in tjs_operator.cpp.
+  grep -q 'gph_neighbors_ext_cached' "$root/src/tjs_operator.cpp" 2>/dev/null \
+    || die "TriDB tridb_graph_vid_cache.patch NOT applied — TJS graph probe still on the uncached shim (advisor plan 034); drift?"
   log "all MSVBASE + TriDB fork patches verified present"
 }
 
@@ -562,6 +566,24 @@ apply_tridb_fork_patches() {
     log "applying TriDB fork patch: operator graph probe -> v1 native AM (advisor plan 025 / ADR-0013 Stage A)"
     ( cd "$root" && git apply "$v1rw_patch" ) \
       || die "tridb_graph_v1_rewire.patch did not apply — tjs-chain drift? re-generate per advisor plan 025"
+  fi
+
+  #   tridb_graph_vid_cache.patch (advisor plan 034 / DEV-1345, PERF-03): the TJS operator's graph
+  #     reachable-set resolution (graphReachableT) probes graph_store.gph_neighbors_ext_cached
+  #     instead of graph_store.gph_neighbors_ext. The cached twin (repo-owned src/graph_store/
+  #     graph_am.c + graph_store_am--0.1.0.sql) reverse-translates each neighbor vid -> ext_id
+  #     through a backend-local, session-lifetime hash (~50ns) rather than a correlated btree + SPI
+  #     subquery (~1us/neighbor, ~2ms at fanout 2000), flushed by a relcache-invalidation hook.
+  #     Byte-identical to the shim (test/graph_vid_cache_test.sql). Rewrites the probe string the
+  #     rewire patch (plan 025) installed, so it MUST apply AFTER tridb_graph_v1_rewire.patch.
+  local vidcache_patch="${_MSVBASE_LIB_DIR}/../patches/tridb_graph_vid_cache.patch"
+  [[ -f "$vidcache_patch" ]] || die "missing TriDB fork patch: $vidcache_patch"
+  if grep -q 'gph_neighbors_ext_cached' "$root/src/tjs_operator.cpp" 2>/dev/null; then
+    log "TriDB fork patch (graph vid cache probe, advisor plan 034) already applied"
+  else
+    log "applying TriDB fork patch: operator graph probe -> cached reverse translator (advisor plan 034 / DEV-1345)"
+    ( cd "$root" && git apply "$vidcache_patch" ) \
+      || die "tridb_graph_vid_cache.patch did not apply — tjs-chain drift? re-generate per advisor plan 034"
   fi
 
   # ----------------------------------------------------------------------------
