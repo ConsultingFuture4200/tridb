@@ -1,7 +1,33 @@
 # TriDB Build Status — per-issue gating
 
-Updated: 2026-07-03. Legend: 🟢 unblocked here · 🟡 partial (design here,
+Updated: 2026-07-04. Legend: 🟢 unblocked here · 🟡 partial (design here,
 build on GX10) · 🔴 GX10-gated (needs live MSVBASE build).
+
+> **🟡 gBRAIN BACKEND HARDENING 036–038 LANDED 2026-07-04 — 3/3 persona-reviewed, MERGED, GX10-UNBUILT.**
+> Additive native-graph-store hardening to make TriDB a backend for **gBrain** (AgentBOX memory, now on
+> the Spark) — spec `docs/gbrain_backend_hardening_v0.1.0.md` (grounded gap analysis G1–G10). All
+> golden rules preserved (TR-1, native AM, one-WAL/FR-7, one canonical surface, three stores); frozen
+> 32-byte slot / metapage format untouched (reserved-field repurposes only). **036** (DEV-1347) — the
+> long-lived-store gate: `gph_freeze(horizon)` freezes stored xids (`gm_reserved`→`gm_frozen_horizon`,
+> size-neutral) + indirect anti-wraparound disarm (manual; auto-freeze table-AM stage deferred).
+> **037** (DEV-1349) — native delete: `gph_tombstone_edge/vertex`; a review caught that a bare flag is
+> NOT abort-atomic (GenericXLog has no undo), fixed by an xid-stamped `es_xmax`/`vr_xmax` (repurposes
+> the pad bytes) + a read-path visibility check — FR-7-correct, byte-identical for pre-037 data.
+> **038** (DEV-1350) — typed + source-scoped traversal via the existing `es_edge_type_id`; backlinks
+> (`direction=in`) RAISE (reverse index deferred, ADR-0016). **CRITICAL — GX10 build must confirm before
+> any of this is real:** the C is authored-but-UNBUILT here (needs the PG 13.4 fork image); 036 uses new
+> PG APIs whose signatures are shape-verified not compiled (`GetOldestXmin` 2-arg vs PG14, `vac_update_relstats`
+> 8-arg form). Run `make graph-test` (freeze/delete/typed suites + FR-7 + crash-recovery) on the Spark.
+> Tracked: A2 HNSW abort-durability (DEV-1348), B3/B5/C1 (adapter, cross-repo) not yet built.
+
+> **🟢 PERF QUICK-WIN BATCH 032–035 LANDED 2026-07-04 — 3/3 persona-reviewed, MERGED, GX10-unbuilt.**
+> `docs/perf_research_v0.1.0.md` PERF-01/02/03/11. **032** NEON inner-product kernel (DEV-1343) — closes
+> the latent cosine-workload bug (default IP metric ran scalar on ARM; directly serves gBrain/nomic-cosine);
+> **033** dense-id identity fast-path + **034** backend-local cached vid map (DEV-1344/1345, the ~2ms v1
+> id-map tax); **035** COPY bulk load (DEV-1346, unblocks the 128GB saturation run + fair at-scale SM-2).
+> Also this session: **SM-1 corrected** 32.0×→**1.07× (FAIL on standin)** — it was recorded with peak=`k`;
+> honest `max(k,reached)` accounting fails the ≥5× target and is hardware-independent (the Spark does not
+> restore it; a streaming-graph-predicate redesign, PERF-09, would). See `docs/benchmark_results_v0.1.0.md`.
 
 > **🟢 ADVISOR BATCH 024–031 LANDED 2026-07-03 — 7 of 8 plans merged, each persona-reviewed 3/3
 > (Fabio + Linus + Liotta) before merge.** From the deep audit + persona review + landscape research
