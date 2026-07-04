@@ -12,6 +12,14 @@
 #   Scenario 2 (uncommitted): leave a tri-store txn OPEN (never COMMIT), crash, restart -> assert
 #                             NONE of the 3 writes visible (the crash-aborted xid fails
 #                             TransactionIdDidCommit / gph_xmin_visible).
+#   Scenario 3 (committed tombstone, plan 037/DEV-1349): commit+CHECKPOINT a live edge 0->1, then
+#                             COMMIT a gph_tombstone_edge(0,1) that lives ONLY in the WAL, crash,
+#                             restart -> assert the tombstone was REDONE (edge 0->1 gone). Proves the
+#                             repurposed es_xmax survives GenericXLog generic-REDO.
+#   Scenario 4 (uncommitted tombstone, plan 037): commit+CHECKPOINT edge 0->1, then leave a txn that
+#                             tombstones 0->1 OPEN (CHECKPOINTed durable but never COMMIT), crash,
+#                             restart -> assert edge 0->1 reads LIVE again (the crash-aborted deleting
+#                             xid is hidden by gph_deleted_visible; FR-7 abort-atomicity, not UNDO).
 #
 # Requires tridb/msvbase:dev (scripts/x86build.sh --docker). Build failures FAIL LOUD (make -> log,
 # nonzero make aborts with the log tail; no `| tail` masking — see scripts/graph_am_test.sh).
@@ -137,5 +145,80 @@ SQL
   echo "--- post-recovery assert (uncommitted) ---"
   $PSQL -v phase=uncommitted -f /tmp/assert.sql
   $B/pg_ctl -D $D2 -m fast -w stop >/dev/null 2>&1 || true
+
+  ########################################################################
+  # Scenario 3 — COMMITTED edge-tombstone survives crash via WAL redo (plan 037).
+  ########################################################################
+  echo "=== scenario 3: committed edge-tombstone, crash (-m immediate), WAL redo ==="
+  D3=/tmp/pg_committed_tomb
+  seed_cluster $D3
+  # Make edge 0->1 durable via an explicit CHECKPOINT, so ONLY the tombstone lives in the WAL:
+  # its absence post-recovery then unambiguously proves the tombstone REDO ran (not a lost insert).
+  $PSQL >/dev/null <<SQL
+SET search_path TO graph_store, public;
+SELECT gph_insert_edge(0, 1);
+CHECKPOINT;                     -- edge 0->1 durable on disk
+BEGIN;
+  SELECT gph_tombstone_edge(0, 1);   -- tombstone lives ONLY in WAL until redo
+COMMIT;
+SQL
+  # CRASH: SIGQUIT, no shutdown checkpoint -> the committed tombstone is only in the WAL.
+  $B/pg_ctl -D $D3 -m immediate -w stop >/dev/null 2>&1 || true
+  $B/pg_ctl -D $D3 -o "-p 5432" -w start >/dev/null 2>&1
+  echo "--- post-recovery assert (committed_tombstone) ---"
+  $PSQL -v phase=committed_tombstone -f /tmp/assert.sql
+  $B/pg_ctl -D $D3 -m fast -w stop >/dev/null 2>&1 || true
+
+  ########################################################################
+  # Scenario 4 — UNCOMMITTED edge-tombstone is crash-aborted (edge reads LIVE again; plan 037).
+  ########################################################################
+  echo "=== scenario 4: uncommitted edge-tombstone, crash, recover -> edge live again ==="
+  D4=/tmp/pg_uncommitted_tomb
+  seed_cluster $D4
+  # Durable live edge 0->1 first (checkpointed), then a DOOMED txn tombstones it and holds open.
+  $PSQL >/dev/null <<SQL
+SET search_path TO graph_store, public;
+SELECT gph_insert_edge(0, 1);
+CHECKPOINT;                     -- edge 0->1 durable on disk
+SQL
+  ( $PSQL >/dev/null 2>&1 <<SQL
+SET search_path TO graph_store, public;
+BEGIN;
+  SELECT gph_tombstone_edge(0, 1);   -- doomed tombstone; deleting xid never commits
+  SELECT pg_sleep(3600);             -- hold the txn open; the crash below interrupts it
+COMMIT;
+SQL
+  ) &
+  BGPID=$!
+  # Same liveness-checked sentinel as scenario 2: observing pg_sleep active proves the tombstone
+  # already executed inside the open txn (it precedes pg_sleep in the same BEGIN block).
+  sentinel=0
+  for i in $(seq 1 360); do
+    if ! kill -0 $BGPID 2>/dev/null; then
+      echo "FAIL (uncommitted_tombstone): doomed background session exited before reaching its in-flight state (the tombstone errored before pg_sleep?)"
+      $B/pg_ctl -D $D4 -m immediate -w stop >/dev/null 2>&1 || true
+      exit 1
+    fi
+    n=$($PSQL -tA -c "SELECT count(*) FROM pg_stat_activity WHERE query LIKE '"'"'%pg_sleep%'"'"' AND state='"'"'active'"'"';" 2>/dev/null || echo 0)
+    if [ "$n" = "1" ]; then sentinel=1; break; fi
+    sleep 0.5
+  done
+  if [ "$sentinel" != "1" ]; then
+    echo "FAIL (uncommitted_tombstone): doomed txn never reached its in-flight state (pg_sleep sentinel not observed after ~180s) — poll timeout"
+    kill $BGPID >/dev/null 2>&1 || true; $B/pg_ctl -D $D4 -m immediate -w stop >/dev/null 2>&1 || true
+    exit 1
+  fi
+  # CHECKPOINT (from a SEPARATE connection) while the doomed txn is open: this flushes the dirty
+  # tombstone page to disk, so after recovery the tombstone bytes (GPH_FLAG_DELETED + es_xmax = the
+  # doomed xid) are physically present — the edge is live ONLY because gph_deleted_visible rejects
+  # the crash-aborted xid, making xid-visibility (not a lost WAL record) the load-bearing proof.
+  $PSQL -c "CHECKPOINT;" >/dev/null 2>&1
+  # CRASH while the tombstone txn is open and uncommitted.
+  $B/pg_ctl -D $D4 -m immediate -w stop >/dev/null 2>&1 || true
+  kill $BGPID >/dev/null 2>&1 || true; wait $BGPID 2>/dev/null || true
+  $B/pg_ctl -D $D4 -o "-p 5432" -w start >/dev/null 2>&1
+  echo "--- post-recovery assert (uncommitted_tombstone) ---"
+  $PSQL -v phase=uncommitted_tombstone -f /tmp/assert.sql
+  $B/pg_ctl -D $D4 -m fast -w stop >/dev/null 2>&1 || true
 ' 2>&1 | grep -vE 'redirecting log|logging collector'
 echo "[crash_recovery_test] done"

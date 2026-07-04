@@ -37,7 +37,7 @@ StaticAssertDecl(BLCKSZ == 32768, "graph store requires --with-blocksize=32 (BLC
 #define GPH_PAGE_ADJ     0x0002
 
 /* Record flag bits. */
-#define GPH_FLAG_DELETED 0x0001       /* soft-delete (MVCC seam; unused in v1 core) */
+#define GPH_FLAG_DELETED 0x0001       /* tombstone (set by gph_tombstone_edge/vertex, plan 037) */
 
 /*
  * Per-page special area. Lives in pd_special; identifies the page type and carries the
@@ -86,7 +86,10 @@ typedef struct GphVertexRecord
 	BlockNumber	vr_adj_head;	/* first adjacency page; InvalidBlockNumber = no edges */
 	BlockNumber	vr_adj_tail;	/* last adjacency page (append target) */
 	TransactionId vr_xmin;		/* inserting xid (MVCC visibility; abort => invisible) */
-	uint32		vr_pad;			/* keeps size at 32 */
+	TransactionId vr_xmax;		/* deleting xid (plan 037): the tombstone is honored only when
+								 * GPH_FLAG_DELETED is set AND this xid is visible, so a delete
+								 * from an aborted/in-progress txn is ignored — same size (uint32,
+								 * was vr_pad), keeps the record at 32 bytes, no layout change */
 } GphVertexRecord;
 
 /*
@@ -99,7 +102,10 @@ typedef struct GphEdgeSlot
 	uint32		es_edge_type_id;	/* GPH_EDGE_TYPE_RELATED_TO in v1 */
 	uint32		es_flags;			/* GPH_FLAG_* */
 	TransactionId es_xmin;			/* inserting xid (MVCC visibility; abort => invisible) */
-	uint32		es_pad;				/* keeps size at 32 */
+	TransactionId es_xmax;			/* deleting xid (plan 037): the tombstone is honored only when
+									 * GPH_FLAG_DELETED is set AND this xid is visible, so a delete
+									 * from an aborted/in-progress txn is ignored — same size (uint32,
+									 * was es_pad), keeps the slot at 32 bytes, no layout change */
 } GphEdgeSlot;
 
 StaticAssertDecl(sizeof(GphVertexRecord) == 32, "GphVertexRecord must be 32 bytes");

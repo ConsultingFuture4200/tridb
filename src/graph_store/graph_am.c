@@ -80,6 +80,25 @@ gph_xmin_visible(TransactionId xmin)
 }
 
 /*
+ * Is a record (vertex or edge) tombstoned AND is that tombstone visible to us? A record is
+ * invisible-by-delete iff GPH_FLAG_DELETED is set AND the DELETING xid (es_xmax / vr_xmax) is
+ * current-or-committed. A tombstone written by a txn that later aborts (or is still in progress)
+ * has an xmax that gph_xmin_visible rejects, so the record stays LIVE — which is exactly what
+ * makes gph_tombstone_edge/vertex roll back atomically with the host txn (FR-7), reusing the same
+ * xid-visibility mechanism that gph_xmin_visible gives INSERTs (a bare flag would have no
+ * transaction stamp and so could not be rolled back — GenericXLog has no in-process UNDO).
+ *
+ * ADDITIVE: for every record written before plan 037, GPH_FLAG_DELETED is clear (nothing set it)
+ * and the repurposed xmax field is 0 (InvalidTransactionId, from the insert-path memset), so this
+ * returns false and the read paths behave byte-identically to pre-037.
+ */
+static inline bool
+gph_deleted_visible(uint32 flags, TransactionId xmax)
+{
+	return (flags & GPH_FLAG_DELETED) && gph_xmin_visible(xmax);
+}
+
+/*
  * Per-backend traversal-step counter (one increment per edge EMITTED by gph_neighbors).
  * Demonstrates that pulling K of N neighbors under LIMIT K does ~K units of work, not N —
  * the TR-1 early-termination probe (mirrors the v0 graph_visits()). Backend-local and
@@ -232,8 +251,10 @@ gph_locate_vertex(Relation rel, uint64 vid, BlockNumber *out_blk, uint32 *out_sl
 		{
 			GphVertexRecord *vr = GphPageGetRecord(page, i, sizeof(GphVertexRecord));
 
-			/* Skip records whose inserting txn aborted / is not visible to us. */
-			if (vr->vr_vid == vid && gph_xmin_visible(vr->vr_xmin))
+			/* Skip records whose inserting txn aborted / is not visible to us, and vertices
+			 * tombstoned by a visible gph_tombstone_vertex (plan 037). */
+			if (vr->vr_vid == vid && gph_xmin_visible(vr->vr_xmin) &&
+				!gph_deleted_visible(vr->vr_flags, vr->vr_xmax))
 			{
 				*out_blk = blk;
 				*out_slot = i;
@@ -779,6 +800,173 @@ gph_freeze(PG_FUNCTION_ARGS)
 	PG_RETURN_INT64(frozen);
 }
 
+/* Mutation: tombstone (soft-delete) edge / vertex (plan 037)          */
+/* ------------------------------------------------------------------ */
+
+/*
+ * gph_tombstone_adjacency — walk vertex `adj_head`'s adjacency-page chain and set GPH_FLAG_DELETED +
+ * es_xmax = `xid` on every LIVE (visibly inserted, not-already-tombstoned) edge slot whose
+ * es_dst_vid == `match_dst`, OR on every live slot when `match_all` is true (the vertex out-edge
+ * sweep). Adjacency pages are per-vertex (gph_owner_vid == the source), so every slot on the chain
+ * already has es_src_vid == the source — no src check needed. Each page that actually has a slot to
+ * flip is rewritten ONCE under GenericXLog in the caller's txn (crash-safe, atomic with the host txn,
+ * one WAL); pages with nothing to flip are left untouched (no WAL record), so the pass is idempotent.
+ * Caller holds RowExclusiveLock on `rel`.
+ */
+static void
+gph_tombstone_adjacency(Relation rel, BlockNumber adj_head, uint64 match_dst, bool match_all,
+						TransactionId xid)
+{
+	BlockNumber	blk = adj_head;
+
+	while (blk != InvalidBlockNumber)
+	{
+		Buffer		buf;
+		Page		page;
+		uint32		count,
+					i;
+		BlockNumber	next;
+		bool		any = false;
+
+		CHECK_FOR_INTERRUPTS();
+		buf = ReadBufferExtended(rel, MAIN_FORKNUM, blk, RBM_NORMAL, NULL);
+		LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+		page = BufferGetPage(buf);
+		count = GphPageRecordCount(page, sizeof(GphEdgeSlot));
+		next = GphPageSpecialPtr(page)->gph_next_pageno;
+
+		/* First pass over the pinned page: is there any live slot to flip here? */
+		for (i = 0; i < count; i++)
+		{
+			GphEdgeSlot *s = GphPageGetRecord(page, i, sizeof(GphEdgeSlot));
+
+			if (!gph_xmin_visible(s->es_xmin))
+				continue;			/* aborted/uncommitted insert — already invisible */
+			if (gph_deleted_visible(s->es_flags, s->es_xmax))
+				continue;			/* already tombstoned — idempotent no-op */
+			if (!match_all && s->es_dst_vid != match_dst)
+				continue;
+			any = true;
+			break;
+		}
+
+		/* Only pages that change are WAL-logged (idempotent re-tombstone => no WAL). Apply the flag
+		 * through the GenericXLog scratch page, matching the same predicate as the probe pass. */
+		if (any)
+		{
+			GenericXLogState *state = GenericXLogStart(rel);
+			Page		wpage = GenericXLogRegisterBuffer(state, buf, 0);
+
+			for (i = 0; i < count; i++)
+			{
+				GphEdgeSlot *s = GphPageGetRecord(wpage, i, sizeof(GphEdgeSlot));
+
+				if (!gph_xmin_visible(s->es_xmin))
+					continue;
+				if (gph_deleted_visible(s->es_flags, s->es_xmax))
+					continue;
+				if (!match_all && s->es_dst_vid != match_dst)
+					continue;
+				s->es_flags |= GPH_FLAG_DELETED;
+				s->es_xmax = xid;
+			}
+			GenericXLogFinish(state);
+		}
+
+		UnlockReleaseBuffer(buf);
+		blk = next;
+	}
+}
+
+PG_FUNCTION_INFO_V1(gph_tombstone_edge);
+
+/*
+ * gph_tombstone_edge(src bigint, dst bigint) RETURNS void — soft-delete every visible src->dst
+ * :related_to edge by setting GPH_FLAG_DELETED + es_xmax under GenericXLog (crash-safe, atomic with
+ * the host txn; FR-7). Idempotent: tombstoning an already-deleted or absent edge (or an absent src)
+ * is a no-op, not an error. The read path already filters visible tombstones (gph_deleted_visible),
+ * so traversal stops emitting the edge immediately; the store-wide gm_edge_count is a raw
+ * monotone counter and is deliberately NOT decremented (physical reclamation rides plan 036's freeze
+ * pass). Owner-guarded (REVOKEd from PUBLIC, plan 026).
+ */
+Datum
+gph_tombstone_edge(PG_FUNCTION_ARGS)
+{
+	uint64		src = (uint64) PG_GETARG_INT64(0);
+	uint64		dst = (uint64) PG_GETARG_INT64(1);
+	Relation	rel = gph_open_store(RowExclusiveLock);
+	GphVertexRecord	src_rec;
+	BlockNumber	vblk;
+	uint32		vslot;
+
+	/* vr_adj_head is stable once set (only vr_adj_tail moves on chaining) and the single-writer
+	 * contract excludes a concurrent mutator, so the head read here drives a correct chain walk;
+	 * each page is re-read under its own exclusive lock inside gph_tombstone_adjacency. */
+	if (gph_locate_vertex(rel, src, &vblk, &vslot, &src_rec))
+		gph_tombstone_adjacency(rel, src_rec.vr_adj_head, dst, false,
+								GetCurrentTransactionId());
+
+	relation_close(rel, RowExclusiveLock);
+	PG_RETURN_VOID();
+}
+
+PG_FUNCTION_INFO_V1(gph_tombstone_vertex);
+
+/*
+ * gph_tombstone_vertex(vid bigint) RETURNS void — soft-delete a vertex: set GPH_FLAG_DELETED +
+ * vr_xmax on its vertex record AND tombstone all of its OUT-edges, under GenericXLog (crash-safe,
+ * atomic with the host txn; FR-7). After this the vertex is invisible as a traversal source and to
+ * gph_vertex_count, and its out-edges vanish from traversal. Idempotent: no-op on an absent or
+ * already-tombstoned vertex (gph_locate_vertex filters visible tombstones).
+ *
+ * IN-EDGES: the v1 store has no reverse (backlink) index — reverse traversal is plan 038 — so
+ * in-edges pointing AT this vertex are NOT physically swept here. They remain as edge slots whose
+ * dst is now a tombstoned vertex; a traversal that REACHES this vertex still yields the edge, but the
+ * target reads as deleted (gph_locate_vertex / gph_vertex_count filter it). The full reverse-sweep is
+ * a 038 follow-on (see plan 037 STOP condition). Owner-guarded (REVOKEd from PUBLIC, plan 026).
+ */
+Datum
+gph_tombstone_vertex(PG_FUNCTION_ARGS)
+{
+	uint64		vid = (uint64) PG_GETARG_INT64(0);
+	Relation	rel = gph_open_store(RowExclusiveLock);
+	GphVertexRecord	src_rec;
+	BlockNumber	vblk;
+	uint32		vslot;
+	TransactionId	xid;
+	Buffer		buf;
+	GenericXLogState *state;
+	Page		wpage;
+	GphVertexRecord *vr;
+
+	if (!gph_locate_vertex(rel, vid, &vblk, &vslot, &src_rec))
+	{
+		relation_close(rel, RowExclusiveLock);
+		PG_RETURN_VOID();		/* absent/already-tombstoned => no-op */
+	}
+
+	xid = GetCurrentTransactionId();
+
+	/* 1. Tombstone the vertex record itself. Re-read under the exclusive lock; the slot index is
+	 * stable (records never move — the same invariant gph_insert_edge relies on), so vslot from the
+	 * released share lock in gph_locate_vertex is still valid. */
+	buf = ReadBufferExtended(rel, MAIN_FORKNUM, vblk, RBM_NORMAL, NULL);
+	LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+	state = GenericXLogStart(rel);
+	wpage = GenericXLogRegisterBuffer(state, buf, 0);
+	vr = GphPageGetRecord(wpage, vslot, sizeof(GphVertexRecord));
+	vr->vr_flags |= GPH_FLAG_DELETED;
+	vr->vr_xmax = xid;
+	GenericXLogFinish(state);
+	UnlockReleaseBuffer(buf);	/* release before the out-edge sweep: never two buffers at once */
+
+	/* 2. Tombstone all of the vertex's out-edges so traversal FROM it yields nothing. */
+	gph_tombstone_adjacency(rel, src_rec.vr_adj_head, 0, true, xid);
+
+	relation_close(rel, RowExclusiveLock);
+	PG_RETURN_VOID();
+}
+
 /* ------------------------------------------------------------------ */
 /* Traversal: Open / Next / Close incremental iterator                 */
 /* ------------------------------------------------------------------ */
@@ -903,8 +1091,8 @@ gs_getnext(Relation rel, GraphScanDesc *scan, GraphElement *out)
 		{
 			GphEdgeSlot *slot = &scan->page_buf[scan->page_i++];
 
-			if (slot->es_flags & GPH_FLAG_DELETED)
-				continue;
+			if (gph_deleted_visible(slot->es_flags, slot->es_xmax))
+				continue;		/* tombstoned by a visible gph_tombstone_* (plan 037) */
 			if (slot->es_edge_type_id != GPH_EDGE_TYPE_RELATED_TO)
 				continue;
 			if (!gph_xmin_visible(slot->es_xmin))
@@ -1347,7 +1535,8 @@ gph_vertex_count(PG_FUNCTION_ARGS)
 		{
 			GphVertexRecord *vr = GphPageGetRecord(page, i, sizeof(GphVertexRecord));
 
-			if (gph_xmin_visible(vr->vr_xmin))
+			if (gph_xmin_visible(vr->vr_xmin) &&
+				!gph_deleted_visible(vr->vr_flags, vr->vr_xmax))
 				n++;
 		}
 		next = GphPageSpecialPtr(page)->gph_next_pageno;
