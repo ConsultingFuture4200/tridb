@@ -1,4 +1,4 @@
-.PHONY: test lint graph-test smoke-test test-all baseline-up baseline-down seed bench bench-live sweep sm2 fetch-dataset bench-public bench-repro fetch-hotpot graphrag graphrag-live bench-filtered ablation recall-decay tjs-open-ref tjs-open-live graphrag-h2h rabitq-sim gpu-build-index wiki-fetch wiki-extract wiki-scale lock clean
+.PHONY: test lint graph-test smoke-test test-all baseline-up baseline-down seed bench bench-live sweep sm2 fetch-dataset bench-public bench-repro fetch-hotpot graphrag graphrag-live bench-filtered ablation recall-decay tjs-open-ref tjs-open-live graphrag-h2h rabitq-sim gpu-build-index wiki-fetch wiki-extract wiki-scale wiki-neo4j wiki-subgraph lock clean
 
 PUBLIC_DATASET ?= gist-960-euclidean
 
@@ -333,6 +333,32 @@ wiki-scale:
 	$(PY) -m bench.wiki_scale_report --wiki-manifest-dir "$(WIKI_OUT)" \
 	  --slice data/hotpot/dev_slice.json \
 	  $(if $(WIKI_CORPUS_EMB),--corpus-emb $(WIKI_CORPUS_EMB) --query-emb $(WIKI_QUERY_EMB),)
+
+# =============================================================================
+# OFFLINE-WIKI VISUAL TRACK (DEV-1354): load the wiki graph into the baseline
+# Neo4j (image neo4j:5.20 COMMUNITY) and render a k-hop neighborhood as a
+# self-contained, CDN-free interactive HTML. Community-compatible (NO Bloom).
+# Guards mirror sm2: the neo4j container must be up (make baseline-up) and the
+# wiki manifest must exist. Full corpus by default; WIKI_NEO4J_LIMIT=50000 smoke.
+# =============================================================================
+WIKI_NEO4J_MANIFEST ?= data/wiki/simplewiki_full
+WIKI_NEO4J_LIMIT    ?=                  # cap edges for a smoke load; empty = full
+WIKI_SEED           ?= April
+WIKI_HOPS           ?= 2
+WIKI_SUBGRAPH_LIMIT ?= 150
+
+wiki-neo4j:
+	@docker ps --filter name=tridb-baseline-neo4j --format '{{.Names}}' | grep -q tridb-baseline-neo4j || \
+	  { echo "neo4j not up — run: make baseline-up (or docker compose -f baseline/docker-compose.yml up -d neo4j)"; exit 1; }
+	@test -f "$(WIKI_NEO4J_MANIFEST)/manifest.json" || \
+	  { echo "wiki manifest $(WIKI_NEO4J_MANIFEST)/manifest.json missing — run: make wiki-extract"; exit 1; }
+	$(PY) -m tools.wiki_neo4j_load --manifest-dir "$(WIKI_NEO4J_MANIFEST)" \
+	  $(if $(WIKI_NEO4J_LIMIT),--limit $(WIKI_NEO4J_LIMIT),)
+
+wiki-subgraph:
+	@docker ps --filter name=tridb-baseline-neo4j --format '{{.Names}}' | grep -q tridb-baseline-neo4j || \
+	  { echo "neo4j not up — run: make baseline-up (or docker compose -f baseline/docker-compose.yml up -d neo4j)"; exit 1; }
+	$(PY) -m tools.wiki_subgraph --seed "$(WIKI_SEED)" --hops $(WIKI_HOPS) --limit $(WIKI_SUBGRAPH_LIMIT)
 
 baseline-up:
 	docker compose -f baseline/docker-compose.yml up -d
