@@ -54,6 +54,10 @@ SQL
 
 echo "corpus: N=$N avg_deg=$AVG_DEG hubs=$HUBS hub_fanout=$HUB_FANOUT depth=$DEPTH reps=$REPS"
 echo "edges: $($PSQL -c 'SELECT count(*) FROM links')"
+# Resolve the REAL native vids ONCE (do NOT assume identity mode: PERF-02 is unverified and
+# vid != page_id in general). One forward id-map probe per query, not per neighbor.
+HUB1_VID=$($PSQL -c "SELECT graph_store.gph_upsert_vertex(1)")
+REG_VID=$($PSQL -c "SELECT graph_store.gph_upsert_vertex($((HUBS+7)))")
 # correctness + in-session page reads for the hub expansion (same backend via \gset).
 $PSQL <<SQL
 SELECT graph_store.gph_page_reads() AS r0 \gset
@@ -75,7 +79,7 @@ median_ms() {
 echo
 echo "=== A. single-hop expansion from hub #1 (degree ~$HUB_FANOUT) — (a) RAW native surface ==="
 REL_A=$(median_ms "SELECT to_page_id FROM links WHERE from_page_id=1 AND deleted_at IS NULL")
-NAT_A=$(median_ms "SELECT n FROM graph_store.gph_neighbors(1) n")
+NAT_A=$(median_ms "SELECT n FROM graph_store.gph_neighbors($HUB1_VID) n")
 echo "  relational (idx_links_from scan): ${REL_A} ms      native AM (raw gph_neighbors): ${NAT_A} ms"
 
 echo
@@ -91,9 +95,9 @@ REL_CTE() { echo "WITH RECURSIVE g(id,d,path) AS (
 for DD in 2 3; do
   # parity: distinct reached (relational, minus the seed) must equal the native BFS count.
   RELC=$($PSQL -c "$(REL_CTE $DD)"); RELC=$((RELC-1))
-  NATC=$($PSQL -c "SELECT count(*) FROM graph_store.gph_traverse_bfs(1,$DD,0)")
+  NATC=$($PSQL -c "SELECT count(*) FROM graph_store.gph_traverse_bfs($HUB1_VID,$DD,0)")
   REL_B=$(median_ms "$(REL_CTE $DD)")
-  NAT_B=$(median_ms "SELECT count(*) FROM graph_store.gph_traverse_bfs(1,$DD,0)")
+  NAT_B=$(median_ms "SELECT count(*) FROM graph_store.gph_traverse_bfs($HUB1_VID,$DD,0)")
   [ "$RELC" = "$NATC" ] && PAR="PARITY-OK" || PAR="MISMATCH rel=$RELC nat=$NATC"
   echo "  depth $DD: relational CTE ${REL_B} ms   vs   native BFS ${NAT_B} ms   [reached=$NATC $PAR]"
 done
@@ -101,7 +105,7 @@ done
 echo
 echo "=== C. single-hop from a REGULAR node (low degree ~$AVG_DEG) ==="
 REL_C=$(median_ms "SELECT to_page_id FROM links WHERE from_page_id=$((HUBS+7)) AND deleted_at IS NULL")
-NAT_C=$(median_ms "SELECT n FROM graph_store.gph_neighbors($((HUBS+7))) n")
+NAT_C=$(median_ms "SELECT n FROM graph_store.gph_neighbors($REG_VID) n")
 echo "  relational: ${REL_C} ms      native AM: ${NAT_C} ms"
 
 pg_ctl -D "$D" -m immediate stop >/dev/null 2>&1 || true
