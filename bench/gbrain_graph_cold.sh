@@ -42,11 +42,15 @@ for H in $(seq 1 $HUBS); do
   REL=$($PSQL -c "EXPLAIN (ANALYZE, BUFFERS, TIMING OFF) SELECT to_page_id FROM links WHERE from_page_id=$H AND deleted_at IS NULL")
   rp=$(echo "$REL" | grep -oE 'shared hit=[0-9]+ read=[0-9]+|shared read=[0-9]+|shared hit=[0-9]+' | grep -oE '[0-9]+' | awk '{s+=$1} END{print s+0}')
   rms=$(echo "$REL" | grep -oE 'Execution Time: [0-9.]+' | grep -oE '[0-9.]+')
-  # NATIVE: adjacency pages touched (counter delta) + exec time.
-  read r0 < <($PSQL -c "SELECT graph_store.gph_page_reads()")
+  # NATIVE: adjacency pages touched — counter delta measured IN ONE SESSION (\gset), else the
+  # per-backend counter reads across separate connections give a meaningless 0.
+  np=$($PSQL <<SQL
+SELECT graph_store.gph_page_reads() AS r0 \gset
+SELECT count(*) FROM graph_store.gph_neighbors($VID) \gset
+SELECT graph_store.gph_page_reads() - :r0
+SQL
+)
   NAT=$($PSQL -c "EXPLAIN (ANALYZE, TIMING OFF) SELECT n FROM graph_store.gph_neighbors($VID) n")
-  read r1 < <($PSQL -c "SELECT graph_store.gph_page_reads()")
-  np=$((r1 - r0))
   nms=$(echo "$NAT" | grep -oE 'Execution Time: [0-9.]+' | grep -oE '[0-9.]+')
   REL_PAGES=$((REL_PAGES + rp)); NAT_PAGES=$((NAT_PAGES + np)); NH=$((NH+1))
   REL_MS=$(awk "BEGIN{print $REL_MS + $rms}"); NAT_MS=$(awk "BEGIN{print $NAT_MS + $nms}")
