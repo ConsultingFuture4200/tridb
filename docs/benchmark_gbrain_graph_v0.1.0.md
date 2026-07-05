@@ -60,6 +60,46 @@ fanout 2000 (power-law-ish knowledge graph); warm cache; median of 7–9 (EXPLAI
 - The relational baseline is genuinely tuned (partial indexes, ANALYZE, no parallelism to keep it
   comparable). This is the number to beat, and honestly reported as beating the *naive* native path.
 
+## Addendum v0.2.0 — built (a) raw surface + (b) fused BFS operator, re-ran (parity-verified)
+
+Per the v0.1.0 recommendations, built both and re-ran on the same substrate:
+- **(a)** the bench now calls the **raw** `gph_neighbors` (vid resolved once via `gph_upsert_vertex`,
+  NOT the unverified identity-mode assumption — that bug made the first BFS traverse the wrong vertex;
+  caught by a ground-truth parity check).
+- **(b)** a new fused C operator `gph_traverse_bfs(seed_vid, max_depth, type_id)` — full BFS in C
+  (frontier + visited over the native adjacency, ONE call), the native counterpart to gBrain's
+  recursive-CTE `traverseGraph`. **Parity verified**: it reaches the identical set as the relational
+  CTE (and a `UNION` ground truth) at every depth.
+
+| | Relational (tuned CTE / index) | Native (raw `gph_neighbors` / fused `gph_traverse_bfs`) |
+|---|---:|---:|
+| **20k** 1-hop hub (deg 2000) | 0.25 ms | 1.3 ms |
+| **20k** 2-hop (reached 13k) | 24.6 ms | **22.2 ms** (native 10% faster) |
+| **20k** 3-hop (reached 20k) | 94 ms | 98 ms (≈ tie) |
+| **100k** 1-hop hub (deg 3000) | 0.34 ms | 0.90 ms |
+| **100k** 2-hop (reached 21k) | 30.6 ms | 88.9 ms (native 2.9× slower) |
+| **100k** 3-hop (reached 80k) | 146 ms | 577 ms (native 4× slower) |
+
+**Verdict (honest, and it does not favor the thesis at warm cache):**
+- **(b) helped, but only at small scale.** The fused BFS took multi-hop from **8× slower** (per-node
+  SRF) to a **tie** at 20k — then **relatively WORSE at 100k** (3–4× slower). The relational engine's
+  **set-based join** (one optimized hash-join per BFS level over the whole frontier) scales better than
+  **per-node** adjacency walks; the fused BFS still pays per-node `gs_open`/HTAB/page-fetch overhead
+  × (nodes reached), which grows with the frontier.
+- **(a) did not flip single-hop.** The raw surface is faster than the SQL shim but still ~3–5× slower
+  than the relational index scan — the native SRF's per-row return overhead vs the executor's index scan.
+- **The native store's efficiency is real but doesn't cash out as traversal latency here.** 3 page reads
+  for a 3000-edge hub is a genuine storage win, but warm-cache traversal is CPU/overhead-bound, not
+  I/O-bound, so it doesn't show. The one untested regime where it *should* matter is **cold cache /
+  graph exceeds RAM** (I/O-bound single-hop) — not run.
+
+**Bottom line for gBrain-on-TriDB:** do NOT pitch it as a graph-traversal speedup — at warm moderate
+scale it is at best a tie and at 100k it loses. TriDB's honest value for gBrain remains **architectural**
+(one WAL / transactional consistency across the three legs; one system to run), not traversal latency.
+A latency win would require either a genuinely I/O-bound regime, or a set-based native traversal
+primitive (batch the frontier expansion in C the way the planner batches the join) — a redesign, not a
+tweak. `gph_traverse_bfs` is committed and parity-correct; it is not a latency win at scale as-is.
+
 ## Repro
 
 ```bash
