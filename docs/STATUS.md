@@ -3,6 +3,22 @@
 Updated: 2026-07-04. Legend: 🟢 unblocked here · 🟡 partial (design here,
 build on GX10) · 🔴 GX10-gated (needs live MSVBASE build).
 
+> **🟢 gBRAIN-ON-TriDB: pgvector shim PROVEN + Phase C adapter TYPECHECKS (2026-07-04).**
+> The chosen vector-path integration is a **pgvector-compat shim** (advisor plan 039, `scripts/add_pgvector.sh`):
+> gBrain fuses app-side and never uses TJS, so gBrain-on-TriDB needs only **pgvector (vector leg) +
+> `graph_store_am` (native graph leg)** in one DB — NOT `vectordb`, so pgvector's `hnsw` AM doesn't
+> collide. Built pgvector v0.8.0 into the fork image (`tridb/msvbase:gx10-v1-pgv`); **validated live on
+> the Spark**: pgvector cosine + `hnsw vector_cosine_ops` work on ARM PG13.4, and pgvector +
+> `graph_store_am` coexist in one DB (both legs correct). **Phase C adapter** (in AgentBOX, branch
+> `feat/tridb-engine`): a `TriDBEngine extends PostgresEngine` — vector/BM25/pages/facts inherit
+> unchanged; only the graph leg is native (`initSchema` + `graph_store_am`, `syncGraphFromLinks`,
+> early-terminating `traverseNative`, dual-write `addLink`/`removeLink`). **`bun x tsc --noEmit` = 0
+> errors.** Re-scopes the "remaining hardening": B5 (multi-dim) is satisfied by pgvector; A2 (TriDB's own
+> HNSW durability) is OFF gBrain's critical path (pgvector ≠ vectordb); B3 (edge props) is moot (the
+> relational `links` table holds them). NEXT: the head-to-head benchmark — native `traverseNative` vs
+> gBrain's recursive-CTE `traverseGraph` on identical topology, vector/BM25 held constant.
+> **crash_recovery fully green (DEV-1331 closed, `3933f3c`).**
+
 > **🟢 gBRAIN BACKEND HARDENING 036–038 — 3/3 persona-reviewed, MERGED, ENGINE-VERIFIED ON THE GX10 (2026-07-04).**
 > Built + run on the DGX Spark against `tridb/msvbase:gx10-v1` (`make graph-test`): **all three new suites
 > PASS** — `gph_freeze` (036: froze records, visibility byte-identical, aborted row invisible, relfrozenxid
