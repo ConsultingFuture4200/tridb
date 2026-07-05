@@ -1,0 +1,188 @@
+/**
+ * TriDBEngine — a gBrain storage backend that runs on TriDB (a PostgreSQL 13.4 fork with a NATIVE
+ * adjacency-list graph access method, `graph_store_am`) plus stock pgvector.
+ *
+ * TriDB is Postgres, so this EXTENDS the PostgresEngine and inherits everything unchanged — pages,
+ * chunks, the pgvector vector leg (`searchVector`/`upsertChunks`, cosine `<=>`, `hnsw
+ * vector_cosine_ops`), BM25 (`searchKeyword`), facts/takes, migrations, schema-verify. gBrain fuses
+ * app-side (RRF over vector + keyword + graph), so it never uses TriDB's TJS operator; the ONE thing
+ * TriDB changes is the GRAPH leg: gBrain models edges as a relational `links` table walked by
+ * recursive CTEs, and TriDB replaces that with a native adjacency store + early-terminating traversal.
+ *
+ * Requires the pgvector-enabled fork image (scripts/add_pgvector.sh -> tridb/msvbase:gx10-v1-pgv):
+ * one database with `CREATE EXTENSION vector` (inherited via schema-embedded.ts) + `CREATE EXTENSION
+ * graph_store_am` (added here). We do NOT load TriDB's `vectordb`, so pgvector's `hnsw` access method
+ * does not collide.
+ *
+ * FIRST-CUT (2026-07-04): benchmark-oriented. `initSchema` + `syncGraphFromLinks` + `traverseNative`
+ * are the head-to-head essentials; `addLink`/`removeLink` dual-write for production. The full
+ * `traverseGraph`/`traversePaths` overrides (rebuilding GraphNode/GraphPath from native results) are
+ * a follow-on — until then those inherit the recursive-CTE path, and the benchmark compares that
+ * inherited path against `traverseNative` on identical topology.
+ */
+import { PostgresEngine } from './postgres-engine.ts';
+
+/** A native (src,dst) traversal edge, ext-ids = page ids. */
+export interface NativeEdge {
+  src: number;
+  dst: number;
+}
+
+export class TriDBEngine extends PostgresEngine {
+  // Keep the inherited `kind = 'postgres'` — TriDB IS PG 13.4, and every migration / schema-verify /
+  // vector-index guard keys on kind === 'postgres'. Do not invent a 'tridb' kind.
+
+  /** link_type name -> native edge-type id (graph_store.register_edge_type), cached per instance. */
+  private _edgeTypeIds = new Map<string, number>();
+
+  async initSchema(): Promise<void> {
+    // Parent creates pgvector, all tables, the pgvector cosine HNSW index, runs migrations + verify.
+    await super.initSchema();
+    const sql = this.sql;
+    // Add the native graph store. Idempotent; independent of pgvector (no shared AM).
+    await sql`CREATE EXTENSION IF NOT EXISTS graph_store_am`;
+    // Pre-register the canonical gBrain link_source / link_type values so ids are stable. Traversal
+    // uses type_id 0 = "any"; id 1 = related_to is the built-in default.
+    for (const name of ['markdown', 'frontmatter', 'manual', 'mentions']) {
+      await this.edgeTypeId(name);
+    }
+  }
+
+  /** Resolve (and cache) a native edge-type id for a link_type/link_source name. */
+  private async edgeTypeId(name: string | null | undefined): Promise<number> {
+    if (!name) return 1; // related_to default
+    const cached = this._edgeTypeIds.get(name);
+    if (cached !== undefined) return cached;
+    const sql = this.sql;
+    const rows = await sql<{ id: number }[]>`SELECT graph_store.register_edge_type(${name}) AS id`;
+    const id = rows[0].id;
+    this._edgeTypeIds.set(name, id);
+    return id;
+  }
+
+  // --------------------------------------------------------------------------------------------
+  // Benchmark path: populate the native AM from the already-loaded relational `links` table in ONE
+  // set-based pass, so the native graph and the relational graph hold IDENTICAL topology. This is the
+  // apples-to-apples substrate for `traverseNative` (AM) vs the inherited `traverseGraph` (CTE).
+  // --------------------------------------------------------------------------------------------
+  async syncGraphFromLinks(opts?: { sourceId?: string }): Promise<{ vertices: number; edges: number }> {
+    const sql = this.sql;
+    const src = opts?.sourceId;
+    // 1. Materialize every page as a native vertex (vid == page id via the id-map), in id order.
+    const vres = await sql<{ n: number }[]>`
+      SELECT count(graph_store.gph_upsert_vertex(id))::int AS n
+      FROM (SELECT id FROM pages ${src ? sql`WHERE source_id = ${src}` : sql``} ORDER BY id) p`;
+    // 2. Register every distinct link_type, then insert edges typed, in a single pass. deleted_at
+    //    IS NULL mirrors gBrain's read filters.
+    const types = await sql<{ link_type: string | null }[]>`
+      SELECT DISTINCT link_type FROM links WHERE deleted_at IS NULL`;
+    for (const t of types) await this.edgeTypeId(t.link_type ?? undefined);
+    let edges = 0;
+    for (const t of types) {
+      const typeId = await this.edgeTypeId(t.link_type ?? undefined);
+      const eres = await sql<{ n: number }[]>`
+        SELECT count(graph_store.gph_insert_edge(
+                 graph_store.gph_upsert_vertex(l.from_page_id),
+                 graph_store.gph_upsert_vertex(l.to_page_id),
+                 ${typeId}))::int AS n
+        FROM links l
+        WHERE l.deleted_at IS NULL
+          AND l.link_type IS NOT DISTINCT FROM ${t.link_type}
+          ${src ? sql`AND EXISTS (SELECT 1 FROM pages p WHERE p.id = l.from_page_id AND p.source_id = ${src})` : sql``}`;
+      edges += eres[0]?.n ?? 0;
+    }
+    return { vertices: vres[0]?.n ?? 0, edges };
+  }
+
+  /**
+   * Native BFS from a seed page, out-direction, up to `depth` hops, source-scoped. Returns the raw
+   * reached (src,dst) edges — the head-to-head counterpart to the inherited recursive-CTE
+   * `traverseGraph`. Honors TR-1: `gph_traverse_typed` is an early-terminating Open/Next/Close SRF.
+   * `direction=0` (out) only; in/both raise in the AM (reverse index is a follow-on).
+   */
+  async traverseNative(
+    seedSlug: string,
+    depth: number,
+    opts?: { sourceId?: string; linkType?: string },
+  ): Promise<NativeEdge[]> {
+    const sql = this.sql;
+    const src = opts?.sourceId ?? 'default';
+    const typeId = opts?.linkType ? await this.edgeTypeId(opts.linkType) : 0; // 0 = any
+    const seed = await sql<{ id: number }[]>`
+      SELECT id FROM pages WHERE slug = ${seedSlug} AND source_id = ${src} LIMIT 1`;
+    if (seed.length === 0) return [];
+    const seedId = seed[0].id;
+
+    const out: NativeEdge[] = [];
+    const seen = new Set<number>([seedId]);
+    let frontier = [seedId];
+    for (let d = 0; d < depth && frontier.length > 0; d++) {
+      // One set-based expansion per hop: unnest the frontier, LATERAL the native typed traversal.
+      const rows = await sql<{ src: number; dst: number }[]>`
+        SELECT f AS src, e.dst
+        FROM unnest(${frontier}::bigint[]) AS f
+        CROSS JOIN LATERAL graph_store.gph_traverse_typed(
+          graph_store.gph_upsert_vertex(f), ${typeId}, 0, graph_store.gph_upsert_vertex(f)) AS e(src bigint, dst bigint)`;
+      const next: number[] = [];
+      for (const r of rows) {
+        out.push({ src: Number(r.src), dst: Number(r.dst) });
+        if (!seen.has(Number(r.dst))) {
+          seen.add(Number(r.dst));
+          next.push(Number(r.dst));
+        }
+      }
+      frontier = next;
+    }
+    return out;
+  }
+
+  // --------------------------------------------------------------------------------------------
+  // Production dual-write: keep the relational `links` row (edge metadata: context/link_source/
+  // origin_*) AND feed the native topology to the AM, atomically in the same txn (one WAL / FR-7).
+  // --------------------------------------------------------------------------------------------
+  async addLink(
+    from: string,
+    to: string,
+    context?: string,
+    linkType?: string,
+    linkSource?: string,
+    originSlug?: string,
+    originField?: string,
+    opts?: { fromSourceId?: string; toSourceId?: string; originSourceId?: string },
+  ): Promise<void> {
+    // Relational insert (throws if a page is missing — then we skip the native edge).
+    await super.addLink(from, to, context, linkType, linkSource, originSlug, originField, opts);
+    const sql = this.sql;
+    const fromSrc = opts?.fromSourceId ?? 'default';
+    const toSrc = opts?.toSourceId ?? 'default';
+    const typeId = await this.edgeTypeId(linkType);
+    await sql`
+      SELECT graph_store.gph_insert_edge(
+               graph_store.gph_upsert_vertex(f.id),
+               graph_store.gph_upsert_vertex(t.id),
+               ${typeId})
+      FROM pages f, pages t
+      WHERE f.slug = ${from} AND f.source_id = ${fromSrc}
+        AND t.slug = ${to}   AND t.source_id = ${toSrc}`;
+  }
+
+  async removeLink(
+    from: string,
+    to: string,
+    linkType?: string,
+    linkSource?: string,
+    opts?: { fromSourceId?: string; toSourceId?: string },
+  ): Promise<void> {
+    await super.removeLink(from, to, linkType, linkSource, opts);
+    const sql = this.sql;
+    const fromSrc = opts?.fromSourceId ?? 'default';
+    const toSrc = opts?.toSourceId ?? 'default';
+    await sql`
+      SELECT graph_store.gph_tombstone_edge(
+               graph_store.gph_upsert_vertex(f.id),
+               graph_store.gph_upsert_vertex(t.id))
+      FROM pages f, pages t
+      WHERE f.slug = ${from} AND f.source_id = ${fromSrc}
+        AND t.slug = ${to}   AND t.source_id = ${toSrc}`;
+  }
+}
