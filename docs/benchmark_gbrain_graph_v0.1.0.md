@@ -100,6 +100,39 @@ A latency win would require either a genuinely I/O-bound regime, or a set-based 
 primitive (batch the frontier expansion in C the way the planner batches the join) — a redesign, not a
 tweak. `gph_traverse_bfs` is committed and parity-correct; it is not a latency win at scale as-is.
 
+## Addendum v0.3.0 — the I/O-bound / cold regime (the storage-locality thesis's best case)
+
+`bench/gbrain_graph_cold.sh`: single-hop hub expansion (deg 3000), **cold** (16 MB `shared_buffers`,
+post-restart), measuring **pages touched** (the cache-independent storage metric) over 30 fresh hubs.
+
+| | pages touched (cold) | latency (cold) |
+|---|---:|---:|
+| relational (`idx_links_from` + scattered heap) | **84.7** | 0.40 ms |
+| native AM (co-located adjacency) | **3.0** | 1.53 ms |
+| ratio | **28× fewer reads for native** | relational still 3.8× faster |
+
+**The storage-locality thesis is TRUE — and still doesn't produce a latency win here.** The native
+store touches **28× fewer pages** (3 vs 85) for the same hub — the read-once-per-page adjacency claim
+holds cold. But on a 128 GB Spark **nothing is actually disk-I/O-bound**: those 85 relational pages are
+all OS-page-cache hits (cheap), so the native SRF's per-row overhead still dominates latency (1.5 vs
+0.4 ms).
+
+**When the 28× would matter:** only when the workload is genuinely I/O-bound — the graph exceeds RAM,
+or storage is slow/remote/networked. For a personal gBrain (186k pages ≈ tens of MB) on a 128 GB box,
+that never happens; it fits in RAM thousands of times over. So the native store's efficiency is real but
+**latent and irrelevant at gBrain's scale on this hardware.**
+
+### Final conclusion (all regimes)
+- **Warm, moderate scale (gBrain's actual regime):** relational wins single-hop; fused BFS ties then
+  loses multi-hop at 100k. Native does NOT win.
+- **Cold / I/O metric:** native touches 28× fewer pages, but that doesn't convert to latency because
+  gBrain fits in RAM.
+- **Verdict:** TriDB's value for gBrain is **architectural** (one WAL / transactional consistency across
+  the three legs; one system), full stop — **not** graph-traversal latency, in any regime tested. A
+  latency win needs a workload that outgrows RAM, which a personal brain does not.
+- **Bug found along the way:** PERF-02 identity fast-path is silently wrong (`vid = ext_id-1`, not
+  `==`) — DEV-1352.
+
 ## Repro
 
 ```bash
