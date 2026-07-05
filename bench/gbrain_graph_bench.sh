@@ -41,16 +41,26 @@ INSERT INTO links(from_page_id, to_page_id)
 CREATE INDEX idx_links_from ON links(from_page_id) WHERE deleted_at IS NULL;
 CREATE INDEX idx_links_to   ON links(to_page_id)   WHERE deleted_at IS NULL;
 ANALYZE pages; ANALYZE links;
--- Mirror the SAME topology into the native AM.
+-- Mirror the SAME topology into the native AM, dense page-ids loaded IN ID ORDER so vid == ext_id.
 SELECT count(graph_store.gph_upsert_vertex(id)) FROM (SELECT id FROM pages ORDER BY id) p;
 SELECT count(graph_store.gph_insert_edge(
          graph_store.gph_upsert_vertex(from_page_id),
          graph_store.gph_upsert_vertex(to_page_id), 1))
   FROM links WHERE deleted_at IS NULL;
+-- PERF-02 identity fast-path: dense in-order load => the id-map is the identity, so gph_neighbors_ext
+-- skips the per-neighbor reverse lookups. gBrain page-ids are dense SERIAL, so this is the real path.
+SELECT graph_store.gph_set_identity_mode(true);
 SQL
 
 echo "corpus: N=$N avg_deg=$AVG_DEG hubs=$HUBS hub_fanout=$HUB_FANOUT depth=$DEPTH reps=$REPS"
 echo "edges: $($PSQL -c 'SELECT count(*) FROM links')"
+# correctness + in-session page reads for the hub expansion (same backend via \gset).
+$PSQL <<SQL
+SELECT graph_store.gph_page_reads() AS r0 \gset
+SELECT count(*) AS deg FROM graph_store.neighbors(1) \gset
+SELECT graph_store.gph_page_reads() AS r1 \gset
+\echo native neighbors(hub#1) returned :deg edges; adjacency page reads = :r1 - :r0
+SQL
 
 # helper: median execution-time (ms) of a query over REPS runs, via EXPLAIN ANALYZE server-side time.
 median_ms() {
@@ -64,35 +74,24 @@ median_ms() {
 
 echo
 echo "=== A. single-hop expansion from hub #1 (degree ~$HUB_FANOUT) — the atomic graph op ==="
-$PSQL >/dev/null -c "SELECT graph_store.gph_page_reads();"  # warm counter
-NREADS0=$($PSQL -c "SELECT graph_store.gph_page_reads();")
-$PSQL >/dev/null -c "SELECT count(*) FROM graph_store.neighbors(1);"
-NREADS1=$($PSQL -c "SELECT graph_store.gph_page_reads();")
 REL_A=$(median_ms "SELECT to_page_id FROM links WHERE from_page_id=1 AND deleted_at IS NULL")
 NAT_A=$(median_ms "SELECT n FROM graph_store.neighbors(1) n")
-echo "  relational (idx_links_from scan): ${REL_A} ms"
-echo "  native AM (neighbors, read-once/page): ${NAT_A} ms   [adjacency page reads for the hub: $((NREADS1 - NREADS0))]"
+echo "  relational (idx_links_from scan): ${REL_A} ms      native AM (neighbors): ${NAT_A} ms"
 
 echo
-echo "=== B. multi-hop traversal to depth $DEPTH from hub #1 (recursive, same query shape) ==="
-REL_B=$(median_ms "WITH RECURSIVE g(id,d) AS (
-    SELECT 1,0
-    UNION ALL
-    SELECT l.to_page_id, g.d+1 FROM g JOIN links l ON l.from_page_id=g.id AND l.deleted_at IS NULL WHERE g.d < $DEPTH)
-  SELECT count(DISTINCT id) FROM g")
-NAT_B=$(median_ms "WITH RECURSIVE g(id,d) AS (
-    SELECT 1,0
-    UNION ALL
-    SELECT n.n, g.d+1 FROM g CROSS JOIN LATERAL graph_store.neighbors(g.id) AS n(n) WHERE g.d < $DEPTH)
-  SELECT count(DISTINCT id) FROM g")
-echo "  relational recursive-CTE over links: ${REL_B} ms"
-echo "  native AM (recursive over neighbors): ${NAT_B} ms"
+echo "=== B. 2-hop expansion from hub #1 (nested LATERAL, identical semantics both sides) ==="
+REL_B=$(median_ms "SELECT count(DISTINCT l2.to_page_id)
+  FROM links l1 JOIN links l2 ON l2.from_page_id=l1.to_page_id AND l2.deleted_at IS NULL
+  WHERE l1.from_page_id=1 AND l1.deleted_at IS NULL")
+NAT_B=$(median_ms "SELECT count(DISTINCT b.n)
+  FROM graph_store.neighbors(1) AS a(n) CROSS JOIN LATERAL graph_store.neighbors(a.n) AS b(n)")
+echo "  relational (2x links join): ${REL_B} ms      native AM (nested neighbors): ${NAT_B} ms"
 
 echo
 echo "=== C. single-hop from a REGULAR node (low degree ~$AVG_DEG) — the common case ==="
 REL_C=$(median_ms "SELECT to_page_id FROM links WHERE from_page_id=$((HUBS+7)) AND deleted_at IS NULL")
 NAT_C=$(median_ms "SELECT n FROM graph_store.neighbors($((HUBS+7))) n")
-echo "  relational: ${REL_C} ms    native AM: ${NAT_C} ms"
+echo "  relational: ${REL_C} ms      native AM: ${NAT_C} ms"
 
 pg_ctl -D "$D" -m immediate stop >/dev/null 2>&1 || true
 echo; echo "[gbrain_graph_bench] done"
