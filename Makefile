@@ -1,4 +1,4 @@
-.PHONY: test lint graph-test smoke-test test-all baseline-up baseline-down seed bench bench-live sweep sm2 fetch-dataset bench-public bench-repro fetch-hotpot graphrag graphrag-live bench-filtered ablation recall-decay tjs-open-ref tjs-open-live graphrag-h2h rabitq-sim gpu-build-index lock clean
+.PHONY: test lint graph-test smoke-test test-all baseline-up baseline-down seed bench bench-live sweep sm2 fetch-dataset bench-public bench-repro fetch-hotpot graphrag graphrag-live bench-filtered ablation recall-decay tjs-open-ref tjs-open-live graphrag-h2h rabitq-sim gpu-build-index wiki-fetch wiki-extract wiki-scale lock clean
 
 PUBLIC_DATASET ?= gist-960-euclidean
 
@@ -284,6 +284,55 @@ INDEX_OUT ?= data/index/cagra_hnsw.bin
 gpu-build-index:
 	@test -n "$(DATASET)" || { echo "set DATASET=<.npy/.fvecs/.hdf5> (the corpus to index)"; exit 1; }
 	bash scripts/gpu_build_index.sh --vectors $(DATASET) --out $(INDEX_OUT)
+
+# =============================================================================
+# FULL-WIKIPEDIA SCALE BENCHMARK (docs/wiki_scale_benchmark_spec_v0.1.0.md, DEV-1354)
+# Phase 0 (extract) + Phase 3 (retrieve-from-all-wiki recall) are hardware-independent
+# and run HERE; the LIVE tjs_open latency / HNSW build / COPY load are GX10/Spark-gated
+# (docs/wiki_scale_load_design_v0.1.0.md). These guards mirror fetch-hotpot/graphrag.
+# =============================================================================
+WIKI ?= simple                                   # simple | full
+SIMPLEWIKI_URL ?= https://dumps.wikimedia.org/simplewiki/latest/simplewiki-latest-pages-articles.xml.bz2
+ENWIKI_URL     ?= https://dumps.wikimedia.org/enwiki/latest/enwiki-latest-pages-articles.xml.bz2
+WIKI_DUMP ?= data/wiki/simplewiki-latest-pages-articles.xml.bz2
+WIKI_OUT  ?= data/wiki/simplewiki_slice
+WIKI_MAX  ?= 20000                               # articles to index/emit (slice); unset for full
+
+# Network-gated: download a MediaWiki pages-articles dump to data/wiki/. NOT run by
+# tests/CI (same policy as fetch-dataset). WIKI=full pulls enwiki (~20 GB compressed,
+# ~90 GB extracted) — LONG. Skips a dump that is already present.
+wiki-fetch:
+	@mkdir -p data/wiki
+	@if [ "$(WIKI)" = "full" ]; then URL="$(ENWIKI_URL)"; else URL="$(SIMPLEWIKI_URL)"; fi; \
+	  DEST="data/wiki/$$(basename $$URL)"; \
+	  if [ -s "$$DEST" ]; then echo "[wiki-fetch] $$DEST already present — skipping"; \
+	  else echo "[wiki-fetch] downloading $$URL (resumable; enwiki is LONG)"; \
+	    curl -L -C - -o "$$DEST" "$$URL"; fi
+
+# Phase 0 extraction (hardware-independent): stream a dump into a portable corpus
+# manifest (tools/wiki_extract). Slice by default (WIKI_MAX); a FULL run is
+# `make wiki-extract WIKI_DUMP=data/wiki/enwiki-...xml.bz2 WIKI_OUT=data/wiki/enwiki WIKI_MAX=`.
+wiki-extract:
+	@test -f "$(WIKI_DUMP)" || \
+	  { echo "dump $(WIKI_DUMP) missing — run: make wiki-fetch (WIKI=simple|full)"; exit 1; }
+	$(PY) -m tools.wiki_extract --dump "$(WIKI_DUMP)" --out "$(WIKI_OUT)" \
+	  $(if $(WIKI_MAX),--max-articles $(WIKI_MAX),)
+
+# Host-side full-wiki HotpotQA retrieve-from-ALL recall (bench/wiki_scale_report).
+# Grades multi-hop joint evidence recall@k over the whole corpus, gold resolved via
+# tools/wiki_hotpot_link. Guards on BOTH the wiki manifest (make wiki-extract) and the
+# HotpotQA dev slice (make fetch-hotpot). At 6.8M pass GPU-precomputed embeddings via
+# WIKI_CORPUS_EMB/WIKI_QUERY_EMB. The LIVE tjs_open latency is a SEPARATE GX10-gated
+# note: `make wiki-scale ... ` emits the SQL with --emit-sql; run it on the Spark
+# (scripts/graph_test.sh) — this target NEVER fabricates a live latency here.
+wiki-scale:
+	@test -f "$(WIKI_OUT)/manifest.json" || \
+	  { echo "wiki manifest $(WIKI_OUT)/manifest.json missing — run: make wiki-extract"; exit 1; }
+	@test -f data/hotpot/dev_slice.json || \
+	  { echo "no HotpotQA dev slice — run: make fetch-hotpot"; exit 1; }
+	$(PY) -m bench.wiki_scale_report --wiki-manifest-dir "$(WIKI_OUT)" \
+	  --slice data/hotpot/dev_slice.json \
+	  $(if $(WIKI_CORPUS_EMB),--corpus-emb $(WIKI_CORPUS_EMB) --query-emb $(WIKI_QUERY_EMB),)
 
 baseline-up:
 	docker compose -f baseline/docker-compose.yml up -d
