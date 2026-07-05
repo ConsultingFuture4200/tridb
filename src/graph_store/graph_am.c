@@ -1235,6 +1235,133 @@ gph_neighbors(PG_FUNCTION_ARGS)
 }
 
 /* ------------------------------------------------------------------ */
+/* Fused multi-hop BFS operator (the gBrain graph-leg fast path)       */
+/* ------------------------------------------------------------------ */
+/*
+ * gph_traverse_bfs(seed vid, max_depth, type_id) RETURNS SETOF bigint — the distinct vertices
+ * reachable from `seed` within `max_depth` out-hops (excluding the seed), computed ENTIRELY in C:
+ * frontier expansion + a visited hash, walking the native adjacency directly via gs_open/gs_getnext.
+ * ONE call does the whole traversal — no per-node SQL SRF round-trip, no recursive-CTE join per hop.
+ * This is the native counterpart to gBrain's relational recursive-CTE `traverseGraph`. `type_id` 0 =
+ * any type. TR-1 is respected in spirit (bounded by max_depth; a future early-out-on-k variant is a
+ * follow-on). Result is materialized once at Open, then served one vid per Next().
+ */
+typedef struct GphBfsResult
+{
+	int64	   *ids;
+	int64		n;
+	int64		idx;
+} GphBfsResult;
+
+PG_FUNCTION_INFO_V1(gph_traverse_bfs);
+Datum
+gph_traverse_bfs(PG_FUNCTION_ARGS)
+{
+	FuncCallContext *funcctx;
+	GphBfsResult   *res;
+
+	if (SRF_IS_FIRSTCALL())		/* === Open: run the whole BFS === */
+	{
+		MemoryContext oldctx;
+		GraphVertexId seed = (GraphVertexId) PG_GETARG_INT64(0);
+		int			max_depth = PG_GETARG_INT32(1);
+		int32		arg_type = PG_GETARG_INT32(2);
+		uint32		tfilter = (arg_type == 0) ? GPH_EDGE_TYPE_ANY : (uint32) arg_type;
+		Relation	rel;
+		HASHCTL		hctl;
+		HTAB	   *visited;
+		int64	   *ids;
+		int64		cap = 256,
+					n = 0;
+		int64	   *frontier,
+				   *next;
+		int64		fcap = 256,
+					ncap = 256,
+					fn = 0,
+					nn;
+		int64		key;
+		bool		found;
+		int			d;
+
+		funcctx = SRF_FIRSTCALL_INIT();
+		oldctx = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
+
+		memset(&hctl, 0, sizeof(hctl));
+		hctl.keysize = sizeof(int64);
+		hctl.entrysize = sizeof(int64);
+		visited = hash_create("gph_bfs_visited", 1024, &hctl, HASH_ELEM | HASH_BLOBS);
+
+		ids = (int64 *) palloc(cap * sizeof(int64));
+		frontier = (int64 *) palloc(fcap * sizeof(int64));
+		next = (int64 *) palloc(ncap * sizeof(int64));
+
+		key = (int64) seed;
+		(void) hash_search(visited, &key, HASH_ENTER, &found);	/* mark seed; never emitted */
+		frontier[fn++] = (int64) seed;
+
+		rel = gph_open_store(AccessShareLock);
+		for (d = 0; d < max_depth && fn > 0; d++)
+		{
+			int64		i;
+
+			nn = 0;
+			for (i = 0; i < fn; i++)
+			{
+				GraphScanDesc scan;
+				GraphElement  elem;
+
+				memset(&scan, 0, sizeof(scan));
+				(void) gs_open(&scan, rel, (GraphVertexId) frontier[i], GRAPH_SCAN_OUTGOING,
+							   tfilter, (GraphVertexId) GRAPHSTORE_INVALID_ID);
+				while (gs_getnext(rel, &scan, &elem))
+				{
+					key = (int64) elem.edge_dst;
+					(void) hash_search(visited, &key, HASH_ENTER, &found);
+					if (!found)			/* first time reached: record + enqueue */
+					{
+						if (n == cap)
+						{
+							cap *= 2;
+							ids = (int64 *) repalloc(ids, cap * sizeof(int64));
+						}
+						ids[n++] = key;
+						if (nn == ncap)
+						{
+							ncap *= 2;
+							next = (int64 *) repalloc(next, ncap * sizeof(int64));
+						}
+						next[nn++] = key;
+					}
+				}
+				gs_close(&scan);
+			}
+			/* next becomes the frontier for the following hop */
+			if (nn > fcap)
+			{
+				fcap = ncap;
+				frontier = (int64 *) repalloc(frontier, fcap * sizeof(int64));
+			}
+			memcpy(frontier, next, nn * sizeof(int64));
+			fn = nn;
+		}
+		relation_close(rel, AccessShareLock);
+
+		res = (GphBfsResult *) palloc(sizeof(GphBfsResult));
+		res->ids = ids;
+		res->n = n;
+		res->idx = 0;
+		funcctx->user_fctx = res;
+		MemoryContextSwitchTo(oldctx);
+	}
+
+	funcctx = SRF_PERCALL_SETUP();	/* === Next === */
+	res = (GphBfsResult *) funcctx->user_fctx;
+	if (res->idx < res->n)
+		SRF_RETURN_NEXT(funcctx, Int64GetDatum(res->ids[res->idx++]));
+	SRF_RETURN_DONE(funcctx);		/* === Close === */
+}
+
+/* ------------------------------------------------------------------ */
 /* Backend-local reverse id cache (plan 034 / DEV-1345, PERF-03)       */
 /* ------------------------------------------------------------------ */
 

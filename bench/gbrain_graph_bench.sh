@@ -73,24 +73,35 @@ median_ms() {
 }
 
 echo
-echo "=== A. single-hop expansion from hub #1 (degree ~$HUB_FANOUT) — the atomic graph op ==="
+echo "=== A. single-hop expansion from hub #1 (degree ~$HUB_FANOUT) — (a) RAW native surface ==="
 REL_A=$(median_ms "SELECT to_page_id FROM links WHERE from_page_id=1 AND deleted_at IS NULL")
-NAT_A=$(median_ms "SELECT n FROM graph_store.neighbors(1) n")
-echo "  relational (idx_links_from scan): ${REL_A} ms      native AM (neighbors): ${NAT_A} ms"
+NAT_A=$(median_ms "SELECT n FROM graph_store.gph_neighbors(1) n")
+echo "  relational (idx_links_from scan): ${REL_A} ms      native AM (raw gph_neighbors): ${NAT_A} ms"
 
 echo
-echo "=== B. 2-hop expansion from hub #1 (nested LATERAL, identical semantics both sides) ==="
-REL_B=$(median_ms "SELECT count(DISTINCT l2.to_page_id)
-  FROM links l1 JOIN links l2 ON l2.from_page_id=l1.to_page_id AND l2.deleted_at IS NULL
-  WHERE l1.from_page_id=1 AND l1.deleted_at IS NULL")
-NAT_B=$(median_ms "SELECT count(DISTINCT b.n)
-  FROM graph_store.neighbors(1) AS a(n) CROSS JOIN LATERAL graph_store.neighbors(a.n) AS b(n)")
-echo "  relational (2x links join): ${REL_B} ms      native AM (nested neighbors): ${NAT_B} ms"
+echo "=== B. multi-hop from hub #1 — (b) gBrain recursive-CTE vs FUSED native gph_traverse_bfs ==="
+# relational side is gBrain-faithful: recursive CTE with path-array cycle prevention.
+REL_CTE() { echo "WITH RECURSIVE g(id,d,path) AS (
+    SELECT 1,0,ARRAY[1]
+    UNION ALL
+    SELECT l.to_page_id, g.d+1, g.path||l.to_page_id
+    FROM g JOIN links l ON l.from_page_id=g.id AND l.deleted_at IS NULL
+    WHERE g.d < $1 AND NOT (l.to_page_id = ANY(g.path)))
+  SELECT count(DISTINCT id) FROM g"; }
+for DD in 2 3; do
+  # parity: distinct reached (relational, minus the seed) must equal the native BFS count.
+  RELC=$($PSQL -c "$(REL_CTE $DD)"); RELC=$((RELC-1))
+  NATC=$($PSQL -c "SELECT count(*) FROM graph_store.gph_traverse_bfs(1,$DD,0)")
+  REL_B=$(median_ms "$(REL_CTE $DD)")
+  NAT_B=$(median_ms "SELECT count(*) FROM graph_store.gph_traverse_bfs(1,$DD,0)")
+  [ "$RELC" = "$NATC" ] && PAR="PARITY-OK" || PAR="MISMATCH rel=$RELC nat=$NATC"
+  echo "  depth $DD: relational CTE ${REL_B} ms   vs   native BFS ${NAT_B} ms   [reached=$NATC $PAR]"
+done
 
 echo
-echo "=== C. single-hop from a REGULAR node (low degree ~$AVG_DEG) — the common case ==="
+echo "=== C. single-hop from a REGULAR node (low degree ~$AVG_DEG) ==="
 REL_C=$(median_ms "SELECT to_page_id FROM links WHERE from_page_id=$((HUBS+7)) AND deleted_at IS NULL")
-NAT_C=$(median_ms "SELECT n FROM graph_store.neighbors($((HUBS+7))) n")
+NAT_C=$(median_ms "SELECT n FROM graph_store.gph_neighbors($((HUBS+7))) n")
 echo "  relational: ${REL_C} ms      native AM: ${NAT_C} ms"
 
 pg_ctl -D "$D" -m immediate stop >/dev/null 2>&1 || true

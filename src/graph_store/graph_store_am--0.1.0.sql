@@ -87,6 +87,12 @@ CREATE FUNCTION gph_traverse_typed(bigint, integer, integer, bigint,
                                    OUT src bigint, OUT dst bigint) RETURNS SETOF record
   AS 'MODULE_PATHNAME' LANGUAGE C VOLATILE STRICT;
 
+-- Fused multi-hop BFS (the gBrain graph-leg fast path): distinct vertices reachable from a seed vid
+-- within max_depth out-hops, computed ENTIRELY in C (frontier + visited over the native adjacency) in
+-- ONE call — the native counterpart to a relational recursive-CTE traversal. type_id 0 = any type.
+CREATE FUNCTION gph_traverse_bfs(bigint, integer, integer) RETURNS SETOF bigint
+  AS 'MODULE_PATHNAME' LANGUAGE C VOLATILE STRICT;
+
 CREATE FUNCTION gph_visits() RETURNS bigint
   AS 'MODULE_PATHNAME' LANGUAGE C VOLATILE;
 
