@@ -1,4 +1,4 @@
-.PHONY: test lint graph-test smoke-test test-all baseline-up baseline-down seed bench bench-live sweep sm2 fetch-dataset bench-public bench-repro fetch-hotpot graphrag graphrag-live bench-filtered ablation recall-decay tjs-open-ref tjs-open-live graphrag-h2h rabitq-sim gpu-build-index wiki-fetch wiki-extract wiki-scale wiki-neo4j wiki-subgraph lock clean
+.PHONY: test lint graph-test smoke-test test-all baseline-up baseline-down seed bench bench-live sweep sm2 fetch-dataset bench-public bench-repro fetch-hotpot graphrag graphrag-live bench-filtered ablation recall-decay tjs-open-ref tjs-open-live graphrag-h2h rabitq-sim gpu-build-index wiki-fetch wiki-extract wiki-scale wiki-neo4j wiki-subgraph wiki-linkpred lock clean
 
 PUBLIC_DATASET ?= gist-960-euclidean
 
@@ -359,6 +359,20 @@ wiki-subgraph:
 	@docker ps --filter name=tridb-baseline-neo4j --format '{{.Names}}' | grep -q tridb-baseline-neo4j || \
 	  { echo "neo4j not up — run: make baseline-up (or docker compose -f baseline/docker-compose.yml up -d neo4j)"; exit 1; }
 	$(PY) -m tools.wiki_subgraph --seed "$(WIKI_SEED)" --hops $(WIKI_HOPS) --limit $(WIKI_SUBGRAPH_LIMIT)
+
+# Link prediction over the offline-wiki corpus (DEV-1354): embed articles (fastembed
+# BGE, CPU here), hnswlib ANN, cosine-neighbors-MINUS-existing-edges -> ranked predicted
+# connections + an overlap sanity metric. This is the cosine-only LOWER BOUND; the
+# production predictor fuses this with graph structure via tjs_open (GX10-gated). Full
+# enwiki (~7M) embedding is the Spark GPU step; WIKI_LP_LIMIT=0 runs the whole corpus.
+WIKI_LP_MANIFEST ?= data/wiki/simplewiki_full
+WIKI_LP_LIMIT    ?= 30000
+WIKI_LP_SAMPLE   ?= 2000
+wiki-linkpred:
+	@test -f "$(WIKI_LP_MANIFEST)/manifest.json" || \
+	  { echo "wiki manifest $(WIKI_LP_MANIFEST)/manifest.json missing — run: make wiki-extract"; exit 1; }
+	$(PY) -m tools.wiki_linkpredict --corpus "$(WIKI_LP_MANIFEST)" \
+	  --limit $(WIKI_LP_LIMIT) --sample $(WIKI_LP_SAMPLE) --print-n 15
 
 baseline-up:
 	docker compose -f baseline/docker-compose.yml up -d
