@@ -21,7 +21,8 @@ welded into one operator, so we split it along that seam:
 | Work | Processor | Rationale | Phase-2 status |
 |---|---|---|---|
 | Query + corpus **embedding** | GPU (torch) | dense matmul | **PROVEN** — 1,301 art/s floor, 96% util |
-| **ANN seed retrieval** (top-`m_seeds`) | GPU (cuVS CAGRA) | data-parallel graph-ANN | **PROVEN** — 11.2 µs/q, recall@1 0.999 |
+| **OFFLINE index build** (CAGRA graph → hnswlib export, PERF-08) | GPU (cuVS CAGRA), *offline* | data-parallel graph-ANN build, exits before serving | **PROVEN** — build 1.52 s; the 11.2 µs/q / recall@1 0.999 was a *standalone* CAGRA search, not in-AM |
+| **ANN seed retrieval** at serve time (top-`m_seeds`) | **CPU** (hnswlib, served from the PERF-08 export) | no GPU call on the query path (PERF-08 §2); the served index is CPU-native | n/a (CPU) |
 | **Batch candidate distances** (the vector ranking stream) | GPU (batched `<->`) | one kernel over the frontier | HYPOTHESIS (in-AM) |
 | **RaBitQ** 4-bit quant + in-scan rerank (PERF-10) | GPU | vectorized bit ops + FP rerank | HYPOTHESIS (host sim only today) |
 | **Native adjacency traversal** / PPR forward-push | **CPU** | branchy, latency-bound pointer-chasing — GPU-hostile | n/a (CPU) |
@@ -47,7 +48,8 @@ Map the ADR-0012 pipeline onto the two processors and watch the boundary crossin
 
 ```
   ANN top-m_seeds        graph bridges          FR merge → top-k
-  (GPU: CAGRA)           (CPU: adjacency PPR)   (CPU control + GPU distances)
+  (CPU: HNSW,            (CPU: adjacency PPR)   (CPU control + GPU distances)
+   PERF-08 export)
        |                       |                        |
        v                       v                        v
   seed ids  ------------> frontier of candidate ids --> distances(frontier) --> W/B bounds --> stop?
@@ -75,7 +77,7 @@ whether to stop.
 The concrete fused loop (one Open/Next/Close pass, TR-1-preserving):
 
 ```
-open:   embed(query) on GPU; CAGRA ANN → m_seeds (GPU); seed the CPU PPR frontier
+open:   embed(query) on GPU; ANN → m_seeds on CPU (hnswlib, PERF-08 export); seed the CPU PPR frontier
 next (repeat until FR-bound stop OR k settled):
   CPU:  pop max-residue node, push α·residue to reserve, spread to out-neighbors
         (native graph_store_am), appending newly-touched candidate ids to the shared frontier buffer
@@ -175,15 +177,27 @@ offline index build (PERF-08) only.
 3. **Pages touched** (SM-3, the I/O-bound proof) — the native-graph page-locality signal;
    independent of processor, so it should match CPU-only. Confirms the arms are the same
    query.
-4. **GPU util % and CPU util %** — GB10 reports `memory.used = [N/A]` on unified memory
-   (Phase 2), so **utilization % is the liveness/overlap signal**. The fused arm's evidence
-   of overlap is GPU util > 0 *concurrently* with CPU util > 0 during a query; copy-hybrid
-   should show alternating (stall) util.
-5. **Per-round crossing cost** (fused vs copy-hybrid) — direct measure of the zero-copy
-   saving, in µs/round.
+4. **CPU/GPU overlap** — measured **per round with CUDA events + NVTX**, not nvidia-smi.
+   A `tjs_open` query here is single-digit ms (CAGRA search 11.2 µs, ~171-candidate frontier
+   over a few hops) and per-round GPU work is sub-ms; nvidia-smi util% is a ~1 Hz coarse
+   duty-cycle estimate and **physically cannot resolve sub-ms per-round overlap during a
+   query**. Instrument each per-round GPU distance call with `cudaEventRecord` around the
+   kernel (`cudaEventElapsedTime` → GPU-time) inside an NVTX range, and stamp CPU wall-clock
+   around the FR-merge; the overlap is GPU-time and CPU-time on the *same* round advancing
+   concurrently. Reserve **nvidia-smi util%** (GB10 reports `memory.used = [N/A]` on unified
+   memory, Phase 2) only for **aggregate liveness over a sustained back-to-back query loop
+   (throughput mode)** — a coarse sanity check that the GPU is busy at all, never a
+   per-query overlap measurement.
+5. **Per-round crossing cost** (fused vs copy-hybrid) — the ONLY clean isolation of the
+   zero-copy claim (H1, §5 line 161), so it too is measured with **CUDA events + NVTX**:
+   the delta between the fused arm's per-round GPU-time and the copy-hybrid arm's
+   (kernel-time + explicit `cudaMemcpy` time) is the zero-copy saving, in µs/round. This is
+   sub-millisecond and has no viable nvidia-smi measurement path.
 
 **Kill criterion (pre-registered).** If, at fixed recall@k on the 7M I/O-bound workload,
-zero-copy fused does **not** beat CPU-only by more than measurement noise, H1 is falsified:
+zero-copy fused does **not** beat CPU-only by **≥ 20% median latency** (the pre-registered
+effect-size budget — well outside run-to-run noise, and it must also beat copy-hybrid to
+attribute the win to zero-copy rather than GPU arithmetic alone), H1 is falsified:
 the serving-path heterogeneous model is abandoned, the GPU stays an offline-index-build
 accelerator (PERF-08), and the serving operator remains CPU-only and TR-1-clean. Publishing
 that negative is a valid outcome (it's the honest half of the `wiki_scale_benchmark_spec`
@@ -202,13 +216,33 @@ report GPU contention state alongside every number, as Phase 2 did).
 
 1. **Now (proven, no in-AM GPU):** PERF-08 offline CAGRA→HNSW build feeds the 7M vector leg.
    This is pure upside and unblocks the wiki-scale load regardless of the fused hypothesis.
-2. **Next (integration spike, §3):** stand up a persistent per-backend CUDA context + a
-   zero-copy frontier/distance buffer in the fork's custom scan; prove a single GPU
-   batch-distance call from inside `execTJS` at acceptable latency. This is the gate — if the
+   Note this and the single open()-time seed ANN are the genuinely high-leverage GPU wins,
+   and they need **neither** the fused per-round machinery **nor** zero-copy.
+2. **Pre-gate (CPU-only, no GX10 C — do this BEFORE step 3):** the determinant of whether ANY
+   serving-path GPU win is even possible is the actual 7M frontier size and the vector-leg
+   fraction of end-to-end latency — this is the primary risk (ADR-0017 §Consequences), so
+   measure it first and cheaply. On the full 7M corpus, using the wiki-scale harness CPU-only
+   (no CUDA-in-AM glue), measure (a) the actual per-query frontier / candidates-examined at
+   the fixed-recall target, and (b) the vector-distance fraction of end-to-end latency.
+   **Performance budget (pre-registered gate to proceed to step 3):**
+   - **Minimum viable frontier** — the per-round GPU batch-distance must be large enough that
+     plausible GPU arithmetic is ≥ ~10× the measured kernel-launch overhead. At HotpotQA's
+     ≈171 candidates × 384-d that is ~66K MACs/query (microseconds on one Grace core, well
+     under a single kernel launch), so a frontier that stays ≈171 on 7M **fails the gate** —
+     order-of-thousands candidates/round, or many-query frontier batching, is the floor.
+   - **Vector-distance fraction ≥ 30% of end-to-end latency.** Below that, Amdahl caps any
+     vector-only speedup under ~1.4× even at infinite GPU speed — no zero-copy trick moves
+     metric #1, so building the CUDA-in-AM glue cannot pay.
+   If the 7M workload is I/O-bound with a small frontier (the wiki-spec expectation), the gate
+   fails here: stop, keep PERF-08-only, and do not build the fused machinery to accelerate the
+   lowest-arithmetic part of the pipeline.
+3. **Integration spike (§3, GX10-gated) — only if step 2 passes:** stand up a persistent
+   per-backend CUDA context + a zero-copy frontier/distance buffer in the fork's custom scan;
+   prove a single GPU batch-distance call from inside `execTJS` at acceptable latency. If the
    integration cost is fatal, stop here and keep PERF-08-only.
-3. **Then (the experiment, §5):** three-arm run on 7M wiki; report the five metrics; apply the
+4. **The experiment (§5):** three-arm run on 7M wiki; report the five metrics; apply the
    kill criterion honestly.
 
-Only after step 3 returns a positive, reproduced result may any material claim GPU
+Only after step 4 returns a positive, reproduced result may any material claim GPU
 `tjs_open` as faster. Until then: PERF-08 is the shipped GPU value; the fused operator is a
 measured hypothesis.

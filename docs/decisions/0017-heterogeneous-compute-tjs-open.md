@@ -47,8 +47,10 @@ part, with this fixed work-partition:
 
 | Leg | Runs on | Why |
 |---|---|---|
-| ANN seed retrieval + candidate batch-distance (the vector ranking stream) | **GPU** (cuVS CAGRA + batch `<->`) | dense data-parallel float arithmetic; proven 11.2 µs/query on the GB10 |
-| RaBitQ quantization / in-scan rerank (PERF-10) | **GPU** | vectorized bit ops + full-precision rerank over the frontier |
+| OFFLINE index build (CAGRA graph → hnswlib export, PERF-08) | **GPU** (cuVS CAGRA), *offline* | dense data-parallel build; the standalone CAGRA search that measured 11.2 µs/query is proven, but the artifact is a CPU-native HNSW file and the build **exits before serving** — zero GPU state at query time (PERF-08 §2) |
+| ANN seed retrieval at serve time (top-`m_seeds`) | **CPU** (hnswlib, served from the PERF-08 export) | no GPU call on the query path; the served index is CPU-native (PERF-08 §2). The 11.2 µs/query figure was a standalone python-venv CAGRA search, never in-AM and never from the served HNSW |
+| Candidate batch-distance over the frontier (the vector ranking stream) | **GPU** (batch `<->`) — HYPOTHESIS | dense data-parallel float arithmetic; unproven in-AM |
+| RaBitQ quantization / in-scan rerank (PERF-10) | **GPU** — HYPOTHESIS | vectorized bit ops + full-precision rerank over the frontier; host sim only today |
 | Embedding (query + offline corpus) | **GPU** (torch) | proven 1,301 art/s floor |
 | Native adjacency traversal (pointer-chasing, PPR forward-push) | **CPU** | branchy, cache/latency-bound, GPU-hostile |
 | `tjs_open` early-termination control (FR / `consecutive_drops`) | **CPU** | serial control flow; the TR-1 brain |
