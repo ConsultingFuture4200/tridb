@@ -16,9 +16,19 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from tools.wiki_linkpredict import (  # noqa: E402
     linked_fraction,
+    load_out_edges,
     predicted_unlinked,
     save_embeddings,
 )
+
+
+def _write_corpus(tmp_path, edges):
+    """Minimal corpus dir: manifest.json + one tab-separated edge shard."""
+    (tmp_path / "edges.tsv").write_text("".join(f"{s}\t{d}\n" for s, d in edges))
+    (tmp_path / "manifest.json").write_text(
+        json.dumps({"shards": {"edges": {"files": [{"path": "edges.tsv"}]}}})
+    )
+    return tmp_path
 
 
 def test_predicted_unlinked_subtracts_self_and_edges_preserving_rank():
@@ -42,6 +52,18 @@ def test_linked_fraction_excludes_self_and_ratios_over_neighbours():
 
 def test_linked_fraction_empty_neighbours_is_zero():
     assert linked_fraction([1], self_id=1, linked=set()) == 0.0
+
+
+def test_load_out_edges_scopes_to_src_keep(tmp_path):
+    # slice keep = {1,2,3}; edge 3->4 leaves the slice (dropped on dst).
+    corpus = _write_corpus(tmp_path, [(1, 2), (1, 3), (2, 3), (3, 1), (3, 4)])
+    keep = {1, 2, 3}
+    # src_keep restricts the loaded adjacency to the sampled sources only.
+    scoped = load_out_edges(corpus, keep, {1})
+    assert scoped == {1: {2, 3}}  # source 2 and 3 not ingested
+    # None => every in-slice source, dst still filtered by keep (3->4 gone).
+    full = load_out_edges(corpus, keep, None)
+    assert full == {1: {2, 3}, 2: {3}, 3: {1}}
 
 
 def test_save_embeddings_roundtrip(tmp_path):

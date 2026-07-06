@@ -26,11 +26,17 @@ tools/hotpot_corpus.py and the hnswlib index usage from bench/recall_decay.py.
 SCALE / GATING (honest boundaries):
 - This runs on simplewiki (282,900 articles) on CPU, HERE. `--limit` bounds the
   slice for a fast validation run; `--limit 0` embeds the whole corpus.
-- Memory envelope (`--limit 0`): the normalized fp32 vectors and the hnswlib graph
-  are the two resident structures. At enwiki 7.19M x dim=384 that is ~11 GB of
-  vectors + a comparable index, plus the id/title lists — bounded, and it fits the
-  GB10's 128 GB coherent unified memory. The encode step has a transient ~2x on the
-  vector array (list-of-batches then one np.asarray copy) before the temporaries drop.
+- Memory envelope (`--limit 0`): the dominant resident structures are the
+  normalized fp32 vectors and the hnswlib graph. At enwiki 7.19M x dim=384 that is
+  ~11 GB of vectors + a comparable index, plus the id/title lists. A third resident
+  structure is the out-edge adjacency (dict[int, set[int]]) — but it is bounded to
+  the sampled sources, not the full edge set: load_out_edges only ingests out-edges
+  for the `--sample` scored sources (~2000 * avg_degree, a few MB), so it does NOT
+  materialize all 232M enwiki edges. All three are bounded and fit the GB10's 128 GB
+  coherent unified memory. The encode step has a transient ~2x on the vector array
+  (list-of-batches then one np.asarray copy) before the temporaries drop. Caveat:
+  `--sample 0` (score every article) loads the full O(E) adjacency — at enwiki that
+  is 232M edges as Python int/set members (tens of GB); prefer a bounded --sample.
 - Full enwiki (~7M articles) embedding is the Spark/GX10 GPU step — NOT run here.
 - The PRODUCTION predictor fuses this vector signal with graph structure via
   tjs_open (the tri-modal join, GX10-gated). This cosine-only predictor is the
@@ -132,8 +138,17 @@ def load_articles(corpus: Path, limit: int) -> tuple[list[int], list[str], list[
     return ids, titles, texts
 
 
-def load_out_edges(corpus: Path, keep: set[int]) -> dict[int, set[int]]:
-    """src_id -> set of dst_ids, restricted to endpoints in `keep` (the slice)."""
+def load_out_edges(
+    corpus: Path, keep: set[int], src_keep: set[int] | None = None
+) -> dict[int, set[int]]:
+    """src_id -> set of dst_ids, restricted to endpoints in `keep` (the slice).
+
+    `out_edges` is only ever consulted for the scored sources, so when `src_keep`
+    is given (the sampled source ids) the scan keeps out-edges for those sources
+    only. This collapses the resident adjacency from O(E) (232M edges at enwiki
+    --limit 0) to O(sample * avg_degree). `src_keep=None` keeps every in-slice
+    source (the --sample 0 / score-all path, which legitimately reads them all).
+    dst membership always uses the full `keep` set."""
     manifest = json.loads((corpus / "manifest.json").read_text())
     edges: dict[int, set[int]] = {}
     for s in manifest["shards"]["edges"]["files"]:
@@ -142,6 +157,8 @@ def load_out_edges(corpus: Path, keep: set[int]) -> dict[int, set[int]]:
                 src_s, _, dst_s = line.partition("\t")
                 src = int(src_s)
                 if src not in keep:
+                    continue
+                if src_keep is not None and src not in src_keep:
                     continue
                 dst = int(dst_s)
                 if dst in keep:
@@ -210,18 +227,23 @@ def run(corpus: Path, args: argparse.Namespace) -> dict:
         )
         print(f"[wiki-linkpred] wrote embeddings artifact {args.emb_out}")
 
+    # Choose the sources we will score BEFORE loading edges. out_edges is only ever
+    # read for these sampled sources, so scope the (up to 232M-edge) adjacency load
+    # to them — the full slice is still used for dst membership. --sample 0 scores
+    # every source, so it needs every in-slice source's out-edges (src_keep=None).
+    rng = np.random.default_rng(args.seed)
+    sample_n = len(ids) if args.sample == 0 else min(args.sample, len(ids))
+    sample_rows = rng.choice(len(ids), size=sample_n, replace=False)
+    src_keep = None if args.sample == 0 else {ids[r] for r in sample_rows}
+
     print("[wiki-linkpred] loading edges...")
-    out_edges = load_out_edges(corpus, keep)
+    out_edges = load_out_edges(corpus, keep, src_keep)
 
     print(f"[wiki-linkpred] building hnswlib index over {len(ids)} vectors...")
     id_arr = np.asarray(ids, dtype=np.int64)
     idx = build_index(vecs, id_arr, m=args.m, efc=args.efc)
     # query k+1 to absorb the self-hit, then trim to k neighbours.
     idx.set_ef(max(2 * (args.k + 1), 64))
-
-    rng = np.random.default_rng(args.seed)
-    sample_n = len(ids) if args.sample == 0 else min(args.sample, len(ids))
-    sample_rows = rng.choice(len(ids), size=sample_n, replace=False)
 
     q = vecs[sample_rows]
     labels, dists = idx.knn_query(q, k=args.k + 1)
