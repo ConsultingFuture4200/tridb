@@ -20,6 +20,11 @@ tools/hotpot_corpus.py and the hnswlib index usage from bench/recall_decay.py.
 SCALE / GATING (honest boundaries):
 - This runs on simplewiki (282,900 articles) on CPU, HERE. `--limit` bounds the
   slice for a fast validation run; `--limit 0` embeds the whole corpus.
+- Memory envelope (`--limit 0`): the normalized fp32 vectors and the hnswlib graph
+  are the two resident structures. At enwiki 7.19M x dim=384 that is ~11 GB of
+  vectors + a comparable index, plus the id/title lists — bounded, and it fits the
+  GB10's 128 GB coherent unified memory. The encode step has a transient ~2x on the
+  vector array (list-of-batches then one np.asarray copy) before the temporaries drop.
 - Full enwiki (~7M articles) embedding is the Spark/GX10 GPU step — NOT run here.
 - The PRODUCTION predictor fuses this vector signal with graph structure via
   tjs_open (the tri-modal join, GX10-gated). This cosine-only predictor is the
@@ -164,6 +169,28 @@ def load_redirect_excluded(
 
 
 # --------------------------------------------------------------------------- #
+# Embedding artifact (reusable by the Phase-2 engine load — the expensive GPU
+# embed runs ONCE; the tri-modal SQL/tjs_open load reads these back, not re-embeds)
+# --------------------------------------------------------------------------- #
+def save_embeddings(path: Path, vecs: np.ndarray, ids: list[int], meta: dict) -> None:
+    """Persist normalized vectors + row->id map as a reusable artifact.
+
+    Writes three sidecars next to `path` (e.g. `wiki_emb.npy`):
+      - `wiki_emb.npy`       float32 (N, dim), L2-normalized (unit) rows
+      - `wiki_emb.ids.npy`   int64 (N,), row i's article id
+      - `wiki_emb.meta.json` provenance (model, dim, count, normalized, corpus)
+    Row order is shared across the two .npy files. The engine load reuses these
+    instead of re-embedding 7M articles."""
+    stem = path.with_suffix("")  # drop the .npy so companions read cleanly
+    path.parent.mkdir(parents=True, exist_ok=True)
+    np.save(path, vecs)
+    np.save(stem.with_name(stem.name + ".ids"), np.asarray(ids, dtype=np.int64))
+    stem.with_name(stem.name + ".meta.json").write_text(
+        json.dumps(meta, ensure_ascii=False, indent=2)
+    )
+
+
+# --------------------------------------------------------------------------- #
 # Index (mirror bench/recall_decay.py hnswlib usage; cosine via IP on L2-norm)
 # --------------------------------------------------------------------------- #
 def build_index(vecs: np.ndarray, ids: np.ndarray, *, m: int, efc: int):
@@ -186,6 +213,22 @@ def run(corpus: Path, args: argparse.Namespace) -> dict:
     print(f"[wiki-linkpred] embedding with {embedder.model_name} (dim={args.dim})...")
     vecs = embedder.encode(texts)
     vecs /= np.linalg.norm(vecs, axis=1, keepdims=True) + 1e-12
+
+    if args.emb_out:
+        save_embeddings(
+            args.emb_out,
+            vecs,
+            ids,
+            {
+                "model": embedder.model_name,
+                "dim": args.dim,
+                "count": len(ids),
+                "normalized": True,
+                "corpus": str(corpus),
+                "row_order": "row i of the .npy == ids[i] in the .ids.npy sidecar",
+            },
+        )
+        print(f"[wiki-linkpred] wrote embeddings artifact {args.emb_out}")
 
     print("[wiki-linkpred] loading edges + redirects...")
     out_edges = load_out_edges(corpus, keep)
@@ -244,6 +287,9 @@ def run(corpus: Path, args: argparse.Namespace) -> dict:
         )
 
     mean_overlap = float(np.mean(overlaps)) if overlaps else 0.0
+    mean_out_edges = (
+        float(np.mean([r["n_out_edges_in_slice"] for r in records])) if records else 0.0
+    )
     return {
         "source": "simplewiki_full (real, offline-wiki extraction)",
         "corpus": str(corpus),
@@ -255,12 +301,17 @@ def run(corpus: Path, args: argparse.Namespace) -> dict:
         "top_per_article": args.top,
         "overlap_metric": {
             "mean_topk_already_linked": round(mean_overlap, 4),
+            "mean_out_edges_in_slice": round(mean_out_edges, 4),
             "note": (
                 "fraction of top-k cosine neighbours that are already out-edges; "
                 "complement is the candidate-prediction pool. Bounded --limit "
-                "slices deflate this (most true out-edges leave the slice)."
+                "slices deflate this (most true out-edges leave the slice). "
+                "mean_out_edges_in_slice quantifies that deflation: the overlap "
+                "ceiling is ~min(k, out_edges_in_slice)/k, so a low in-slice "
+                "out-edge count caps how high the overlap can read on a slice."
             ),
         },
+        "emb_artifact": str(args.emb_out) if args.emb_out else None,
         "hnsw": {"M": args.m, "ef_construction": args.efc, "space": "ip(cosine)"},
         "predictions": records,
         "gating": (
@@ -314,6 +365,13 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--print-n", type=int, default=15, help="articles to print")
     ap.add_argument(
         "--json-out", type=Path, default=Path("bench/out/wiki_linkpred.json")
+    )
+    ap.add_argument(
+        "--emb-out",
+        type=Path,
+        default=None,
+        help="persist normalized embeddings (.npy + .ids.npy + .meta.json) for "
+        "the Phase-2 engine load to reuse instead of re-embedding",
     )
     args = ap.parse_args(argv)
 

@@ -368,11 +368,13 @@ wiki-subgraph:
 WIKI_LP_MANIFEST ?= data/wiki/simplewiki_full
 WIKI_LP_LIMIT    ?= 30000
 WIKI_LP_SAMPLE   ?= 2000
+WIKI_LP_EMB_OUT  ?=
 wiki-linkpred:
 	@test -f "$(WIKI_LP_MANIFEST)/manifest.json" || \
 	  { echo "wiki manifest $(WIKI_LP_MANIFEST)/manifest.json missing — run: make wiki-extract"; exit 1; }
 	$(PY) -m tools.wiki_linkpredict --corpus "$(WIKI_LP_MANIFEST)" \
-	  --limit $(WIKI_LP_LIMIT) --sample $(WIKI_LP_SAMPLE) --print-n 15
+	  --limit $(WIKI_LP_LIMIT) --sample $(WIKI_LP_SAMPLE) --print-n 15 \
+	  $(if $(WIKI_LP_EMB_OUT),--emb-out "$(WIKI_LP_EMB_OUT)")
 
 baseline-up:
 	docker compose -f baseline/docker-compose.yml up -d

@@ -26,7 +26,8 @@ TL;DR
 | Streaming extractor (Phase 0) | `tools/wiki_extract.py` | `tests/test_wiki_extract.py` (10 cases) + a real 40k simplewiki slice (below) |
 | HotpotQA → full-wiki title linker | `tools/wiki_hotpot_link.py` | `tests/test_wiki_hotpot_link.py` (5 cases: resolution, redirect chain, coverage, manifest round-trip) + real 40k run |
 | Retrieve-from-all-wiki recall harness | `bench/wiki_scale_report.py` | `tests/test_wiki_scale_report.py` (end-to-end: manifest→link→grade→emit SQL) + a controlled CLI run |
-| Makefile targets | `Makefile` (`wiki-fetch` / `wiki-extract` / `wiki-scale`) | guards mirror `fetch-hotpot`/`graphrag`; network + engine gated, not in CI |
+| Link-prediction track (cosine-only LOWER BOUND) | `tools/wiki_linkpredict.py` | `tests/test_wiki_linkpredict.py` (5 cases: set-subtraction, overlap metric, artifact round-trip); host CPU run on the simplewiki slice |
+| Makefile targets | `Makefile` (`wiki-fetch` / `wiki-extract` / `wiki-scale` / `wiki-linkpred`) | guards mirror `fetch-hotpot`/`graphrag`; network + engine gated, not in CI |
 
 **Real 40k simplewiki slice (`make wiki-extract WIKI_MAX=40000`).** Streamed the simplewiki dump
 (two-pass, bounded RAM) into a portable manifest:
@@ -62,6 +63,18 @@ make wiki-scale                              # retrieve-from-all-wiki recall (ho
 (On the 40k simplewiki slice `make wiki-scale` reports 0 gradeable questions and stops — expected;
 point it at a full-enwiki manifest with GPU-precomputed `WIKI_CORPUS_EMB`/`WIKI_QUERY_EMB` for the
 real grade.)
+
+**Link-prediction track (`make wiki-linkpred`).** A second host-side track: candidate links are pairs
+that are semantically close (high BGE cosine) but NOT already a hyperlink/redirect. For each article we
+take its top-k cosine neighbours and subtract self + in-slice out-edges + redirect-equivalents; the
+remainder is the ranked "should-probably-be-linked" set. This is the **cosine-only LOWER BOUND** — it
+sees semantic proximity but not multi-hop topology; the production predictor fuses it with graph
+structure via `tjs_open` (GX10-gated), so the numbers here are a floor, not the fused-engine result.
+The reported **overlap** metric (fraction of top-k neighbours already linked) is honestly *deflated* on
+a bounded slice because most true out-edges point outside the slice; `wiki-linkpred` emits
+`mean_out_edges_in_slice` alongside it to quantify that ceiling. `WIKI_LP_LIMIT=0` embeds the whole
+corpus; `WIKI_LP_EMB_OUT=<path>` persists the normalized embeddings (`.npy` + `.ids.npy` + `.meta.json`)
+so the Phase-2 engine load reuses them instead of paying the 7M GPU embed twice.
 
 ---
 

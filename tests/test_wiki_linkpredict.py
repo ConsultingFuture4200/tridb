@@ -6,12 +6,19 @@ subtraction and the overlap metric on a tiny hand-built fixture. Runs under
 
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
+import numpy as np
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from tools.wiki_linkpredict import linked_fraction, predicted_unlinked  # noqa: E402
+from tools.wiki_linkpredict import (  # noqa: E402
+    linked_fraction,
+    predicted_unlinked,
+    save_embeddings,
+)
 
 
 def test_predicted_unlinked_subtracts_self_edges_redirects_preserving_rank():
@@ -42,3 +49,19 @@ def test_linked_fraction_excludes_self_and_ratios_over_neighbours():
 
 def test_linked_fraction_empty_neighbours_is_zero():
     assert linked_fraction([1], self_id=1, linked=set()) == 0.0
+
+
+def test_save_embeddings_roundtrip(tmp_path):
+    # vecs and ids must round-trip in matching row order, with meta provenance,
+    # so the Phase-2 engine load can reuse them instead of re-embedding.
+    vecs = np.array([[1.0, 0.0], [0.0, 1.0], [0.6, 0.8]], dtype=np.float32)
+    ids = [10, 20, 30]
+    p = tmp_path / "wiki_emb.npy"
+    save_embeddings(p, vecs, ids, {"model": "bge-small", "dim": 2, "count": 3})
+
+    assert np.array_equal(np.load(p), vecs)
+    loaded_ids = np.load(tmp_path / "wiki_emb.ids.npy")
+    assert loaded_ids.dtype == np.int64
+    assert loaded_ids.tolist() == ids
+    meta = json.loads((tmp_path / "wiki_emb.meta.json").read_text())
+    assert meta["model"] == "bge-small" and meta["count"] == 3
