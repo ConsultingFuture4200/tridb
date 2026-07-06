@@ -107,3 +107,80 @@ so the Phase-2 engine load reuses them instead of paying the 7M GPU embed twice.
 
 Tracking: DEV-1354. Extends `tools/fetch_hotpot.py`, `tools/hotpot_corpus.py`, `bench/graphrag_report.py`
 to full-wiki scale; the load contracts relate to PERF-11/04/08/10.
+
+---
+
+## Addendum A (2026-07-06) — Phase-2 AT-SCALE LOADER + VERIFIED bounded proof on the real engine
+
+**What this adds.** The Phase-2 load tooling of `docs/wiki_scale_load_design_v0.1.0.md` is now BUILT
+(`tools/wiki_engine_load.py` + `scripts/wiki_engine_load.sh`) and RUN, bounded, against the LIVE
+`tridb/msvbase:gx10-v1` engine on the Spark (GB10). This is a **verified bounded proof of the loader +
+tri-modal fusion**, plus an honest extrapolation to full 7M/232M — **not** a latency head-to-head (that
+still needs the baseline stack at scale; see gaps).
+
+**Engine surface actually probed (gx10-v1, 2026-07-06).** The batched C entry point
+`gph_insert_edges(src, dst[])` that load-design §2 calls "new engine work to specify" is **NOT** in the
+shipped SQL. The available bulk lever is therefore what the loader implements: materialize N dense
+vertices in id order (vid == article id), then bulk-insert edges by calling `gph_insert_edge(src,dst)`
+**directly by vid** from a COPY-staged relation `ORDER BY src` — bypassing the per-edge id-map tax that
+`add_edge()` pays (two `gph_upsert_vertex` descents/edge). `gph_set_identity_mode(true)` is flipped only
+**after** the verified dense in-order load so the `tjs_open` read path skips the map too.
+
+**Bounded run — 100,000 articles + their 3,444,031 induced edges + a 100k-vector HNSW** (dim-64
+deterministic synthetic vectors; see honesty note). Driven the repo way
+(`scripts/wiki_engine_load.sh tridb/msvbase:gx10-v1 <prep>` → PGXS-build `graph_store_am` into a
+throwaway cluster, `\copy` + native load + asserts). **All assertions passed, exit 0.** Raw transcript:
+`bench/out/wiki_engine_load_100k_gx10v1.log`; prep manifest `bench/out/wiki_engine_load_100k_prep.json`.
+
+| Load step | Rows | Wall time | Rate |
+|---|---:|---:|---:|
+| `\copy articles (id,title,ts,embedding)` (PERF-11) | 100,000 | 1.72 s | 58,200 art/s |
+| HNSW build, dim-64 synthetic (`USING hnsw`) | 100,000 | 34.49 s | 2,900 vec/s |
+| Dense vertex materialize (`gph_upsert_vertex` 0..N-1 in order) | 100,000 | 1.86 s | 53,800 v/s |
+| `\copy edge_stage` (staging) | 3,444,031 | 0.75 s | 4.6 M edges/s |
+| **Native edge insert** (`gph_insert_edge` direct-by-vid, `ORDER BY src`) | 3,444,031 | **182.0 s** | **18,900 edges/s** |
+
+**Verified (engine-asserted, not modelled):**
+- `#WL ASSERT articles=100000 OK` — relational count == slice.
+- `#WL ASSERT edges=3444031 vertices=100000 OK` — native `gph_edge_count()` / `gph_vertex_count()`
+  == slice exactly.
+- `tjs_open('articles', 10, 64, 8, 1, …)` → 10 ids, **candidates examined = 128 ≪ 100,000** (TR-1 early
+  termination holds at 100k).
+- `gph_neighbors_ext(0)` under identity mode = `{11208,47112,95129,2924,13883,2390,8725,10525}` — all
+  in the loaded induced out-neighbor set → the plan-033 identity-mode read is **correct for this
+  dense-in-order load** (DEV-1352 not triggered here).
+- Bridge injection over REAL topology: `bridges_injected = 148`, top-60 overlaps seed 0's induced
+  out-neighbors → the graph leg fuses into the vector top-k.
+
+**Honest extrapolation to full enwiki (7,189,653 art / 232,055,532 edges), at the measured rates:**
+
+| Leg | Full-scale estimate | Basis / caveat |
+|---|---:|---|
+| Article COPY | ~2 min | 7.19M / 58.2k·s⁻¹ (id+title+ts only; body excluded per design §1) |
+| Vertex materialize | ~2.2 min | 7.19M / 53.8k·s⁻¹ |
+| Edge staging COPY | ~50 s | 232M / 4.6M·s⁻¹ |
+| **Native edge insert** | **~3.4 hours** | 232M / 18.9k·s⁻¹ — **the gating load cost** |
+| Embeddings (real) | ~84 h CPU **(blocked)** | 23.7 docs/s measured on this box; no GPU path (below) |
+| HNSW build (real dim-768) | tens of hours **(blocked)** | design §3; the dim-64 34.5 s number does **not** extrapolate |
+| Vector-leg footprint | ~44 GB raw + ~tens GB index | 7.19M × 768 × `float8`(8 B); the 128 GB tight point (spec) |
+
+**Remaining gaps (honest, this is the acceptance criterion):**
+1. **The per-edge path is ~3.4 h at 232M.** The staged direct-by-vid loader removes the SQL
+   round-trip and the `add_edge` map tax, but **not** the per-edge C call + per-edge WAL record.
+   Load-design §2's true batched `gph_insert_edges` (one page-extend + one GenericXLog per adjacency
+   run) — the thing that turns hours into minutes — is **still unbuilt** in the gx10 images.
+2. **Real embeddings are blocked on this GB10.** `onnxruntime.get_available_providers()` on the
+   Blackwell/sbsa box = `['AzureExecutionProvider','CPUExecutionProvider']` — **no
+   `CUDAExecutionProvider`**, so fastembed runs CPU-only (23.7 docs/s → ~84 h for 7.19M). The GPU
+   CAGRA build (PERF-08) needs either a working Blackwell `onnxruntime-gpu` wheel or a cuVS path;
+   neither installs here without sudo/root. This bounded proof therefore used **deterministic dim-64
+   synthetic vectors** — sufficient to prove the LOADER, the HNSW build path, TR-1 early termination,
+   the native counts, and graph→vector fusion, but **not** recall quality (Phase-1/Phase-3).
+3. **No at-scale latency head-to-head yet.** The multi-system baseline (Milvus+Neo4j+pgvector) is not
+   stood up at 7M, so the fused-`tjs_open` SM-2 win/loss (spec §"winning"/"failure mode") is still
+   undecided at the I/O-bound scale. This addendum does **not** pre-announce a win.
+
+**Reproduce:** `python tools/wiki_engine_load.py prepare --manifest data/wiki/enwiki --out <dir>
+--limit 100000 --dim 64 --synthetic` then `scripts/wiki_engine_load.sh tridb/msvbase:gx10-v1 <dir>`.
+The same tool is full-7M-ready: drop `--limit`, and supply real vectors via `--emb corpus_emb.npy`
+(Phase-1 persisted) or `--embed` (fastembed) instead of `--synthetic`.
