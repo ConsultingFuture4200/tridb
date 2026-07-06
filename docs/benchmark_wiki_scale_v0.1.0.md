@@ -65,9 +65,11 @@ point it at a full-enwiki manifest with GPU-precomputed `WIKI_CORPUS_EMB`/`WIKI_
 real grade.)
 
 **Link-prediction track (`make wiki-linkpred`).** A second host-side track: candidate links are pairs
-that are semantically close (high BGE cosine) but NOT already a hyperlink/redirect. For each article we
-take its top-k cosine neighbours and subtract self + in-slice out-edges + redirect-equivalents; the
-remainder is the ranked "should-probably-be-linked" set. This is the **cosine-only LOWER BOUND** — it
+that are semantically close (high BGE cosine) but NOT already a hyperlink. For each article we
+take its top-k cosine neighbours and subtract self + in-slice out-edges; the
+remainder is the ranked "should-probably-be-linked" set. (Redirect equivalence needs no separate
+subtraction: the extractor resolves every wikilink through the redirect map before emitting edges, so
+redirect targets are already canonical out-edges — and redirect pages are never emitted as articles.) This is the **cosine-only LOWER BOUND** — it
 sees semantic proximity but not multi-hop topology; the production predictor fuses it with graph
 structure via `tjs_open` (GX10-gated), so the numbers here are a floor, not the fused-engine result.
 The reported **overlap** metric (fraction of top-k neighbours already linked) is honestly *deflated* on

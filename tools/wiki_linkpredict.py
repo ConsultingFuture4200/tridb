@@ -2,10 +2,16 @@
 
 Prediction model (lower bound): a candidate link A->B is a pair that is
 *semantically close* (high cosine between BGE embeddings) but NOT already linked
-by a hyperlink or redirect. Concretely, for each article we take its top-k cosine
-neighbours and SUBTRACT its existing out-edges, redirect-equivalents, and self —
-the remainder is the ranked set of "should probably be linked but isn't yet"
-connections.
+by a hyperlink. Concretely, for each article we take its top-k cosine neighbours
+and SUBTRACT its existing out-edges and self — the remainder is the ranked set of
+"should probably be linked but isn't yet" connections.
+
+Redirect equivalence needs no separate subtraction here: the extractor already
+resolves every [[wikilink]] through the redirect map before emitting edges (see
+resolve_edge in tools/wiki_extract.py), so an article's out-edges already point at
+canonical redirect targets — they are captured by the out-edge subtraction. Redirect
+pages are never emitted as ns0 articles, so their alias titles are not in the article
+set and could never be neighbours to exclude in the first place.
 
 Signal sanity (reported, not spun): the OVERLAP metric is the fraction of each
 article's top-k cosine neighbours that are ALREADY linked out-edges. High overlap
@@ -77,17 +83,14 @@ def predicted_unlinked(
     *,
     self_id: int,
     linked: set[int],
-    redirect_excluded: set[int],
 ) -> list[int]:
-    """Rank-preserving neighbours minus self, existing out-edges, and redirects.
+    """Rank-preserving neighbours minus self and existing out-edges.
 
     `neighbors` is the cosine-ranked neighbour id list (nearest first). The output
-    keeps that order — it is the ranked PREDICTED-link list for the source."""
-    return [
-        n
-        for n in neighbors
-        if n != self_id and n not in linked and n not in redirect_excluded
-    ]
+    keeps that order — it is the ranked PREDICTED-link list for the source. Redirect
+    targets are already canonicalized into `linked` at extraction time (resolve_edge
+    in tools/wiki_extract.py), so no extra redirect subtraction is needed here."""
+    return [n for n in neighbors if n != self_id and n not in linked]
 
 
 def linked_fraction(neighbors: list[int], *, self_id: int, linked: set[int]) -> float:
@@ -146,28 +149,6 @@ def load_out_edges(corpus: Path, keep: set[int]) -> dict[int, set[int]]:
     return edges
 
 
-def load_redirect_excluded(
-    corpus: Path, title_to_id: dict[str, int]
-) -> dict[int, set[int]]:
-    """id -> set of ids it is redirect-equivalent to (either direction), in-slice.
-
-    redirects.tsv is title->title (alias -> canonical). Only pairs whose BOTH ends
-    are canonical articles in the slice matter for neighbour exclusion."""
-    excl: dict[int, set[int]] = {}
-    rpath = corpus / "redirects.tsv"
-    if not rpath.exists():
-        return excl
-    with rpath.open() as fh:
-        for line in fh:
-            src_t, _, dst_t = line.rstrip("\n").partition("\t")
-            a, b = title_to_id.get(src_t), title_to_id.get(dst_t)
-            if a is None or b is None or a == b:
-                continue
-            excl.setdefault(a, set()).add(b)
-            excl.setdefault(b, set()).add(a)
-    return excl
-
-
 # --------------------------------------------------------------------------- #
 # Embedding artifact (reusable by the Phase-2 engine load — the expensive GPU
 # embed runs ONCE; the tri-modal SQL/tjs_open load reads these back, not re-embeds)
@@ -205,7 +186,6 @@ def build_index(vecs: np.ndarray, ids: np.ndarray, *, m: int, efc: int):
 def run(corpus: Path, args: argparse.Namespace) -> dict:
     ids, titles, texts = load_articles(corpus, args.limit)
     id_to_title = dict(zip(ids, titles))
-    title_to_id = {t: i for i, t in zip(ids, titles)}  # last-wins on dup titles
     keep = set(ids)
     print(f"[wiki-linkpred] loaded {len(ids)} articles from {corpus}")
 
@@ -230,9 +210,8 @@ def run(corpus: Path, args: argparse.Namespace) -> dict:
         )
         print(f"[wiki-linkpred] wrote embeddings artifact {args.emb_out}")
 
-    print("[wiki-linkpred] loading edges + redirects...")
+    print("[wiki-linkpred] loading edges...")
     out_edges = load_out_edges(corpus, keep)
-    redir = load_redirect_excluded(corpus, title_to_id)
 
     print(f"[wiki-linkpred] building hnswlib index over {len(ids)} vectors...")
     id_arr = np.asarray(ids, dtype=np.int64)
@@ -264,12 +243,7 @@ def run(corpus: Path, args: argparse.Namespace) -> dict:
                 break
         linked = out_edges.get(src_id, set())
         overlaps.append(linked_fraction(neigh, self_id=src_id, linked=linked))
-        pred = predicted_unlinked(
-            neigh,
-            self_id=src_id,
-            linked=linked,
-            redirect_excluded=redir.get(src_id, set()),
-        )
+        pred = predicted_unlinked(neigh, self_id=src_id, linked=linked)
         records.append(
             {
                 "id": src_id,
