@@ -80,7 +80,9 @@ early termination and is rejected exactly as the blocking composition (A) was in
 - **Proven vs unproven is explicit.** The GPU embed path and cuVS CAGRA build/search are
   proven on the GB10 (Phase 2). The *fused, zero-copy, in-access-method* operator is
   unbuilt and its win is a HYPOTHESIS — it must be falsified against CPU-only on the
-  I/O-bound 7M wiki workload before any "GPU makes `tjs_open` faster" claim ships. The
+  7M wiki workload before any "GPU makes `tjs_open` faster" claim ships (the design doc's §5
+  pins that run to dim-384/RAM-resident/compute-bound; a genuinely I/O-bound regime is where
+  the fused offload is *expected to fail*, not win). The
   design doc pins that experiment (fixed-accuracy latency, candidates examined, pages
   touched, GPU/CPU util) and its kill criterion.
 - **Integration is the hard, unsolved part.** Calling CUDA from inside a PG custom scan
@@ -89,11 +91,15 @@ early termination and is rejected exactly as the blocking composition (A) was in
   per-query frontier `tjs_open` examines (ADR-0012 measured ≈171 candidates on HotpotQA).
   If launch overhead dominates at that frontier size, the offload loses even with zero copy
   — this is the primary risk and the first thing the experiment must measure.
-- **The safe fallback already has value.** PERF-08 (GPU CAGRA *offline index build*) is
-  proven and useful regardless of this ADR — it needs no in-operator GPU call. If the fused
-  serving-path hypothesis is falsified, the GPU stays an offline-build accelerator and the
-  serving operator remains CPU-only and TR-1-clean. This ADR does not bet the roadmap on the
-  fused path; it authorizes measuring it.
+- **The safe fallback is low-risk, but not yet proven end-to-end.** PERF-08 (GPU CAGRA
+  *offline index build*)'s GPU-side build + `hnsw.save` export + recall are GB10-validated and
+  need no in-operator GPU call. Its *last* step — the fork's `hnsw` AM loading/serving the
+  cuVS-26.06 export (format-compat + fork-load recall A/B, `docs/gpu_index_build_v0.1.0.md` §3,
+  a potential **STOP**) — is still GX10-pending. If that layout does not load, the fallback
+  requires a backend port before it can serve, so its serving path is low-risk but not yet
+  proven. Conditional on that load check: if the fused serving-path hypothesis is falsified, the
+  GPU stays an offline-build accelerator and the serving operator remains CPU-only and TR-1-clean.
+  This ADR does not bet the roadmap on the fused path; it authorizes measuring it.
 - **`onnxruntime-gpu` is off the table on this platform.** The embedding leg is torch, not
   fastembed-on-CUDA. Documented so nobody re-litigates the missing wheel.
 - Build is GX10/engine-gated C (the CUDA-in-AM glue, like the other `tjs_open` fork work).

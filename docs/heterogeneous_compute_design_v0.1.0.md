@@ -95,10 +95,14 @@ get a vote on when to stop, and it never sees more than a bounded window.**
 
 - **Vector leg = cuVS CAGRA** for seed retrieval, tied to **PERF-08** (`docs/gpu_index_build_v0.1.0.md`,
   plan 008). PERF-08's *offline* build path — `cagra.build` → `from_cagra(hierarchy="cpu")`
-  → `hnsw.save` into the hnswlib on-disk format the fork's `vectordb` AM already loads — is
-  **validated on the GB10** and needs **no in-operator GPU call**. That is the proven,
-  low-risk half: the GPU builds the index offline, the CPU serves from it. This design adds
-  the *serving-path* GPU use (batch distances over the frontier), which is the unproven half.
+  → `hnsw.save` (into an hnswlib on-disk layout) plus the GPU-side recall of that export — is
+  **GB10-validated** and needs **no in-operator GPU call**. But the *last* step of that path —
+  the fork's `vectordb`/`hnsw` AM actually **loading and serving** the cuVS-26.06 `hnsw.save`
+  layout (format-compat + a fork-load recall A/B, PERF-08 §3 and §5) — is **GX10-pending and a
+  potential STOP**: whether the fork's (older) hnswlib reads the cuVS-26.06 layout is unresolved.
+  So PERF-08 is the **low-risk half** (build + export + GPU-side recall proven), **not yet a
+  proven end-to-end CPU serve path**. This design adds the *serving-path* GPU use (batch
+  distances over the frontier), which is the separately unproven half.
 - **RaBitQ (PERF-10)** is the footprint lever for the 7M/chunk-level regime that exceeds
   128 GB. Today it is a host numpy simulator (`bench/rabitq_sim.py`, real-SIFT: 4-bit +
   in-scan full-precision rerank ≈ recall@10 1.0). Under this model the 4-bit distance +
@@ -134,7 +138,8 @@ get a vote on when to stop, and it never sees more than a bounded window.**
 
 **HYPOTHESIS (unbuilt — this design's claims to falsify):**
 - That a **zero-copy fused** operator (CPU graph + GPU vector over one address space) beats
-  CPU-only at fixed accuracy on the I/O-bound 7M wiki workload.
+  CPU-only at fixed accuracy on the 7M wiki workload (dim-384, RAM-resident, compute-bound
+  regime — §5; I/O-bound is the expected-fail regime, not the win regime).
 - That CUDA can be called from inside a PG custom scan at acceptable per-query cost
   (context, memory, launch) — §3's integration reality.
 - That GPU batch-distance over `tjs_open`'s *small* per-round frontier is compute-bound
@@ -146,11 +151,25 @@ the three-arm experiment that could show it is — or kill it.
 
 ## 5. The falsifiable experiment
 
-**Hypothesis (H1).** On the full-Wikipedia I/O-bound workload (7,189,653 articles /
-232 M edges, `docs/wiki_scale_benchmark_spec_v0.1.0.md`), a zero-copy fused `tjs_open`
-(CPU-graph + GPU-vector, one address space) achieves **lower latency at fixed retrieval
-accuracy** than CPU-only `tjs_open`, and the advantage comes from the coherent-memory
-zero-copy, not GPU arithmetic alone.
+**Hypothesis (H1).** On the full-Wikipedia corpus (7,189,653 articles / 232 M edges,
+`docs/wiki_scale_benchmark_spec_v0.1.0.md`), a zero-copy fused `tjs_open` (CPU-graph +
+GPU-vector, one address space) achieves **lower latency at fixed retrieval accuracy** than
+CPU-only `tjs_open`, and the advantage comes from the coherent-memory zero-copy, not GPU
+arithmetic alone.
+
+**Regime — where this can win, and where it cannot.** A GPU vector co-processor can only move
+end-to-end latency if the vector-distance stream is a large enough fraction of that latency
+(the gate-2 "vector-distance fraction ≥ 30%" Amdahl bound, §6 step 2). That is a
+**RAM-resident, large-frontier,
+vector-compute-bound** regime. The genuinely **I/O-bound** regime is the *opposite*: when
+page-fetch dominates latency the vector fraction is small, gate-2 fails, and no zero-copy trick
+can help — I/O-bound is exactly where this ADR is **expected to FAIL**, not win (the wiki-spec
+"or the speed thesis dies" half). H1 is therefore a compute-bound hypothesis. At this design's
+only proven embed + CAGRA parameters (dim-384 float32; §4), the 7M working set is RAM-resident
+(≈26 GB of 128 GB — §5), so the benchmark lands in the regime where the win is *possible*; the
+open question gate-2 settles is whether the frontier is large enough to make it *real*. The
+spec's 44–80 GB I/O-pressure math depends on dim-768 float8, which this design does not adopt or
+re-validate (see §5).
 
 **Three arms, same operator semantics, same corpus, same accuracy target:**
 
@@ -170,13 +189,17 @@ offline index build (PERF-08) only.
 
 1. **Latency at FIXED accuracy** — the GTM metric. Fix multi-hop joint evidence recall@k
    (the ADR-0012 quality bar); report ms/query at that recall. A faster wrong answer is
-   worthless (`wiki_scale_benchmark_spec` SM metric).
+   worthless (`wiki_scale_benchmark_spec` SM metric). **Precondition: measured on a
+   dedicated/uncontended GPU** (evict/pause any resident GPU tenant first — see "How to run");
+   a contended GPU biases this verdict and is not decision-grade.
 2. **Candidates examined** (SM-3) — must be ~equal across arms at fixed accuracy (same
    operator semantics); if the GPU arm examines *more* to hit the same recall, the offload is
    changing the algorithm, not just its speed. Guard, not a win metric.
-3. **Pages touched** (SM-3, the I/O-bound proof) — the native-graph page-locality signal;
+3. **Pages touched** (SM-3, same-query guard) — the native-graph page-locality signal;
    independent of processor, so it should match CPU-only. Confirms the arms are the same
-   query.
+   query. (Not an "I/O-bound proof": at the dim-384 RAM-resident working set of §5 this
+   workload is not I/O-bound; pages-touched here is a cross-arm equality check, not evidence
+   of an I/O-pressure regime.)
 4. **CPU/GPU overlap** — measured **per round with CUDA events + NVTX**, not nvidia-smi.
    A `tjs_open` query here is single-digit ms (CAGRA search 11.2 µs, ~171-candidate frontier
    over a few hops) and per-round GPU work is sub-ms; nvidia-smi util% is a ~1 Hz coarse
@@ -194,7 +217,8 @@ offline index build (PERF-08) only.
    (kernel-time + explicit `cudaMemcpy` time) is the zero-copy saving, in µs/round. This is
    sub-millisecond and has no viable nvidia-smi measurement path.
 
-**Kill criterion (pre-registered).** If, at fixed recall@k on the 7M I/O-bound workload,
+**Kill criterion (pre-registered).** If, at fixed recall@k on the 7M workload (dim-384,
+RAM-resident per §5's "How to run"),
 zero-copy fused does **not** beat CPU-only by **≥ 20% median latency** (the pre-registered
 effect-size budget — well outside run-to-run noise, and it must also beat copy-hybrid to
 attribute the win to zero-copy rather than GPU arithmetic alone), H1 is falsified:
@@ -208,16 +232,39 @@ Phase 3): drive all three arms through the same `tjs_open(table, k, term_cond, m
 attr, filter, order)` surface on the Spark, GPU index built via PERF-08 (CAGRA→HNSW), edges
 in native `graph_store_am`. The copy-hybrid arm is a build flag on the same C operator that
 inserts explicit `cudaMemcpy` at the frontier crossing; CPU-only disables the GPU distance
-kernel. Warm CUDA kernels at backend start (§3). Do not launch competing multi-hour CPU jobs
-on the Spark while measuring (the resident link-pred/vLLM contention biases util readings —
-report GPU contention state alongside every number, as Phase 2 did).
+kernel. Warm CUDA kernels at backend start (§3).
+
+**Benchmark parameters (pinned so the regime is not ambiguous).** The run uses **dim-384
+float32** — the only embed + CAGRA path proven in Phase 2 (§4). At 7,189,653 vectors × 384 × 4 B
+that is ≈11 GB raw vectors, ≈22 GB with the HNSW graph, ≈4 GB native adjacency ≈ **~26 GB
+working set of the 128 GB unified pool → decisively RAM-resident, not I/O-bound**. This places
+the benchmark in the compute-bound regime where a GPU vector co-processor *can* help (per the H1
+regime note); it is **not** the spec's 44–80 GB I/O-pressure regime, which requires dim-768
+float8 and would additionally require re-validating the torch-embed + cuVS CAGRA path at 768
+(Phase-2 evidence covers only 384).
+
+**GPU contention (decisive run must be clean).** The top-line kill-criterion measurement
+(metric #1, the ≥20% median-latency verdict) MUST run on a **dedicated/uncontended GPU**: evict
+or pause the resident vLLM `EngineCore` (and any other GPU tenant) before the timed three-arm
+run, and **record GPU-resident state as a precondition, not just an annotation**. A resident LLM
+engine contending the Blackwell GPU biases the GPU arms' latency upward toward a false null —
+it could falsely kill H1 and makes any null un-attributable ("fused doesn't help" vs "GPU was
+contended"). Annotating contention (as Phase 2 did) is not controlling it. The per-round
+CUDA-events measurements (metrics #4/#5) are less contention-sensitive, but the 20% verdict is
+not decision-grade unless measured clean. Do not launch competing multi-hour CPU jobs on the
+Spark while measuring. The contended-GPU path is retained only for metric #4's throughput-mode
+liveness sanity check.
 
 ## 6. Sequencing
 
-1. **Now (proven, no in-AM GPU):** PERF-08 offline CAGRA→HNSW build feeds the 7M vector leg.
-   This is pure upside and unblocks the wiki-scale load regardless of the fused hypothesis.
-   Note this and the single open()-time seed ANN are the genuinely high-leverage GPU wins,
-   and they need **neither** the fused per-round machinery **nor** zero-copy.
+1. **Now (low-risk, no in-AM GPU):** PERF-08 offline CAGRA→HNSW build feeds the 7M vector leg —
+   *once the fork-AM load of the cuVS-26.06 export is confirmed*. The GPU build + `hnsw.save`
+   export + GPU-side recall are GB10-validated, but the fork's `hnsw` AM loading/serving that
+   export (format-compat + recall A/B, PERF-08 §3/§5) is GX10-pending and a potential STOP; if
+   it does not load, this step needs a backend-port first. Conditional on that load check, it is
+   upside that unblocks the wiki-scale load regardless of the fused hypothesis, and — with the
+   single open()-time seed ANN — is the genuinely high-leverage GPU win, needing **neither** the
+   fused per-round machinery **nor** zero-copy.
 2. **Pre-gate (CPU-only, no GX10 C — do this BEFORE step 3):** the determinant of whether ANY
    serving-path GPU win is even possible is the actual 7M frontier size and the vector-leg
    fraction of end-to-end latency — this is the primary risk (ADR-0017 §Consequences), so
