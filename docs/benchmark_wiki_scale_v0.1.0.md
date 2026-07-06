@@ -182,5 +182,15 @@ throwaway cluster, `\copy` + native load + asserts). **All assertions passed, ex
 
 **Reproduce:** `python tools/wiki_engine_load.py prepare --manifest data/wiki/enwiki --out <dir>
 --limit 100000 --dim 64 --synthetic` then `scripts/wiki_engine_load.sh tridb/msvbase:gx10-v1 <dir>`.
-The same tool is full-7M-ready: drop `--limit`, and supply real vectors via `--emb corpus_emb.npy`
-(Phase-1 persisted) or `--embed` (fastembed) instead of `--synthetic`.
+**Full-scale status: BLOCKED, not "ready".** The loader is *validated on the shard-0 / 100k slice
+only*. Unbounded (`--limit 0`) full-7M is blocked pending **manifest reconciliation**: the enwiki
+extract has duplicate + truncated shards — 76 shard descriptors for 72 distinct files
+(`articles-00071` ×3, `-00049`/`-00028` ×2), and on-disk articles (~7.14M) fall short of the
+manifest count (7.19M) because the extractor reopens revisited shards in `w`/truncate mode
+(`wiki_extract.py:301`, data loss). The loader now (a) dedupes shard paths so a full run no longer
+double-reads a shard into a duplicate-key COPY abort, (b) materializes native vertices over the
+dense `[0, max_id]` id range (article ids are sparse) instead of `generate_series(0, N-1)`, and
+(c) in the unbounded case **aborts** if the loaded slice does not reconcile against ground-truth
+manifest counts — rather than silently emitting a truncated corpus whose self-referential asserts
+still pass. Once the extract is regenerated clean, drop `--limit` and supply real vectors via
+`--emb corpus_emb.npy` (Phase-1 persisted) or `--embed` (fastembed) instead of `--synthetic`.

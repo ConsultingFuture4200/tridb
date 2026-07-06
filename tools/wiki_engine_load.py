@@ -3,8 +3,14 @@
 Implements the load contracts in `docs/wiki_scale_load_design_v0.1.0.md` against the
 REAL engine surface shipped in the gx10 images (`graph_store_am` + `vectordb`). This is
 the scale twin of `tools/bench_sm2_corpus.py`'s loader: it consumes a `tools/wiki_extract`
-manifest and stages a tri-modal load that is byte-for-byte the same shape at 7M as at the
+manifest and stages a tri-modal load whose shape is intended to be identical at 7M and at the
 bounded slice we actually run.
+
+VALIDATION STATUS: validated on the shard-0 / 100k slice only. Full-scale (unbounded, `--limit 0`)
+is BLOCKED pending manifest reconciliation — the enwiki extract has duplicate + truncated shards
+(76 shard descriptors for 72 distinct files; on-disk articles ~7.14M < manifest count 7.19M). The
+loader now dedupes shard paths and, in the unbounded case, ABORTS if the loaded slice does not
+reconcile against the ground-truth manifest counts rather than emitting a silently-truncated corpus.
 
 Design realities this tool encodes (probed on tridb/msvbase:gx10-v1, 2026-07-06):
 
@@ -46,6 +52,7 @@ import random
 import sys
 import time
 
+
 # --------------------------------------------------------------------------------------
 # COPY FORMAT text escaping (design §1: MediaWiki titles/categories can contain backslashes
 # per $wgLegalTitleChars, so raw TSV would corrupt them).
@@ -83,14 +90,22 @@ def _load_manifest(manifest_dir: str) -> dict:
 
 
 def _article_shards(manifest: dict) -> list[str]:
-    return [s["path"] for s in manifest["shards"]["articles"]["files"]]
+    # Dedup order-preserving: the real enwiki manifest lists the same shard path more than once
+    # (the extractor reopens a shard in 'w'/truncate mode and appends a fresh descriptor each time
+    # the non-monotonic id stream revisits it), so the raw 'files' list has duplicate paths. Reading
+    # a path twice would emit the same article ids twice -> duplicate-key violation on the 'id bigint
+    # PRIMARY KEY' COPY. dict.fromkeys keeps first-seen order.
+    return list(
+        dict.fromkeys(s["path"] for s in manifest["shards"]["articles"]["files"])
+    )
 
 
 def _edge_shards(manifest: dict) -> list[str]:
     # edges shards are index-aligned to article shards; the extractor names them edges-NNNNN.tsv.
+    # Dedup order-preserving for the same reason as _article_shards (index-aligned duplicate paths).
     files = manifest["shards"].get("edges", {}).get("files")
     if files:
-        return [s["path"] for s in files]
+        return list(dict.fromkeys(s["path"] for s in files))
     # fall back to the naming convention when the manifest omits an edges block.
     n = len(_article_shards(manifest))
     return [f"edges-{i:05d}.tsv" for i in range(n)]
@@ -102,6 +117,8 @@ def _edge_shards(manifest: dict) -> list[str]:
 def prepare(args) -> int:
     manifest = _load_manifest(args.manifest)
     total_articles = manifest["counts"]["articles"]
+    total_edges = manifest["counts"].get("edges")
+    unbounded = not (args.limit and args.limit > 0)
     N = args.limit if args.limit and args.limit > 0 else total_articles
     N = min(N, total_articles)
     dim = args.dim
@@ -119,7 +136,8 @@ def prepare(args) -> int:
         emb = np.load(args.emb, mmap_mode="r")
         if emb.shape[0] < N:
             print(
-                f"[prepare] --emb has {emb.shape[0]} rows < N={N}; capping N", file=sys.stderr
+                f"[prepare] --emb has {emb.shape[0]} rows < N={N}; capping N",
+                file=sys.stderr,
             )
             N = emb.shape[0]
         dim = int(emb.shape[1])
@@ -134,9 +152,14 @@ def prepare(args) -> int:
 
     # ---- ARTICLES + VECTORS: stream shards, write COPY rows --------------------------
     t0 = time.time()
-    seed_vec = None  # the query vector for the sample tjs_open (a real loaded row's vector)
+    seed_vec = (
+        None  # the query vector for the sample tjs_open (a real loaded row's vector)
+    )
     written = 0
-    pending_texts: list[tuple[int, str, str, str]] = []  # (id,title,ts,text) for --embed batch
+    max_id = -1  # highest article id actually loaded -> drives dense vertex materialization (identity)
+    pending_texts: list[
+        tuple[int, str, str, str]
+    ] = []  # (id,title,ts,text) for --embed batch
 
     def _emit_row(fout, art_id, title, ts, vec):
         nonlocal seed_vec
@@ -159,6 +182,8 @@ def prepare(args) -> int:
                     aid = o["id"]
                     if aid >= N:
                         continue
+                    if aid > max_id:
+                        max_id = aid
                     title = o.get("title") or ""
                     ts = o.get("ts") or ""
                     if embedder is not None:
@@ -174,8 +199,22 @@ def prepare(args) -> int:
         if embedder is not None and pending_texts:
             _flush_embed(fout, pending_texts, embedder, _emit_row)
     art_secs = time.time() - t0
+    if unbounded and written != total_articles:
+        # Full-scale runs MUST reconcile against ground-truth manifest counts, not the self-derived N:
+        # the enwiki extract has truncated/duplicate shards on disk, so an unbounded pass silently
+        # loads FEWER than 'all 7M' (and 'aid >= N' drops any sparse high-id article). Abort loudly
+        # rather than emit a silently-truncated corpus whose self-referential asserts would still pass.
+        raise SystemExit(
+            f"[prepare] ABORT (unbounded): loaded {written} articles but manifest counts "
+            f"{total_articles} (delta {total_articles - written}). Full-scale load is BLOCKED "
+            f"pending manifest reconciliation (truncated/duplicate shards). Refusing to emit a "
+            f"silently-truncated corpus."
+        )
     if written != N:
-        print(f"[prepare] WARNING: wrote {written} article rows, expected N={N}", file=sys.stderr)
+        print(
+            f"[prepare] WARNING: wrote {written} article rows, expected N={N}",
+            file=sys.stderr,
+        )
         N = written
     if seed_vec is None:
         seed_vec = (
@@ -187,14 +226,20 @@ def prepare(args) -> int:
     # ---- EDGES: induced subgraph (both endpoints < N), streamed to COPY file ----------
     t1 = time.time()
     edge_count = 0
-    seed_out_neighbor = None  # a real induced out-neighbor of seed_id, for bridge-injection proof
-    seed_neighbors: list[int] = []  # up to SEED_NEIGH_CAP induced out-neighbors of seed_id
+    seed_out_neighbor = (
+        None  # a real induced out-neighbor of seed_id, for bridge-injection proof
+    )
+    seed_neighbors: list[
+        int
+    ] = []  # up to SEED_NEIGH_CAP induced out-neighbors of seed_id
     SEED_NEIGH_CAP = 200
     # Edge shards are src-partitioned + index-aligned to the article shards (design §0): shard i
     # holds only edges whose src is in article shard i (ids i*shard_size..). So for a bounded slice
     # of N articles, only shards 0..floor((N-1)/shard_size) can contain an induced (src<N) edge —
     # reading the rest would scan the whole 232M-edge corpus to produce a small slice.
-    shard_size = manifest.get("shard_size") or manifest["shards"]["articles"]["files"][0]["rows"]
+    shard_size = (
+        manifest.get("shard_size") or manifest["shards"]["articles"]["files"][0]["rows"]
+    )
     max_edge_shard = (N - 1) // shard_size
     with open(edges_copy, "w") as fout:
         for idx, shard in enumerate(_edge_shards(manifest)):
@@ -225,10 +270,24 @@ def prepare(args) -> int:
                         if len(seed_neighbors) < SEED_NEIGH_CAP:
                             seed_neighbors.append(dst)
     edge_secs = time.time() - t1
+    if unbounded and total_edges is not None and edge_count != total_edges:
+        # Same ground-truth reconciliation as articles: an unbounded pass must materialize every
+        # induced edge in the manifest, not a self-derived subset of a truncated on-disk corpus.
+        raise SystemExit(
+            f"[prepare] ABORT (unbounded): induced {edge_count} edges but manifest counts "
+            f"{total_edges} (delta {total_edges - edge_count}). Full-scale load is BLOCKED "
+            f"pending manifest reconciliation (truncated/duplicate shards)."
+        )
+
+    # Native identity mode (vid == ext_id) requires a DENSE vertex range [0, max_id]; article ids are
+    # sparse, so we materialize up to the highest loaded id (not N-1, which fabricates phantom vertices
+    # for gap ids and drops real high-id articles). n_vertices == 0 iff no articles were loaded.
+    n_vertices = max_id + 1
 
     # ---- LOAD.SQL driver -------------------------------------------------------------
     sql = _build_load_sql(
         N=N,
+        n_vertices=n_vertices,
         dim=dim,
         edge_count=edge_count,
         seed_id=args.seed_id,
@@ -240,7 +299,9 @@ def prepare(args) -> int:
         term_cond=args.term_cond,
         m_seeds=args.m_seeds,
         hops=args.hops,
-        vector_source=("emb" if emb is not None else "embed" if embedder else "synthetic"),
+        vector_source=(
+            "emb" if emb is not None else "embed" if embedder else "synthetic"
+        ),
     )
     with open(sql_path, "w") as f:
         f.write(sql)
@@ -249,9 +310,12 @@ def prepare(args) -> int:
         "manifest": os.path.abspath(args.manifest),
         "articles_loaded": N,
         "articles_total": total_articles,
+        "graph_vertices": n_vertices,
         "induced_edges": edge_count,
         "dim": dim,
-        "vector_source": ("emb" if emb is not None else "embed" if embedder else "synthetic"),
+        "vector_source": (
+            "emb" if emb is not None else "embed" if embedder else "synthetic"
+        ),
         "seed_id": args.seed_id,
         "seed_out_neighbor": seed_out_neighbor,
         "prepare_articles_secs": round(art_secs, 2),
@@ -282,6 +346,7 @@ def _flush_embed(fout, batch, embedder, emit):
 def _build_load_sql(
     *,
     N,
+    n_vertices,
     dim,
     edge_count,
     seed_id,
@@ -298,9 +363,13 @@ def _build_load_sql(
     L: list[str] = []
     w = L.append
     qvec = _vec_literal(seed_vec)
-    w("-- AUTO-GENERATED by tools/wiki_engine_load.py — TriDB Phase-2 AT-SCALE tri-modal load.")
+    w(
+        "-- AUTO-GENERATED by tools/wiki_engine_load.py — TriDB Phase-2 AT-SCALE tri-modal load."
+    )
     w(f"-- N={N} induced_edges={edge_count} dim={dim} vectors={vector_source}")
-    w("-- Load path: COPY articles (PERF-11) + dense vertices in id order + COPY-staged")
+    w(
+        "-- Load path: COPY articles (PERF-11) + dense vertices in id order + COPY-staged"
+    )
     w("-- direct-by-vid gph_insert_edge (identity lever, design §2) + HNSW build.")
     w("\\set ON_ERROR_STOP on")
     w("\\timing on")
@@ -320,12 +389,16 @@ def _build_load_sql(
     w("-- assert: relational row count == prepared slice")
     w("DO $$ BEGIN")
     w(f"  IF (SELECT count(*) FROM articles) <> {N} THEN")
-    w(f"    RAISE EXCEPTION 'articles count % != expected {N}', (SELECT count(*) FROM articles);")
+    w(
+        f"    RAISE EXCEPTION 'articles count % != expected {N}', (SELECT count(*) FROM articles);"
+    )
     w("  END IF;")
     w("  RAISE NOTICE '#WL ASSERT articles=% OK', (SELECT count(*) FROM articles);")
     w("END $$;")
     w("")
-    w("-- ===== §3 vector leg: HNSW build (CPU hnswlib now; GPU CAGRA per Phase-2 PERF-08) =====")
+    w(
+        "-- ===== §3 vector leg: HNSW build (CPU hnswlib now; GPU CAGRA per Phase-2 PERF-08) ====="
+    )
     w("\\echo #WL HNSW_BUILD_START")
     w("CREATE INDEX articles_hnsw ON articles USING hnsw(embedding)")
     w(f"    WITH (dimension = {dim}, distmethod = l2_distance);")
@@ -334,15 +407,31 @@ def _build_load_sql(
     w("")
     w("-- ===== §2 native graph: dense vertices in id order -> vid == article id =====")
     w("\\echo #WL VERTEX_MATERIALIZE_START")
-    w("-- gph_upsert_vertex(0..N-1) in ascending order: native vids are dense/monotone from 0,")
-    w("-- so ext_id == vid for every vertex (the identity precondition, design §2 step 1).")
+    w(
+        "-- gph_upsert_vertex(0..max_id) in ascending order: native vids are dense/monotone from 0, so"
+    )
+    w(
+        "-- ext_id == vid for every vertex (the identity precondition, design §2 step 1). Article ids are"
+    )
+    w(
+        "-- SPARSE, so the range runs to the highest LOADED id (not N-1) — a dense range is what identity"
+    )
+    w(
+        "-- mode requires; gap ids get an isolated vertex, real high-id articles are never dropped."
+    )
     w("SELECT count(*) FROM (")
-    w(f"  SELECT graph_store.gph_upsert_vertex(g) FROM (SELECT g FROM generate_series(0,{N-1}) g ORDER BY g) s")
+    w(
+        f"  SELECT graph_store.gph_upsert_vertex(g) FROM (SELECT g FROM generate_series(0,{n_vertices - 1}) g ORDER BY g) s"
+    )
     w(") _;")
     w("\\echo #WL VERTEX_MATERIALIZE_DONE")
     w("")
-    w("-- COPY-stage the induced edges, then ONE set-oriented direct-by-vid insert ORDER BY src")
-    w("-- (adjacency-chain locality). No gph_upsert_vertex per edge: src/dst ARE vids (design §2 step 3).")
+    w(
+        "-- COPY-stage the induced edges, then ONE set-oriented direct-by-vid insert ORDER BY src"
+    )
+    w(
+        "-- (adjacency-chain locality). No gph_upsert_vertex per edge: src/dst ARE vids (design §2 step 3)."
+    )
     w("CREATE TEMP TABLE edge_stage (src bigint, dst bigint);")
     w("\\echo #WL COPY_EDGES_START")
     w("\\copy edge_stage (src,dst) FROM '/data/edges.copy'")
@@ -353,7 +442,9 @@ def _build_load_sql(
     w(") _;")
     w("\\echo #WL EDGE_INSERT_DONE")
     w("DROP TABLE edge_stage;")
-    w("-- dense in-order load verified above -> flip identity mode (tjs_open read path skips the map)")
+    w(
+        "-- dense in-order load verified above -> flip identity mode (tjs_open read path skips the map)"
+    )
     w("SELECT graph_store.gph_set_identity_mode(true);")
     w("")
     w("-- assert: native edge/vertex counts == prepared slice")
@@ -364,13 +455,15 @@ def _build_load_sql(
     w("  SELECT graph_store.gph_vertex_count() INTO vc;")
     w(f"  IF ec <> {edge_count} THEN")
     w(f"    RAISE EXCEPTION 'gph_edge_count % != expected {edge_count}', ec; END IF;")
-    w(f"  IF vc <> {N} THEN")
-    w(f"    RAISE EXCEPTION 'gph_vertex_count % != expected {N}', vc; END IF;")
+    w(f"  IF vc <> {n_vertices} THEN")
+    w(f"    RAISE EXCEPTION 'gph_vertex_count % != expected {n_vertices}', vc; END IF;")
     w("  RAISE NOTICE '#WL ASSERT edges=% vertices=% OK', ec, vc;")
     w("END $$;")
     w("")
     w("-- ===== sample tjs_open: verify tri-modal fusion returns sane top-k =====")
-    w(f"\\echo #WL TJS_OPEN k={k} term_cond={term_cond} m_seeds={m_seeds} hops={hops} seed={seed_id}")
+    w(
+        f"\\echo #WL TJS_OPEN k={k} term_cond={term_cond} m_seeds={m_seeds} hops={hops} seed={seed_id}"
+    )
     w("-- (1) top-k count + early termination (TR-1: examined << N)")
     w("DO $$")
     w("DECLARE got bigint[]; ex bigint;")
@@ -384,60 +477,102 @@ def _build_load_sql(
     w("  ex := tjs_open_candidates_examined();")
     w(f"  RAISE NOTICE '#WL TJS_OPEN topk=% examined=% (corpus {N})', got, ex;")
     w(f"  IF array_length(got,1) IS DISTINCT FROM {k} THEN")
-    w(f"    RAISE EXCEPTION 'tjs_open returned % rows, expected k={k}', array_length(got,1); END IF;")
+    w(
+        f"    RAISE EXCEPTION 'tjs_open returned % rows, expected k={k}', array_length(got,1); END IF;"
+    )
     w(f"  IF ex >= {N} THEN")
-    w("    RAISE EXCEPTION 'tjs_open NOT early-terminating: examined % >= corpus (blocking!)', ex; END IF;")
+    w(
+        "    RAISE EXCEPTION 'tjs_open NOT early-terminating: examined % >= corpus (blocking!)', ex; END IF;"
+    )
     w(f"  RAISE NOTICE '#WL PASS top-k + early termination (examined % << {N})', ex;")
     w("END $$;")
     if seed_neighbors:
         neigh_lit = "ARRAY[" + ",".join(str(n) for n in seed_neighbors) + "]::bigint[]"
         bridge_k = max(k, 60)
         w("")
-        w("-- (1b) native graph-read diagnostic (isolate graph-leg health from tjs fusion, and")
-        w("--      positively rule out the DEV-1352 identity-mode read corruption for THIS load):")
-        w(f"--      gph_neighbors_ext({seed_id}) under identity mode must return real induced neighbors.")
+        w(
+            "-- (1b) native graph-read diagnostic (isolate graph-leg health from tjs fusion, and"
+        )
+        w(
+            "--      positively rule out the DEV-1352 identity-mode read corruption for THIS load):"
+        )
+        w(
+            f"--      gph_neighbors_ext({seed_id}) under identity mode must return real induced neighbors."
+        )
         w("DO $$")
         w("DECLARE ns bigint[];")
         w("BEGIN")
-        w(f"  SELECT array_agg(n) INTO ns FROM (SELECT graph_store.gph_neighbors_ext({seed_id}) n LIMIT 8) s;")
-        w("  RAISE NOTICE '#WL GRAPH_READ gph_neighbors_ext(%) first8 = %', " + str(seed_id) + ", ns;")
+        w(
+            f"  SELECT array_agg(n) INTO ns FROM (SELECT graph_store.gph_neighbors_ext({seed_id}) n LIMIT 8) s;"
+        )
+        w(
+            "  RAISE NOTICE '#WL GRAPH_READ gph_neighbors_ext(%) first8 = %', "
+            + str(seed_id)
+            + ", ns;"
+        )
         w("  IF ns IS NULL OR array_length(ns,1) IS NULL THEN")
-        w(f"    RAISE EXCEPTION 'graph read DEAD: gph_neighbors_ext({seed_id}) empty under identity mode (DEV-1352?)';")
+        w(
+            f"    RAISE EXCEPTION 'graph read DEAD: gph_neighbors_ext({seed_id}) empty under identity mode (DEV-1352?)';"
+        )
         w("  END IF;")
         if seed_neigh_complete:
             # we captured the seed's COMPLETE induced-neighbor set, so every returned id must be in it.
             w(f"  IF NOT (ns <@ {neigh_lit}) THEN")
-            w(f"    RAISE EXCEPTION 'graph read CORRUPT: gph_neighbors_ext({seed_id}) returned ids outside the induced out-neighbor set (identity-mode bug): %', ns;")
+            w(
+                f"    RAISE EXCEPTION 'graph read CORRUPT: gph_neighbors_ext({seed_id}) returned ids outside the induced out-neighbor set (identity-mode bug): %', ns;"
+            )
             w("  END IF;")
         else:
             # partial neighbor set captured: assert the read at least overlaps the known induced neighbors.
             w(f"  IF NOT (ns && {neigh_lit}) THEN")
-            w(f"    RAISE EXCEPTION 'graph read SUSPECT: gph_neighbors_ext({seed_id}) shares no id with the known induced out-neighbors: %', ns;")
+            w(
+                f"    RAISE EXCEPTION 'graph read SUSPECT: gph_neighbors_ext({seed_id}) shares no id with the known induced out-neighbors: %', ns;"
+            )
             w("  END IF;")
-        w("  RAISE NOTICE '#WL PASS graph read: native neighbors match the loaded induced topology';")
+        w(
+            "  RAISE NOTICE '#WL PASS graph read: native neighbors match the loaded induced topology';"
+        )
         w("END $$;")
         w("")
-        w("-- (2) bridge injection over REAL topology: the seed's induced out-neighbors are (almost")
-        w("--     surely) far in vector space, so any that appear in the top-k arrived via the GRAPH")
-        w("--     leg, not the vector leg. m_seeds=1 pins the seed set to {seed_id}; assert the top-k")
-        w("--     OVERLAPS the seed's induced-neighbor set (robust to the k/2 bridge cap, which keeps")
-        w("--     a subset of a high-degree seed's neighbors) AND that the operator injected bridges.")
+        w(
+            "-- (2) bridge injection over REAL topology: the seed's induced out-neighbors are (almost"
+        )
+        w(
+            "--     surely) far in vector space, so any that appear in the top-k arrived via the GRAPH"
+        )
+        w(
+            "--     leg, not the vector leg. m_seeds=1 pins the seed set to {seed_id}; assert the top-k"
+        )
+        w(
+            "--     OVERLAPS the seed's induced-neighbor set (robust to the k/2 bridge cap, which keeps"
+        )
+        w(
+            "--     a subset of a high-degree seed's neighbors) AND that the operator injected bridges."
+        )
         w("DO $$")
         w("DECLARE got bigint[]; bi bigint;")
         w("BEGIN")
         w("  SELECT array_agg(id) INTO got FROM (")
-        w(f"    SELECT t.id FROM tjs_open('articles', {bridge_k}, 0, 1, {max(hops,1)}, 'id', '',")
+        w(
+            f"    SELECT t.id FROM tjs_open('articles', {bridge_k}, 0, 1, {max(hops, 1)}, 'id', '',"
+        )
         w(f"      'embedding <-> ''{qvec}''') AS t(id bigint)")
         w("  ) q;")
         w("  bi := tjs_open_bridges_injected();")
         w(f"  RAISE NOTICE '#WL BRIDGE top-{bridge_k}=% bridges_injected=%', got, bi;")
         w(f"  IF NOT (got && {neigh_lit}) THEN")
-        w(f"    RAISE EXCEPTION 'bridge injection FAILED: top-{bridge_k} shares NO id with seed {seed_id}''s induced out-neighbors (graph leg dead?): %', got;")
+        w(
+            f"    RAISE EXCEPTION 'bridge injection FAILED: top-{bridge_k} shares NO id with seed {seed_id}''s induced out-neighbors (graph leg dead?): %', got;"
+        )
         w("  END IF;")
         w("  IF bi < 1 THEN")
-        w("    RAISE EXCEPTION 'bridge injection FAILED: tjs_open_bridges_injected()=% (graph leg did not fire)', bi;")
+        w(
+            "    RAISE EXCEPTION 'bridge injection FAILED: tjs_open_bridges_injected()=% (graph leg did not fire)', bi;"
+        )
         w("  END IF;")
-        w(f"  RAISE NOTICE '#WL PASS bridge injection: real induced neighbors of seed {seed_id} admitted via the graph leg (bridges_injected=%)', bi;")
+        w(
+            f"  RAISE NOTICE '#WL PASS bridge injection: real induced neighbors of seed {seed_id} admitted via the graph leg (bridges_injected=%)', bi;"
+        )
         w("END $$;")
     w("")
     w("\\echo #WL LOAD_COMPLETE")
@@ -447,20 +582,52 @@ def _build_load_sql(
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     sub = p.add_subparsers(dest="cmd", required=True)
-    pp = sub.add_parser("prepare", help="write articles.copy + edges.copy + load.sql from a manifest slice")
+    pp = sub.add_parser(
+        "prepare",
+        help="write articles.copy + edges.copy + load.sql from a manifest slice",
+    )
     pp.add_argument("--manifest", required=True, help="tools/wiki_extract manifest DIR")
-    pp.add_argument("--out", required=True, help="output dir (mounted as /data by the runner)")
-    pp.add_argument("--limit", type=int, default=0, help="load first N articles (0 = all 7M)")
-    pp.add_argument("--dim", type=int, default=64, help="synthetic-vector dim (ignored for --emb/--embed)")
-    pp.add_argument("--emb", help="persisted id-aligned embeddings .npy (float32[N,dim])")
-    pp.add_argument("--embed", action="store_true", help="embed a slice with fastembed (CPU here)")
+    pp.add_argument(
+        "--out", required=True, help="output dir (mounted as /data by the runner)"
+    )
+    pp.add_argument(
+        "--limit",
+        type=int,
+        default=0,
+        help="load first N articles (0 = all; BLOCKED at full scale — see module docstring VALIDATION STATUS)",
+    )
+    pp.add_argument(
+        "--dim",
+        type=int,
+        default=64,
+        help="synthetic-vector dim (ignored for --emb/--embed)",
+    )
+    pp.add_argument(
+        "--emb", help="persisted id-aligned embeddings .npy (float32[N,dim])"
+    )
+    pp.add_argument(
+        "--embed", action="store_true", help="embed a slice with fastembed (CPU here)"
+    )
     pp.add_argument("--embed-model", default="BAAI/bge-small-en-v1.5")
     pp.add_argument("--embed-batch", type=int, default=1024)
-    pp.add_argument("--threads", type=int, default=0, help="fastembed threads (0 = library default)")
-    pp.add_argument("--synthetic", action="store_true", help="deterministic per-id vectors (default when no --emb/--embed)")
-    pp.add_argument("--seed-id", type=int, default=0, help="article id used as the sample tjs_open query vector")
+    pp.add_argument(
+        "--threads", type=int, default=0, help="fastembed threads (0 = library default)"
+    )
+    pp.add_argument(
+        "--synthetic",
+        action="store_true",
+        help="deterministic per-id vectors (default when no --emb/--embed)",
+    )
+    pp.add_argument(
+        "--seed-id",
+        type=int,
+        default=0,
+        help="article id used as the sample tjs_open query vector",
+    )
     pp.add_argument("--k", type=int, default=10)
-    pp.add_argument("--term-cond", type=int, default=64, help="tjs_open early-termination depth")
+    pp.add_argument(
+        "--term-cond", type=int, default=64, help="tjs_open early-termination depth"
+    )
     pp.add_argument("--m-seeds", type=int, default=8)
     pp.add_argument("--hops", type=int, default=1)
     args = p.parse_args(argv)
