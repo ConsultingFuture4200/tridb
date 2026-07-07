@@ -1,6 +1,6 @@
 """Browsable offline Wikipedia reader over the enwiki corpus (DEV-1354 action #3).
 
-A single-user personal tool: REVIEW + SEARCH + RELATED. No LLM / RAG (deferred).
+A single-user personal tool: REVIEW + SEARCH + RELATED + ASK (RAG).
 
 Two subcommands:
 
@@ -9,10 +9,13 @@ Two subcommands:
           answer "related" queries without re-scanning 30 GB of JSONL.
 
   serve   A stdlib http.server app (bind 127.0.0.1) that serves a single-page
-          HTML reader with title search, article view, and two "Related"
-          columns: semantic neighbours (cuVS CAGRA over the 6.9M BGE vectors,
-          reusing tools/wiki_linkpredict.build_cuvs_index) and out-going
-          hyperlinks (CSR adjacency built from the edge TSVs).
+          HTML reader with title search, article view, two "Related" columns
+          (semantic neighbours via cuVS CAGRA over the 6.9M BGE vectors, reusing
+          tools/wiki_linkpredict.build_cuvs_index; and out-going hyperlinks from
+          a CSR adjacency), and an "Ask" box: retrieval-augmented Q&A that embeds
+          the question with the same BGE model, retrieves top-k passages over the
+          already-loaded CAGRA index, and answers with a small local LLM served
+          by ollama (default qwen2.5:7b-instruct), citing the retrieved sources.
 
 Artifacts written by `build`, all next to the corpus (data/wiki/enwiki/):
   reader.db            sqlite: articles(id, title, shard, byte_offset) + titles FTS5
@@ -28,10 +31,12 @@ from __future__ import annotations
 import argparse
 import html
 import json
+import os
 import re
 import sqlite3
 import threading
 import time
+import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
@@ -42,6 +47,14 @@ DB_NAME = "reader.db"
 ID2ROW_NAME = "id2row.i32.npy"
 CSR_DST_NAME = "edges_csr_dst.i32.npy"
 CSR_OFF_NAME = "edges_csr_off.i64.npy"
+
+# --- Ask (RAG) config -------------------------------------------------------- #
+# The LLM is a SMALL quantized instruct model served locally by ollama; it must
+# stay well under the GPU budget so a later heavy job has the unified pool free.
+ASK_MODEL = os.environ.get("WIKI_ASK_MODEL", "qwen2.5:7b-instruct")
+OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434").rstrip("/")
+ASK_K = 8  # passages fed to the LLM
+PASSAGE_CHARS = 1500  # per-passage body budget so k passages fit the context
 
 
 # --------------------------------------------------------------------------- #
@@ -216,6 +229,11 @@ class Reader:
         vecs_ram = np.ascontiguousarray(self.vecs)  # real RAM copy for the GPU build
         self.index = build_cuvs_index(vecs_ram, self.row2id, graph_degree=32)
         self.index_lock = threading.Lock()
+
+        # Ask (RAG): the question embedder is lazy — fastembed loads on the first
+        # /ask so startup stays ~49s. Same BGE model the corpus was embedded with.
+        self._embedder = None
+        self._embedder_lock = threading.Lock()
         print("[serve] ready.")
 
     # -- queries ----------------------------------------------------------- #
@@ -295,6 +313,98 @@ class Reader:
         out = [{"id": i, "title": titles[i]} for i in dst_ids if i in titles]
         return out[:cap]
 
+    # -- Ask (RAG) --------------------------------------------------------- #
+    def _get_embedder(self):
+        if self._embedder is None:
+            with self._embedder_lock:
+                if self._embedder is None:
+                    from wiki_linkpredict import DEFAULT_DIM, DEFAULT_MODEL, Embedder
+
+                    print("[serve] loading question embedder (fastembed BGE, CPU) ...")
+                    self._embedder = Embedder(DEFAULT_MODEL, DEFAULT_DIM)
+        return self._embedder
+
+    def retrieve(self, q: str, k: int = ASK_K) -> list[dict]:
+        """Embed the question with the SAME BGE model as the corpus, then pull the
+        top-k passages from the already-loaded CAGRA index. Missing articles (the
+        ~4% clobbered) are skipped, so we over-fetch a few to still land k."""
+        emb = self._get_embedder()
+        v = emb.encode([q])
+        v /= np.linalg.norm(v, axis=1, keepdims=True) + 1e-12
+        v = np.ascontiguousarray(v, dtype=np.float32)
+        with self.index_lock:
+            labels, dists = self.index.knn_query(v, k=k + 4)
+        passages: list[dict] = []
+        for lab, d in zip(labels[0], dists[0]):
+            aid = int(lab)
+            art = self.article(aid)  # None if the article shard was clobbered
+            if art is None:
+                continue
+            passages.append(
+                {
+                    "id": aid,
+                    "title": art["title"],
+                    "score": round(1.0 - float(d), 4),
+                    "body": art["body"][:PASSAGE_CHARS],
+                }
+            )
+            if len(passages) >= k:
+                break
+        return passages
+
+    def _llm_answer(self, q: str, passages: list[dict]) -> str:
+        """Grounded generation via the local ollama HTTP API. The model is told to
+        answer ONLY from the numbered passages and to cite them; num_ctx is set
+        explicitly because ollama otherwise defaults to 2048 and would truncate."""
+        ctx = "\n\n".join(f"[{i + 1}] {p['title']}\n{p['body']}" for i, p in enumerate(passages))
+        system = (
+            "You answer questions using ONLY the provided Wikipedia passages. "
+            "Cite the passage numbers you rely on inline, like [1] or [2]. "
+            "If the passages do not contain the answer, say so plainly. "
+            "Do not use any outside knowledge."
+        )
+        user = f"Passages:\n\n{ctx}\n\nQuestion: {q}\n\nAnswer (cite passages):"
+        payload = {
+            "model": ASK_MODEL,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            "stream": False,
+            "options": {"temperature": 0.2, "num_ctx": 8192, "num_predict": 512},
+        }
+        req = urllib.request.Request(
+            f"{OLLAMA_URL}/api/chat",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=180) as r:
+                resp = json.loads(r.read())
+            return resp["message"]["content"].strip()
+        except Exception as e:  # surface the failure honestly rather than fabricate
+            return (
+                f"[LLM unavailable: {e!r}. Is ollama serving '{ASK_MODEL}' at "
+                f"{OLLAMA_URL}? The retrieved sources below are still valid.]"
+            )
+
+    def ask(self, q: str, k: int = ASK_K) -> dict:
+        q = (q or "").strip()
+        if not q:
+            return {"answer": "Ask a question.", "sources": []}
+        passages = self.retrieve(q, k=k)
+        if not passages:
+            return {
+                "answer": "No matching Wikipedia articles were found for this question.",
+                "sources": [],
+            }
+        answer = self._llm_answer(q, passages)
+        sources = [
+            {"n": i + 1, "id": p["id"], "title": p["title"], "score": p["score"]}
+            for i, p in enumerate(passages)
+        ]
+        return {"answer": answer, "sources": sources}
+
 
 def _clean_body(text: str) -> str:
     """Light wikitext-residue cleanup — the extractor already stripped most markup.
@@ -331,6 +441,10 @@ header { padding:10px 16px; background:#36c; color:#fff; display:flex; gap:12px;
   align-items:center; position:sticky; top:0; z-index:10; }
 header h1 { font-size:16px; margin:0; font-weight:600; white-space:nowrap; }
 #q { flex:1; padding:8px 12px; font-size:15px; border:0; border-radius:4px; }
+#ask { flex:1.4; padding:8px 12px; font-size:15px; border:0; border-radius:4px;
+  background:#fff8e1; }
+.answer { line-height:1.7; font-size:15px; white-space:pre-wrap; margin-bottom:8px;
+  background:#fffbea; border:1px solid #f0e2b0; border-radius:6px; padding:14px 16px; }
 main { display:grid; grid-template-columns:260px 1fr 300px; gap:0; height:calc(100vh - 52px); }
 #results, #related { overflow-y:auto; padding:8px; border-right:1px solid #ddd; background:#fff; }
 #related { border-right:0; border-left:1px solid #ddd; }
@@ -349,7 +463,8 @@ p { line-height:1.6; }
 <body>
 <header>
   <h1>Offline Wikipedia</h1>
-  <input id="q" placeholder="Search titles (e.g. Ada Lovelace) — Enter to search" autofocus>
+  <input id="q" placeholder="Search titles (e.g. Ada Lovelace) — Enter" autofocus>
+  <input id="ask" placeholder="Ask a question (RAG over 6.9M articles) — Enter">
 </header>
 <main>
   <div id="results"><div class="hint">Type a query and press Enter.</div></div>
@@ -393,7 +508,26 @@ async function loadRelated(id){
     : '<div class="hint">none</div>';
   rel.innerHTML = h;
 }
+async function ask(){
+  const q = $('#ask').value.trim();
+  if(!q) return;
+  const art = $('#article');
+  art.innerHTML = '<div class="hint">Thinking — retrieving passages + local LLM…</div>';
+  let r;
+  try { r = await j('/ask?q='+encodeURIComponent(q)); }
+  catch(e){ art.innerHTML = '<div class="hint">Ask failed: '+esc(String(e))+'</div>'; return; }
+  let h = '<h2>Ask</h2><div class="answer">'+esc(r.answer)+'</div>';
+  if(r.sources && r.sources.length){
+    h += '<div class="hd">Sources (click to open)</div>';
+    h += r.sources.map(s => `<div class="item" onclick="open_(${s.id})"><span class="score">${s.score}</span>[${s.n}] ${esc(s.title)}</div>`).join('');
+  } else {
+    h += '<div class="hint">No sources retrieved.</div>';
+  }
+  art.innerHTML = h;
+  art.scrollTop = 0;
+}
 $('#q').addEventListener('keydown', e => { if(e.key==='Enter') search(); });
+$('#ask').addEventListener('keydown', e => { if(e.key==='Enter') ask(); });
 </script>
 </body></html>"""
 
@@ -422,6 +556,9 @@ def make_handler(reader: Reader):
                 elif path == "/search":
                     q = parse_qs(u.query).get("q", [""])[0]
                     self._json(reader.search(q))
+                elif path == "/ask":
+                    q = parse_qs(u.query).get("q", [""])[0]
+                    self._json(reader.ask(q))
                 elif path.startswith("/article/"):
                     aid = int(unquote(path.split("/")[-1]))
                     art = reader.article(aid)
