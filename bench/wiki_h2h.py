@@ -167,15 +167,27 @@ def load_induced_adj(cfg: Cfg) -> dict[int, list[int]]:
     return adj
 
 
-def sample_queries(cfg: Cfg, q: int, seed: int) -> list[int]:
+def sample_queries(cfg: Cfg, q: int, seed: int, emb: np.ndarray) -> list[int]:
     """Q article-anchored query ids from [0, N), fixed seed — the SAME queries both sides.
 
     Each query's vector is that article's own embedding (article-anchored multi-hop probe):
     this is `tjs_open`'s home regime (source-anchored fused retrieval, ADR-0017) and it is
     well defined for the whole loaded slice, unlike HotpotQA link-resolution which resolves
-    too few gold titles into a 1M-article prefix to grade (tools/wiki_hotpot_link)."""
+    too few gold titles into a 1M-article prefix to grade (tools/wiki_hotpot_link).
+
+    The real corpus id space is SPARSE (289,612 gap ids across 0..7.19M); a gap id maps to a
+    zero-filled row in dense_id_aligned.npy, so after L2-normalize it is a ~zero vector whose
+    self-similarity is ~0 everywhere and whose oracle top-k is arbitrary — a degenerate noise
+    query (reviewer finding, line 170). Draw only from rows with a non-degenerate unit norm so
+    the recall average is not polluted by phantom-gap ids that neither store holds a row for."""
+    norms = np.linalg.norm(emb, axis=1)
+    valid = np.flatnonzero(norms > 0.5)  # normalized rows are ~1.0; gap rows are ~0.0
+    if valid.size < q:
+        raise SystemExit(
+            f"only {valid.size} non-degenerate rows in [0,{cfg.n}); cannot sample {q} queries"
+        )
     rng = np.random.default_rng(seed)
-    return sorted(int(x) for x in rng.choice(cfg.n, size=q, replace=False))
+    return sorted(int(x) for x in rng.choice(valid, size=q, replace=False))
 
 
 # ======================================================================================
@@ -261,12 +273,20 @@ def emit_tridb_sql(
     """Per (query, knob-combo): one warm-up (also the graded ids + SM-3 counters) then
     `runs` \\timing'd repeats. Knobs swept: (m_seeds, hops, term_cond). The query vector is
     the article's own embedding, inlined as a float8[] text literal (the operator's calling
-    convention, matching tools/wiki_engine_load). enable_seqscan=off forces the HNSW leg."""
+    convention, matching tools/wiki_engine_load).
+
+    WARNING (reviewer finding, line 269): `SET enable_seqscan=off` does NOT guarantee the
+    HNSW leg. On the shipped gx10-v1 image the `float8[] <->` distance operator does not bind
+    the `articles_hnsw` index, so tjs_open's vector leg seqscans 1M×384 and cancels at the
+    statement timeout (examined=0) at N=1M. Any timing harvested from this SQL is trustworthy
+    ONLY if the EXAMINED counter is > 0 — the report gate below refuses a TriDB point whose
+    median examined is 0 (a silent seqscan / timeout). Fix the opclass binding before quoting
+    a fixed-recall latency point."""
     out: list[str] = []
     w = out.append
     w("\\set ON_ERROR_STOP on")
     w("\\pset pager off")
-    w("SET enable_seqscan = off;  -- force the HNSW ANN scan for tjs_open's vector leg")
+    w("SET enable_seqscan = off;  -- NB: does NOT force HNSW here; gate on EXAMINED>0 (see docstring)")
     w("\\timing off")
     for qid in qids:
         qv = _vec_lit(emb[qid])
@@ -511,6 +531,90 @@ def operating_point(curve: dict[str, dict], target: float) -> tuple[str, dict] |
     return min(ok, key=lambda kv: kv[1]["median_latency_ms"])
 
 
+def _int(s) -> int | None:
+    try:
+        return int(str(s).replace(",", "").strip())
+    except (TypeError, ValueError):
+        return None
+
+
+# max |recall_tridb - recall_baseline| still called "equal recall" (reviewer finding, line 502).
+RECALL_EPS = float(os.environ.get("WH_RECALL_EPS", "0.02"))
+
+
+def publication_gate(
+    tp: tuple[str, dict] | None,
+    bp: tuple[str, dict] | None,
+    oracle_meta: dict,
+) -> list[str]:
+    """Blockers that must ALL clear before a latency ratio / 'Yx' headline may be printed.
+
+    A public GTM number cannot ride on a caveat footnote. This encodes the reviewer's
+    blocker + majors as hard gates: the harness refuses the headline until they reconcile.
+    Returns [] when publishable, else a list of human-readable blocker strings."""
+    blockers: list[str] = []
+
+    # Finding 1 / critical: the two systems must benchmark the SAME graph. The oracle and
+    # Neo4j hold the manifest-induced edge set; the engine's native graph must match it
+    # byte-for-byte on the same slice, else recall/latency/pages-touched are cross-mismatched.
+    e_edges = _int(oracle_meta.get("engine_edges"))
+    n_edges = _int(oracle_meta.get("neo4j_edges"))
+    if e_edges is None or n_edges is None:
+        blockers.append(
+            "graph-set: engine/oracle edge counts unknown — cannot confirm both systems "
+            "traverse the same topology (set WH_ENGINE_EDGES / WH_NEO4J_EDGES)."
+        )
+    elif e_edges != n_edges:
+        blockers.append(
+            f"graph-set MISMATCH: engine native graph = {e_edges:,} edges vs oracle/Neo4j "
+            f"induced = {n_edges:,} edges ({n_edges / max(e_edges, 1):.2f}x) on the same "
+            "slice. TriDB is graded against a graph it does not physically contain. "
+            "Root-cause the edge-load path (dedup / identity-mode / directedness) or rebuild "
+            "the oracle + Neo4j from the engine's ACTUAL loaded adjacency before comparing."
+        )
+
+    # Finding 2 / major: timer-boundary parity. TriDB latency is server-side psql \\timing
+    # over a local unix socket; the baseline is Python wall-clock over three TCP round-trips.
+    # Refuse the ratio until someone equalizes the boundary and asserts it via the env flag.
+    if os.environ.get("WH_BOUNDARY_PARITY", "").lower() not in ("1", "true", "yes"):
+        blockers.append(
+            "timer boundary asymmetry: TriDB = server-side \\timing (local socket), baseline "
+            "= client-side wall-clock over 3 TCP round-trips + driver serialization. The ratio "
+            "flatters TriDB by construction. Measure both at the same boundary, then set "
+            "WH_BOUNDARY_PARITY=1 to acknowledge it."
+        )
+
+    if tp is None or bp is None:
+        blockers.append(
+            "no matched operating point: "
+            + ("TriDB " if tp is None else "")
+            + ("baseline " if bp is None else "")
+            + "has no combo clearing the recall target in the swept grid."
+        )
+        return blockers
+
+    # Finding 3 / major: 'fixed EQUAL recall' means MATCHED, not merely both-above-threshold.
+    tr = tp[1]["recall_at_k"]
+    br = bp[1]["recall_at_k"]
+    if abs(tr - br) > RECALL_EPS:
+        blockers.append(
+            f"recall NOT matched: TriDB operates at recall {tr:.3f}, baseline at {br:.3f} "
+            f"(|Δ|={abs(tr - br):.3f} > eps {RECALL_EPS:.3f}). A latency ratio at unequal "
+            "recall is apples-to-oranges — interpolate both sides to a common recall first."
+        )
+
+    # Finding 6 / minor promoted: a TriDB point with median examined == 0 is a silent seqscan
+    # or statement-timeout (the float8[] <-> leg not binding articles_hnsw), not a real point.
+    ex = tp[1].get("median_examined")
+    if ex is not None and ex == ex and ex <= 0:
+        blockers.append(
+            "TriDB vector leg did NOT use the HNSW index: median candidates examined = 0 "
+            "(seqscan / statement-timeout). No real fixed-recall latency point exists — fix "
+            "the float8[] <-> opclass binding before quoting a number."
+        )
+    return blockers
+
+
 def render_md(
     cfg: Cfg,
     tridb: dict,
@@ -535,7 +639,22 @@ def render_md(
     w("")
     tp = operating_point(tridb, target)
     bp = operating_point(baseline, target)
-    if tp and bp:
+    blockers = publication_gate(tp, bp, oracle_meta)
+    if blockers:
+        w(
+            "> **COMPARISON INVALID — no headline latency ratio is emitted.** The following "
+            "must reconcile before a matched `tjs_open`-vs-multi-store number is publishable "
+            "(reviewer blocker + majors; a caveat footnote is not sufficient for a GTM claim):"
+        )
+        w("")
+        for b in blockers:
+            w(f"> - {b}")
+        w("")
+        w(
+            "> Recall curves for each side are printed below for diagnosis, but they are "
+            "graded against the manifest-induced oracle and are NOT a matched head-to-head."
+        )
+    elif tp and bp:
         tt, tc = tp
         bt, bc = bp
         ratio = (
@@ -546,19 +665,11 @@ def render_md(
         w(
             f"**At a fixed recall@{k} >= {target:.2f} vs the exact fused oracle, over {q} "
             f"article-anchored queries at N={cfg.n:,}:** TriDB's fused `tjs_open` "
-            f"(`{tt}`, recall {tc['recall_at_k']:.3f}) runs **{tc['median_latency_ms']:.2f} ms** "
-            f"and touches **{tc['median_examined']:.0f}** candidates (SM-3); the multi-store "
-            f"baseline (`{bt}`, recall {bc['recall_at_k']:.3f}) runs "
+            f"(`{tt}`, recall {tc['recall_at_k']:.3f}) runs **{tc['median_latency_ms']:.2f} ms**; "
+            f"the multi-store baseline (`{bt}`, recall {bc['recall_at_k']:.3f}) runs "
             f"**{bc['median_latency_ms']:.2f} ms** end-to-end across three systems "
-            f"(**{ratio:.2f}x**)."
-        )
-    else:
-        w(
-            f"**No fixed-accuracy operating point at recall@{k} >= {target:.2f} for "
-            f"{'TriDB' if not tp else ''}{' and ' if not tp and not bp else ''}"
-            f"{'the baseline' if not bp else ''}** in the swept grid — widen the sweep. "
-            "Recall curves are still emitted below; no latency win is asserted without a "
-            "matched operating point."
+            f"(**{ratio:.2f}x**). Both timers measured at the SAME boundary "
+            "(WH_BOUNDARY_PARITY acknowledged)."
         )
     w("")
     w(f"## TriDB fused `tjs_open` — recall curve (warm, median of runs), N={cfg.n:,}")
@@ -592,20 +703,24 @@ def render_md(
         "(source-anchored, `tjs_open`'s home regime)."
     )
     w(
-        "- **Pages-touched (SM-3):** TriDB's `tjs_open_candidates_examined()` — the "
-        "early-termination locality proxy. The baseline has no single comparable counter "
-        "(work is split across three engines); its cost shows as the end-to-end wall-clock."
+        "- **Pages-touched (SM-3) is engine-internal and NON-COMPARABLE (reviewer finding).** "
+        "`tjs_open_candidates_examined()` is shown in the TriDB curve table only as an "
+        "early-termination diagnostic — NOT as a head-to-head win. The baseline has no "
+        "comparable counter, AND a low examined count partly reflects the engine holding "
+        "fewer edges than the oracle/Neo4j (see graph-set blocker), not superior locality. "
+        "It is deliberately kept out of the headline until the graph legs reconcile."
     )
     w(
         "- **Warm** on both sides (engine buffers hot, Milvus/Neo4j collections loaded, PG "
         "cached). Reported consistently; no cold-cache number is mixed in."
     )
     w(
-        f"- **Graph-set caveat:** the engine's native graph reports "
-        f"{oracle_meta.get('engine_edges', '?')} edges while Neo4j holds "
-        f"{oracle_meta.get('neo4j_edges', '?')} induced relationships for the SAME 1M slice "
-        "— a load-integrity discrepancy that means the two graph legs are not byte-identical. "
-        "Flagged, not hidden; the oracle uses the manifest-induced set."
+        f"- **Graph-set BLOCKER (not a caveat):** the engine's native graph reports "
+        f"{oracle_meta.get('engine_edges', '?')} edges while Neo4j / the oracle hold "
+        f"{oracle_meta.get('neo4j_edges', '?')} induced relationships for the same slice. "
+        "The two graph legs are not byte-identical, so TriDB is graded against a graph it "
+        "does not physically contain. This gates the headline ratio above (comparison "
+        "invalid) until the edge counts reconcile — it is NOT demoted to a footnote."
     )
     w("")
     w("_Generated by `bench/wiki_h2h.py`. Numbers observed; no result fabricated._")
@@ -654,7 +769,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "oracle":
         emb = load_emb(cfg)
         adj = load_induced_adj(cfg)
-        qids = sample_queries(cfg, args.queries, args.seed)
+        qids = sample_queries(cfg, args.queries, args.seed, emb)
         t0 = time.time()
         oracle = compute_oracle(
             emb, adj, qids, k=args.k, m_seeds=args.oracle_mseeds, hops=args.oracle_hops
