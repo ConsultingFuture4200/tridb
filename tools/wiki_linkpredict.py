@@ -138,6 +138,23 @@ def load_articles(corpus: Path, limit: int) -> tuple[list[int], list[str], list[
     return ids, titles, texts
 
 
+def load_titles(corpus: Path, wanted: set[int]) -> dict[int, str]:
+    """id -> title for the given ids (used by the --emb-in reuse path, which loads
+    vectors from a checkpoint but still needs human-readable titles for output)."""
+    manifest = json.loads((corpus / "manifest.json").read_text())
+    out: dict[int, str] = {}
+    for s in manifest["shards"]["articles"]["files"]:
+        if len(out) >= len(wanted):
+            break
+        with (corpus / s["path"]).open() as fh:
+            for line in fh:
+                obj = json.loads(line)
+                i = int(obj["id"])
+                if i in wanted:
+                    out[i] = obj["title"]
+    return out
+
+
 def load_out_edges(
     corpus: Path, keep: set[int], src_keep: set[int] | None = None
 ) -> dict[int, set[int]]:
@@ -200,24 +217,55 @@ def build_index(vecs: np.ndarray, ids: np.ndarray, *, m: int, efc: int):
     return idx
 
 
+def load_emb_checkpoint(emb_dir: Path) -> tuple[np.ndarray, list[int], str]:
+    """Load a wiki_embed_hybrid checkpoint (vectors.f32 + ids.i64.npy + meta.json).
+
+    Returns (vecs (N,dim) float32, ids list, model_name). Vectors are already
+    L2-normalized by the embed run (meta.normalized == True). This is the REUSE
+    path: the expensive GPU embed runs ONCE via tools/wiki_embed_hybrid; the
+    link-prediction overlap metric is then computed cheaply from the artifact."""
+    meta = json.loads((emb_dir / "meta.json").read_text())
+    n, dim = int(meta["N"]), int(meta["dim"])
+    vecs = np.asarray(
+        np.memmap(emb_dir / "vectors.f32", dtype=np.float32, mode="r", shape=(n, dim))
+    )
+    ids = np.load(emb_dir / "ids.i64.npy").tolist()
+    return vecs, ids, meta.get("model", "unknown")
+
+
 def run(corpus: Path, args: argparse.Namespace) -> dict:
-    ids, titles, texts = load_articles(corpus, args.limit)
-    id_to_title = dict(zip(ids, titles))
-    keep = set(ids)
-    print(f"[wiki-linkpred] loaded {len(ids)} articles from {corpus}")
+    if args.emb_in:
+        vecs, ids, model_name = load_emb_checkpoint(args.emb_in)
+        titles_by_id = load_titles(corpus, set(ids))
+        titles = [titles_by_id.get(i, str(i)) for i in ids]
+        id_to_title = dict(zip(ids, titles))
+        keep = set(ids)
+        print(
+            f"[wiki-linkpred] loaded {len(ids)} embeddings from checkpoint "
+            f"{args.emb_in} (model={model_name})"
+        )
+        embed_model = model_name
+    else:
+        ids, titles, texts = load_articles(corpus, args.limit)
+        id_to_title = dict(zip(ids, titles))
+        keep = set(ids)
+        print(f"[wiki-linkpred] loaded {len(ids)} articles from {corpus}")
 
-    embedder = Embedder(args.model, args.dim)
-    print(f"[wiki-linkpred] embedding with {embedder.model_name} (dim={args.dim})...")
-    vecs = embedder.encode(texts)
-    vecs /= np.linalg.norm(vecs, axis=1, keepdims=True) + 1e-12
+        embedder = Embedder(args.model, args.dim)
+        print(
+            f"[wiki-linkpred] embedding with {embedder.model_name} (dim={args.dim})..."
+        )
+        vecs = embedder.encode(texts)
+        vecs /= np.linalg.norm(vecs, axis=1, keepdims=True) + 1e-12
+        embed_model = embedder.model_name
 
-    if args.emb_out:
+    if not args.emb_in and args.emb_out:
         save_embeddings(
             args.emb_out,
             vecs,
             ids,
             {
-                "model": embedder.model_name,
+                "model": embed_model,
                 "dim": args.dim,
                 "count": len(ids),
                 "normalized": True,
@@ -290,7 +338,7 @@ def run(corpus: Path, args: argparse.Namespace) -> dict:
         "source": "simplewiki_full (real, offline-wiki extraction)",
         "corpus": str(corpus),
         "articles_embedded": len(ids),
-        "embed_model": embedder.model_name,
+        "embed_model": embed_model,
         "embed_dim": args.dim,
         "k": args.k,
         "sampled": sample_n,
@@ -368,6 +416,13 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="persist normalized embeddings (.npy + .ids.npy + .meta.json) for "
         "the Phase-2 engine load to reuse instead of re-embedding",
+    )
+    ap.add_argument(
+        "--emb-in",
+        type=Path,
+        default=None,
+        help="REUSE a wiki_embed_hybrid checkpoint dir (vectors.f32 + "
+        "ids.i64.npy + meta.json) instead of re-embedding; --limit is ignored",
     )
     args = ap.parse_args(argv)
 
