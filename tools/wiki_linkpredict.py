@@ -217,6 +217,70 @@ def build_index(vecs: np.ndarray, ids: np.ndarray, *, m: int, efc: int):
     return idx
 
 
+class _CuvsIndex:
+    """hnswlib-compatible shim around a cuVS CAGRA GPU index (build_cuvs_index).
+
+    Exposes the same knn_query(q, k) -> (id_labels, 1-cosine) contract as the
+    hnswlib path so all downstream overlap / subtraction / title logic is reused
+    unchanged. The GPU is touched only inside build + knn_query; nothing
+    GPU-resident is returned or held on the query path."""
+
+    def __init__(self, index, ids: np.ndarray, build_s: float):
+        self._index = index
+        self._ids = ids
+        self.build_s = build_s
+
+    def set_ef(self, ef: int) -> None:  # hnswlib parity no-op (CAGRA uses itopk_size)
+        pass
+
+    def knn_query(self, q: np.ndarray, k: int):
+        from cuvs.neighbors import cagra
+        from pylibraft.common import device_ndarray
+
+        qd = device_ndarray(np.ascontiguousarray(q, dtype=np.float32))
+        sp = cagra.SearchParams(itopk_size=max(4 * k, 256))
+        dist, ind = cagra.search(sp, self._index, qd, k)
+        rows = np.asarray(ind.copy_to_host())
+        d = np.asarray(dist.copy_to_host(), dtype=np.float32)
+        labels = self._ids[rows]  # neighbour rows -> article ids
+        # unit vectors: sqeuclidean = 2 - 2cos, so sqeuclidean/2 == 1 - cosine,
+        # matching the hnswlib 'ip' distance the caller expects (score = 1 - d).
+        return labels, d * 0.5
+
+
+def build_cuvs_index(
+    vecs: np.ndarray,
+    ids: np.ndarray,
+    *,
+    graph_degree: int = 32,
+    intermediate_graph_degree: int = 64,
+):
+    """Build a cuVS CAGRA index on the GPU over L2-normalized vectors.
+
+    Vectors are unit-norm, so squared-Euclidean ranks identically to cosine
+    (||a-b||^2 = 2 - 2cos). We build with metric='sqeuclidean' (the verified GB10
+    path, scripts/spark_gpu_setup.sh + docs/gpu_index_build_v0.1.0.md) and convert
+    distances back to cosine at query time. Returns a _CuvsIndex shim."""
+    import time
+
+    from cuvs.neighbors import cagra
+
+    data = np.ascontiguousarray(vecs, dtype=np.float32)  # real RAM copy for the build
+    params = cagra.IndexParams(
+        metric="sqeuclidean",
+        graph_degree=graph_degree,
+        intermediate_graph_degree=intermediate_graph_degree,
+    )
+    t0 = time.time()
+    index = cagra.build(params, data)
+    build_s = time.time() - t0
+    print(
+        f"[wiki-linkpred] CAGRA build over {data.shape[0]} vectors "
+        f"(graph_degree={graph_degree}) in {build_s:.1f}s"
+    )
+    return _CuvsIndex(index, ids, build_s)
+
+
 def load_emb_checkpoint(emb_dir: Path) -> tuple[np.ndarray, list[int], str]:
     """Load a wiki_embed_hybrid checkpoint (vectors.f32 + ids.i64.npy + meta.json).
 
@@ -287,14 +351,22 @@ def run(corpus: Path, args: argparse.Namespace) -> dict:
     print("[wiki-linkpred] loading edges...")
     out_edges = load_out_edges(corpus, keep, src_keep)
 
-    print(f"[wiki-linkpred] building hnswlib index over {len(ids)} vectors...")
     id_arr = np.asarray(ids, dtype=np.int64)
-    idx = build_index(vecs, id_arr, m=args.m, efc=args.efc)
-    # query k+1 to absorb the self-hit, then trim to k neighbours.
-    idx.set_ef(max(2 * (args.k + 1), 64))
+    # fetch k + buffer + 1: the +1 absorbs the self-hit, the buffer deepens the
+    # predicted-link pool (overlap is still measured over the top-k, below).
+    fetch = args.k + args.buffer + 1
+    if args.index == "cuvs":
+        print(
+            f"[wiki-linkpred] building cuVS CAGRA index over {len(ids)} vectors (GPU)..."
+        )
+        idx = build_cuvs_index(vecs, id_arr, graph_degree=args.graph_degree)
+    else:
+        print(f"[wiki-linkpred] building hnswlib index over {len(ids)} vectors...")
+        idx = build_index(vecs, id_arr, m=args.m, efc=args.efc)
+        idx.set_ef(max(2 * fetch, 64))
 
-    q = vecs[sample_rows]
-    labels, dists = idx.knn_query(q, k=args.k + 1)
+    q = np.ascontiguousarray(vecs[sample_rows])
+    labels, dists = idx.knn_query(q, k=fetch)
 
     overlaps: list[float] = []
     records: list[dict] = []
@@ -308,11 +380,12 @@ def run(corpus: Path, args: argparse.Namespace) -> dict:
             if lab == src_id:
                 continue
             neigh.append(lab)
-            scores[lab] = 1.0 - float(d)  # ip distance = 1 - cosine
-            if len(neigh) >= args.k:
+            scores[lab] = 1.0 - float(d)  # 1 - cosine distance -> cosine
+            if len(neigh) >= args.k + args.buffer:
                 break
         linked = out_edges.get(src_id, set())
-        overlaps.append(linked_fraction(neigh, self_id=src_id, linked=linked))
+        # overlap: top-k only; predicted: the full k+buffer pool minus linked/self.
+        overlaps.append(linked_fraction(neigh[: args.k], self_id=src_id, linked=linked))
         pred = predicted_unlinked(neigh, self_id=src_id, linked=linked)
         records.append(
             {
@@ -330,17 +403,22 @@ def run(corpus: Path, args: argparse.Namespace) -> dict:
             }
         )
 
+    # Whole-corpus (emb-in artifact, or --limit 0) => every dst endpoint is
+    # in-corpus, so out-edge counts are true out-degrees and the overlap is not
+    # slice-deflated. A bounded --limit slice IS deflated (most dsts leave it).
+    full_corpus = args.emb_in is not None or args.limit == 0
     mean_overlap = float(np.mean(overlaps)) if overlaps else 0.0
     mean_out_edges = (
         float(np.mean([r["n_out_edges_in_slice"] for r in records])) if records else 0.0
     )
     return {
-        "source": "simplewiki_full (real, offline-wiki extraction)",
+        "source": f"{corpus.name} (real, offline-wiki extraction)",
         "corpus": str(corpus),
         "articles_embedded": len(ids),
         "embed_model": embed_model,
         "embed_dim": args.dim,
         "k": args.k,
+        "buffer": args.buffer,
         "sampled": sample_n,
         "top_per_article": args.top,
         "overlap_metric": {
@@ -348,19 +426,36 @@ def run(corpus: Path, args: argparse.Namespace) -> dict:
             "mean_out_edges_in_slice": round(mean_out_edges, 4),
             "note": (
                 "fraction of top-k cosine neighbours that are already out-edges; "
-                "complement is the candidate-prediction pool. Bounded --limit "
-                "slices deflate this (most true out-edges leave the slice). "
-                "mean_out_edges_in_slice quantifies that deflation: the overlap "
-                "ceiling is ~min(k, out_edges_in_slice)/k, so a low in-slice "
-                "out-edge count caps how high the overlap can read on a slice."
+                "complement is the candidate-prediction pool. "
+                + (
+                    "Whole-corpus run: every dst endpoint is in-corpus, so "
+                    "mean_out_edges_in_slice is the true out-degree and the overlap "
+                    "is NOT slice-deflated — it is the genuine fraction of a "
+                    "source's global nearest neighbours that it already links out to."
+                    if full_corpus
+                    else "Bounded --limit slices deflate this (most true out-edges "
+                    "leave the slice); mean_out_edges_in_slice quantifies that: the "
+                    "overlap ceiling is ~min(k, out_edges_in_slice)/k."
+                )
             ),
         },
         "emb_artifact": str(args.emb_out) if args.emb_out else None,
-        "hnsw": {"M": args.m, "ef_construction": args.efc, "space": "ip(cosine)"},
+        "index": (
+            {
+                "backend": "cuvs_cagra",
+                "metric": "sqeuclidean (== cosine on unit vectors)",
+                "graph_degree": args.graph_degree,
+                "build_seconds": round(idx.build_s, 2),
+            }
+            if args.index == "cuvs"
+            else {"M": args.m, "ef_construction": args.efc, "space": "ip(cosine)"}
+        ),
         "predictions": records,
         "gating": (
-            "cosine-only LOWER BOUND on CPU/simplewiki; full enwiki embed = "
-            "Spark/GX10 GPU; production predictor fuses via tjs_open (GX10-gated)."
+            ("full-corpus GPU CAGRA run; " if args.index == "cuvs" else "CPU run; ")
+            + "cosine-only predictor is the LOWER BOUND — it sees semantic "
+            "proximity but not multi-hop topology; the production predictor fuses "
+            "this vector signal with graph structure via tjs_open (GX10-gated)."
         ),
     }
 
@@ -405,6 +500,25 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--dim", type=int, default=DEFAULT_DIM)
     ap.add_argument("--m", type=int, default=16)
     ap.add_argument("--efc", type=int, default=200)
+    ap.add_argument(
+        "--index",
+        choices=["hnswlib", "cuvs"],
+        default="hnswlib",
+        help="ANN backend: hnswlib (CPU, default) or cuvs (GPU CAGRA, GX10-only)",
+    )
+    ap.add_argument(
+        "--buffer",
+        type=int,
+        default=0,
+        help="extra neighbours fetched beyond k for the predicted-link pool; "
+        "overlap is always measured over the top-k (default 0)",
+    )
+    ap.add_argument(
+        "--graph-degree",
+        type=int,
+        default=32,
+        help="cuVS CAGRA graph degree (only used with --index cuvs)",
+    )
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--print-n", type=int, default=15, help="articles to print")
     ap.add_argument(
