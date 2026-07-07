@@ -1,0 +1,50 @@
+{
+  "source": "enwiki (real, offline-wiki extraction)",
+  "corpus": "data/wiki/enwiki",
+  "articles_embedded": 6900039,
+  "corpus_truth": {
+    "articles": 6900039,
+    "edges": 224475283
+  },
+  "embed_model": "BAAI/bge-small-en-v1.5",
+  "embed_dim": 384,
+  "embed_dtype": "float32 (bge-small; NOT the spec dim-768 float8 I/O basis)",
+  "k": 10,
+  "pool": 50,
+  "sampled": 5000,
+  "seed": 42,
+  "candidate_generation": "cosine kNN via cuVS CAGRA (bounded pool, TR-1 respected)",
+  "topological_scorers": {
+    "common_neighbors": "|succ(A) ∩ succ(B)| (bibliographic coupling)",
+    "adamic_adar": "Σ_{z∈succ(A)∩succ(B)} 1/log(indeg z)",
+    "node2vec_included": false,
+    "node2vec_skip_reason": "training node2vec on 6.9M nodes / 224M edges = multi-billion-token walk corpus + skip-gram training, multi-hour job, out of scope for the cheapest-test remit; CN/AA are training-free"
+  },
+  "fusion": "reciprocal-rank fusion(cosine, adamic_adar), rrf_k=60",
+  "overlap_at_k": {
+    "cosine_only": 0.11,
+    "common_neighbor_only": 0.1279,
+    "adamic_adar_only": 0.1331,
+    "fused": 0.1297,
+    "baseline_cosine_lower_bound": 0.1101,
+    "pool_base_rate": 0.0423,
+    "mean_out_degree": 31.5206,
+    "note": "fraction of each source's top-k reranked candidates that are already out-edges; candidate pool is the cosine top-`pool` for ALL columns, so cosine_only reproduces the 0.110 lower bound and the rest are pure reranks of the identical pool. pool_base_rate is the linked fraction over the whole pool (the reranking ceiling is set by how many true out-edges land in the cosine pool)."
+  },
+  "fused_vs_cosine_delta": 0.0197,
+  "verdict": "TOPOLOGY ADDS SIGNAL: fused 0.1297 beats cosine 0.11 (Δ+0.0197, 17.9% relative). Graph structure concentrates the true links higher than embedding proximity alone.",
+  "index": {
+    "backend": "cuvs_cagra",
+    "metric": "sqeuclidean (== cosine on unit vectors)",
+    "graph_degree": 32,
+    "build_seconds": 49.54
+  },
+  "adjacency": {
+    "edge_rows_read": 224475283,
+    "edge_rows_valid": 221135287,
+    "needed_sources": 245902,
+    "succ_nodes_materialized": 245758,
+    "adjacency_seconds": 28.9
+  },
+  "gating": "compute-bound-ish (dim-384 f32) predictive-signal test, NOT a latency claim (ADR-0017: I/O regime is expected-fail). Real 224M-edge graph, bounded reranking pool."
+}
