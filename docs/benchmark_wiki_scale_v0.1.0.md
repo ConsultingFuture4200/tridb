@@ -115,7 +115,7 @@ to full-wiki scale; the load contracts relate to PERF-11/04/08/10.
 **What this adds.** The Phase-2 load tooling of `docs/wiki_scale_load_design_v0.1.0.md` is now BUILT
 (`tools/wiki_engine_load.py` + `scripts/wiki_engine_load.sh`) and RUN, bounded, against the LIVE
 `tridb/msvbase:gx10-v1` engine on the Spark (GB10). This is a **verified bounded proof of the loader +
-tri-modal fusion**, plus an honest extrapolation to full 7M/232M — **not** a latency head-to-head (that
+tri-modal fusion**, plus an honest extrapolation to full 6.9M/224M — **not** a latency head-to-head (that
 still needs the baseline stack at scale; see gaps).
 
 **Engine surface actually probed (gx10-v1, 2026-07-06).** The batched C entry point
@@ -152,26 +152,26 @@ throwaway cluster, `\copy` + native load + asserts). **All assertions passed, ex
 - Bridge injection over REAL topology: `bridges_injected = 148`, top-60 overlaps seed 0's induced
   out-neighbors → the graph leg fuses into the vector top-k.
 
-**Honest extrapolation to full enwiki (7,189,653 art / 232,055,532 edges), at the measured rates:**
+**Honest extrapolation to full enwiki (6,900,039 art / 224,475,283 edges), at the measured rates:**
 
 | Leg | Full-scale estimate | Basis / caveat |
 |---|---:|---|
-| Article COPY | ~2 min | 7.19M / 58.2k·s⁻¹ (id+title+ts only; body excluded per design §1) |
-| Vertex materialize | ~2.2 min | 7.19M / 53.8k·s⁻¹ |
-| Edge staging COPY | ~50 s | 232M / 4.6M·s⁻¹ |
-| **Native edge insert** | **~3.4 hours** | 232M / 18.9k·s⁻¹ — **the gating load cost** |
+| Article COPY | ~2 min | 6.9M / 58.2k·s⁻¹ (id+title+ts only; body excluded per design §1) |
+| Vertex materialize | ~2.2 min | 6.9M / 53.8k·s⁻¹ |
+| Edge staging COPY | ~50 s | 224M / 4.6M·s⁻¹ |
+| **Native edge insert** | **~3.4 hours** | 224M / 18.9k·s⁻¹ — **the gating load cost** |
 | Embeddings (real) | ~84 h CPU **(blocked)** | 23.7 docs/s measured on this box; no GPU path (below) |
 | HNSW build (real dim-768) | tens of hours **(blocked)** | design §3; the dim-64 34.5 s number does **not** extrapolate |
-| Vector-leg footprint | ~44 GB raw + ~tens GB index | 7.19M × 768 × `float8`(8 B); the 128 GB tight point (spec) |
+| Vector-leg footprint | ~44 GB raw + ~tens GB index | 6.9M × 768 × `float8`(8 B); the 128 GB tight point (spec) |
 
 **Remaining gaps (honest, this is the acceptance criterion):**
-1. **The per-edge path is ~3.4 h at 232M.** The staged direct-by-vid loader removes the SQL
+1. **The per-edge path is ~3.4 h at 224M.** The staged direct-by-vid loader removes the SQL
    round-trip and the `add_edge` map tax, but **not** the per-edge C call + per-edge WAL record.
    Load-design §2's true batched `gph_insert_edges` (one page-extend + one GenericXLog per adjacency
    run) — the thing that turns hours into minutes — is **still unbuilt** in the gx10 images.
 2. **Real embeddings are blocked on this GB10.** `onnxruntime.get_available_providers()` on the
    Blackwell/sbsa box = `['AzureExecutionProvider','CPUExecutionProvider']` — **no
-   `CUDAExecutionProvider`**, so fastembed runs CPU-only (23.7 docs/s → ~84 h for 7.19M). The GPU
+   `CUDAExecutionProvider`**, so fastembed runs CPU-only (23.7 docs/s → ~84 h for 6.9M). The GPU
    CAGRA build (PERF-08) needs either a working Blackwell `onnxruntime-gpu` wheel or a cuVS path;
    neither installs here without sudo/root. This bounded proof therefore used **deterministic dim-64
    synthetic vectors** — sufficient to prove the LOADER, the HNSW build path, TR-1 early termination,
@@ -186,7 +186,7 @@ throwaway cluster, `\copy` + native load + asserts). **All assertions passed, ex
 only*. Unbounded (`--limit 0`) full-7M is blocked pending **manifest reconciliation**: the enwiki
 extract has duplicate + truncated shards — 76 shard descriptors for 72 distinct files
 (`articles-00071` ×3, `-00049`/`-00028` ×2), and on-disk articles (~7.14M) fall short of the
-manifest count (7.19M) because the extractor reopens revisited shards in `w`/truncate mode
+manifest count (6.9M) because the extractor reopens revisited shards in `w`/truncate mode
 (`wiki_extract.py:301`, data loss). The loader now (a) dedupes shard paths so a full run no longer
 double-reads a shard into a duplicate-key COPY abort, (b) materializes native vertices over the
 dense `[0, max_id]` id range (article ids are sparse) instead of `generate_series(0, N-1)`, and

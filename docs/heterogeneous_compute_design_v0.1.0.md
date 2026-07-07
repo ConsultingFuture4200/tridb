@@ -151,7 +151,7 @@ the three-arm experiment that could show it is — or kill it.
 
 ## 5. The falsifiable experiment
 
-**Hypothesis (H1).** On the full-Wikipedia corpus (7,189,653 articles / 232 M edges,
+**Hypothesis (H1).** On the full-Wikipedia corpus (6,900,039 articles / 224 M edges,
 `docs/wiki_scale_benchmark_spec_v0.1.0.md`), a zero-copy fused `tjs_open` (CPU-graph +
 GPU-vector, one address space) achieves **lower latency at fixed retrieval accuracy** than
 CPU-only `tjs_open`, and the advantage comes from the coherent-memory zero-copy, not GPU
@@ -235,7 +235,7 @@ inserts explicit `cudaMemcpy` at the frontier crossing; CPU-only disables the GP
 kernel. Warm CUDA kernels at backend start (§3).
 
 **Benchmark parameters (pinned so the regime is not ambiguous).** The run uses **dim-384
-float32** — the only embed + CAGRA path proven in Phase 2 (§4). At 7,189,653 vectors × 384 × 4 B
+float32** — the only embed + CAGRA path proven in Phase 2 (§4). At 6,900,039 vectors × 384 × 4 B
 that is ≈11 GB raw vectors, ≈22 GB with the HNSW graph, ≈4 GB native adjacency ≈ **~26 GB
 working set of the 128 GB unified pool → decisively RAM-resident, not I/O-bound**. This places
 the benchmark in the compute-bound regime where a GPU vector co-processor *can* help (per the H1

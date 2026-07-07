@@ -4,12 +4,12 @@
 **Host:** DGX Spark — NVIDIA GB10 (Grace 20-core ARM64 + Blackwell GPU), 128 GB
 coherent unified memory. `ssh spark`.
 **Tool:** `tools/wiki_embed_hybrid.py`
-**Issue:** DEV-1354 (offline-wiki). **Corpus:** `data/wiki/enwiki` (7,189,653 articles).
+**Issue:** DEV-1354 (offline-wiki). **Corpus:** `data/wiki/enwiki` (6,900,039 articles).
 **Model:** `BAAI/bge-small-en-v1.5` (384-dim), title + leading text[:512], L2-normalized.
 
 ## TL;DR
 
-A prior CPU-only embed of all 7.19M enwiki articles took >12h with **zero visibility**
+A prior CPU-only embed of all 6.9M enwiki articles took >12h with **zero visibility**
 (block-buffered stdout to a file) and **no checkpoint** — it could be neither observed
 nor resumed. This redoes it right:
 
@@ -135,7 +135,7 @@ host-side pipeline and dropped net throughput. **The full run therefore uses `--
    its loop and exits on reparent, so `kill`-ing the launcher stops the pool within one
    shard. On a *clean* box the real numbers are far higher (below).
 
-Steady-state on the full 7.19M run (`--shard-size 5000 --cpu-workers 2`, fp16, clean box):
+Steady-state on the full 6.9M run (`--shard-size 5000 --cpu-workers 2`, fp16, clean box):
 **~1,500 rows/s (GPU) → ETA ≈ 80 min.** Both devices confirmed live (`gpu_rows` and
 `cpu_rows` both > 0). This is ~9x the prior CPU-only run's effective ~166 art/s (>12h) and,
 unlike it, fully observable and resumable. CPU adds a low-single-digit % (each worker
@@ -171,7 +171,7 @@ This is why the full run uses a smaller shard size than a GPU-only run would wan
 
 ## How to run / resume / monitor
 
-Full 7.19M run (background, live-tailable):
+Full 6.9M run (background, live-tailable):
 
 ```bash
 ssh spark 'cd ~/code/tridb && nohup .venv/bin/python -u -m tools.wiki_embed_hybrid \

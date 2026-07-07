@@ -59,15 +59,23 @@ TEXT_CHARS = 512  # leading body chars fed to the encoder (matches wiki_linkpred
 # --------------------------------------------------------------------------- #
 # Corpus layout: global row order == concatenation of manifest article shards.
 # --------------------------------------------------------------------------- #
-def shard_file_layout(corpus: Path) -> tuple[list[tuple[str, int, int]], int]:
-    """Return ([(path, global_start, nrows), ...], total_rows) in manifest order."""
-    manifest = json.loads((corpus / "manifest.json").read_text())
-    files = manifest["shards"]["articles"]["files"]
-    layout: list[tuple[str, int, int]] = []
+def shard_file_layout(corpus: Path) -> tuple[list[tuple[str, int, int, int]], int]:
+    """Return ([(path, global_start, nrows, 0), ...], total_rows) from the ACTUAL
+    article shard files (glob articles-*.jsonl, sorted), counting REAL lines.
+
+    Deliberately does NOT trust the manifest 'rows' counts: the enwiki extractor's
+    sharded writer clobbered 3 files (articles-00028/00049/00071 reopened in
+    truncate mode), so the manifest overstates reality by 289,612 rows (files hold
+    6,900,039 lines; the manifest claims 7,189,653). Real line counts are the robust
+    source of truth. Validate/repair the manifest with tools/wiki_manifest_verify.py."""
+    files = sorted(corpus.glob("articles-*.jsonl"))
+    layout: list[tuple[str, int, int, int]] = []
     pos = 0
-    for f in files:
-        layout.append((f["path"], pos, int(f["rows"])))
-        pos += int(f["rows"])
+    for p in files:
+        with p.open() as fh:
+            nrows = sum(1 for _ in fh)
+        layout.append((p.name, pos, nrows, 0))
+        pos += nrows
     return layout, pos
 
 
@@ -93,12 +101,14 @@ def read_rows(
     rows/s vs ~21k rows/s cached — the difference between a ~5h and a ~2h run."""
     ids: list[int] = []
     texts: list[str] = []
-    for path, fstart, nrows in layout:
+    for path, fstart, nrows, foff in layout:
         fend = fstart + nrows
         if fend <= start or fstart >= end:
             continue
-        lo = max(start, fstart) - fstart
-        hi = min(end, fend) - fstart
+        # local line offsets INTO THE FILE: shift by foff so a file's Nth manifest
+        # entry reads file lines [foff+lo, foff+hi), not [lo, hi) from line 0.
+        lo = foff + (max(start, fstart) - fstart)
+        hi = foff + (min(end, fend) - fstart)
         if cache is not None:
             if path not in cache:
                 cache.clear()  # keep only one file resident (~150 MB)
@@ -122,6 +132,11 @@ def read_rows(
                     obj = json.loads(line)
                     ids.append(int(obj["id"]))
                     texts.append(_embed_text(obj["title"], obj.get("text", "")))
+    if end > start and len(texts) != end - start:
+        raise ValueError(
+            f"read_rows [{start},{end}) resolved {len(texts)} rows "
+            f"(expected {end - start}) — manifest layout gap/overlap"
+        )
     return ids, texts
 
 
