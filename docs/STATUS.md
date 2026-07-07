@@ -3,6 +3,29 @@
 Updated: 2026-07-04. Legend: 🟢 unblocked here · 🟡 partial (design here,
 build on GX10) · 🔴 GX10-gated (needs live MSVBASE build).
 
+> **🟡 DEV-1354 WIKI-SCALE #1 + #2 SYNTHESIZED (2026-07-07) — one real signal win, one honest blocker.**
+> Two follow-ups on the real **6,900,039-article / 224,475,283-edge** enwiki corpus (near-full;
+> ~4% / 3 shards lost to the extractor clobber, fixed forward). Combined summary:
+> `bench/results/wiki_scale_1_2_summary.md`.
+> **#1 fused-vs-cosine link recovery** (`docs/benchmark_wiki_linkpred_fused_v0.1.0.md`, `e106409`):
+> topology adds a **small but statistically significant** signal. RRF-fused cosine+Adamic-Adar
+> recovers **overlap@10 = 0.1261 vs the 0.1101 cosine lower bound (+14.6%)**; AA-corrected 0.1246,
+> CN-corrected 0.1222, popularity/in-degree **0.0955 (below cosine → confound ruled out)**. Paired
+> bootstrap 95% CI **[+0.0118, +0.0176]**, Wilcoxon **p=2.6e-24**; Spearman(cos,AA)=0.172 (partly
+> orthogonal). A leave-out-the-positives leakage control moved the headline from a leaky raw +21% to
+> the honest **corrected +14.6%**, and reversed the old "AA-alone beats fusion" claim (leaky-AA
+> artifact). **Predictive-signal test only — dim-384 f32, reconstruction proxy, NO latency claim.**
+> **#2 `tjs_open` vs multi-store head-to-head** (`docs/benchmark_wiki_scale_h2h_v0.1.0.md`, `2233cd5`):
+> **NO matched run happened at any scale — inconclusive/blocked, not a win, not a loss.** Corpus
+> *verified* near-full; the 6.9M engine load is blocked (single-threaded HNSW = spec's "tens of
+> hours", no PERF-04/PERF-08 in load.sql); a 500k slice was *attempted* and did not complete (host
+> prep 106.3s+11.3s measured; in-engine HNSW still building >29 min, no completion record); baseline
+> stack holds the 1M synthetic SM-2 corpus, not wiki; no wiki-scale matched harness exists. The
+> ADR-0017 prior (value is **architectural** — one-WAL consistency, not raw speed) stands
+> **unrefuted but UNRETESTED at wiki scale**. No latency@fixed-accuracy table fabricated. **Caveat
+> that travels with every count: dim-384 (not dim-768) = RAM-resident on the 128 GB Spark = wrong
+> regime for the spec's I/O speed thesis.**
+
 > **🟢 gBRAIN-ON-TriDB: pgvector shim PROVEN + Phase C adapter TYPECHECKS (2026-07-04).**
 > The chosen vector-path integration is a **pgvector-compat shim** (advisor plan 039, `scripts/add_pgvector.sh`):
 > gBrain fuses app-side and never uses TJS, so gBrain-on-TriDB needs only **pgvector (vector leg) +
