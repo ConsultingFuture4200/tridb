@@ -1,0 +1,7 @@
+{
+  "n_probe": 40,
+  "median_pages_touched": 267.0,
+  "p95_pages_touched": 330,
+  "min_pages": 255,
+  "max_pages": 300336
+}

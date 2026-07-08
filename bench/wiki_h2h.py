@@ -412,12 +412,14 @@ def run_baseline(
         return [int(h.id) for h in res[0]]
 
     def neo4j_hop(seed_ids, hops):
+        # NB: the wiki loader stores Article.id as a STRING property, so seeds must be matched
+        # as strings — an int `a.id IN $ids` silently matches NOTHING (empty graph leg).
         cy = (
             f"MATCH (a:{cfg.neo4j_node_label})-[:{cfg.neo4j_rel}*1..{hops}]->"
             f"(b:{cfg.neo4j_node_label}) WHERE a.id IN $ids RETURN DISTINCT b.id AS id"
         )
         with driver.session() as s:
-            rows = s.run(cy, ids=seed_ids)
+            rows = s.run(cy, ids=[str(x) for x in seed_ids])
             return {int(r["id"]) for r in rows}
 
     def pg_rerank(qv, cand, k):
