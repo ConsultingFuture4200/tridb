@@ -314,3 +314,90 @@ near AND topologically close rank highest.
   harmless for BFS, not de-duplicated.
 - **Narration** is single-shot and un-cached; it re-runs the `/path` resolve +
   BFS when `narrate=1` (cheap) before calling the LLM.
+
+---
+
+## Addendum v4 — inline article auto-linking + hover-preview cards (DEV-1354)
+
+Article bodies are now rendered with inline links and Wikipedia-style **page-preview
+hovercards**, instead of flat text. The stored body is **plain text** (the extractor
+stripped all `[[wikilink]]` markup — `articles-*.jsonl` is `{id,title,text,ts}` with
+no link residue), so the links are **reconstructed**, not parsed out.
+
+### Layer A — real links (default ON, precise)
+For the viewed article we take its **directed out-edge target ids** (the CSR
+`edges_csr_dst`, i.e. the articles this page actually links to) and match each
+target's **canonical title** — plus any **prose redirect alias** pointing at it — in
+the body, wrapping the phrase as `<a class="wl" href="/article/{id}">`. This
+reproduces Wikipedia's own curated linking: dense where the author linked, zero
+overlinking elsewhere. Matching is **longest-match, case-insensitive, word-boundary**,
+**first occurrence per target** (cleaner than linking every mention). The body is
+**HTML-escaped first**; link markup is only ever inserted around already-escaped text
+spans, so the output is injection-safe (verified: `&`, `<`, `>`, `'` in a body all
+escape correctly and never break a tag). Ada Lovelace (id 195): **~179 real links
+restored**, e.g. *Charles Babbage*, *the analytical engine*, *Lord Byron*, *general-
+purpose computer*.
+
+Redirect aliases come from a new `redir(target_id, alias)` table in `reader.db`, built
+by `python tools/wiki_reader.py build-redirects` (23 s; also folded into full `build`).
+Of 11.9M redirects we keep the **10.0M prose-like** aliases (contain a space, no
+subpage `/`, ≤60 chars); camelCase link tokens and slashed subpages are dropped as
+they never occur in running prose. At serve time only the aliases **whose target is an
+out-edge of the current page** are pulled, so aliases add surface forms without
+loosening precision.
+
+### Layer B — denser "notable terms" (toggle, default OFF)
+The **"denser links"** checkbox re-renders with `?dense=1`, additionally linking
+**notable multi-word titles** found in the body that Layer A didn't already link.
+Notability filter (the WP:OVERLINK guard): a title must be **2–4 words**, have
+**inbound degree ≥ 40**, and **not begin or end with a function word** (kills common-
+phrase false positives like *"up to"*, *"for good"*, *"the junction"* while keeping
+*United States*, *nervous system*, *Harvard University*, *think tank*). That yields a
+**~600k-title** matcher (from the 6.9M corpus), built **lazily on the first denser
+request** (~5 s, one bincount over the CSR + one title scan) and cached — normal
+startup stays ~49 s. Matching is a token n-gram lookup against the set (no external
+Aho-Corasick dependency). On Ada Lovelace, Layer B adds ~47 links (*Fourth Estate*,
+*women in science*, *operating system*, *popular culture*, …).
+
+### Hovercards (both layers)
+New endpoint **`GET /summary/{id}`** returns the article's **lead** (title + first
+real paragraph, ~2 sentences, 320-char cap) via the same O(1) offset fetch. On the
+frontend, hovering a `.wl` link (debounced 250 ms) fetches the summary and shows a
+floating card near the cursor (title + lead + **read →**); summaries are cached
+client-side per session. Inline links are click-intercepted to open in-app rather than
+navigate. All JS/CSS is inline — offline, no CDNs.
+
+### The maintainer's question, answered honestly
+Yes — hovercards and matching against the **whole 6.9M-title DB** are both technically
+possible. We deliberately **do not link every word**: that is textbook overlinking
+(WP:OVERLINK) and makes the body unreadable, and a whole-corpus automaton is memory-
+heavy for marginal value. The chosen design is **real links (precise, from the page's
+own out-edges) + optional notable-term density + hovercards on all links** — more
+links than the original where useful, without the noise.
+
+### Perf / limits of Layer B (corners cut)
+- The notable set is **restricted** to 2–4-word titles with **inbound degree ≥ 40**
+  and non-stopword edges (~600k of 6.9M). Single words and long/low-degree titles are
+  intentionally excluded — raising density there is the overlink trap.
+- n-gram matching joins word tokens with single spaces, so titles with **internal
+  punctuation** (e.g. *Spider-Man*, *Rock 'n' Roll*) can be missed by Layer B. Layer A
+  still links them when they're the page's own out-edge (matched on the exact title).
+- Layer A links the **first occurrence per target** only; later mentions are plain.
+- Redirect aliases are filtered to prose forms; some legitimate one-word alternate
+  names (no space) are not indexed.
+
+### New / changed endpoints
+
+| Endpoint | Returns |
+|---|---|
+| `GET /article/{id}?dense=0\|1` | now also `body_html` — body with inline `.wl` links (Layer A always; Layer B when `dense=1`) |
+| `GET /summary/{id}` | `{id, title, lead}` — lead paragraph for hovercards |
+| `python tools/wiki_reader.py build-redirects` | build ONLY the `redir` alias table (fast, no corpus re-scan) |
+
+### Verified live (Spark, 2026-07-07)
+- `/article/195` → 179 inline `.wl` links restored (Layer A), injection-safe escaping.
+- `/article/195?dense=1` → +47 notable-term links (Layer B), noise-phrases filtered.
+- `/summary/195` → Ada Lovelace lead paragraph.
+- Served page carries the hovercard handler (`showHover`, `#hovercard`, `/summary/`).
+- No regression: `/`, `/search`, `/related/{id}` (unchanged `{semantic,hyperlinks}`),
+  `/related_fused/{id}`, `/path`, `/ask` all 200; cuVS CAGRA still loads (~48 s).

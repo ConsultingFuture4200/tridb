@@ -61,6 +61,35 @@ OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434").rstrip("/")
 ASK_K = 8  # passages fed to the LLM
 PASSAGE_CHARS = 1500  # per-passage body budget so k passages fit the context
 
+# --- Inline auto-linking config --------------------------------------------- #
+# Layer B ("denser links") notable-term set: only titles that are BOTH multi-word
+# and reasonably notable (inbound hyperlink degree >= threshold) enter the matcher.
+# This is the WP:OVERLINK guard — never link every single word; a filtered set of
+# 2–4-word notable titles keeps the automaton small (built lazily, once) and the
+# result readable. See docs/offline_wiki_reader_v0.1.0.md.
+NOTABLE_MIN_INDEG = 40  # min inbound links for a title to count as "notable"
+NOTABLE_MIN_WORDS = 2  # multi-word only (single common words are the overlink trap)
+NOTABLE_MAX_WORDS = 4  # cap phrase length so the n-gram scan stays cheap
+LINK_TARGET_CAP = 2000  # max out-edge targets considered for Layer A per article
+
+# Layer B skips notable titles whose first or last word is a function word: those
+# are the common-phrase false positives (e.g. "up to", "for good", "the junction")
+# that read as overlinking. Proper nouns like "United States" survive; a leading-
+# "The" title ("The Beatles") is dropped from Layer B but is still linked by Layer A
+# on any page that actually links it.
+_STOPWORDS = frozenset(
+    "a an and are as at be but by for from in into is it its of on or the to up "
+    "with was were will would can could may might been has have had do does not no "
+    "this that these those he she they them his her their we you i".split()
+)
+
+_WORD_RE = re.compile(r"[0-9A-Za-z]+")
+
+
+def _norm_ws(s: str) -> str:
+    """Collapse internal whitespace to single spaces (title/alias normal form)."""
+    return " ".join(s.split())
+
 
 # --------------------------------------------------------------------------- #
 # Build
@@ -211,6 +240,72 @@ def build_undirected_csr(corpus: Path) -> None:
     )
 
 
+def build_redirects(conn: sqlite3.Connection, corpus: Path) -> int:
+    """Index redirect aliases → target article id, for extra Layer-A surface forms.
+
+    redirects.tsv is `alias_title \\t canonical_title` (both title strings). For inline
+    linking we want, per real article, the alternate PROSE names that redirect to it
+    (e.g. "Autism spectrum" → Autism, "Al Gore" ← "Albert Gore"). We keep only
+    prose-like aliases (contain a space, no '/', bounded length) and resolve the
+    canonical title to its article id via the already-built `articles` table, storing
+    (target_id, alias) rows indexed by target_id. Serve-time Layer A then pulls only
+    the aliases whose target is an out-edge of the current page — precise, no overlink.
+
+    Junk aliases (camelCase link tokens like "AccessibleComputing", slashed subpage
+    redirects) are dropped: they never appear in running prose so they add only noise."""
+    path = corpus / "redirects.tsv"
+    if not path.exists():
+        print("[build] redirects.tsv absent — skipping redirect alias index")
+        return 0
+    # title -> id from the articles table (canonical titles are unique-ish)
+    print("[build] loading title->id map for redirect resolution ...")
+    title2id: dict[str, int] = {}
+    for aid, title in conn.execute("SELECT id, title FROM articles"):
+        title2id[title] = aid
+    print(f"[build] {len(title2id):,} titles loaded")
+
+    conn.execute("DROP TABLE IF EXISTS redir")
+    conn.execute("CREATE TABLE redir (target_id INTEGER, alias TEXT)")
+    n = 0
+    kept = 0
+    batch: list[tuple] = []
+    with path.open("r", encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            n += 1
+            tab = line.find("\t")
+            if tab < 0:
+                continue
+            alias = line[:tab]
+            canon = line[tab + 1 :].rstrip("\n")
+            # prose-like filter: multi-word, no subpage slash, bounded length
+            if " " not in alias or "/" in alias or len(alias) > 60 or len(alias) < 3:
+                continue
+            tid = title2id.get(canon)
+            if tid is None:
+                continue
+            batch.append((tid, _norm_ws(alias)))
+            kept += 1
+            if len(batch) >= 50000:
+                conn.executemany("INSERT INTO redir VALUES (?,?)", batch)
+                batch.clear()
+    if batch:
+        conn.executemany("INSERT INTO redir VALUES (?,?)", batch)
+    conn.execute("CREATE INDEX idx_redir_target ON redir(target_id)")
+    conn.commit()
+    print(f"[build] redirects: scanned {n:,}, kept {kept:,} prose aliases")
+    return kept
+
+
+def cmd_build_redirects(corpus: Path) -> None:
+    t0 = time.time()
+    conn = sqlite3.connect(corpus / DB_NAME)
+    conn.execute("PRAGMA journal_mode=OFF")
+    conn.execute("PRAGMA synchronous=OFF")
+    build_redirects(conn, corpus)
+    conn.close()
+    print(f"[build] redirect alias index done in {time.time() - t0:.1f}s")
+
+
 def cmd_build(corpus: Path) -> None:
     t0 = time.time()
     db_path = corpus / DB_NAME
@@ -234,6 +329,13 @@ def cmd_build(corpus: Path) -> None:
 
     print("[build] building undirected CSR (for connection finder)...")
     build_undirected_csr(corpus)
+
+    print("[build] building redirect alias index (Layer-A surface forms)...")
+    conn2 = sqlite3.connect(db_path)
+    conn2.execute("PRAGMA journal_mode=OFF")
+    conn2.execute("PRAGMA synchronous=OFF")
+    build_redirects(conn2, corpus)
+    conn2.close()
 
     db_mb = db_path.stat().st_size / 1e6
     csr_mb = (
@@ -297,6 +399,20 @@ class Reader:
         # /ask so startup stays ~49s. Same BGE model the corpus was embedded with.
         self._embedder = None
         self._embedder_lock = threading.Lock()
+
+        # Inline auto-linking. Redirect aliases (Layer A extra surface forms) are
+        # queried on demand from the optional `redir` table. The Layer-B notable
+        # matcher is built lazily on the first "denser links" request so normal
+        # startup stays ~49s.
+        with self.db_lock:
+            self._has_redir = bool(
+                self.db.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name='redir'"
+                ).fetchone()
+            )
+        print(f"[serve] redirect alias index: {'present' if self._has_redir else 'absent'}")
+        self._notable: dict[str, int] | None = None
+        self._notable_lock = threading.Lock()
         print("[serve] ready.")
 
     # -- queries ----------------------------------------------------------- #
@@ -375,6 +491,179 @@ class Reader:
         titles = self._titles(dst_ids)  # some dsts may be missing (clobbered shards)
         out = [{"id": i, "title": titles[i]} for i in dst_ids if i in titles]
         return out[:cap]
+
+    # -- Inline auto-linking (Layer A: real links; Layer B: notable terms) -- #
+    def _titles_chunked(self, ids: list[int]) -> dict[int, str]:
+        """_titles for arbitrarily many ids (chunked under SQLite's param limit)."""
+        out: dict[int, str] = {}
+        for i in range(0, len(ids), 900):
+            out.update(self._titles(ids[i : i + 900]))
+        return out
+
+    def _out_target_titles(self, aid: int) -> dict[int, str]:
+        """Directed out-edge targets of `aid` as {id: canonical_title} (capped)."""
+        if aid + 1 >= len(self.csr_off):
+            return {}
+        lo, hi = int(self.csr_off[aid]), int(self.csr_off[aid + 1])
+        dst_ids = [int(x) for x in self.csr_dst[lo:hi][:LINK_TARGET_CAP]]
+        return self._titles_chunked(dst_ids)
+
+    def _aliases_for(self, ids: list[int]) -> list[tuple[int, str]]:
+        """Redirect aliases (prose surface forms) for the given target ids."""
+        if not self._has_redir or not ids:
+            return []
+        rows: list[tuple[int, str]] = []
+        for i in range(0, len(ids), 900):
+            chunk = ids[i : i + 900]
+            qm = ",".join("?" * len(chunk))
+            with self.db_lock:
+                rows.extend(
+                    self.db.execute(
+                        f"SELECT target_id, alias FROM redir WHERE target_id IN ({qm})",
+                        chunk,
+                    ).fetchall()
+                )
+        return rows
+
+    def _ensure_notable(self) -> dict[str, int]:
+        """Lazily build the Layer-B notable-term matcher: {lowercased multi-word
+        title -> id} for titles with inbound degree >= NOTABLE_MIN_INDEG. This is the
+        FILTERED set (not all 6.9M titles) that keeps denser-links readable and the
+        scan cheap. Inbound degree is a single bincount over the directed CSR dst."""
+        if self._notable is not None:
+            return self._notable
+        with self._notable_lock:
+            if self._notable is not None:
+                return self._notable
+            t0 = time.time()
+            print("[serve] building Layer-B notable-term matcher (first denser request)...")
+            indeg = np.bincount(self.csr_dst.astype(np.int64, copy=False))
+            n_ids = len(indeg)
+            notable: dict[str, int] = {}
+            with self.db_lock:
+                cur = self.db.execute("SELECT id, title FROM articles")
+                for aid, title in cur:
+                    if aid >= n_ids or indeg[aid] < NOTABLE_MIN_INDEG:
+                        continue
+                    key = _norm_ws(title).lower()
+                    words = key.split(" ")
+                    wc = len(words)
+                    if wc < NOTABLE_MIN_WORDS or wc > NOTABLE_MAX_WORDS or len(key) < 5:
+                        continue
+                    # drop common-phrase false positives (stopword at either edge)
+                    if words[0] in _STOPWORDS or words[-1] in _STOPWORDS:
+                        continue
+                    # keep the higher-degree title on a lowercase collision
+                    cur_id = notable.get(key)
+                    if cur_id is None or indeg[aid] > indeg[cur_id]:
+                        notable[key] = aid
+            self._notable = notable
+            print(
+                f"[serve] notable matcher: {len(notable):,} multi-word titles "
+                f"(indeg>={NOTABLE_MIN_INDEG}) in {time.time() - t0:.1f}s"
+            )
+        return self._notable
+
+    def link_body(self, aid: int, body: str, dense: bool = False) -> str:
+        """Return the article body as safe HTML with inline links.
+
+        Layer A (always): every DIRECTED out-edge target of `aid` — the articles this
+        page actually links to — matched in the body by its canonical title (and any
+        prose redirect alias) and wrapped as <a class="wl">. Longest-match, word-
+        boundary, case-insensitive, first occurrence per target (Wikipedia-style).
+        Layer B (dense=True): additionally link notable multi-word titles present in
+        the body. Escaping: link markup is only ever inserted around html.escape()'d
+        text spans of the RAW body, so output is injection-safe."""
+        # -- Layer A surface forms: canonical titles + redirect aliases -------
+        targets = self._out_target_titles(aid)
+        surf: dict[str, int] = {}
+        for tid, title in targets.items():
+            key = _norm_ws(title).lower()
+            if len(key) >= 2:
+                surf.setdefault(key, tid)
+        for tid, alias in self._aliases_for(list(targets)):
+            key = _norm_ws(alias).lower()
+            if len(key) >= 3:
+                surf.setdefault(key, tid)
+
+        spans: list[tuple[int, int, int]] = []  # (start, end, target_id)
+        used: set[int] = set()
+        if surf:
+            keys = sorted(surf, key=len, reverse=True)  # longest-match wins
+            alt = "|".join(re.escape(k) for k in keys)
+            rx = re.compile(
+                r"(?<![0-9A-Za-z])(?:" + alt + r")(?![0-9A-Za-z])", re.IGNORECASE
+            )
+            for m in rx.finditer(body):
+                tid = surf.get(_norm_ws(m.group(0)).lower())
+                if tid is None or tid in used:
+                    continue  # first occurrence per target only (cleaner UX)
+                used.add(tid)
+                spans.append((m.start(), m.end(), tid))
+
+        # -- Layer B notable multi-word terms (denser mode) -------------------
+        if dense:
+            notable = self._ensure_notable()
+            a_spans = sorted(spans)  # for overlap checks
+            toks = [(mm.start(), mm.end(), mm.group(0).lower()) for mm in _WORD_RE.finditer(body)]
+            i = 0
+            while i < len(toks):
+                hit = None
+                for n in range(min(NOTABLE_MAX_WORDS, len(toks) - i), NOTABLE_MIN_WORDS - 1, -1):
+                    phrase = " ".join(toks[i + j][2] for j in range(n))
+                    tid = notable.get(phrase)
+                    if tid is None or tid in used or tid == aid:
+                        continue
+                    s, e = toks[i][0], toks[i + n - 1][1]
+                    if any(s < ae and as_ < e for as_, ae, _ in a_spans):
+                        continue  # don't overlap a Layer-A link
+                    hit = (s, e, tid, n)
+                    break
+                if hit:
+                    s, e, tid, n = hit
+                    spans.append((s, e, tid))
+                    used.add(tid)
+                    i += n
+                else:
+                    i += 1
+
+        # -- render: escape gaps, wrap spans, reconstruct paragraphs ----------
+        spans.sort()
+        parts: list[str] = []
+        pos = 0
+        for s, e, tid in spans:
+            if s < pos:
+                continue
+            parts.append(html.escape(body[pos:s]))
+            parts.append(f'<a href="/article/{tid}" class="wl" data-id="{tid}">')
+            parts.append(html.escape(body[s:e]))
+            parts.append("</a>")
+            pos = e
+        parts.append(html.escape(body[pos:]))
+        linked = "".join(parts)
+        linked = re.sub(r"\n{2,}", "</p><p>", linked).replace("\n", "<br>")
+        return "<p>" + linked + "</p>"
+
+    def summary(self, aid: int) -> dict | None:
+        """Lead of an article for hovercards: title + first paragraph (1–2 sentences)."""
+        art = self.article(aid)
+        if art is None:
+            return None
+        lead = ""
+        for para in re.split(r"\n\n+", art["body"]):
+            para = para.strip()
+            # skip a bare section-heading-ish first line; take the first real prose
+            if len(para) >= 40:
+                lead = para
+                break
+        if not lead:
+            lead = art["body"].strip()[:300]
+        # first ~2 sentences, hard-capped
+        sents = re.split(r"(?<=[.!?])\s+", lead)
+        lead = " ".join(sents[:2]).strip()
+        if len(lead) > 320:
+            lead = lead[:317].rstrip() + "…"
+        return {"id": aid, "title": art["title"], "lead": lead}
 
     # -- Connection finder (bidirectional BFS over the undirected graph) ---- #
     def resolve(self, s: str) -> dict | None:
@@ -805,6 +1094,23 @@ p { line-height:1.6; }
 .pv-both { background:#e3f5e6; color:#1a7a2e; }
 .pv-mean { background:#e8eefc; color:#2554c7; }
 .pv-link { background:#f4ecf9; color:#7a4aa0; }
+/* inline article links (Layer A real links + Layer B notable terms) */
+#article a.wl { color:#36c; text-decoration:none; border-bottom:1px solid #cdddff;
+  cursor:pointer; }
+#article a.wl:hover { background:#eef3ff; border-bottom-color:#36c; }
+.densewrap { display:flex; align-items:center; gap:5px; color:#555; white-space:nowrap;
+  font-size:12px; cursor:pointer; user-select:none; }
+.densewrap input { margin:0; cursor:pointer; }
+/* hovercard (page preview) */
+#hovercard { position:fixed; display:none; z-index:50; width:320px; max-width:88vw;
+  background:#fff; border:1px solid #d3d7de; border-radius:8px;
+  box-shadow:0 6px 24px rgba(0,0,0,.18); padding:12px 14px; font-size:13px;
+  line-height:1.5; color:#222; }
+#hovercard .hc-title { font-weight:600; font-size:14px; margin-bottom:5px; }
+#hovercard .hc-lead { color:#333; }
+#hovercard .hc-read { display:inline-block; margin-top:8px; color:#36c; cursor:pointer;
+  font-size:12px; font-weight:600; }
+#hovercard .hc-load { color:#999; font-style:italic; }
 </style></head>
 <body>
 <header>
@@ -818,12 +1124,16 @@ p { line-height:1.6; }
   <span class="cbarrow">&rarr;</span>
   <input id="to" placeholder="To (e.g. Charles Babbage)">
   <button id="cbtn" onclick="connect()">Connect</button>
+  <label class="densewrap" title="Also link notable multi-word topics found in the body (off = only Wikipedia's own links)">
+    <input type="checkbox" id="dense" onchange="reopenDense()"> denser links
+  </label>
 </div>
 <main>
   <div id="results"><div class="hint">Type a query and press Enter.</div></div>
   <div id="article"><div class="hint">Select an article.</div></div>
   <div id="related"></div>
 </main>
+<div id="hovercard"></div>
 <script>
 const $ = s => document.querySelector(s);
 async function j(u){ const r = await fetch(u); return r.json(); }
@@ -871,15 +1181,23 @@ async function search(){
   el.innerHTML = '<div class="secttl">'+items.length+' results</div>' +
     items.map(a => `<div class="item" onclick="open_(${a.id})">${esc(a.title)}</div>`).join('');
 }
+let _curId = null;
 async function open_(id){
-  const a = await j('/article/'+id);
+  _curId = id;
+  const dense = $('#dense').checked ? '?dense=1' : '';
+  const a = await j('/article/'+id+dense);
   const art = $('#article');
-  if(!a){ art.innerHTML = '<div class="hint">Not found.</div>'; return; }
-  const paras = a.body.split(/\\n\\n+/).map(p => '<p>'+esc(p).replace(/\\n/g,'<br>')+'</p>').join('');
-  art.innerHTML = '<h2>'+esc(a.title)+'</h2>'+paras;
+  if(!a || a.error){ art.innerHTML = '<div class="hint">Not found.</div>'; return; }
+  // body_html carries the inline <a class="wl"> links (escaped server-side); fall
+  // back to plain-text rendering if an older server didn't provide it.
+  const body = a.body_html
+    ? a.body_html
+    : a.body.split(/\\n\\n+/).map(p => '<p>'+esc(p).replace(/\\n/g,'<br>')+'</p>').join('');
+  art.innerHTML = '<h2>'+esc(a.title)+'</h2>'+body;
   art.scrollTop = 0;
   loadRelated(id);
 }
+function reopenDense(){ if(_curId!=null) open_(_curId); }
 async function loadRelated(id){
   const rel = $('#related');
   rel.innerHTML = '<div class="hd">Loading…</div>';
@@ -961,6 +1279,59 @@ async function ask(){
   art.innerHTML = h;
   art.scrollTop = 0;
 }
+// -- inline-link clicks + hovercards (page previews) --------------------------
+const _sumCache = {};        // id -> {title, lead}, cached per session
+let _hcTimer = null, _hcId = null;
+const _hc = $('#hovercard');
+function hideHover(){ if(_hcTimer){clearTimeout(_hcTimer); _hcTimer=null;} _hcId=null; _hc.style.display='none'; }
+function placeHover(x, y){
+  _hc.style.display = 'block';
+  const w = _hc.offsetWidth, h = _hc.offsetHeight;
+  let left = x + 14, top = y + 16;
+  if(left + w > window.innerWidth - 8) left = x - w - 14;
+  if(left < 8) left = 8;
+  if(top + h > window.innerHeight - 8) top = y - h - 16;
+  if(top < 8) top = 8;
+  _hc.style.left = left + 'px'; _hc.style.top = top + 'px';
+}
+function renderHover(s, x, y){
+  _hc.innerHTML = '<div class="hc-title">'+esc(s.title)+'</div>'+
+    '<div class="hc-lead">'+esc(s.lead || '')+'</div>'+
+    '<div class="hc-read" onclick="open_('+s.id+');hideHover()">read &rarr;</div>';
+  placeHover(x, y);
+}
+async function showHover(id, x, y){
+  _hcId = id;
+  if(_sumCache[id]){ renderHover(_sumCache[id], x, y); return; }
+  _hc.innerHTML = '<div class="hc-load">loading preview…</div>';
+  placeHover(x, y);
+  let s;
+  try { s = await j('/summary/'+id); } catch(e){ return; }
+  if(!s || s.error) { if(_hcId===id) hideHover(); return; }
+  _sumCache[id] = s;
+  if(_hcId === id) renderHover(s, x, y);      // still hovering the same link
+}
+$('#article').addEventListener('mouseover', e => {
+  const a = e.target.closest('a.wl');
+  if(!a) return;
+  const id = parseInt(a.getAttribute('data-id'), 10);
+  const x = e.clientX, y = e.clientY;
+  if(_hcTimer) clearTimeout(_hcTimer);
+  _hcTimer = setTimeout(() => showHover(id, x, y), 250);   // debounce
+});
+$('#article').addEventListener('mouseout', e => {
+  const a = e.target.closest('a.wl');
+  if(a && !a.contains(e.relatedTarget) && !_hc.contains(e.relatedTarget)) hideHover();
+});
+$('#article').addEventListener('click', e => {   // intercept inline links -> open in-app
+  const a = e.target.closest('a.wl');
+  if(!a) return;
+  e.preventDefault();
+  hideHover();
+  open_(parseInt(a.getAttribute('data-id'), 10));
+});
+$('#hovercard').addEventListener('mouseleave', hideHover);
+
 $('#q').addEventListener('keydown', e => { if(e.key==='Enter') search(); });
 $('#ask').addEventListener('keydown', e => { if(e.key==='Enter') ask(); });
 $('#from').addEventListener('keydown', e => { if(e.key==='Enter') connect(); });
@@ -1002,7 +1373,13 @@ def make_handler(reader: Reader):
                     if art is None:
                         self._json({"error": "not found"})
                     else:
+                        dense = parse_qs(u.query).get("dense", ["0"])[0] == "1"
+                        art["body_html"] = reader.link_body(aid, art["body"], dense)
                         self._json(art)
+                elif path.startswith("/summary/"):
+                    aid = int(unquote(path.split("/")[-1]))
+                    s = reader.summary(aid)
+                    self._json(s if s is not None else {"error": "not found"})
                 elif path.startswith("/related/"):
                     aid = int(path.split("/")[-1])
                     self._json(
@@ -1054,6 +1431,10 @@ def main(argv: list[str] | None = None) -> int:
         "build-undirected",
         help="build ONLY the undirected CSR from the existing directed CSR (fast)",
     )
+    sub.add_parser(
+        "build-redirects",
+        help="build ONLY the redirect alias index in reader.db (fast, no re-scan)",
+    )
     sp = sub.add_parser("serve", help="serve the reader")
     sp.add_argument("--host", default="127.0.0.1")
     sp.add_argument("--port", type=int, default=8080)
@@ -1068,6 +1449,8 @@ def main(argv: list[str] | None = None) -> int:
         t0 = time.time()
         build_undirected_csr(args.corpus)
         print(f"[build] undirected CSR done in {time.time() - t0:.1f}s")
+    elif args.cmd == "build-redirects":
+        cmd_build_redirects(args.corpus)
     else:
         cmd_serve(args.corpus, args.host, args.port)
     return 0
