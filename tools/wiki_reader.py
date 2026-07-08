@@ -32,6 +32,7 @@ import argparse
 import html
 import json
 import os
+import random
 import re
 import sqlite3
 import threading
@@ -503,6 +504,8 @@ class Reader:
         # matcher and filtered semantic search. Built at most once (lazy bincount).
         self._indeg: np.ndarray | None = None
         self._indeg_lock = threading.Lock()
+        # Max article id (sparse PK), cached for the random-article landing page.
+        self._max_id: int | None = None
         print("[serve] ready.")
 
     # -- queries ----------------------------------------------------------- #
@@ -547,6 +550,28 @@ class Reader:
             fh.seek(off)
             obj = json.loads(fh.readline())
         return {"id": aid, "title": title, "body": _clean_body(obj.get("text", ""))}
+
+    def random_article(self) -> dict | None:
+        """A random existing article via the PK index — O(log n), no full scan.
+
+        Article ids are sparse (gaps from clobbered shards), so we pick a random id
+        in [0, max_id] and take the next existing row (`WHERE id >= r ORDER BY id
+        LIMIT 1`, using the PK B-tree). If the pick lands past the last id we wrap to
+        the first row. Every call returns a fresh pick — the home page never caches."""
+        with self.db_lock:
+            if self._max_id is None:
+                row = self.db.execute("SELECT MAX(id) FROM articles").fetchone()
+                self._max_id = int(row[0]) if row and row[0] is not None else 0
+        r = random.randint(0, self._max_id)
+        with self.db_lock:
+            row = self.db.execute(
+                "SELECT id, title FROM articles WHERE id >= ? ORDER BY id LIMIT 1", (r,)
+            ).fetchone()
+            if row is None:  # r fell past the last id — wrap to the first article
+                row = self.db.execute(
+                    "SELECT id, title FROM articles ORDER BY id LIMIT 1"
+                ).fetchone()
+        return {"id": int(row[0]), "title": row[1]} if row else None
 
     def semantic(self, aid: int, k: int = 10) -> list[dict]:
         if aid >= len(self.id2row):
@@ -1431,7 +1456,8 @@ body { margin:0; font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-
   color:#1a1a1a; background:#fafafa; }
 header { padding:10px 16px; background:#36c; color:#fff; display:flex; gap:12px;
   align-items:center; position:sticky; top:0; z-index:10; }
-header h1 { font-size:16px; margin:0; font-weight:600; white-space:nowrap; }
+header h1 { font-size:16px; margin:0; font-weight:600; white-space:nowrap; cursor:pointer; }
+header h1:hover { text-decoration:underline; }
 #q { flex:1; padding:8px 12px; font-size:15px; border:0; border-radius:4px; }
 #ask { flex:1.4; padding:8px 12px; font-size:15px; border:0; border-radius:4px;
   background:#fff8e1; }
@@ -1522,6 +1548,14 @@ p { line-height:1.6; }
 #back { padding:7px 12px; border:0; border-radius:4px; background:#2a5bd0; color:#fff;
   cursor:pointer; font-size:13px; white-space:nowrap; visibility:hidden; }
 #back:hover { background:#25b; }
+/* home control in the header (distinct from Back: jumps to a fresh random article) */
+#home { padding:7px 12px; border:0; border-radius:4px; background:#2a5bd0; color:#fff;
+  cursor:pointer; font-size:13px; white-space:nowrap; }
+#home:hover { background:#25b; }
+/* landing-page "another random" bar, sits above the random article body */
+.homebar { display:flex; align-items:center; gap:10px; margin:0 0 14px;
+  padding-bottom:12px; border-bottom:1px solid #eee; }
+.homebar .subtle { margin:0; }
 /* hovercard (page preview) */
 #hovercard { position:fixed; display:none; z-index:50; width:320px; max-width:88vw;
   background:#fff; border:1px solid #d3d7de; border-radius:8px;
@@ -1536,7 +1570,8 @@ p { line-height:1.6; }
 <body>
 <header>
   <button id="back" onclick="goBack()" title="Back (also works with the browser Back button)">&larr; Back</button>
-  <h1>Offline Wikipedia</h1>
+  <button id="home" onclick="goHome()" title="Home — jump to a fresh random article">&#127968; Home</button>
+  <h1 onclick="goHome()" title="Home — a fresh random article">Offline Wikipedia</h1>
   <input id="q" placeholder="Search titles (e.g. Ada Lovelace) — Enter" autofocus>
   <input id="ask" placeholder="Ask a question (RAG over 6.9M articles) — Enter">
   <label class="gexp" title="Graph-aware RAG: expand along hyperlinks before answering">
@@ -1855,14 +1890,38 @@ function updateBack(){
   $('#back').style.visibility = (st && st.view && st.view!=='home') ? 'visible' : 'hidden';
 }
 function goBack(){ history.back(); }
-function homeView(){
+// Home = the random-article landing. Distinct from Back (history): Home jumps to a
+// FRESH random article every time, never a cached pick.
+async function loadHome(){   // render a fresh random article as the landing view
   _curId = null; hideHover();
-  $('#article').innerHTML = '<div class="hint">Select an article.</div>';
+  $('#results').innerHTML = '<div class="hint">Type a query and press Enter, or explore a random article &rarr;</div>';
+  const art = $('#article');
+  art.innerHTML = '<div class="hint">Loading a random article…</div>';
   $('#related').innerHTML = '';
+  let r;
+  try { r = await j('/random'); }
+  catch(e){ art.innerHTML = '<div class="hint">Random article failed: '+esc(String(e))+'</div>'; return; }
+  if(!r || !r.id){ art.innerHTML = '<div class="hint">No article available.</div>'; return; }
+  await loadArticle(r.id);   // full render: invisible links + hovercards + related
+  // prepend the "another random" control above the freshly-rendered article
+  const bar = document.createElement('div');
+  bar.className = 'homebar';
+  bar.innerHTML = '<button class="lbtn" onclick="anotherRandom()">&#127922; Another random article</button>'+
+    '<span class="subtle">Random article &middot; Home or &#127922; for another</span>';
+  art.insertBefore(bar, art.firstChild);
+  art.scrollTop = 0;
+}
+// 🎲 refresh in place — no new history entry (keeps the Back stack clean)
+function anotherRandom(){ loadHome(); }
+// Home button / title click — jump to a fresh random landing. If we are already on
+// a home state, just refresh in place; otherwise push a home entry so Back returns.
+function goHome(){
+  if(history.state && history.state.view==='home'){ loadHome(); }
+  else { loadHome(); pushView({view:'home'}); }
 }
 function renderState(st){   // restore a view for a popstate (no new push)
   hideHover();
-  if(!st || st.view==='home'){ homeView(); }
+  if(!st || st.view==='home'){ loadHome(); }
   else if(st.view==='article'){ loadArticle(st.id); }
   else if(st.view==='connect'){ loadConnect(st.f, st.t); }
   else if(st.view==='ask'){ loadAsk(st.q); }
@@ -1873,6 +1932,7 @@ function renderState(st){   // restore a view for a popstate (no new push)
 window.addEventListener('popstate', e => renderState(e.state));
 history.replaceState({view:'home'}, '', location.pathname);   // base state
 updateBack();
+loadHome();   // landing view: a fresh random article
 
 $('#q').addEventListener('keydown', e => { if(e.key==='Enter') search(); });
 $('#ask').addEventListener('keydown', e => { if(e.key==='Enter') ask(); });
@@ -1905,6 +1965,9 @@ def make_handler(reader: Reader):
             try:
                 if path == "/":
                     self._send(200, INDEX_HTML.encode("utf-8"), "text/html; charset=utf-8")
+                elif path == "/random":
+                    r = reader.random_article()
+                    self._json(r if r is not None else {"error": "no articles"})
                 elif path == "/search":
                     q = parse_qs(u.query).get("q", [""])[0]
                     self._json(reader.search(q))

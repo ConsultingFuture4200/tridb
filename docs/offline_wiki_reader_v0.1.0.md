@@ -583,3 +583,65 @@ near the question wording.
   clustered seed set the picks can be topically adjacent (e.g. the seed's biographical
   neighbours) rather than a long bridging chain; the mechanism and provenance are honest
   regardless. 2-hop (`hops=2`) is wired but off by default (1-hop keeps context tight).
+
+---
+
+# Addendum v7 — random-article home page + Home nav (DEV-1354)
+
+Small, client-plus-one-endpoint feature: a landing view that surfaces a **fresh
+random article every time**, and a **Home** control distinct from the existing Back
+(history) button. No retrieval, artifact, or engine change.
+
+### Feature — `GET /random`
+Returns `{id, title}` of a random existing article. Selection is **O(log n) on the PK
+index — no `ORDER BY RANDOM()`** (which would full-scan 6.9M rows): pick a random id in
+`[0, max_id]` (max_id cached once) and take the next existing row
+(`WHERE id >= :r ORDER BY id LIMIT 1`, using the sparse PK B-tree), wrapping to the
+first row if the pick lands past the last id. Every call returns a fresh pick — never
+cached.
+
+Examples (three consecutive calls, three distinct articles):
+```
+{"id": 5622402, "title": "Chessa"}
+{"id": 3520820, "title": "Milko Gaydarski"}
+{"id": 2237904, "title": "Rafael Carbonell"}
+```
+
+### Home view
+On load — and on every Home navigation — the client calls `/random` and **fully
+renders** the picked article via the existing `loadArticle` path, so all inline
+invisible `.wl` links, hovercards, headings/lists, and the Related panel apply exactly
+as on any article. A `.homebar` above the title carries a **"🎲 Another random
+article"** button that pulls a fresh `/random` **in place** (no full page reload). The
+prominent header search box sits above it as always. Refreshing the page or going Home
+= a new random article each time (the pick is never cached).
+
+### Home navigation control
+The header gains a **`🏠 Home`** button, and the **"Offline Wikipedia" title is now
+clickable** — both call `goHome()`. This is **distinct from `← Back`**: Home jumps to
+the random-article landing; Back walks history.
+
+**History integration.** `goHome()` renders a fresh random article then
+`pushState({view:'home'})` (unless already on a home state, in which case it refreshes
+in place — no stacked home entries). `🎲 Another random` refreshes in place without a
+push, keeping the Back stack clean. The `popstate` handler's `home` branch now calls
+`loadHome()`, so reaching Home via the browser Back button lands on the random view too
+(with a fresh pick — consistent with the "never cached" design). All prior popstate
+branches (article / search / connect / ask / sem) are unchanged, so the existing Back
+button is not regressed. `#back` stays hidden on home states (as before).
+
+### Verified live (Spark, 2026-07-07, PID rotated cleanly)
+- `/random` ×3 → three distinct articles (above).
+- Served `/` HTML carries the wiring: `#home` button + clickable `<h1 onclick="goHome()">`,
+  `loadHome()`/`anotherRandom()`/`goHome()`, the `/random` fetch, the "Another random
+  article" control, `popstate`→`loadHome()`, and `loadHome()` on initial load.
+- **No regression:** `/article/195` (Ada Lovelace) 200 with **3,175 invisible `.wl`
+  links** intact; `/search`, `/summary/195`, `/related_fused/195`, `/related/195`,
+  `/search_semantic`, `/path` all 200; cuVS CAGRA still loads.
+
+### Corners cut
+- **Home is intentionally non-deterministic:** Back-ing into a home entry re-randomises
+  rather than restoring the exact article you last saw there (home state stores no id).
+  This matches the explicit "Home/refresh = a new random article each time" requirement;
+  the trade-off is that a specific random article is not itself a stable back target
+  (open it as an `article` view — e.g. via a link — if you want to return to it).
