@@ -401,3 +401,87 @@ links than the original where useful, without the noise.
 - Served page carries the hovercard handler (`showHover`, `#hovercard`, `/summary/`).
 - No regression: `/`, `/search`, `/related/{id}` (unchanged `{semantic,hyperlinks}`),
   `/related_fused/{id}`, `/path`, `/ask` all 200; cuVS CAGRA still loads (~48 s).
+
+---
+
+## Addendum v5 — invisible links, comprehensive linking, plain-text formatting, Back nav (DEV-1354)
+
+Maintainer revision of the v4 inline-linking feature. **This addendum supersedes v4's
+link styling, the density model, and the `?dense` toggle** (the two-layer "precise vs
+notable" split and the "denser links" checkbox are gone). Layer A's precise out-edge
+matching survives as the *precedence* rule below.
+
+### 1. Invisible link styling
+Inline links now render **identical to body prose** — `#article a.wl { color:inherit;
+text-decoration:none; }` — no blue, no underline at rest. Reading looks like plain
+prose. The only affordance is **hover-only**: `a.wl:hover` shows a faint tint + faint
+underline. This is what makes comprehensive linking acceptable (density is invisible).
+
+### 2. Comprehensive linking is the DEFAULT (link every word/phrase that resolves)
+Every word/phrase that resolves to an article is linked, from a **full-corpus matcher**
+`{lowercased title surface → best article id}`:
+- **Precedence:** a phrase that is one of the page's **real out-edge targets** (matched
+  by the Layer-A regex over canonical titles + prose redirect aliases — handles
+  punctuation and disambiguates) is linked to that **precise** target and wins. Every
+  other matchable phrase links to the **best global title match** (highest inbound-degree
+  article for that surface form, a notability tie-break).
+- **Longest-match wins** (multi-word entities beat their component words).
+- **Skip list is tiny** — only pure function words (`the of a an and to is in on for
+  as`) plus 1-char tokens (the stray "s" in "Babbage's"). Everything else links; maximal
+  coverage is the goal, and invisible styling keeps it readable.
+
+**Matcher footprint (measured, Spark / 128 GB):** the full set is **~6.89M surface
+forms**, built **lazily on the first article view in ~8 s** (one bincount over the CSR +
+one title scan), then cached. It is genuinely feasible on this box — no cutoff needed,
+the FULL 6.9M title set is used. The matcher dict adds ~2 GB; total serve RSS ~12.6 GB
+(dominated by the CAGRA/vector working set, not the matcher). Ada Lovelace (id 195):
+**~179 links (v4 Layer A) → ~3,175 links** now.
+
+### 3. Wikipedia formatting from plain text — what is and isn't recoverable
+The extractor stored **plain `{text}` with all markup stripped**, so the following is
+recovered heuristically from the plain text:
+- **Section headings** — short, standalone, title-cased lines with no terminal
+  punctuation/commas and ≤6 words become `<h3 class="wsec">` (e.g. *Biography*,
+  *Childhood*, *Work*, *First published computer program*; 36 on Ada Lovelace).
+  Conservative on purpose — a comma or trailing `.`/`:` marks prose/caption, not a
+  heading. **Heading levels (h2 vs h3) are not recoverable** — all render as one level.
+- **Paragraph spacing** — blank-line-separated blocks are preserved as `<p>`.
+- **Bullet lists** — only a run of ≥2 consecutive `*`/`•` lines becomes `<ul>`. Lists
+  almost never survived extraction (~0.1% of lines); numbered lists are NOT detected
+  (ambiguous with years/citations).
+
+**Hard limit (honest):** full Wikipedia formatting — **infoboxes, tables, bold/italic,
+images, reference/citation lists** — **cannot be recovered from the current data** and
+is deliberately **not faked**. The current extractor discarded structure at ingest.
+Restoring it requires **RE-EXTRACTING from Wikipedia's HTML (or wikitext) dump
+preserving structure** — a separate pipeline job, related to the deferred clean
+re-extract (see the wiki-scale memory / DEV-1354 re-extract track). Until then the
+reader shows structured plain text + comprehensive links + hovercards.
+
+### 4. Back / history navigation
+The reader now uses the **History API**: each in-app navigation (`open_`, connect, ask,
+search) does `history.pushState`, and a `popstate` handler re-renders without pushing —
+so the **browser's native Back/Forward** buttons and a **visible header `← Back`
+control** (`goBack()` → `history.back()`) both walk the article/search sequence back to
+the initial search results. Base state is seeded with `history.replaceState`.
+
+### Verified live (Spark, 2026-07-07)
+- Served `/` CSS: `#article a.wl { color:inherit; text-decoration:none; cursor:pointer; }`
+  (invisible at rest) + hover-only underline/tint; `#back` button + `history.pushState`
+  / `popstate` / `goBack()` all present.
+- `/article/195`: **3,175** inline `.wl` links (single content words included), **36**
+  `<h3 class="wsec">` headings; injection-safe escaping (`&#x27;`, `&lt;`).
+- No regression: `/`, `/search`, `/related/{id}` (unchanged `{semantic,hyperlinks}`),
+  `/related_fused/{id}`, `/summary/{id}`, `/path`, `/ask` (8 sources) all 200; cuVS
+  CAGRA still loads (~48 s).
+
+### Corners cut / tradeoffs
+- Comprehensive linking has a noise tail: common one-word titles (*was*, *had*, *also*)
+  link because they are real article titles and the skip list is intentionally minimal.
+  Invisible styling absorbs this; tightening the skip list is a one-line change if noise
+  is unwanted.
+- Global matches are single-sense (highest-indegree article for the surface form); only
+  the page's own out-edges are disambiguated to the author's intended target.
+- First article view after a restart stalls ~8 s while the matcher builds (then cached).
+- Section-heading detection is heuristic; a rare short prose line with no terminal
+  punctuation could be mis-styled as a heading.

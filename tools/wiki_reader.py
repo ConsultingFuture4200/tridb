@@ -62,26 +62,17 @@ ASK_K = 8  # passages fed to the LLM
 PASSAGE_CHARS = 1500  # per-passage body budget so k passages fit the context
 
 # --- Inline auto-linking config --------------------------------------------- #
-# Layer B ("denser links") notable-term set: only titles that are BOTH multi-word
-# and reasonably notable (inbound hyperlink degree >= threshold) enter the matcher.
-# This is the WP:OVERLINK guard — never link every single word; a filtered set of
-# 2–4-word notable titles keeps the automaton small (built lazily, once) and the
-# result readable. See docs/offline_wiki_reader_v0.1.0.md.
-NOTABLE_MIN_INDEG = 40  # min inbound links for a title to count as "notable"
-NOTABLE_MIN_WORDS = 2  # multi-word only (single common words are the overlink trap)
-NOTABLE_MAX_WORDS = 4  # cap phrase length so the n-gram scan stays cheap
-LINK_TARGET_CAP = 2000  # max out-edge targets considered for Layer A per article
-
-# Layer B skips notable titles whose first or last word is a function word: those
-# are the common-phrase false positives (e.g. "up to", "for good", "the junction")
-# that read as overlinking. Proper nouns like "United States" survive; a leading-
-# "The" title ("The Beatles") is dropped from Layer B but is still linked by Layer A
-# on any page that actually links it.
-_STOPWORDS = frozenset(
-    "a an and are as at be but by for from in into is it its of on or the to up "
-    "with was were will would can could may might been has have had do does not no "
-    "this that these those he she they them his her their we you i".split()
-)
+# Comprehensive linking is the DEFAULT: every word/phrase that resolves to an
+# article is linked. This is safe because links are styled INVISIBLE (identical to
+# body text, affordance on :hover only) — so density is not visually disruptive.
+# Precedence: a phrase that is one of the page's REAL out-edge targets (Layer A) is
+# linked to that precise/disambiguated target; every other matchable phrase links to
+# the best global title match (highest inbound-degree article for that surface form).
+# Longest-match wins (multi-word entities beat their component words). We skip only a
+# tiny set of pure function words — the goal is maximal coverage.
+LINK_TARGET_CAP = 4000  # max out-edge targets considered for Layer A per article
+MAX_PHRASE_WORDS = 6  # longest multi-word entity attempted per position
+_SKIP_WORDS = frozenset("the of a an and to is in on for as".split())
 
 _WORD_RE = re.compile(r"[0-9A-Za-z]+")
 
@@ -89,6 +80,28 @@ _WORD_RE = re.compile(r"[0-9A-Za-z]+")
 def _norm_ws(s: str) -> str:
     """Collapse internal whitespace to single spaces (title/alias normal form)."""
     return " ".join(s.split())
+
+
+def _is_heading(s: str) -> bool:
+    """Heuristic: is this stripped line a section heading recoverable from plain text?
+
+    Section titles survive extraction as short, standalone, title-cased lines with no
+    terminal sentence punctuation (e.g. "Biography", "Post-training quantization").
+    Conservative on purpose — a comma or trailing '.'/':' or >6 words means prose or a
+    caption, not a heading, so we don't mangle body text."""
+    if not (2 <= len(s) <= 50):
+        return False
+    if not (s[0].isalpha() and s[0].isupper()):
+        return False
+    if s[-1] in ".,:;!?" or "," in s:
+        return False
+    return len(s.split()) <= 6
+
+
+def _is_bullet(s: str) -> bool:
+    """A surviving bullet list item (rare — most list markup was stripped). Only
+    unambiguous '*'/'•' markers count; '-' is left as prose to avoid false positives."""
+    return bool(re.match(r"^[\*•]\s+\S", s))
 
 
 # --------------------------------------------------------------------------- #
@@ -411,8 +424,8 @@ class Reader:
                 ).fetchone()
             )
         print(f"[serve] redirect alias index: {'present' if self._has_redir else 'absent'}")
-        self._notable: dict[str, int] | None = None
-        self._notable_lock = threading.Lock()
+        self._global: dict[str, int] | None = None
+        self._global_lock = threading.Lock()
         print("[serve] ready.")
 
     # -- queries ----------------------------------------------------------- #
@@ -525,124 +538,172 @@ class Reader:
                 )
         return rows
 
-    def _ensure_notable(self) -> dict[str, int]:
-        """Lazily build the Layer-B notable-term matcher: {lowercased multi-word
-        title -> id} for titles with inbound degree >= NOTABLE_MIN_INDEG. This is the
-        FILTERED set (not all 6.9M titles) that keeps denser-links readable and the
-        scan cheap. Inbound degree is a single bincount over the directed CSR dst."""
-        if self._notable is not None:
-            return self._notable
-        with self._notable_lock:
-            if self._notable is not None:
-                return self._notable
+    def _ensure_global(self) -> dict[str, int]:
+        """Lazily build the FULL comprehensive matcher: {lowercased title surface ->
+        best article id}. Every title in the 6.9M corpus enters (only the tiny
+        _SKIP_WORDS function words are dropped). On a lowercase collision the higher
+        inbound-degree article wins (notability tie-break). Footprint on the 128 GB
+        box: ~6.9M keys, ~8 s build, ~2 GB resident — built once, then cached."""
+        if self._global is not None:
+            return self._global
+        with self._global_lock:
+            if self._global is not None:
+                return self._global
             t0 = time.time()
-            print("[serve] building Layer-B notable-term matcher (first denser request)...")
+            print("[serve] building full-corpus link matcher (first article view)...")
             indeg = np.bincount(self.csr_dst.astype(np.int64, copy=False))
             n_ids = len(indeg)
-            notable: dict[str, int] = {}
+
+            def deg(i: int) -> int:
+                return int(indeg[i]) if i < n_ids else 0
+
+            gmap: dict[str, int] = {}
             with self.db_lock:
-                cur = self.db.execute("SELECT id, title FROM articles")
-                for aid, title in cur:
-                    if aid >= n_ids or indeg[aid] < NOTABLE_MIN_INDEG:
-                        continue
+                for aid, title in self.db.execute("SELECT id, title FROM articles"):
                     key = _norm_ws(title).lower()
-                    words = key.split(" ")
-                    wc = len(words)
-                    if wc < NOTABLE_MIN_WORDS or wc > NOTABLE_MAX_WORDS or len(key) < 5:
+                    if not key or key in _SKIP_WORDS:
                         continue
-                    # drop common-phrase false positives (stopword at either edge)
-                    if words[0] in _STOPWORDS or words[-1] in _STOPWORDS:
-                        continue
-                    # keep the higher-degree title on a lowercase collision
-                    cur_id = notable.get(key)
-                    if cur_id is None or indeg[aid] > indeg[cur_id]:
-                        notable[key] = aid
-            self._notable = notable
+                    cur = gmap.get(key)
+                    if cur is None or deg(aid) > deg(cur):
+                        gmap[key] = aid
+            self._global = gmap
             print(
-                f"[serve] notable matcher: {len(notable):,} multi-word titles "
-                f"(indeg>={NOTABLE_MIN_INDEG}) in {time.time() - t0:.1f}s"
+                f"[serve] full link matcher: {len(gmap):,} surface forms "
+                f"in {time.time() - t0:.1f}s"
             )
-        return self._notable
+        return self._global
 
-    def link_body(self, aid: int, body: str, dense: bool = False) -> str:
-        """Return the article body as safe HTML with inline links.
+    def _linkify(self, frag: str, a_surf: dict[str, int], a_rx, aid: int) -> str:
+        """Escape a plain-text fragment and insert inline <a class="wl"> links.
 
-        Layer A (always): every DIRECTED out-edge target of `aid` — the articles this
-        page actually links to — matched in the body by its canonical title (and any
-        prose redirect alias) and wrapped as <a class="wl">. Longest-match, word-
-        boundary, case-insensitive, first occurrence per target (Wikipedia-style).
-        Layer B (dense=True): additionally link notable multi-word titles present in
-        the body. Escaping: link markup is only ever inserted around html.escape()'d
-        text spans of the RAW body, so output is injection-safe."""
-        # -- Layer A surface forms: canonical titles + redirect aliases -------
-        targets = self._out_target_titles(aid)
-        surf: dict[str, int] = {}
-        for tid, title in targets.items():
-            key = _norm_ws(title).lower()
-            if len(key) >= 2:
-                surf.setdefault(key, tid)
-        for tid, alias in self._aliases_for(list(targets)):
-            key = _norm_ws(alias).lower()
-            if len(key) >= 3:
-                surf.setdefault(key, tid)
-
-        spans: list[tuple[int, int, int]] = []  # (start, end, target_id)
-        used: set[int] = set()
-        if surf:
-            keys = sorted(surf, key=len, reverse=True)  # longest-match wins
-            alt = "|".join(re.escape(k) for k in keys)
-            rx = re.compile(
-                r"(?<![0-9A-Za-z])(?:" + alt + r")(?![0-9A-Za-z])", re.IGNORECASE
-            )
-            for m in rx.finditer(body):
-                tid = surf.get(_norm_ws(m.group(0)).lower())
-                if tid is None or tid in used:
-                    continue  # first occurrence per target only (cleaner UX)
-                used.add(tid)
-                spans.append((m.start(), m.end(), tid))
-
-        # -- Layer B notable multi-word terms (denser mode) -------------------
-        if dense:
-            notable = self._ensure_notable()
-            a_spans = sorted(spans)  # for overlap checks
-            toks = [(mm.start(), mm.end(), mm.group(0).lower()) for mm in _WORD_RE.finditer(body)]
-            i = 0
-            while i < len(toks):
-                hit = None
-                for n in range(min(NOTABLE_MAX_WORDS, len(toks) - i), NOTABLE_MIN_WORDS - 1, -1):
-                    phrase = " ".join(toks[i + j][2] for j in range(n))
-                    tid = notable.get(phrase)
-                    if tid is None or tid in used or tid == aid:
-                        continue
-                    s, e = toks[i][0], toks[i + n - 1][1]
-                    if any(s < ae and as_ < e for as_, ae, _ in a_spans):
-                        continue  # don't overlap a Layer-A link
-                    hit = (s, e, tid, n)
-                    break
-                if hit:
-                    s, e, tid, n = hit
-                    spans.append((s, e, tid))
-                    used.add(tid)
-                    i += n
-                else:
-                    i += 1
-
-        # -- render: escape gaps, wrap spans, reconstruct paragraphs ----------
+        Precedence: Layer A (the page's real out-edge targets, matched by the `a_rx`
+        regex over canonical titles + redirect aliases — handles punctuation and
+        disambiguates) is applied FIRST and wins. Every remaining word/phrase is then
+        matched against the full-corpus matcher by longest-first token n-gram. Link
+        markup is only ever inserted around html.escape()'d spans → injection-safe."""
+        gmap = self._ensure_global()
+        spans: list[tuple[int, int, int]] = []
+        if a_rx is not None:
+            for m in a_rx.finditer(frag):
+                tid = a_surf.get(_norm_ws(m.group(0)).lower())
+                if tid is not None:
+                    spans.append((m.start(), m.end(), tid))
+        toks = list(_WORD_RE.finditer(frag))
+        lower = [t.group(0).lower() for t in toks]
+        # mark tokens already covered by a Layer-A span (two-pointer, both sorted)
         spans.sort()
-        parts: list[str] = []
+        cov = [False] * len(toks)
+        si = 0
+        for j, t in enumerate(toks):
+            ts = t.start()
+            while si < len(spans) and spans[si][1] <= ts:
+                si += 1
+            if si < len(spans) and spans[si][0] <= ts < spans[si][1]:
+                cov[j] = True
+        # global longest-match scan over uncovered tokens
+        i, N = 0, len(toks)
+        while i < N:
+            if cov[i]:
+                i += 1
+                continue
+            hit = 0
+            for n in range(min(MAX_PHRASE_WORDS, N - i), 0, -1):
+                if any(cov[i + j] for j in range(n)):
+                    continue
+                phrase = " ".join(lower[i : i + n])
+                if n == 1 and (len(phrase) < 2 or phrase in _SKIP_WORDS):
+                    continue  # skip bare function words + 1-char tokens (e.g. the "s" in "Babbage's")
+                tid = gmap.get(phrase)
+                if tid is None or tid == aid:
+                    continue
+                spans.append((toks[i].start(), toks[i + n - 1].end(), tid))
+                hit = n
+                break
+            i += hit if hit else 1
+        # render
+        spans.sort()
+        out: list[str] = []
         pos = 0
         for s, e, tid in spans:
             if s < pos:
                 continue
-            parts.append(html.escape(body[pos:s]))
-            parts.append(f'<a href="/article/{tid}" class="wl" data-id="{tid}">')
-            parts.append(html.escape(body[s:e]))
-            parts.append("</a>")
+            out.append(html.escape(frag[pos:s]))
+            out.append(f'<a href="/article/{tid}" class="wl" data-id="{tid}">')
+            out.append(html.escape(frag[s:e]))
+            out.append("</a>")
             pos = e
-        parts.append(html.escape(body[pos:]))
-        linked = "".join(parts)
-        linked = re.sub(r"\n{2,}", "</p><p>", linked).replace("\n", "<br>")
-        return "<p>" + linked + "</p>"
+        out.append(html.escape(frag[pos:]))
+        return "".join(out)
+
+    def link_body(self, aid: int, body: str) -> str:
+        """Render the plain-text body to safe HTML: comprehensive inline links plus
+        the typographic structure recoverable from plain text (section headings,
+        paragraph spacing, and the rare surviving bullet list). Rich Wikipedia
+        formatting — infoboxes, tables, bold/italic, images, citations — is NOT
+        recoverable here: the extractor discarded all markup (see the doc)."""
+        # -- Layer A surface map + regex (out-edge targets + redirect aliases) -
+        targets = self._out_target_titles(aid)
+        a_surf: dict[str, int] = {}
+        for tid, title in targets.items():
+            key = _norm_ws(title).lower()
+            if len(key) >= 2:
+                a_surf.setdefault(key, tid)
+        for tid, alias in self._aliases_for(list(targets)):
+            key = _norm_ws(alias).lower()
+            if len(key) >= 3:
+                a_surf.setdefault(key, tid)
+        a_rx = None
+        if a_surf:
+            alt = "|".join(re.escape(k) for k in sorted(a_surf, key=len, reverse=True))
+            a_rx = re.compile(
+                r"(?<![0-9A-Za-z])(?:" + alt + r")(?![0-9A-Za-z])", re.IGNORECASE
+            )
+
+        def link(frag: str) -> str:
+            return self._linkify(frag, a_surf, a_rx, aid)
+
+        # -- structure: headings / paragraphs / bullet lists ------------------
+        parts: list[str] = []
+        for block in re.split(r"\n{2,}", body):
+            lines = block.split("\n")
+            buf: list[str] = []
+
+            def flush() -> None:
+                real = [ln for ln in buf if ln.strip()]
+                if real:
+                    parts.append("<p>" + "<br>".join(link(ln) for ln in real) + "</p>")
+                buf.clear()
+
+            i = 0
+            while i < len(lines):
+                s = lines[i].strip()
+                if not s:
+                    i += 1
+                    continue
+                if _is_heading(s):
+                    flush()
+                    parts.append('<h3 class="wsec">' + link(s) + "</h3>")
+                    i += 1
+                elif _is_bullet(s):
+                    j = i
+                    items: list[str] = []
+                    while j < len(lines) and _is_bullet(lines[j].strip()):
+                        items.append(re.sub(r"^[\*•]\s+", "", lines[j].strip()))
+                        j += 1
+                    if len(items) >= 2:  # conservative: only a real run becomes a list
+                        flush()
+                        parts.append(
+                            "<ul>" + "".join(f"<li>{link(it)}</li>" for it in items) + "</ul>"
+                        )
+                        i = j
+                    else:
+                        buf.append(lines[i])
+                        i += 1
+                else:
+                    buf.append(lines[i])
+                    i += 1
+            flush()
+        return "".join(parts)
 
     def summary(self, aid: int) -> dict | None:
         """Lead of an article for hovercards: title + first paragraph (1–2 sentences)."""
@@ -1094,13 +1155,21 @@ p { line-height:1.6; }
 .pv-both { background:#e3f5e6; color:#1a7a2e; }
 .pv-mean { background:#e8eefc; color:#2554c7; }
 .pv-link { background:#f4ecf9; color:#7a4aa0; }
-/* inline article links (Layer A real links + Layer B notable terms) */
-#article a.wl { color:#36c; text-decoration:none; border-bottom:1px solid #cdddff;
-  cursor:pointer; }
-#article a.wl:hover { background:#eef3ff; border-bottom-color:#36c; }
-.densewrap { display:flex; align-items:center; gap:5px; color:#555; white-space:nowrap;
-  font-size:12px; cursor:pointer; user-select:none; }
-.densewrap input { margin:0; cursor:pointer; }
+/* inline links are INVISIBLE at rest: identical color/font to body prose, no
+   underline, no blue. A faint tint + underline appears ONLY on :hover, so links
+   stay discoverable without disrupting reading. */
+#article a.wl { color:inherit; text-decoration:none; cursor:pointer; }
+#article a.wl:hover { background:#eef3ff; text-decoration:underline;
+  text-decoration-color:#9db6e0; text-underline-offset:2px; }
+/* section headings + lists recovered from the plain text */
+#article h3.wsec { font-size:1.16em; font-weight:600; margin:1.5em 0 .5em;
+  padding-bottom:.2em; border-bottom:1px solid #e4e4e4; }
+#article ul { margin:.5em 0 .6em 1.4em; padding:0; }
+#article li { line-height:1.6; margin:.2em 0; }
+/* back control in the header */
+#back { padding:7px 12px; border:0; border-radius:4px; background:#2a5bd0; color:#fff;
+  cursor:pointer; font-size:13px; white-space:nowrap; visibility:hidden; }
+#back:hover { background:#25b; }
 /* hovercard (page preview) */
 #hovercard { position:fixed; display:none; z-index:50; width:320px; max-width:88vw;
   background:#fff; border:1px solid #d3d7de; border-radius:8px;
@@ -1114,6 +1183,7 @@ p { line-height:1.6; }
 </style></head>
 <body>
 <header>
+  <button id="back" onclick="goBack()" title="Back (also works with the browser Back button)">&larr; Back</button>
   <h1>Offline Wikipedia</h1>
   <input id="q" placeholder="Search titles (e.g. Ada Lovelace) — Enter" autofocus>
   <input id="ask" placeholder="Ask a question (RAG over 6.9M articles) — Enter">
@@ -1124,9 +1194,6 @@ p { line-height:1.6; }
   <span class="cbarrow">&rarr;</span>
   <input id="to" placeholder="To (e.g. Charles Babbage)">
   <button id="cbtn" onclick="connect()">Connect</button>
-  <label class="densewrap" title="Also link notable multi-word topics found in the body (off = only Wikipedia's own links)">
-    <input type="checkbox" id="dense" onchange="reopenDense()"> denser links
-  </label>
 </div>
 <main>
   <div id="results"><div class="hint">Type a query and press Enter.</div></div>
@@ -1175,6 +1242,11 @@ function fusedRow(a){
 async function search(){
   const q = $('#q').value.trim();
   if(!q) return;
+  await loadSearch(q);
+  pushView({view:'search', q:q});
+}
+async function loadSearch(q){   // render only, no history push
+  $('#q').value = q;
   const items = await j('/search?q='+encodeURIComponent(q));
   const el = $('#results');
   if(!items.length){ el.innerHTML = '<div class="hint">No title matches.</div>'; return; }
@@ -1182,14 +1254,16 @@ async function search(){
     items.map(a => `<div class="item" onclick="open_(${a.id})">${esc(a.title)}</div>`).join('');
 }
 let _curId = null;
-async function open_(id){
+// open_ = in-app navigation to an article: render + push a history entry so the
+// browser Back/Forward buttons and the header "← Back" walk the article sequence.
+async function open_(id){ await loadArticle(id); pushView({view:'article', id:id}); }
+async function loadArticle(id){   // render only, no history push (used by popstate)
   _curId = id;
-  const dense = $('#dense').checked ? '?dense=1' : '';
-  const a = await j('/article/'+id+dense);
+  const a = await j('/article/'+id);
   const art = $('#article');
   if(!a || a.error){ art.innerHTML = '<div class="hint">Not found.</div>'; return; }
-  // body_html carries the inline <a class="wl"> links (escaped server-side); fall
-  // back to plain-text rendering if an older server didn't provide it.
+  // body_html carries the inline <a class="wl"> links + heading/list structure
+  // (escaped server-side); fall back to plain-text if an older server omits it.
   const body = a.body_html
     ? a.body_html
     : a.body.split(/\\n\\n+/).map(p => '<p>'+esc(p).replace(/\\n/g,'<br>')+'</p>').join('');
@@ -1197,7 +1271,6 @@ async function open_(id){
   art.scrollTop = 0;
   loadRelated(id);
 }
-function reopenDense(){ if(_curId!=null) open_(_curId); }
 async function loadRelated(id){
   const rel = $('#related');
   rel.innerHTML = '<div class="hd">Loading…</div>';
@@ -1239,6 +1312,10 @@ function renderConnection(r){
 async function connect(){
   const f = $('#from').value.trim(), t = $('#to').value.trim();
   if(!f || !t) return;
+  await loadConnect(f, t);
+  pushView({view:'connect', f:f, t:t});
+}
+async function loadConnect(f, t){   // render only, no history push
   const art = $('#article');
   art.innerHTML = '<div class="hint">Finding the shortest link path…</div>';
   let r;
@@ -1263,6 +1340,10 @@ async function narrate(){
 async function ask(){
   const q = $('#ask').value.trim();
   if(!q) return;
+  await loadAsk(q);
+  pushView({view:'ask', q:q});
+}
+async function loadAsk(q){   // render only, no history push
   const art = $('#article');
   art.innerHTML = '<div class="hint">Thinking — retrieving passages + local LLM…</div>';
   let r;
@@ -1332,6 +1413,37 @@ $('#article').addEventListener('click', e => {   // intercept inline links -> op
 });
 $('#hovercard').addEventListener('mouseleave', hideHover);
 
+// -- in-app history navigation (browser Back/Forward + header "← Back") --------
+// Each in-app navigation pushes a state; popstate re-renders WITHOUT pushing, so
+// native Back/Forward and goBack() walk the same article/search sequence.
+function pushView(st){
+  const hash = st.view + (st.id!=null ? '/'+st.id : '');
+  history.pushState(st, '', '#'+hash);
+  updateBack();
+}
+function updateBack(){
+  const st = history.state;
+  $('#back').style.visibility = (st && st.view && st.view!=='home') ? 'visible' : 'hidden';
+}
+function goBack(){ history.back(); }
+function homeView(){
+  _curId = null; hideHover();
+  $('#article').innerHTML = '<div class="hint">Select an article.</div>';
+  $('#related').innerHTML = '';
+}
+function renderState(st){   // restore a view for a popstate (no new push)
+  hideHover();
+  if(!st || st.view==='home'){ homeView(); }
+  else if(st.view==='article'){ loadArticle(st.id); }
+  else if(st.view==='connect'){ loadConnect(st.f, st.t); }
+  else if(st.view==='ask'){ loadAsk(st.q); }
+  else if(st.view==='search'){ loadSearch(st.q); }
+  updateBack();
+}
+window.addEventListener('popstate', e => renderState(e.state));
+history.replaceState({view:'home'}, '', location.pathname);   // base state
+updateBack();
+
 $('#q').addEventListener('keydown', e => { if(e.key==='Enter') search(); });
 $('#ask').addEventListener('keydown', e => { if(e.key==='Enter') ask(); });
 $('#from').addEventListener('keydown', e => { if(e.key==='Enter') connect(); });
@@ -1373,8 +1485,7 @@ def make_handler(reader: Reader):
                     if art is None:
                         self._json({"error": "not found"})
                     else:
-                        dense = parse_qs(u.query).get("dense", ["0"])[0] == "1"
-                        art["body_html"] = reader.link_body(aid, art["body"], dense)
+                        art["body_html"] = reader.link_body(aid, art["body"])
                         self._json(art)
                 elif path.startswith("/summary/"):
                     aid = int(unquote(path.split("/")[-1]))
