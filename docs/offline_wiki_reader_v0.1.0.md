@@ -485,3 +485,101 @@ the initial search results. Base state is seeded with `history.replaceState`.
 - First article view after a restart stalls ~8 s while the matcher builds (then cached).
 - Section-heading detection is heuristic; a rare short prose line with no terminal
   punctuation could be mis-styled as a heading.
+
+---
+
+## Addendum v6 — filtered semantic search + graph-aware RAG (DEV-1354)
+
+The two closing reader features. Both are **TriDB's tri-modal thesis as a personal
+tool**: v6.1 is *vector similarity + relational filter*; v6.2 is *vector similarity +
+graph traversal*. No engine/docker changes — pure host-side reader python + one new
+host index.
+
+### Feature 1 — Filtered semantic search (`GET /search_semantic`)
+Retrieve the `pool` (default 150) nearest articles by **meaning** (cuVS CAGRA cosine
+over the query embedded with the same BGE model as `/ask`), **then** apply RELATIONAL
+filters and return the surviving ranked list with **pre/post-filter counts**. Semantic
+first, filter second — never the reverse.
+
+- **Endpoint** `GET /search_semantic?q=<text>&min_indeg=&min_len=&max_len=&cat=&pool=`
+  → `{query, pool, pre_count, post_count, cats_available, filters, results:[{id, title,
+  score, indeg, length, cats}]}`.
+- **Filters:**
+  - **`min_indeg`** — minimum inbound-degree (importance). From a cached `bincount`
+    over the CSR dst values (`_ensure_indeg`, shared with the link matcher — built once).
+  - **`min_len` / `max_len`** — article body length in chars. Read lazily: bodies are
+    seeked only for candidates that survive the cheap filters, so `length` is `null` in
+    results unless a length filter is active.
+  - **`cat`** — category contains `<text>` (case-insensitive). Backed by a new `cats`
+    table (see below); a bounded index join `article_id IN (candidates) AND
+    lower(category) LIKE '%text%'`. Degrades to a no-op (with `cats_available:false`) if
+    the index is absent.
+- **UI:** a purple "Semantic search" bar under the connect bar — meaning query + `min
+  links` / `min chars` / `max chars` / `category contains` inputs. Results render in the
+  left panel with the existing cosine legibility bars + invisible links, a `countbar`
+  showing `pool → pre → post`, per-result meta (`N links · M chars`) and category pills.
+
+### Category index (`build-categories` subcommand — the new host artifact)
+`cats(article_id, category)` with an index on `article_id`, built from the already-
+extracted `categories-*.tsv` sidecars (`article_id \t category`) — **no corpus
+re-scan**. Only `article_id` is indexed: the category filter always constrains by
+candidate id first, so the `LIKE` scans only the handful of category rows for the
+top-N. **Measured on Spark:** 72 shards → **40,178,200 rows in 40.1 s**; reader.db grew
+**910 MB → 3.09 GB**. Run once: `python3 tools/wiki_reader.py build-categories` (also
+folded into the full `build`).
+
+### Feature 2 — Graph-aware RAG (`GET /ask?...&expand=1`, default ON)
+After the semantic top-k seed retrieval, **expand along hyperlinks**: pull 1-hop
+(optionally `hops=2`) out-neighbours of the seeds from the directed CSR, rank those
+neighbours by **cosine to the question**, and fold the most relevant into the LLM
+context (total capped at **12 passages**: 6 semantic seeds + up to 6 graph) **before**
+answering. This grounds multi-hop questions in the link **chain**, not just articles
+near the question wording.
+
+- Citations always point at the **real source article id**; each source is tagged
+  `origin: "semantic" | "graph"`, and graph sources carry `via` = the seed they were
+  hyperlinked from (the *original* seed even for 2-hop, so a citation always traces to a
+  real seed).
+- `expand=0` restores the exact prior `/ask` (8 semantic seeds, no graph). Response adds
+  `expanded`, `n_semantic`, `n_graph`.
+- **UI:** a `graph` checkbox next to the Ask box (default checked); the Sources panel
+  shows a per-source SEMANTIC / GRAPH badge (graph badge reads `graph ← <seed title>`)
+  and a sub-line `"N from semantic retrieval · M pulled in by graph expansion"`.
+
+### Endpoints (summary)
+| Endpoint | Returns |
+|---|---|
+| `GET /search_semantic?q=&min_indeg=&min_len=&max_len=&cat=&pool=` | cosine top-N + relational filter; pre/post counts + ranked results |
+| `GET /ask?q=&expand=1&hops=1` | graph-aware RAG; sources tagged semantic vs graph-expanded |
+
+### Verified live (Spark, 2026-07-07, PID rotated cleanly)
+- **Category build:** 40,178,200 rows / 40.1 s; reader.db 910 MB → 3.09 GB.
+- **Filtered search** `q="quantum computing"` (pool=150):
+  - `min_indeg=100` → 150 → **11** (Quantum computing indeg=1069, Quantum algorithm 108,
+    Post-quantum cryptography 114, David Deutsch 118, …).
+  - `min_len=20000` → 150 → **15** (Quantum computing len=52,399; Superconducting quantum
+    computing 42,926; …).
+  - `cat~algorithm` → 150 → **16** (Quantum algorithm, Feynman's algorithm, Quantum
+    Fourier transform, … all `Quantum algorithms`-tagged).
+  - combined `min_indeg=50 & min_len=10000 & cat~quantum` → 150 → **13**.
+- **Graph-aware RAG** `q="How is Ada Lovelace connected to the modern computer?"`,
+  `expand=1` → **6 semantic + 6 graph** sources; graph picks tagged e.g. *Herman
+  Goldstine ← via Adele Goldstine*, *Thelma Estrin ← via Ada Lovelace Award*; answer
+  cited [1] Ada Lovelace. `expand=0` → 8 semantic-only sources (prior behaviour intact).
+- **No regression:** `/`, `/search`, `/article/{id}` (invisible `.wl` links intact),
+  `/summary/{id}`, `/related/{id}` (unchanged `{semantic,hyperlinks}`),
+  `/related_fused/{id}`, `/path` all 200; cuVS CAGRA still loads (~48 s).
+
+### Corners cut / tradeoffs
+- **Body length is lazy** — only computed (and shown) when a length filter is active, to
+  avoid seeking `pool` bodies on every search. Importance (`indeg`) is always shown
+  (free).
+- **Category `LIKE` is a substring match**, not a taxonomy walk — `cat=physics` matches
+  any category *containing* "physics", not sub-categories of Physics.
+- **Filter pool is fixed at 150** by default: a filter stricter than any of the top-150
+  candidates legitimately returns `post_count=0` (correct, not a bug). Raise `pool` for
+  rarer intersections.
+- **Graph expansion ranks neighbours by cosine to the question**, so on a tightly-
+  clustered seed set the picks can be topically adjacent (e.g. the seed's biographical
+  neighbours) rather than a long bridging chain; the mechanism and provenance are honest
+  regardless. 2-hop (`hops=2`) is wired but off by default (1-hop keeps context tight).

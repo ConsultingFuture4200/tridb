@@ -118,6 +118,11 @@ def _edge_files(corpus: Path) -> list[str]:
     return [s["path"] for s in manifest["shards"]["edges"]["files"]]
 
 
+def _category_files(corpus: Path) -> list[str]:
+    manifest = json.loads((corpus / "manifest.json").read_text())
+    return [s["path"] for s in manifest["shards"]["categories"]["files"]]
+
+
 def build_articles(conn: sqlite3.Connection, corpus: Path) -> int:
     """Scan every article shard, recording (id, title, shard, byte_offset).
 
@@ -319,6 +324,60 @@ def cmd_build_redirects(corpus: Path) -> None:
     print(f"[build] redirect alias index done in {time.time() - t0:.1f}s")
 
 
+def build_categories(conn: sqlite3.Connection, corpus: Path) -> int:
+    """Index (article_id, category) into a `cats` table indexed by article_id.
+
+    This is the RELATIONAL leg of filtered semantic search: after a cosine top-N
+    the category filter is a bounded index join (article_id IN <candidates> AND
+    category LIKE ...). Reads the already-extracted categories-*.tsv sidecars
+    (`article_id \\t category`) — no corpus re-scan. Only the article_id index is
+    built: we always constrain by candidate id first, so a category LIKE over the
+    handful of survivors is cheap and needs no per-category index."""
+    conn.execute("DROP TABLE IF EXISTS cats")
+    conn.execute("CREATE TABLE cats (article_id INTEGER, category TEXT)")
+    n = 0
+    batch: list[tuple] = []
+    for name in _category_files(corpus):
+        path = corpus / name
+        if not path.exists() or path.stat().st_size == 0:
+            continue
+        with path.open("r", encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                tab = line.find("\t")
+                if tab < 0:
+                    continue
+                try:
+                    aid = int(line[:tab])
+                except ValueError:
+                    continue
+                cat = line[tab + 1 :].rstrip("\n")
+                if not cat:
+                    continue
+                batch.append((aid, cat))
+                if len(batch) >= 100000:
+                    conn.executemany("INSERT INTO cats VALUES (?,?)", batch)
+                    n += len(batch)
+                    batch.clear()
+        print(f"[build] categories: {name} done, {n + len(batch)} rows so far")
+    if batch:
+        conn.executemany("INSERT INTO cats VALUES (?,?)", batch)
+        n += len(batch)
+    print(f"[build] categories: {n:,} rows inserted, building index on article_id ...")
+    conn.execute("CREATE INDEX idx_cats_article ON cats(article_id)")
+    conn.commit()
+    return n
+
+
+def cmd_build_categories(corpus: Path) -> None:
+    t0 = time.time()
+    conn = sqlite3.connect(corpus / DB_NAME)
+    conn.execute("PRAGMA journal_mode=OFF")
+    conn.execute("PRAGMA synchronous=OFF")
+    n = build_categories(conn, corpus)
+    conn.close()
+    print(f"[build] category index: {n:,} rows in {time.time() - t0:.1f}s")
+
+
 def cmd_build(corpus: Path) -> None:
     t0 = time.time()
     db_path = corpus / DB_NAME
@@ -349,6 +408,13 @@ def cmd_build(corpus: Path) -> None:
     conn2.execute("PRAGMA synchronous=OFF")
     build_redirects(conn2, corpus)
     conn2.close()
+
+    print("[build] building category index (relational filter leg)...")
+    conn3 = sqlite3.connect(db_path)
+    conn3.execute("PRAGMA journal_mode=OFF")
+    conn3.execute("PRAGMA synchronous=OFF")
+    build_categories(conn3, corpus)
+    conn3.close()
 
     db_mb = db_path.stat().st_size / 1e6
     csr_mb = (
@@ -424,8 +490,19 @@ class Reader:
                 ).fetchone()
             )
         print(f"[serve] redirect alias index: {'present' if self._has_redir else 'absent'}")
+        with self.db_lock:
+            self._has_cats = bool(
+                self.db.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name='cats'"
+                ).fetchone()
+            )
+        print(f"[serve] category index: {'present' if self._has_cats else 'absent'}")
         self._global: dict[str, int] | None = None
         self._global_lock = threading.Lock()
+        # Inbound-degree per article id — the importance signal shared by the link
+        # matcher and filtered semantic search. Built at most once (lazy bincount).
+        self._indeg: np.ndarray | None = None
+        self._indeg_lock = threading.Lock()
         print("[serve] ready.")
 
     # -- queries ----------------------------------------------------------- #
@@ -538,6 +615,18 @@ class Reader:
                 )
         return rows
 
+    def _ensure_indeg(self) -> np.ndarray:
+        """Inbound-degree per article id (bincount over the CSR dst values), cached.
+
+        Shared by the full-corpus link matcher (notability tie-break) and filtered
+        semantic search's importance filter, so the ~7M-bin bincount runs once."""
+        if self._indeg is not None:
+            return self._indeg
+        with self._indeg_lock:
+            if self._indeg is None:
+                self._indeg = np.bincount(self.csr_dst.astype(np.int64, copy=False))
+        return self._indeg
+
     def _ensure_global(self) -> dict[str, int]:
         """Lazily build the FULL comprehensive matcher: {lowercased title surface ->
         best article id}. Every title in the 6.9M corpus enters (only the tiny
@@ -551,7 +640,7 @@ class Reader:
                 return self._global
             t0 = time.time()
             print("[serve] building full-corpus link matcher (first article view)...")
-            indeg = np.bincount(self.csr_dst.astype(np.int64, copy=False))
+            indeg = self._ensure_indeg()
             n_ids = len(indeg)
 
             def deg(i: int) -> int:
@@ -986,19 +1075,27 @@ class Reader:
                     self._embedder = Embedder(DEFAULT_MODEL, DEFAULT_DIM)
         return self._embedder
 
-    def retrieve(self, q: str, k: int = ASK_K) -> list[dict]:
-        """Embed the question with the SAME BGE model as the corpus, then pull the
-        top-k passages from the already-loaded CAGRA index. Missing articles (the
-        ~4% clobbered) are skipped, so we over-fetch a few to still land k."""
+    def _embed_query(self, q: str) -> np.ndarray:
+        """Encode a query with the SAME BGE model as the corpus and L2-normalise it,
+        so a dot product against a normalised corpus vector is cosine similarity."""
         emb = self._get_embedder()
         v = emb.encode([q])
         v /= np.linalg.norm(v, axis=1, keepdims=True) + 1e-12
-        v = np.ascontiguousarray(v, dtype=np.float32)
+        return np.ascontiguousarray(v, dtype=np.float32)
+
+    def _knn_passages(
+        self, qvec: np.ndarray, k: int, exclude: set[int] | None = None
+    ) -> list[dict]:
+        """Top-k passages for an already-embedded query over the CAGRA index.
+        Missing articles (the ~4% clobbered) are skipped, so we over-fetch."""
+        exclude = exclude or set()
         with self.index_lock:
-            labels, dists = self.index.knn_query(v, k=k + 4)
+            labels, dists = self.index.knn_query(qvec, k=k + 4 + len(exclude))
         passages: list[dict] = []
         for lab, d in zip(labels[0], dists[0]):
             aid = int(lab)
+            if aid in exclude:
+                continue
             art = self.article(aid)  # None if the article shard was clobbered
             if art is None:
                 continue
@@ -1013,6 +1110,138 @@ class Reader:
             if len(passages) >= k:
                 break
         return passages
+
+    def retrieve(self, q: str, k: int = ASK_K) -> list[dict]:
+        """Embed the question, then pull the top-k passages from the CAGRA index."""
+        return self._knn_passages(self._embed_query(q), k)
+
+    # -- Filtered semantic search (vector similarity + relational filter) --- #
+    def _filter_by_category(self, ids: list[int], text: str) -> set[int]:
+        """Subset of `ids` whose article has a category LIKE %text% (case-insens).
+
+        Constrained by the (indexed) candidate ids first, so the LIKE only scans the
+        handful of category rows belonging to the top-N — no full-table scan."""
+        if not ids or not self._has_cats or not text:
+            return set()
+        keep: set[int] = set()
+        like = f"%{text.lower()}%"
+        for i in range(0, len(ids), 900):
+            chunk = ids[i : i + 900]
+            qm = ",".join("?" * len(chunk))
+            with self.db_lock:
+                rows = self.db.execute(
+                    f"SELECT DISTINCT article_id FROM cats WHERE article_id IN ({qm}) "
+                    "AND lower(category) LIKE ?",
+                    (*chunk, like),
+                ).fetchall()
+            keep.update(int(r[0]) for r in rows)
+        return keep
+
+    def _cats_for(self, ids: list[int], per: int = 3) -> dict[int, list[str]]:
+        """Up to `per` category names per id, to annotate results with their tags."""
+        if not ids or not self._has_cats:
+            return {}
+        out: dict[int, list[str]] = {}
+        for i in range(0, len(ids), 900):
+            chunk = ids[i : i + 900]
+            qm = ",".join("?" * len(chunk))
+            with self.db_lock:
+                rows = self.db.execute(
+                    f"SELECT article_id, category FROM cats WHERE article_id IN ({qm})",
+                    chunk,
+                ).fetchall()
+            for aid, cat in rows:
+                lst = out.setdefault(int(aid), [])
+                if len(lst) < per:
+                    lst.append(cat)
+        return out
+
+    def search_semantic(
+        self,
+        q: str,
+        pool: int = 150,
+        min_indeg: int = 0,
+        min_len: int = 0,
+        max_len: int = 0,
+        cat: str = "",
+    ) -> dict:
+        """TriDB's thesis as a personal tool: retrieve the `pool` nearest articles by
+        MEANING (cuVS cosine), THEN apply RELATIONAL filters (inbound-degree /
+        importance, body length, category) and return the surviving ranked list with
+        pre/post-filter counts. Semantic first, filter second — never the reverse."""
+        q = (q or "").strip()
+        base = {
+            "query": q,
+            "pool": pool,
+            "cats_available": self._has_cats,
+            "filters": {
+                "min_indeg": min_indeg,
+                "min_len": min_len,
+                "max_len": max_len,
+                "category": cat,
+            },
+        }
+        if not q:
+            return {**base, "pre_count": 0, "post_count": 0, "results": []}
+        qvec = self._embed_query(q)
+        with self.index_lock:
+            labels, dists = self.index.knn_query(qvec, k=pool)
+        cand: list[tuple[int, float]] = []
+        seen: set[int] = set()
+        for lab, d in zip(labels[0], dists[0]):
+            aid = int(lab)
+            if aid in seen:
+                continue
+            seen.add(aid)
+            cand.append((aid, round(1.0 - float(d), 4)))
+        titles = self._titles([a for a, _ in cand])
+        cand = [(a, s) for a, s in cand if a in titles]  # drop clobbered/missing
+        pre_count = len(cand)
+
+        indeg = self._ensure_indeg()
+        n_indeg = len(indeg)
+
+        def deg(a: int) -> int:
+            return int(indeg[a]) if a < n_indeg else 0
+
+        # cheap relational filters first (importance, category) — no body read
+        if min_indeg > 0:
+            cand = [(a, s) for a, s in cand if deg(a) >= min_indeg]
+        if cat and self._has_cats:
+            keep = self._filter_by_category([a for a, _ in cand], cat)
+            cand = [(a, s) for a, s in cand if a in keep]
+
+        # length filter needs a body read — only for the survivors of the above
+        lengths: dict[int, int] = {}
+        if min_len > 0 or max_len > 0:
+            filtered: list[tuple[int, float]] = []
+            for a, s in cand:
+                art = self.article(a)
+                if art is None:
+                    continue
+                length = len(art["body"])
+                if min_len and length < min_len:
+                    continue
+                if max_len and length > max_len:
+                    continue
+                lengths[a] = length
+                filtered.append((a, s))
+            cand = filtered
+
+        ids = [a for a, _ in cand]
+        cats_by = self._cats_for(ids[:40]) if self._has_cats else {}
+        results = [
+            {
+                "id": a,
+                "title": titles[a],
+                "score": s,
+                "indeg": deg(a),
+                "length": lengths.get(a),
+                "cats": cats_by.get(a, []),
+            }
+            for a, s in cand
+        ]
+        return {**base, "pre_count": pre_count, "post_count": len(cand), "results": results}
 
     def _llm_answer(self, q: str, passages: list[dict]) -> str:
         """Grounded generation via the local ollama HTTP API. The model is told to
@@ -1050,22 +1279,123 @@ class Reader:
                 f"{OLLAMA_URL}? The retrieved sources below are still valid.]"
             )
 
-    def ask(self, q: str, k: int = ASK_K) -> dict:
+    def _score_by_query(self, qvec: np.ndarray, ids: list[int]) -> dict[int, float]:
+        """Cosine similarity of each id's corpus vector to the (unit) query vector,
+        for ids that have an embedding row. Batched numpy — cheap for a few hundred."""
+        rows: list[int] = []
+        valid: list[int] = []
+        for a in ids:
+            if 0 <= a < len(self.id2row):
+                r = int(self.id2row[a])
+                if r >= 0:
+                    rows.append(r)
+                    valid.append(a)
+        if not rows:
+            return {}
+        mat = np.ascontiguousarray(self.vecs[rows], dtype=np.float32)
+        mat /= np.linalg.norm(mat, axis=1, keepdims=True) + 1e-12
+        sims = mat @ qvec[0]
+        return {a: float(sims[i]) for i, a in enumerate(valid)}
+
+    def _expand_graph(
+        self,
+        qvec: np.ndarray,
+        seed_ids: list[int],
+        hops: int = 1,
+        cap_total: int = 6,
+        per_seed: int = 60,
+    ) -> list[tuple[int, float, int]]:
+        """1- (optionally 2-) hop out-neighbours of the seeds from the directed CSR,
+        ranked by cosine to the query and returned most-relevant first. Grounds the
+        answer in the hyperlink CHAIN, not just articles near the question.
+
+        Returns [(aid, cosine_to_query, via_seed_id)] — `via` is the ORIGINAL seed
+        each neighbour was reached from, so a 2-hop pick still cites a real seed."""
+        seen = set(seed_ids)
+        cand: dict[int, int] = {}  # neighbour id -> originating seed id
+        via = {s: s for s in seed_ids}
+        frontier = list(seed_ids)
+        for _ in range(max(1, hops)):
+            nxt: list[int] = []
+            for node in frontier:
+                if node + 1 >= len(self.csr_off):
+                    continue
+                lo, hi = int(self.csr_off[node]), int(self.csr_off[node + 1])
+                for x in self.csr_dst[lo:hi][:per_seed].tolist():
+                    if x in seen or x in cand:
+                        continue
+                    src_seed = via.get(node, node)
+                    cand[x] = src_seed
+                    via[x] = src_seed
+                    nxt.append(x)
+            frontier = nxt
+            if not frontier:
+                break
+        if not cand:
+            return []
+        sims = self._score_by_query(qvec, list(cand))
+        ranked = sorted(sims.items(), key=lambda kv: -kv[1])
+        return [(a, round(s, 4), cand[a]) for a, s in ranked[:cap_total]]
+
+    def ask(self, q: str, k: int = ASK_K, expand: bool = True, hops: int = 1) -> dict:
+        """Graph-aware RAG. Semantic retrieval seeds the context; with `expand` on
+        (default) the top seeds' hyperlink neighbours are ranked by relevance and the
+        best are folded in (context capped ~12 passages) BEFORE the LLM answers, so
+        multi-hop questions are grounded in the link chain. Citations always point at
+        the real source article; each source is tagged semantic vs graph-expanded."""
         q = (q or "").strip()
         if not q:
-            return {"answer": "Ask a question.", "sources": []}
-        passages = self.retrieve(q, k=k)
-        if not passages:
+            return {"answer": "Ask a question.", "sources": [], "expanded": False}
+        qvec = self._embed_query(q)
+        cap_total = 12
+        k_seed = 6 if expand else k
+        seeds = self._knn_passages(qvec, k_seed)
+        if not seeds:
             return {
                 "answer": "No matching Wikipedia articles were found for this question.",
                 "sources": [],
+                "expanded": bool(expand),
             }
+        passages = [dict(p, origin="semantic", via=None) for p in seeds]
+        if expand:
+            seed_ids = [p["id"] for p in seeds]
+            picks = self._expand_graph(
+                qvec, seed_ids, hops=hops, cap_total=cap_total - len(passages)
+            )
+            via_titles = self._titles([v for _, _, v in picks])
+            for aid, score, via in picks:
+                art = self.article(aid)
+                if art is None:
+                    continue
+                passages.append(
+                    {
+                        "id": aid,
+                        "title": art["title"],
+                        "score": score,
+                        "body": art["body"][:PASSAGE_CHARS],
+                        "origin": "graph",
+                        "via": via_titles.get(via),
+                    }
+                )
         answer = self._llm_answer(q, passages)
         sources = [
-            {"n": i + 1, "id": p["id"], "title": p["title"], "score": p["score"]}
+            {
+                "n": i + 1,
+                "id": p["id"],
+                "title": p["title"],
+                "score": p["score"],
+                "origin": p["origin"],
+                "via": p.get("via"),
+            }
             for i, p in enumerate(passages)
         ]
-        return {"answer": answer, "sources": sources}
+        return {
+            "answer": answer,
+            "sources": sources,
+            "expanded": bool(expand),
+            "n_semantic": sum(1 for p in passages if p["origin"] == "semantic"),
+            "n_graph": sum(1 for p in passages if p["origin"] == "graph"),
+        }
 
 
 def _clean_body(text: str) -> str:
@@ -1107,7 +1437,7 @@ header h1 { font-size:16px; margin:0; font-weight:600; white-space:nowrap; }
   background:#fff8e1; }
 .answer { line-height:1.7; font-size:15px; white-space:pre-wrap; margin-bottom:8px;
   background:#fffbea; border:1px solid #f0e2b0; border-radius:6px; padding:14px 16px; }
-main { display:grid; grid-template-columns:260px 1fr 300px; gap:0; height:calc(100vh - 96px); }
+main { display:grid; grid-template-columns:260px 1fr 300px; gap:0; height:calc(100vh - 140px); }
 #results, #related { overflow-y:auto; padding:8px; border-right:1px solid #ddd; background:#fff; }
 #related { border-right:0; border-left:1px solid #ddd; }
 #article { overflow-y:auto; padding:20px 32px; max-width:820px; }
@@ -1139,6 +1469,28 @@ p { line-height:1.6; }
 #cbtn { padding:6px 16px; border:0; border-radius:4px; background:#36c; color:#fff;
   cursor:pointer; font-size:13px; }
 #cbtn:hover { background:#25b; }
+/* semantic-search bar (vector similarity + relational filters) */
+#sembar { display:flex; gap:8px; align-items:center; padding:6px 16px;
+  background:#f4f0fb; border-bottom:1px solid #e3ddf0; position:sticky; top:96px;
+  z-index:8; font-size:13px; flex-wrap:wrap; }
+#sembar input { padding:6px 10px; border:1px solid #d6cfe8; border-radius:4px;
+  font-size:13px; background:#fff; }
+#sq { flex:1; min-width:180px; }
+#sembar input.numf { width:90px; }
+#sbtn { padding:6px 16px; border:0; border-radius:4px; background:#7a4aa0; color:#fff;
+  cursor:pointer; font-size:13px; }
+#sbtn:hover { background:#653c88; }
+.gexp { display:flex; align-items:center; gap:4px; color:#fff; font-size:12px;
+  white-space:nowrap; cursor:pointer; }
+.countbar { font-size:12px; color:#555; margin:4px 8px 8px; line-height:1.5; }
+.countbar b { color:#7a4aa0; }
+.meta { font-size:11px; color:#8a8a8a; margin-top:2px; }
+.catpill { display:inline-block; background:#f4ecf9; color:#7a4aa0; border-radius:8px;
+  padding:0 6px; margin:2px 3px 0 0; font-size:10px; }
+.og { font-size:9.5px; text-transform:uppercase; letter-spacing:.03em; padding:1px 5px;
+  border-radius:8px; font-weight:600; white-space:nowrap; }
+.og-sem { background:#e8eefc; color:#2554c7; }
+.og-graph { background:#e3f5e6; color:#1a7a2e; }
 .cblabel { color:#555; font-weight:600; white-space:nowrap; }
 .cbarrow { color:#999; }
 .subtle { color:#888; font-size:12px; margin:2px 0 12px; }
@@ -1187,6 +1539,9 @@ p { line-height:1.6; }
   <h1>Offline Wikipedia</h1>
   <input id="q" placeholder="Search titles (e.g. Ada Lovelace) — Enter" autofocus>
   <input id="ask" placeholder="Ask a question (RAG over 6.9M articles) — Enter">
+  <label class="gexp" title="Graph-aware RAG: expand along hyperlinks before answering">
+    <input type="checkbox" id="gexp" checked> graph
+  </label>
 </header>
 <div id="connectbar">
   <span class="cblabel">How are these connected?</span>
@@ -1194,6 +1549,15 @@ p { line-height:1.6; }
   <span class="cbarrow">&rarr;</span>
   <input id="to" placeholder="To (e.g. Charles Babbage)">
   <button id="cbtn" onclick="connect()">Connect</button>
+</div>
+<div id="sembar">
+  <span class="cblabel">Semantic search</span>
+  <input id="sq" placeholder="Meaning query (e.g. quantum computing)">
+  <input id="minlinks" class="numf" type="number" min="0" placeholder="min links">
+  <input id="minlen" class="numf" type="number" min="0" placeholder="min chars">
+  <input id="maxlen" class="numf" type="number" min="0" placeholder="max chars">
+  <input id="scat" placeholder="category contains…">
+  <button id="sbtn" onclick="semSearch()">Search</button>
 </div>
 <main>
   <div id="results"><div class="hint">Type a query and press Enter.</div></div>
@@ -1343,22 +1707,87 @@ async function ask(){
   await loadAsk(q);
   pushView({view:'ask', q:q});
 }
+function srcRow(s){
+  const badge = (s.origin==='graph')
+    ? '<span class="og og-graph" title="pulled in by graph expansion'+
+        (s.via?' — hyperlinked from '+esc(s.via):'')+'">graph'+
+        (s.via?' &larr; '+esc(s.via):'')+'</span>'
+    : '<span class="og og-sem">semantic</span>';
+  return '<div class="item" onclick="open_('+s.id+')"><div class="rtitle">['+s.n+'] '+
+    esc(s.title)+' '+badge+'</div>'+relInd(s.score)+'</div>';
+}
 async function loadAsk(q){   // render only, no history push
   const art = $('#article');
-  art.innerHTML = '<div class="hint">Thinking — retrieving passages + local LLM…</div>';
+  const expand = $('#gexp').checked ? 1 : 0;
+  art.innerHTML = '<div class="hint">Thinking — retrieving passages'+
+    (expand?' + graph expansion':'')+' + local LLM…</div>';
   let r;
-  try { r = await j('/ask?q='+encodeURIComponent(q)); }
+  try { r = await j('/ask?q='+encodeURIComponent(q)+'&expand='+expand); }
   catch(e){ art.innerHTML = '<div class="hint">Ask failed: '+esc(String(e))+'</div>'; return; }
   let h = '<h2>Ask</h2><div class="answer">'+esc(r.answer)+'</div>';
   if(r.sources && r.sources.length){
-    h += '<div class="hd">Sources (click to open)</div>' +
-      '<div class="legend">how closely each source matches your question (embedding similarity)</div>';
-    h += r.sources.map(s => `<div class="item" onclick="open_(${s.id})"><div class="rtitle">[${s.n}] ${esc(s.title)}</div>${relInd(s.score)}</div>`).join('');
+    const sub = r.expanded
+      ? '<div class="legend">'+r.n_semantic+' from semantic retrieval &middot; '+
+          r.n_graph+' pulled in by graph expansion (hyperlink neighbours), '+
+          'ranked by relevance to the question</div>'
+      : '<div class="legend">semantic retrieval only (graph expansion off)</div>';
+    h += '<div class="hd">Sources (click to open)</div>' + sub;
+    h += r.sources.map(srcRow).join('');
   } else {
     h += '<div class="hint">No sources retrieved.</div>';
   }
   art.innerHTML = h;
   art.scrollTop = 0;
+}
+// -- filtered semantic search (vector similarity + relational filter) ----------
+function semParams(){
+  return { q: $('#sq').value.trim(), min_indeg: $('#minlinks').value.trim(),
+    min_len: $('#minlen').value.trim(), max_len: $('#maxlen').value.trim(),
+    cat: $('#scat').value.trim() };
+}
+async function semSearch(){
+  const p = semParams();
+  if(!p.q) return;
+  await loadSem(p);
+  pushView({view:'sem', p:p});
+}
+async function loadSem(p){   // render only, no history push
+  $('#sq').value=p.q||''; $('#minlinks').value=p.min_indeg||''; $('#minlen').value=p.min_len||'';
+  $('#maxlen').value=p.max_len||''; $('#scat').value=p.cat||'';
+  const el = $('#results');
+  el.innerHTML = '<div class="hint">Embedding query + relational filter…</div>';
+  const qs = '/search_semantic?q='+encodeURIComponent(p.q)+
+    '&min_indeg='+encodeURIComponent(p.min_indeg||0)+
+    '&min_len='+encodeURIComponent(p.min_len||0)+
+    '&max_len='+encodeURIComponent(p.max_len||0)+
+    '&cat='+encodeURIComponent(p.cat||'');
+  let r;
+  try { r = await j(qs); } catch(e){ el.innerHTML='<div class="hint">Search failed.</div>'; return; }
+  renderSem(r);
+}
+function fdesc(f, catsAvail){
+  const parts=[];
+  if(f.min_indeg>0) parts.push('≥'+f.min_indeg+' inbound links');
+  if(f.min_len>0) parts.push('≥'+f.min_len+' chars');
+  if(f.max_len>0) parts.push('≤'+f.max_len+' chars');
+  if(f.category) parts.push('category ~ "'+f.category+'"'+(catsAvail?'':' (category index absent)'));
+  return parts.length ? parts.join(', ') : 'no filters';
+}
+function semRow(a){
+  const meta=[a.indeg.toLocaleString()+' links'];
+  if(a.length!=null) meta.push(a.length.toLocaleString()+' chars');
+  const cats = (a.cats&&a.cats.length)
+    ? '<div>'+a.cats.map(c=>'<span class="catpill">'+esc(c)+'</span>').join('')+'</div>' : '';
+  return '<div class="item" onclick="open_('+a.id+')"><div class="rtitle">'+esc(a.title)+'</div>'+
+    relInd(a.score)+'<div class="meta">'+meta.join(' · ')+'</div>'+cats+'</div>';
+}
+function renderSem(r){
+  const el = $('#results');
+  let h = '<div class="countbar">Retrieved <b>'+r.pool+'</b> by meaning &rarr; <b>'+r.pre_count+
+    '</b> resolved &rarr; <b>'+r.post_count+'</b> after filter'+
+    '<br><span style="color:#999">filters: '+esc(fdesc(r.filters, r.cats_available))+'</span></div>';
+  if(!r.results.length){ el.innerHTML = h+'<div class="hint">No results after filtering.</div>'; return; }
+  el.innerHTML = h + r.results.map(semRow).join('');
 }
 // -- inline-link clicks + hovercards (page previews) --------------------------
 const _sumCache = {};        // id -> {title, lead}, cached per session
@@ -1437,6 +1866,7 @@ function renderState(st){   // restore a view for a popstate (no new push)
   else if(st.view==='article'){ loadArticle(st.id); }
   else if(st.view==='connect'){ loadConnect(st.f, st.t); }
   else if(st.view==='ask'){ loadAsk(st.q); }
+  else if(st.view==='sem'){ loadSem(st.p); }
   else if(st.view==='search'){ loadSearch(st.q); }
   updateBack();
 }
@@ -1448,6 +1878,8 @@ $('#q').addEventListener('keydown', e => { if(e.key==='Enter') search(); });
 $('#ask').addEventListener('keydown', e => { if(e.key==='Enter') ask(); });
 $('#from').addEventListener('keydown', e => { if(e.key==='Enter') connect(); });
 $('#to').addEventListener('keydown', e => { if(e.key==='Enter') connect(); });
+['#sq','#minlinks','#minlen','#maxlen','#scat'].forEach(sel =>
+  $(sel).addEventListener('keydown', e => { if(e.key==='Enter') semSearch(); }));
 </script>
 </body></html>"""
 
@@ -1477,8 +1909,33 @@ def make_handler(reader: Reader):
                     q = parse_qs(u.query).get("q", [""])[0]
                     self._json(reader.search(q))
                 elif path == "/ask":
-                    q = parse_qs(u.query).get("q", [""])[0]
-                    self._json(reader.ask(q))
+                    qs = parse_qs(u.query)
+                    q = qs.get("q", [""])[0]
+                    expand = qs.get("expand", ["1"])[0] != "0"
+                    try:
+                        hops = int(qs.get("hops", ["1"])[0] or "1")
+                    except ValueError:
+                        hops = 1
+                    self._json(reader.ask(q, expand=expand, hops=hops))
+                elif path == "/search_semantic":
+                    qs = parse_qs(u.query)
+
+                    def _int(name: str) -> int:
+                        try:
+                            return int(qs.get(name, ["0"])[0] or "0")
+                        except ValueError:
+                            return 0
+
+                    self._json(
+                        reader.search_semantic(
+                            qs.get("q", [""])[0],
+                            pool=_int("pool") or 150,
+                            min_indeg=_int("min_indeg"),
+                            min_len=_int("min_len"),
+                            max_len=_int("max_len"),
+                            cat=qs.get("cat", [""])[0].strip(),
+                        )
+                    )
                 elif path.startswith("/article/"):
                     aid = int(unquote(path.split("/")[-1]))
                     art = reader.article(aid)
@@ -1546,6 +2003,10 @@ def main(argv: list[str] | None = None) -> int:
         "build-redirects",
         help="build ONLY the redirect alias index in reader.db (fast, no re-scan)",
     )
+    sub.add_parser(
+        "build-categories",
+        help="build ONLY the category index (cats table) in reader.db (no re-scan)",
+    )
     sp = sub.add_parser("serve", help="serve the reader")
     sp.add_argument("--host", default="127.0.0.1")
     sp.add_argument("--port", type=int, default=8080)
@@ -1562,6 +2023,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"[build] undirected CSR done in {time.time() - t0:.1f}s")
     elif args.cmd == "build-redirects":
         cmd_build_redirects(args.corpus)
+    elif args.cmd == "build-categories":
+        cmd_build_categories(args.corpus)
     else:
         cmd_serve(args.corpus, args.host, args.port)
     return 0
