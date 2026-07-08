@@ -208,3 +208,109 @@ Client-side-only UX polish; no endpoints, artifacts, or retrieval logic changed.
 - A one-line footer under the related lists explains the distinction once:
   *"Related by meaning uses AI embeddings; Linked articles uses Wikipedia's own
   hyperlinks."* Inline styles, self-contained, still fully offline.
+
+---
+
+# Addendum — connection finder + fused related (2026-07-07)
+
+Two graph-forward features added to `tools/wiki_reader.py`. Both are self-
+contained, fully offline (no CDNs), and reuse the already-loaded serve state
+(cuVS CAGRA index, `reader.db`, the CSR adjacency). The legibility bars/buckets
+above are preserved.
+
+## Feature 1 — Connection finder ("How are A and B connected?")
+
+Finds the **shortest hyperlink path** between two articles and renders it as a
+clickable chain `A → n1 → … → B`.
+
+- **Endpoint** `GET /path?from=<id|title>&to=<id|title>[&narrate=1]`.
+  `resolve()` accepts a numeric article id, an exact title, or a free-text title
+  query (best FTS hit) for each field, so the two form fields reuse title search.
+- **Response** `{from:{id,title}, to:{id,title}, found:true, hops:N,
+  path:[{id,title},…]}`, or `{found:false, reason:"…"}` when no path is found
+  within the bound (or the undirected index is absent).
+- **Algorithm** — **bidirectional BFS** over an **undirected** view of the graph
+  (a link in either direction connects the two topics). Two frontiers grow
+  alternately (always expanding the smaller one) until they meet. Bounded two
+  ways so hub-heavy neighbourhoods stay fast: `max_hops=6` and `max_expand=400k`
+  nodes touched across both sides. The path is reconstructed from the two parent
+  maps at the meet node.
+- **Undirected CSR** — the BFS needs both link directions, so `build` now emits an
+  undirected CSR (`edges_undir_dst.i32.npy` + `edges_undir_off.i64.npy`) **derived
+  from the existing directed CSR** — for every directed `(u,v)` we emit `(u,v)` and
+  `(v,u)`, then re-group by src. No second pass over the 224M-edge TSV shards.
+  Built once, mmap'd at serve startup (guarded: absent → `/path` returns a clear
+  disabled message rather than crashing). A dedicated `build-undirected`
+  subcommand rebuilds only this sidecar (bounded incremental build).
+  - **Measured (Spark, real enwiki):** 448,950,566 half-edges (2× 224,475,283),
+    max node id 7,189,650, **35.4 s**, sidecars **1,853 MB** (1.80 GB dst + 57 MB
+    off), peak RSS ~11.5 GB. `serve` startup unchanged (~45–49 s, CAGRA-dominated).
+- **Optional LLM narration** (secondary): with `&narrate=1` the resolved chain is
+  sent to the same local ollama backend `/ask` uses for a one-paragraph plain-
+  English explanation ("Explain this connection" button in the UI). Best-effort —
+  the path is the deliverable; an ollama failure returns an explicit
+  `[LLM unavailable: …]` note, never a fabrication.
+- **UI** — a sticky sub-header bar with **From / → / To** fields + a **Connect**
+  button (Enter also submits). The chain renders in the article pane as pill
+  "chips", each clickable to `/article/{id}`.
+
+## Feature 2 — Fused related (meaning × topology)
+
+Adds a **primary "Related (fused)"** ranking to the article view that combines
+semantic similarity with graph proximity, so articles that are BOTH semantically
+near AND topologically close rank highest.
+
+- **Endpoint** `GET /related_fused/{id}` →
+  `{fused:[{id,title,rrf,prov,cos,cocite}], semantic:[…], hyperlinks:[…]}`. The
+  `semantic` and `hyperlinks` arrays are the unchanged component breakdowns (the
+  two existing labelled panels, bars intact) shown below the fused list.
+- **Method** — **reciprocal-rank fusion (RRF)** of two rankings, consistent with
+  `tools/wiki_linkpredict_fused.py`: `score(B) = 1/(rrf_k+rank_cos) +
+  1/(rrf_k+rank_graph)` (`rrf_k=60`; a modality where B is absent contributes 0).
+  - *cosine ranking* = the cuVS CAGRA semantic neighbours (`pool=50`).
+  - *graph-proximity ranking* = 1-hop out-neighbours (directly linked) first, then
+    2-hop neighbours ranked by **co-citation count** (how many of A's own out-links
+    also point at them). The 2-hop fan-out is bounded (`cap_direct=300`,
+    `cap_out=64`) so the call stays fast on hub pages.
+- **Provenance tag** per fused result: **"meaning + linked"** (directly linked AND
+  in the semantic pool — strongest), **"meaning only"** (semantic pool only),
+  **"linked (1-hop)"** / **"linked (2-hop)"** (graph only). Rendered as a small
+  coloured pill; the cosine bar shows when the item is semantically ranked, else a
+  "co-cited ×N" badge.
+- **Verified (Spark, Ada Lovelace / id 195):** the top of the fused list is all
+  "meaning + linked" — *Charles Babbage*, *Analytical engine*, *Alan Turing*,
+  *Lady Byron*, *Note G* — i.e. articles that are both semantically near and
+  directly linked, exactly the dual-signal boost intended; a purely-linked entry
+  ("linked (1-hop)", e.g. *The Right Honourable*) trails below.
+
+## Endpoints (summary)
+
+| Endpoint | Returns |
+|---|---|
+| `GET /path?from=&to=&narrate=` | shortest undirected hyperlink chain (+ optional LLM narration) |
+| `GET /related_fused/{id}` | RRF(meaning, topology) ranking + provenance + component panels |
+
+## Verified live (Spark, 2026-07-07, PID rotated cleanly)
+
+- `/path?from=195&to=Charles%20Babbage` → **1 hop** (directly linked).
+- `/path?from=Ada%20Lovelace&to=Photosynthesis` → **2 hops** via *Computer*.
+- `/related_fused/195` → fused ranking above.
+- No regression: `/`, `/search`, `/article/195`, `/related/195`, `/ask` all 200;
+  `/related` still returns `{semantic, hyperlinks}` unchanged.
+
+## Deferred / corners cut
+
+- **Path search is bounded**, not provably global-shortest for pathological
+  hub-saturated pairs: if `max_expand` (400k nodes) is hit before the frontiers
+  meet, `/path` reports "no path found within N hops" rather than searching on.
+  Fine for a personal tool on a densely-linked graph (most real pairs meet in
+  1–3 hops).
+- **Graph proximity in the fused ranking is 1-hop + bounded 2-hop co-citation**,
+  not the full Adamic-Adar / leakage-corrected scorer of
+  `wiki_linkpredict_fused.py` — that offline analysis materialises a bounded
+  adjacency over all 224M edges per run, too heavy for a per-request serve path.
+  The RRF *method* is the same; the graph feature is the cheap serve-time variant.
+- **Undirected CSR keeps duplicate edges** (when both `u→v` and `v→u` existed);
+  harmless for BFS, not de-duplicated.
+- **Narration** is single-shot and un-cached; it re-runs the `/path` resolve +
+  BFS when `narrate=1` (cheap) before calling the LLM.
