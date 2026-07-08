@@ -182,3 +182,29 @@ Three real questions via curl against the live serve process:
 - Body rendering does a light wikitext-residue cleanup only (drops image/thumb
   caption fragments); it is not a full wiki renderer.
 - Single-user tool: sqlite and the CAGRA index are each guarded by one lock.
+
+---
+
+# Addendum — legibility polish for the related / sources panels (2026-07-07)
+
+Client-side-only UX polish; no endpoints, artifacts, or retrieval logic changed.
+
+- The two related lists are now unambiguously labelled with a one-line legend
+  each: **"Related by meaning"** (semantic / cuVS neighbours) — *"how closely the
+  topics match (embedding similarity)"* — and **"Linked articles"** (out-edges) —
+  *"articles this page links to"*.
+- Each semantic result now renders a small horizontal **bar** (CSS `width` % =
+  the score) plus a plain-language **bucket word** instead of a bare float. The
+  raw number is kept but demoted to a muted, small `.num` span and repeated in the
+  row's `title=` tooltip.
+- **Score semantics (verified).** `/related` and `/ask` return `score` =
+  **cosine similarity** in `[0,1]`, higher = more related. Chain: the cuVS shim
+  (`wiki_linkpredict._CuvsIndex.knn_query`) returns `sqeuclidean/2 = 1 - cos` on
+  the unit vectors, and `semantic()`/`retrieve()` apply `1 - d = cos`, so a longer
+  bar correctly means *more* related. Buckets: `>=0.85` near-identical,
+  `0.75-0.85` very related, `0.60-0.75` related, `<0.60` loosely related.
+- **/ask sources** use the same bar + bucket indicator (still clickable to
+  `/article/{id}`).
+- A one-line footer under the related lists explains the distinction once:
+  *"Related by meaning uses AI embeddings; Linked articles uses Wikipedia's own
+  hyperlinks."* Inline styles, self-contained, still fully offline.

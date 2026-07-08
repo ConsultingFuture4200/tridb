@@ -454,11 +454,20 @@ main { display:grid; grid-template-columns:260px 1fr 300px; gap:0; height:calc(1
 .item:hover { background:#eef3ff; }
 .secttl { font-size:12px; text-transform:uppercase; letter-spacing:.05em; color:#888;
   margin:12px 8px 4px; font-weight:600; }
-.score { color:#999; font-size:11px; float:right; }
 p { line-height:1.6; }
 .hint { color:#999; padding:16px; }
-.hd { color:#999; font-size:11px; text-transform:uppercase; letter-spacing:.05em;
-  margin:16px 8px 4px; font-weight:600; }
+.hd { color:#555; font-size:11px; text-transform:uppercase; letter-spacing:.05em;
+  margin:16px 8px 2px; font-weight:600; }
+.legend { color:#aaa; font-size:10.5px; font-style:italic; margin:0 8px 6px;
+  line-height:1.3; }
+.rtitle { line-height:1.3; }
+.relbarwrap { margin-top:4px; display:flex; align-items:center; gap:6px; }
+.relbar { flex:1; height:6px; background:#eceef2; border-radius:3px; overflow:hidden; }
+.relfill { height:100%; background:#36c; border-radius:3px; }
+.bucket { font-size:11px; color:#555; white-space:nowrap; }
+.num { font-size:10px; color:#bbb; white-space:nowrap; font-variant-numeric:tabular-nums; }
+.foot { color:#aaa; font-size:10.5px; padding:10px 8px 4px; border-top:1px solid #eee;
+  margin-top:14px; line-height:1.45; }
 </style></head>
 <body>
 <header>
@@ -475,6 +484,23 @@ p { line-height:1.6; }
 const $ = s => document.querySelector(s);
 async function j(u){ const r = await fetch(u); return r.json(); }
 function esc(s){ const d=document.createElement('div'); d.textContent=s; return d.innerHTML; }
+// score is cosine similarity (0..1, higher = more related).
+function bucketWord(s){
+  if(s>=0.85) return 'near-identical';
+  if(s>=0.75) return 'very related';
+  if(s>=0.60) return 'related';
+  return 'loosely related';
+}
+function relInd(s){
+  const pct = Math.max(0, Math.min(100, Math.round(s*100)));
+  return '<div class="relbarwrap" title="embedding cosine similarity '+s.toFixed(2)+
+    ' (higher = more related)">'+
+    '<div class="relbar"><div class="relfill" style="width:'+pct+'%"></div></div>'+
+    '<span class="bucket">'+bucketWord(s)+'</span>'+
+    '<span class="num">'+s.toFixed(2)+'</span></div>';
+}
+const RELFOOT = '<div class="foot">&ldquo;Related by meaning&rdquo; uses AI embeddings; '+
+  '&ldquo;Linked articles&rdquo; uses Wikipedia&rsquo;s own hyperlinks.</div>';
 
 async function search(){
   const q = $('#q').value.trim();
@@ -498,14 +524,17 @@ async function loadRelated(id){
   const rel = $('#related');
   rel.innerHTML = '<div class="hd">Loading…</div>';
   const r = await j('/related/'+id);
-  let h = '<div class="hd">Semantic neighbours</div>';
+  let h = '<div class="hd">Related by meaning</div>' +
+    '<div class="legend">how closely the topics match (embedding similarity)</div>';
   h += r.semantic.length
-    ? r.semantic.map(a => `<div class="item" onclick="open_(${a.id})"><span class="score">${a.score}</span>${esc(a.title)}</div>`).join('')
+    ? r.semantic.map(a => `<div class="item" onclick="open_(${a.id})"><div class="rtitle">${esc(a.title)}</div>${relInd(a.score)}</div>`).join('')
     : '<div class="hint">none</div>';
-  h += '<div class="hd">Hyperlinks (out)</div>';
+  h += '<div class="hd">Linked articles</div>' +
+    '<div class="legend">articles this page links to</div>';
   h += r.hyperlinks.length
     ? r.hyperlinks.map(a => `<div class="item" onclick="open_(${a.id})">${esc(a.title)}</div>`).join('')
     : '<div class="hint">none</div>';
+  h += RELFOOT;
   rel.innerHTML = h;
 }
 async function ask(){
@@ -518,8 +547,9 @@ async function ask(){
   catch(e){ art.innerHTML = '<div class="hint">Ask failed: '+esc(String(e))+'</div>'; return; }
   let h = '<h2>Ask</h2><div class="answer">'+esc(r.answer)+'</div>';
   if(r.sources && r.sources.length){
-    h += '<div class="hd">Sources (click to open)</div>';
-    h += r.sources.map(s => `<div class="item" onclick="open_(${s.id})"><span class="score">${s.score}</span>[${s.n}] ${esc(s.title)}</div>`).join('');
+    h += '<div class="hd">Sources (click to open)</div>' +
+      '<div class="legend">how closely each source matches your question (embedding similarity)</div>';
+    h += r.sources.map(s => `<div class="item" onclick="open_(${s.id})"><div class="rtitle">[${s.n}] ${esc(s.title)}</div>${relInd(s.score)}</div>`).join('');
   } else {
     h += '<div class="hint">No sources retrieved.</div>';
   }
