@@ -155,6 +155,10 @@ verify_patches() {
   # translator. Sentinel on the LOAD-BEARING SPI token (gph_neighbors_ext_cached) in tjs_operator.cpp.
   grep -q 'gph_neighbors_ext_cached' "$root/src/tjs_operator.cpp" 2>/dev/null \
     || die "TriDB tridb_graph_vid_cache.patch NOT applied — TJS graph probe still on the uncached shim (advisor plan 034); drift?"
+  # DEV-1354: tjs_open TR-1 HARD work-bound. Sentinel on the LOAD-BEARING GUC name — its presence
+  # proves both the absolute examined ceiling in the phase-3b drain and the honest PG_CATCH reporting.
+  grep -q 'vectordb.tjs_open_max_examined' "$root/src/tjs_open_operator.cpp" 2>/dev/null \
+    || die "TriDB tridb_tjs_open_workbound.patch NOT applied — tjs_open TR-1 work-bound GUC missing (DEV-1354); drift?"
   log "all MSVBASE + TriDB fork patches verified present"
 }
 
@@ -584,6 +588,26 @@ apply_tridb_fork_patches() {
     log "applying TriDB fork patch: operator graph probe -> cached reverse translator (advisor plan 034 / DEV-1345)"
     ( cd "$root" && git apply "$vidcache_patch" ) \
       || die "tridb_graph_vid_cache.patch did not apply — tjs-chain drift? re-generate per advisor plan 034"
+  fi
+
+  #   tridb_tjs_open_workbound.patch (DEV-1354): TR-1 HARD work-bound for tjs_open. Adds the
+  #     vectordb.tjs_open_max_examined GUC (PGC_USERSET, lazy-registered — the extension has no other
+  #     GUC/_PG_init block to join) and an ABSOLUTE examined ceiling in execTJSOpen's phase-3b drain,
+  #     so termination is GUARANTEED bounded at any N. Without it the HNSW relaxed-monotonicity tail
+  #     sporadically improves the top-k within every <term_cond pulls, so the consecutive_drops bound
+  #     never fires at 1M and the drain runs unbounded (200k terminated at examined=90; 1M hung). The
+  #     ceiling does NOT touch the drop counter, so below the cap the streaming top-k/bridge semantics
+  #     are unchanged. Also publishes tjs_open_last_examined/bridges in the PG_CATCH so a cancelled or
+  #     statement_timeout'd scan reports true work, not the stale post-drain 0. Diffed against the
+  #     post-vid-cache tree, so it MUST apply LAST in the tjs chain.
+  local tjswb_patch="${_MSVBASE_LIB_DIR}/../patches/tridb_tjs_open_workbound.patch"
+  [[ -f "$tjswb_patch" ]] || die "missing TriDB fork patch: $tjswb_patch"
+  if grep -q 'tjs_open_max_examined' "$root/src/tjs_open_operator.cpp" 2>/dev/null; then
+    log "TriDB fork patch (tjs_open TR-1 work-bound GUC, DEV-1354) already applied"
+  else
+    log "applying TriDB fork patch: tjs_open TR-1 hard work-bound + honest examined reporting (DEV-1354)"
+    ( cd "$root" && git apply "$tjswb_patch" ) \
+      || die "tridb_tjs_open_workbound.patch did not apply — tjs-chain drift? re-generate per DEV-1354"
   fi
 
   # ----------------------------------------------------------------------------
