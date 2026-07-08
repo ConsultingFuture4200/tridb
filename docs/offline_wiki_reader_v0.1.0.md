@@ -645,3 +645,102 @@ button is not regressed. `#back` stays hidden on home states (as before).
   This matches the explicit "Home/refresh = a new random article each time" requirement;
   the trade-off is that a specific random article is not itself a stable back target
   (open it as an `article` view — e.g. via a link — if you want to return to it).
+
+---
+
+# Addendum v8 — on-demand, reviewed, CITED article enrichment (DEV-1354)
+
+A maintainer-in-the-loop feature that proposes facts the current article **lacks**,
+each **grounded in and citing a specific related article**, and lets the maintainer
+**accept** them into a persistent **overlay** that renders on the page — without ever
+mutating the original body. One mechanism (cited candidate facts) serves all three
+goals: fill gaps, cite sources, stay honest.
+
+## Why on-demand (not auto)
+
+Enrichment runs a local LLM over ~10 source articles, so it is triggered by a
+**🔎 Find enrichments** button on the article view — *not* on every article load.
+Browsing stays as fast as before; only an explicit click pays the LLM cost.
+
+## `GET /enrich/{id}` — propose cited facts
+
+1. **Gather candidate SOURCES** related to the target, in a deliberate priority order:
+   **IN-neighbours first** (articles that *link to* this one — they reference this exact
+   subject), then **OUT-neighbours**, then **cosine (cuVS) neighbours**. IN-neighbours
+   are reconstructed cheaply as `undirected − out` on the CSR sidecars. This ordering is
+   the **entity-resolution guard**: a page that links here is talking about *this*
+   Mercury; a mere cosine neighbour might be the other one. Capped at
+   `ENRICH_MAX_SOURCES` (10); each source contributes its lead (`ENRICH_SOURCE_CHARS`).
+2. **Grounded LLM extraction** (ollama `qwen2.5:7b-instruct`, `format=json`): propose
+   facts about the target subject that are (a) stated in **one specific source's provided
+   text** and (b) **not already in the target**. Strict JSON: a list of
+   `{property, value, source_id, source_snippet}` where the snippet is a **verbatim span**
+   of that source.
+3. **Anti-hallucination gate** (`_snippet_grounded`): every proposed fact is **dropped**
+   unless its snippet is a real (whitespace-normalised, case-insensitive, ≥12-char) span
+   of the exact source text we fed the model. Facts already stated verbatim in the target
+   are also dropped. The response reports `n_dropped`.
+4. **Missing sections**: section headings that recur in ≥ `ENRICH_SECTION_MIN` (2) of the
+   target's semantic neighbours but that the target lacks, as
+   `{type:'section', name, seen_in:[ids]}`.
+
+## `POST /enrich/accept` / `POST /enrich/dismiss` — persist / suppress
+
+Accepted suggestions are written to a **separate overlay DB**,
+`data/wiki/enrich_overlay.db` (**not** inside `reader.db`), so a future `reader.db`
+rebuild from the planned clean re-extract **preserves the maintainer's curation**.
+Schema: `facts(subject_id, property, value, source_id, source_title, source_snippet,
+accepted_ts)` (indexed by `subject_id`) and `dismissed(subject_id, property, value)`.
+Accept is idempotent per (subject, property, value); dismiss suppresses a suggestion so
+it does not resurface on the next `/enrich`.
+
+## UI
+
+The article view gains the **🔎 Find enrichments** button → an amber **"Possibly missing
+(from related articles)"** panel: each suggestion shows the proposed fact, a clickable
+source link (`open_(source_id)`), the supporting snippet, and **Accept / Dismiss**.
+Accepted facts render in a tinted, clearly-marked green **"✨ Enrichments (from related
+articles)"** section (loaded with every `/article/{id}` via a cheap indexed overlay
+lookup), each still showing its source — **the original body is never touched.**
+
+## Guardrails (the rigorous, cited mode)
+
+- **Never an unsourced fact.** Every suggestion cites a source article + a verbatim
+  snippet; the snippet gate drops any that fails verification.
+- **Never mutate the body.** Enrichments live only in the overlay.
+- **Entity-resolution care.** Linked sources are preferred over mere semantic similarity
+  (noted in `_in_neighbor_ids` / `_enrich_source_ids`).
+
+## Verified live (Spark, 2026-07-07, PID rotated cleanly)
+
+- **`/enrich/195` (Ada Lovelace)** → 1 cited suggestion:
+  `lived_at → "Sandown House (now known as Esher Town Hall) in Esher, Surrey"`, cited to
+  source `6797359` *Sandown House* with the verbatim snippet *"Various sources state that
+  the mathematician and writer, Ada Lovelace, lived at Sandown from 1841 until her death
+  in 1852."* — confirmed that span is present in source 6797359's body. Plus 4 missing
+  sections (*Family, Notes, Early life, Books*) seen in her semantic neighbours.
+  `n_sources=10, n_dropped=0`.
+- **Accept flow:** `POST /enrich/accept` persisted the fact (overlay
+  `data/wiki/enrich_overlay.db`, `facts` row for subject 195); `GET /article/195` then
+  returns it under `enrichments`, rendering the tinted section.
+- **Snippet gate:** exercised the real `Reader._snippet_grounded` against source 6797359's
+  text — the genuine snippet returns `True` (kept); a fabricated *"Ada Lovelace personally
+  built the first electronic computer in 1849."* returns `False` (**dropped**). This is
+  the mechanism that removes hallucinated facts before they ever reach the maintainer.
+- **No regression:** `/`, `/random`, `/article/195` (+`enrichments` field), `/summary/195`,
+  `/related/195`, `/related_fused/195`, `/search`, `/search_semantic`, `/path` all 200;
+  cuVS CAGRA still loads; served HTML carries the new wiring.
+
+## Corners cut / honest limits
+
+- **LLM precision is bounded.** `qwen2.5:7b` is conservative here (1 fact on Ada
+  Lovelace); recall is modest and it occasionally proposes trivially-true or
+  already-implied facts. The **snippet gate guarantees soundness, not completeness** —
+  every surviving fact is genuinely in a cited source, but many real gaps go unproposed.
+  The maintainer's Accept/Dismiss is the final arbiter by design.
+- **IN-neighbour reconstruction** (`undirected − out`) lumps *mutual* links into the
+  out-set; they are still included as sources, just not counted as pure in-links.
+- **Missing-section "same-type"** is approximated by cosine neighbours, not a strict
+  category-type match; a recurring heading is a hint, not a guarantee the target needs it.
+- **Sources are lead-only** (`ENRICH_SOURCE_CHARS`), so a fact buried deep in a long
+  source article can be missed (and its snippet would fail the gate, correctly).

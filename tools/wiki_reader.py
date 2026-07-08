@@ -62,6 +62,21 @@ OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434").rstrip("/")
 ASK_K = 8  # passages fed to the LLM
 PASSAGE_CHARS = 1500  # per-passage body budget so k passages fit the context
 
+# --- Enrich (on-demand, reviewed, CITED article enrichment) ----------------- #
+# Proposes facts the current article LACKS, each grounded in and citing a specific
+# related article, which the maintainer accepts into a persistent OVERLAY. The
+# overlay lives OUTSIDE reader.db (its own DB file next to the corpus dir) so a
+# future reader.db rebuild from the planned clean re-extract does NOT wipe the
+# maintainer's curated facts. Anti-hallucination gate: every proposed fact carries
+# a verbatim snippet from the cited source and is dropped unless that snippet is
+# actually found in the source text we fed the model.
+ENRICH_OVERLAY_NAME = "enrich_overlay.db"  # sits at <corpus>/../enrich_overlay.db
+ENRICH_MAX_SOURCES = 10  # cap on candidate source articles fed to the LLM
+ENRICH_SOURCE_CHARS = 900  # per-source text budget (lead + a little body)
+ENRICH_TARGET_CHARS = 2000  # target-article text shown to the model (dedupe context)
+ENRICH_SECTION_MIN = 2  # a section must appear in >= N same-type neighbours to report
+ENRICH_SNIPPET_MIN = 12  # min verbatim-snippet length the grounding gate accepts
+
 # --- Inline auto-linking config --------------------------------------------- #
 # Comprehensive linking is the DEFAULT: every word/phrase that resolves to an
 # article is linked. This is safe because links are styled INVISIBLE (identical to
@@ -506,6 +521,15 @@ class Reader:
         self._indeg_lock = threading.Lock()
         # Max article id (sparse PK), cached for the random-article landing page.
         self._max_id: int | None = None
+
+        # Enrichment overlay: accepted cited facts, in a SEPARATE DB file (not
+        # reader.db) so a reader.db rebuild from a future clean re-extract preserves
+        # the maintainer's curation. Keyed by article (subject) id.
+        self.overlay_path = corpus.parent / ENRICH_OVERLAY_NAME
+        self.overlay = sqlite3.connect(self.overlay_path, check_same_thread=False)
+        self.overlay_lock = threading.Lock()
+        self._init_overlay()
+        print(f"[serve] enrichment overlay: {self.overlay_path}")
         print("[serve] ready.")
 
     # -- queries ----------------------------------------------------------- #
@@ -1422,6 +1446,306 @@ class Reader:
             "n_graph": sum(1 for p in passages if p["origin"] == "graph"),
         }
 
+    # -- Enrich (on-demand, reviewed, CITED fact suggestions) -------------- #
+    def _init_overlay(self) -> None:
+        """Create the overlay schema on first serve. `facts` is the accepted-fact
+        store; `dismissed` suppresses a suggestion the maintainer rejected so it
+        does not resurface on the next /enrich of the same article."""
+        with self.overlay_lock:
+            self.overlay.execute(
+                "CREATE TABLE IF NOT EXISTS facts ("
+                "subject_id INTEGER, property TEXT, value TEXT, source_id INTEGER, "
+                "source_title TEXT, source_snippet TEXT, accepted_ts REAL)"
+            )
+            self.overlay.execute(
+                "CREATE INDEX IF NOT EXISTS idx_facts_subject ON facts(subject_id)"
+            )
+            self.overlay.execute(
+                "CREATE TABLE IF NOT EXISTS dismissed ("
+                "subject_id INTEGER, property TEXT, value TEXT)"
+            )
+            self.overlay.commit()
+
+    def _out_neighbor_ids(self, aid: int) -> list[int]:
+        if aid + 1 >= len(self.csr_off):
+            return []
+        lo, hi = int(self.csr_off[aid]), int(self.csr_off[aid + 1])
+        return [int(x) for x in self.csr_dst[lo:hi]]
+
+    def _in_neighbor_ids(self, aid: int) -> list[int]:
+        """Articles that link TO `aid` (they genuinely reference this exact subject).
+
+        Reconstructed cheaply as (undirected neighbours) − (out neighbours): the
+        undirected CSR is out∪in, so subtracting the out set leaves the pure
+        in-links. Mutual links fall into the out set and are still covered there.
+        Preferring these over mere semantic similarity is the entity-resolution
+        guard against the 'Mercury the planet vs Mercury the element' trap — a page
+        that links here is talking about THIS Mercury, a cosine neighbour may not."""
+        if self.undir_off is None:
+            return []
+        out = set(self._out_neighbor_ids(aid))
+        return [n for n in set(self._undir_neighbors(aid)) if n not in out and n != aid]
+
+    def _section_headings(self, body: str) -> list[str]:
+        """Ordered, de-duplicated section headings recoverable from a plain-text body
+        (reuses the same conservative _is_heading heuristic as the reader render)."""
+        seen: set[str] = set()
+        out: list[str] = []
+        for line in body.split("\n"):
+            s = line.strip()
+            if _is_heading(s):
+                key = s.lower()
+                if key not in seen:
+                    seen.add(key)
+                    out.append(s)
+        return out
+
+    def _enrich_source_ids(self, aid: int, sem: list[dict]) -> list[int]:
+        """Ordered candidate SOURCE ids for enriching `aid`, capped.
+
+        Priority is deliberate (see _in_neighbor_ids): IN-neighbours first (they
+        reference this exact subject), then OUT-neighbours, then cosine neighbours —
+        so semantic drift never crowds out the genuinely-linked sources."""
+        ordered: list[int] = []
+        seen = {aid}
+        for i in (
+            self._in_neighbor_ids(aid)
+            + self._out_neighbor_ids(aid)
+            + [d["id"] for d in sem]
+        ):
+            if i in seen:
+                continue
+            seen.add(i)
+            ordered.append(i)
+            if len(ordered) >= ENRICH_MAX_SOURCES:
+                break
+        return ordered
+
+    def _snippet_grounded(self, snippet: str, source_text: str) -> bool:
+        """Anti-hallucination gate: the model's supporting snippet must be a real
+        (whitespace-normalised, case-insensitive) span of the source text we fed it.
+        A too-short or not-found snippet fails, and the fact is dropped."""
+        a = _norm_ws(snippet).lower()
+        return len(a) >= ENRICH_SNIPPET_MIN and a in _norm_ws(source_text).lower()
+
+    def _enrich_extract(self, target: dict, sources: list[dict]) -> list[dict]:
+        """Grounded LLM extraction (local ollama). Ask for NEW facts about the target
+        subject that are stated in ONE specific source's provided text and NOT already
+        in the target, each with a verbatim supporting snippet. Best-effort: any LLM
+        or JSON failure returns [] (the endpoint still returns missing-sections)."""
+        ctx = "\n\n".join(
+            f"SOURCE id={s['id']} — {s['title']}\n{s['text']}" for s in sources
+        )
+        system = (
+            "You enrich a TARGET Wikipedia article with NEW, SOURCED facts. You are "
+            "given the target article text and several SOURCE articles that reference "
+            "the target's subject. Propose facts about the TARGET SUBJECT that are "
+            "(a) explicitly stated in ONE specific source's provided text, and (b) NOT "
+            "already stated in the target text. For each fact you MUST copy a verbatim "
+            "snippet CHARACTER-FOR-CHARACTER from that source's text that supports it. "
+            "Never invent snippets and never use outside knowledge. Output ONLY JSON: "
+            '{"facts":[{"property":"...","value":"...","source_id":<int>,'
+            '"source_snippet":"<verbatim span from that source>"}]}. '
+            'If there are none, return {"facts":[]}.'
+        )
+        user = (
+            f"TARGET ARTICLE: {target['title']}\n{target['body'][:ENRICH_TARGET_CHARS]}\n\n"
+            f"SOURCE ARTICLES (each may state facts about {target['title']}):\n\n{ctx}\n\n"
+            f'Return JSON with NEW sourced facts about "{target["title"]}".'
+        )
+        payload = {
+            "model": ASK_MODEL,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            "stream": False,
+            "format": "json",
+            "options": {"temperature": 0.1, "num_ctx": 8192, "num_predict": 800},
+        }
+        req = urllib.request.Request(
+            f"{OLLAMA_URL}/api/chat",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=180) as r:
+                content = json.loads(r.read())["message"]["content"]
+            obj = json.loads(content)
+        except Exception as e:
+            print(f"[enrich] LLM extraction failed: {e!r}")
+            return []
+        facts = obj.get("facts") if isinstance(obj, dict) else obj
+        if not isinstance(facts, list):
+            return []
+        return [f for f in facts if isinstance(f, dict)]
+
+    def _enrich_missing_sections(
+        self, aid: int, target: dict, sem: list[dict]
+    ) -> list[dict]:
+        """Sections that several same-type (semantic) neighbours have but the target
+        lacks. 'Same-type' is approximated by cosine neighbours; a heading must recur
+        in >= ENRICH_SECTION_MIN of them to be reported (suppresses one-off noise)."""
+        from collections import defaultdict
+
+        tgt = {h.lower() for h in self._section_headings(target["body"])}
+        seen_in: dict[str, list[int]] = defaultdict(list)
+        names: dict[str, str] = {}
+        for d in sem:
+            art = self.article(d["id"])
+            if art is None:
+                continue
+            for h in self._section_headings(art["body"]):
+                key = h.lower()
+                if key in tgt:
+                    continue
+                seen_in[key].append(d["id"])
+                names.setdefault(key, h)
+        out = [
+            {"type": "section", "name": names[k], "seen_in": ids[:6]}
+            for k, ids in seen_in.items()
+            if len(ids) >= ENRICH_SECTION_MIN
+        ]
+        out.sort(key=lambda s: -len(s["seen_in"]))
+        return out[:8]
+
+    def _dismissed_set(self, aid: int) -> set[tuple[str, str]]:
+        with self.overlay_lock:
+            rows = self.overlay.execute(
+                "SELECT property, value FROM dismissed WHERE subject_id=?", (aid,)
+            ).fetchall()
+        return {(r[0].lower(), r[1].lower()) for r in rows}
+
+    def overlay_facts(self, aid: int) -> list[dict]:
+        """Already-accepted overlay facts for an article (rendered on the page)."""
+        with self.overlay_lock:
+            rows = self.overlay.execute(
+                "SELECT property, value, source_id, source_title, source_snippet, "
+                "accepted_ts FROM facts WHERE subject_id=? ORDER BY accepted_ts",
+                (aid,),
+            ).fetchall()
+        return [
+            {
+                "property": r[0],
+                "value": r[1],
+                "source_id": r[2],
+                "source_title": r[3],
+                "source_snippet": r[4],
+                "accepted_ts": r[5],
+            }
+            for r in rows
+        ]
+
+    def enrich(self, aid: int) -> dict:
+        """On-demand cited enrichment for `aid`: gather linked/semantic sources, run a
+        grounded LLM extraction, drop any fact whose snippet is not verbatim in its
+        cited source (anti-hallucination gate) or already stated in the target, and
+        return the reviewable suggestions + missing-section signals. No mutation —
+        nothing is persisted until the maintainer POSTs /enrich/accept."""
+        target = self.article(aid)
+        if target is None:
+            return {"error": "not found"}
+        sem = self.semantic(aid, k=8)
+        sources: list[dict] = []
+        for i in self._enrich_source_ids(aid, sem):
+            art = self.article(i)  # None if the source shard was clobbered
+            if art is None:
+                continue
+            sources.append(
+                {"id": i, "title": art["title"], "text": art["body"][:ENRICH_SOURCE_CHARS]}
+            )
+        raw = self._enrich_extract(target, sources) if sources else []
+        by_src = {s["id"]: s for s in sources}
+        tgt_lower = _norm_ws(target["body"]).lower()
+        dismissed = self._dismissed_set(aid)
+        accepted = {
+            (f["property"].lower(), f["value"].lower()) for f in self.overlay_facts(aid)
+        }
+        suggestions: list[dict] = []
+        dropped = 0
+        for f in raw:
+            prop = str(f.get("property") or "").strip()
+            val = str(f.get("value") or "").strip()
+            snip = str(f.get("source_snippet") or "").strip()
+            try:
+                sid = int(f.get("source_id"))
+            except (TypeError, ValueError):
+                dropped += 1
+                continue
+            src = by_src.get(sid)
+            if src is None or not prop or not val or not snip:
+                dropped += 1
+                continue
+            if not self._snippet_grounded(snip, src["text"]):
+                dropped += 1  # snippet not verbatim in the cited source -> hallucinated
+                continue
+            if len(val) > 3 and _norm_ws(val).lower() in tgt_lower:
+                dropped += 1  # already stated in the target article
+                continue
+            key = (prop.lower(), val.lower())
+            if key in dismissed or key in accepted:
+                continue
+            suggestions.append(
+                {
+                    "property": prop,
+                    "value": val,
+                    "source_id": sid,
+                    "source_title": src["title"],
+                    "source_snippet": snip,
+                }
+            )
+        return {
+            "id": aid,
+            "title": target["title"],
+            "suggestions": suggestions,
+            "missing_sections": self._enrich_missing_sections(aid, target, sem),
+            "n_sources": len(sources),
+            "n_dropped": dropped,
+        }
+
+    def accept_fact(self, d: dict) -> dict:
+        """Persist an accepted suggestion to the overlay (idempotent per subject +
+        property + value). Returns the refreshed accepted-fact list for the subject."""
+        sid = int(d["subject_id"])
+        prop = str(d.get("property", ""))[:300]
+        val = str(d.get("value", ""))
+        try:
+            source_id = int(d.get("source_id"))
+        except (TypeError, ValueError):
+            source_id = -1
+        with self.overlay_lock:
+            exists = self.overlay.execute(
+                "SELECT 1 FROM facts WHERE subject_id=? AND lower(property)=? "
+                "AND lower(value)=?",
+                (sid, prop.lower(), val.lower()),
+            ).fetchone()
+            if not exists:
+                self.overlay.execute(
+                    "INSERT INTO facts VALUES (?,?,?,?,?,?,?)",
+                    (
+                        sid,
+                        prop,
+                        val,
+                        source_id,
+                        str(d.get("source_title", "")),
+                        str(d.get("source_snippet", "")),
+                        time.time(),
+                    ),
+                )
+                self.overlay.commit()
+        return {"ok": True, "facts": self.overlay_facts(sid)}
+
+    def dismiss_fact(self, d: dict) -> dict:
+        """Suppress a suggestion so it does not resurface on the next /enrich."""
+        sid = int(d["subject_id"])
+        with self.overlay_lock:
+            self.overlay.execute(
+                "INSERT INTO dismissed VALUES (?,?,?)",
+                (sid, str(d.get("property", "")), str(d.get("value", ""))),
+            )
+            self.overlay.commit()
+        return {"ok": True}
+
 
 def _clean_body(text: str) -> str:
     """Light wikitext-residue cleanup — the extractor already stripped most markup.
@@ -1566,6 +1890,24 @@ p { line-height:1.6; }
 #hovercard .hc-read { display:inline-block; margin-top:8px; color:#36c; cursor:pointer;
   font-size:12px; font-weight:600; }
 #hovercard .hc-load { color:#999; font-style:italic; }
+/* Enrichment: on-demand cited fact suggestions + the accepted overlay section.
+   Tinted + clearly marked so it never reads as part of the original article body
+   (which is NEVER mutated — accepted facts live only in the overlay DB). */
+#enrichbar { margin:2px 0 10px; }
+.enrich-sec, .enrich-sug { border-radius:8px; padding:10px 14px; margin:12px 0 16px; }
+.enrich-sec { background:#eefaf0; border:1px solid #bfe6c8; }      /* accepted (green) */
+.enrich-sug { background:#fff8e6; border:1px solid #f0deac; }      /* suggestions (amber) */
+.enrich-h { font-size:12px; font-weight:700; text-transform:uppercase; letter-spacing:.04em;
+  color:#556; margin-bottom:8px; }
+.enrich-fact { border-top:1px solid rgba(0,0,0,.06); padding:8px 0 6px; }
+.enrich-fact:first-of-type { border-top:0; }
+.ef-prop { font-size:11px; text-transform:uppercase; letter-spacing:.03em; color:#7a4aa0;
+  font-weight:600; }
+.ef-val { font-size:15px; line-height:1.45; margin:1px 0 3px; color:#1a1a1a; }
+.ef-src { font-size:12px; color:#777; line-height:1.45; }
+.ef-link { color:#36c; cursor:pointer; }
+.ef-link:hover { text-decoration:underline; }
+.ef-act { margin-top:6px; display:flex; gap:8px; }
 </style></head>
 <body>
 <header>
@@ -1666,9 +2008,94 @@ async function loadArticle(id){   // render only, no history push (used by popst
   const body = a.body_html
     ? a.body_html
     : a.body.split(/\\n\\n+/).map(p => '<p>'+esc(p).replace(/\\n/g,'<br>')+'</p>').join('');
-  art.innerHTML = '<h2>'+esc(a.title)+'</h2>'+body;
+  art.innerHTML = '<h2>'+esc(a.title)+'</h2>'+
+    '<div id="enrichbar"><button class="lbtn" onclick="findEnrich('+id+')">'+
+      '&#128269; Find enrichments</button>'+
+      '<span id="enrichmsg" class="subtle" style="margin-left:8px"></span></div>'+
+    '<div id="enrichaccepted">'+renderEnrichments(a.enrichments)+'</div>'+
+    '<div id="enrichsug"></div>'+
+    body;
   art.scrollTop = 0;
   loadRelated(id);
+}
+// -- Enrichment (on-demand, reviewed, CITED) ----------------------------------
+// Accepted overlay facts render in a tinted, clearly-marked section (green) — the
+// original article body is NEVER mutated. Suggestions (amber) each cite a source
+// article + a verbatim snippet; unsourced ones were dropped server-side.
+let _enrichData = {};
+function renderEnrichments(facts){
+  if(!facts || !facts.length) return '';
+  return '<div class="enrich-sec"><div class="enrich-h">&#10024; Enrichments '+
+    '(from related articles)</div>'+facts.map(enrichFactRow).join('')+'</div>';
+}
+function enrichFactRow(f){
+  return '<div class="enrich-fact"><div class="ef-prop">'+esc(f.property)+'</div>'+
+    '<div class="ef-val">'+esc(f.value)+'</div>'+
+    '<div class="ef-src">source: <a class="ef-link" onclick="open_('+f.source_id+')">'+
+      esc(f.source_title || ('#'+f.source_id))+'</a> &mdash; &ldquo;'+
+      esc(f.source_snippet)+'&rdquo;</div></div>';
+}
+function sugRow(id, f, i){
+  return '<div class="enrich-fact" id="sug'+i+'"><div class="ef-prop">'+esc(f.property)+
+    '</div><div class="ef-val">'+esc(f.value)+'</div>'+
+    '<div class="ef-src">source: <a class="ef-link" onclick="open_('+f.source_id+')">'+
+      esc(f.source_title || ('#'+f.source_id))+'</a> &mdash; &ldquo;'+
+      esc(f.source_snippet)+'&rdquo;</div>'+
+    '<div class="ef-act"><button class="lbtn" onclick="acceptEnrich('+id+','+i+')">'+
+      'Accept</button><button class="lbtn" onclick="dismissEnrich('+id+','+i+')">'+
+      'Dismiss</button></div></div>';
+}
+function renderSuggestions(id, r){
+  _enrichData = {};
+  let h = '';
+  if(r.suggestions && r.suggestions.length){
+    r.suggestions.forEach((f,i) => { _enrichData[i] = f; });
+    h += '<div class="enrich-sug"><div class="enrich-h">Possibly missing '+
+      '(from related articles)</div>'+
+      r.suggestions.map((f,i) => sugRow(id,f,i)).join('')+'</div>';
+  }
+  if(r.missing_sections && r.missing_sections.length){
+    h += '<div class="enrich-sug"><div class="enrich-h">Sections similar articles '+
+      'have</div>'+r.missing_sections.map(s =>
+        '<div class="enrich-fact"><div class="ef-prop">section</div>'+
+        '<div class="ef-val">'+esc(s.name)+'</div>'+
+        '<div class="ef-src">seen in '+s.seen_in.length+' similar article(s)</div></div>'
+      ).join('')+'</div>';
+  }
+  if(!h) h = '<div class="hint">No sourced suggestions found.</div>';
+  return h;
+}
+async function findEnrich(id){
+  const msg = $('#enrichmsg'), box = $('#enrichsug');
+  msg.textContent = 'scanning related articles (local LLM)…';
+  box.innerHTML = '';
+  let r;
+  try { r = await j('/enrich/'+id); }
+  catch(e){ msg.textContent = 'enrich failed: '+String(e); return; }
+  if(r.error){ msg.textContent = r.error; return; }
+  const n = (r.suggestions?r.suggestions.length:0)+(r.missing_sections?r.missing_sections.length:0);
+  msg.textContent = n+' suggestion(s) from '+r.n_sources+' related articles'+
+    (r.n_dropped ? (' · '+r.n_dropped+' unsourced dropped') : '');
+  box.innerHTML = renderSuggestions(id, r);
+}
+async function acceptEnrich(id, i){
+  const f = _enrichData[i]; if(!f) return;
+  const payload = { subject_id:id, property:f.property, value:f.value,
+    source_id:f.source_id, source_title:f.source_title, source_snippet:f.source_snippet };
+  let r;
+  try { r = await (await fetch('/enrich/accept', { method:'POST',
+    headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload) })).json(); }
+  catch(e){ return; }
+  const row = $('#sug'+i); if(row) row.style.display = 'none';
+  if(r.facts) $('#enrichaccepted').innerHTML = renderEnrichments(r.facts);
+}
+async function dismissEnrich(id, i){
+  const f = _enrichData[i]; if(!f) return;
+  try { await fetch('/enrich/dismiss', { method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({ subject_id:id, property:f.property, value:f.value }) }); }
+  catch(e){ return; }
+  const row = $('#sug'+i); if(row) row.style.display = 'none';
 }
 async function loadRelated(id){
   const rel = $('#related');
@@ -2006,7 +2433,13 @@ def make_handler(reader: Reader):
                         self._json({"error": "not found"})
                     else:
                         art["body_html"] = reader.link_body(aid, art["body"])
+                        # cheap indexed overlay lookup — accepted enrichments render
+                        # on the page without a second round-trip (never mutates body)
+                        art["enrichments"] = reader.overlay_facts(aid)
                         self._json(art)
+                elif path.startswith("/enrich/"):
+                    aid = int(unquote(path.split("/")[-1]))
+                    self._json(reader.enrich(aid))
                 elif path.startswith("/summary/"):
                     aid = int(unquote(path.split("/")[-1]))
                     s = reader.summary(aid)
@@ -2037,6 +2470,20 @@ def make_handler(reader: Reader):
                 else:
                     self._send(404, b"not found", "text/plain")
             except Exception as e:  # never take the server down on one bad request
+                self._send(500, html.escape(repr(e)).encode(), "text/plain")
+
+        def do_POST(self):
+            u = urlparse(self.path)
+            try:
+                length = int(self.headers.get("Content-Length", "0") or "0")
+                body = json.loads(self.rfile.read(length) or b"{}") if length else {}
+                if u.path == "/enrich/accept":
+                    self._json(reader.accept_fact(body))
+                elif u.path == "/enrich/dismiss":
+                    self._json(reader.dismiss_fact(body))
+                else:
+                    self._send(404, b"not found", "text/plain")
+            except Exception as e:
                 self._send(500, html.escape(repr(e)).encode(), "text/plain")
 
     return Handler
