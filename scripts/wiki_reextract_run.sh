@@ -36,6 +36,26 @@ fail() {
   exit 1
 }
 
+# NON-FATAL enrichment appendix (DEV-1354): after a verified corpus exists, build the
+# infobox structured-facts KB + mechanical attribute-gap suggestions into the shared
+# overlay DB. A MECHANICAL parse (no LLM) so it fits the overnight batch. It must NEVER
+# fail the re-extract: the corpus is the primary deliverable, so any error here is logged
+# loudly and swallowed — the overall run still exits reflecting the (successful) corpus.
+ENRICH_OVERLAY="$REPO/data/wiki/enrich_overlay.db"
+ENRICH_DONE="/tmp/wiki_enrich.done"
+run_enrichment() {
+  log "--- non-fatal enrichment stage: infobox facts + attr-gap suggestions ---"
+  if "$PY" -m tools.wiki_enrich_batch --corpus "$OUT" \
+       --overlay "$ENRICH_OVERLAY" --sentinel "$ENRICH_DONE"; then
+    log "enrichment stage OK (sentinel: $ENRICH_DONE)"
+  else
+    rc=$?
+    log "ERROR: enrichment stage failed (rc=$rc) — corpus is UNAFFECTED; continuing"
+    { echo "status=FAILED"; echo "reason=wiki_enrich_batch rc=$rc"; echo "time=$(ts)"; } \
+      >"$ENRICH_DONE" 2>/dev/null || true
+  fi
+}
+
 # single-instance guard (mkdir is atomic)
 if ! mkdir "$LOCK" 2>/dev/null; then
   log "another run holds $LOCK — exiting"
@@ -55,6 +75,7 @@ if [ -f "$OUT/manifest.json" ]; then
      && [ "$("$PY" -c "import json;print(json.load(open('$OUT/manifest.json'))['counts']['articles'])" 2>/dev/null)" -ge "$MIN_ARTICLES" ]; then
     log "existing corpus at $OUT already complete + verified — nothing to do"
     { echo "status=OK (already-complete)"; echo "out=$OUT"; echo "time=$(ts)"; } >"$DONE"
+    run_enrichment   # non-fatal; resumable so this short-circuit still refreshes the KB
     exit 0
   fi
   log "existing $OUT is incomplete/unverified — will (re)build (resumable)"
@@ -131,4 +152,8 @@ log "=== DONE: $NART articles, $NEDGE edges, $NCAT category rows in $OUT ($OUTSZ
   echo "time=$(ts)"
 } >"$DONE"
 log "sentinel written: $DONE"
+
+# re-extract succeeded + its sentinel is committed. Run the non-fatal enrichment appendix
+# LAST so a broken enrichment can never cost us the corpus.
+run_enrichment
 exit 0
