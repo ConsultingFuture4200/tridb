@@ -10,8 +10,9 @@
 #   This patch counts candidates examined and returns end-of-scan once `vectordb.hnsw_max_examined`
 #   is exceeded, so the scan is provably O(cap) regardless of whether the 86-window flip ever trips —
 #   a defensive TR-1 guarantee (golden rule #1) and the exact analog of the shipped tjs_open work
-#   bound (tridb_tjs_open_workbound.patch). The executor's ORDER BY reorder still returns the true
-#   top-k by distance among the examined candidates.
+#   bound (tridb_tjs_open_workbound.patch). APPROXIMATE-kNN SEMANTICS (not "true top-k"): a cap set
+#   below the ~86 emission window truncates before xs_inorder stabilizes and lowers recall below 1.0,
+#   and a cap below k returns FEWER than k rows. Above the window the cap is inert (see below).
 #
 # IMPORTANT — VERIFICATION FINDING (the diagnosis premise was NOT reproduced): with a WARM in-RAM
 #   index (vector_index_map cached), the UNBOUNDED (cap=0) plain scan at N=1M terminates in single-
@@ -33,10 +34,15 @@
 #      in _PG_init, next to the HNSW reloption kinds. Plain-scan analog of vectordb.tjs_open_max_examined.
 #
 # TUNING: default 1000 is chosen ABOVE the range=86 emission window so it never truncates the existing
-#   flip-terminated scan (no recall regression: 1M recall@10 identical at cap 0/100/200/500/1000/2000/
-#   4000). Setting the cap BELOW ~86 truncates below the flip and reduces recall (cap=3 -> 3 rows). The
-#   healthy tjs_open drain finishes ~45-90 examined (well under 1000), so tjs_open (which has its own
-#   vectordb.tjs_open_max_examined bound) still terminates and is NOT regressed (tjs_open_smoke passes).
+#   flip-terminated scan. NOTE ON RECALL (do NOT quote this GUC as an SM-4 recall/latency knob): this
+#   cap is NOT a recall tradeoff on the current corpus. Above the ~86 flip it is INERT — cap>=86 gives
+#   byte-identical results to cap=0 (a FLAT curve, not a tradeoff); below ~86 recall falls off a cliff
+#   (cap=3 -> literally 3 rows). The only honest "no-regression" statement is that cap>=86 == cap=0.
+#   The regression check here was NOT a recall@10 over a held-out query set — it was one exact corpus
+#   member (found at 1.0 by construction) plus two ad-hoc probes; any recall number to be SHIPPED must
+#   be re-measured recall@10 over >=100-1000 held-out queries vs the brute-force L2 oracle. The real
+#   recall knob is the range=86 emission window (or tjs_open's term_cond), NOT this cap. tjs_open (with
+#   its own vectordb.tjs_open_max_examined bound) drains ~45-90 examined and is NOT regressed here.
 #
 # Sentinel for verify_patches: "vectordb.hnsw_max_examined" in src/lib.cpp AND "hnsw_max_examined_guc"
 #   in src/hnswindex.cpp. Depends-on: apply LAST in the HNSW chain — after tridb_hnsw_am_entry_guards,
@@ -99,10 +105,10 @@
 +         // trips at large N, and a plain `ORDER BY embedding <-> q LIMIT k` scan drains ~all N nodes
 +         // (the deterministic 1M hang; N=200k flips at ~86 and is unaffected). This absolute ceiling
 +         // guarantees the scan ALWAYS terminates: after `hnsw_max_examined_guc` candidates we signal
-+         // end-of-scan (return false), and the executor's ORDER BY reorder queue still returns the
-+         // true top-k by distance among those examined. 0 disables (legacy unbounded scan). Exact
-+         // analog of the tjs_open term-cond work-bound (DEV-1354). The range-filter branch above
-+         // keeps its own queueThreshold/distanceThreshold termination and is untouched.
++         // end-of-scan (return false). APPROXIMATE-kNN SEMANTICS (not "true top-k"): a cap below the
++         // ~86 emission window truncates before xs_inorder stabilizes so recall drops below 1.0, and a
++         // cap below k returns FEWER than k rows; above the window it is inert (cap>=86 == cap=0 here).
++         // 0 disables (legacy). Range-filter branch above keeps its own thresholds and is untouched.
 +         if (hnsw_max_examined_guc > 0 &&
 +             ++scanState->examined > (int64) hnsw_max_examined_guc)
 +             return false;
@@ -143,8 +149,8 @@
 +// The VBASE iterative iterator ignores ef_ and can expand the whole graph, so a plain
 +// `ORDER BY embedding <-> q LIMIT k` scan whose xs_inorder emission-window flip never trips
 +// drains ~all N nodes (the deterministic 1M hang). This GUC caps the candidates such a scan may
-+// examine, guaranteeing bounded termination at any corpus size; the executor still returns the
-+// true top-k by distance among those examined. 0 disables the ceiling (legacy unbounded scan).
++// examine, guaranteeing bounded termination at any corpus size. APPROXIMATE-kNN: a cap below the
++// ~86 window lowers recall <1.0, a cap below k returns <k rows. 0 disables (legacy unbounded scan).
 +// Read via `extern int hnsw_max_examined_guc;` in hnswindex.cpp (the hnsw_gettuple hot loop).
 +int hnsw_max_examined_guc = 1000;
 +
@@ -165,8 +171,8 @@
 +        "The VBASE relaxed-monotonicity iterator ignores ef_ and can expand the whole graph; at large N "
 +        "the xs_inorder emission-window flip never trips, so a plain ORDER BY <-> LIMIT k scan drains the "
 +        "entire corpus (unbounded work, a TR-1 violation). This caps examined candidates so the scan always "
-+        "terminates; the executor still returns the true top-k by distance among those examined. 0 disables "
-+        "the ceiling. Does not affect the range-filter (WHERE <-> < t) branch, which has its own bound.",
++        "terminates. Approximate-kNN: a cap below the emission window (~86 on current data) reduces recall "
++        "below 1.0, and a cap below k returns fewer than k rows. 0 disables. Range-filter branch is untouched.",
 +        &hnsw_max_examined_guc,
 +        1000,       /* boot / default */
 +        0,          /* min: 0 = unbounded */

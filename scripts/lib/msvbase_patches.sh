@@ -622,8 +622,8 @@ apply_tridb_fork_patches() {
   #     Adds an `int64 examined` counter to HNSWScanOpaqueData and an absolute `vectordb.hnsw_max_examined`
   #     ceiling (GUC, PGC_USERSET, default 1000, 0=disabled; registered in lib.cpp _PG_init) on
   #     hnsw_gettuple's !hasRangeFilter path, so the scan is provably O(cap) regardless of whether the
-  #     FIXED range=86 emission-window flip trips. The executor's ORDER BY reorder still returns the true
-  #     top-k by distance among the examined candidates. NOTE (DEV-1354 verification): the scan does NOT
+  #     FIXED range=86 emission-window flip trips. APPROXIMATE-kNN (not "true top-k"): a cap below the ~86
+  #     window lowers recall <1.0 and a cap below k returns <k rows. NOTE (DEV-1354 verification): the scan does NOT
   #     actually drain at N=1M — the xs_inorder flip trips and the UNBOUNDED (cap=0) scan finishes in
   #     single-digit ms for member/non-member/midpoint queries (recall identical to capped). The real 1M
   #     >600s cost is LoadIndex's O(heap) rebuild (DEV-1235), not the scan; this cap is a defensive net
