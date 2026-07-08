@@ -159,6 +159,13 @@ verify_patches() {
   # proves both the absolute examined ceiling in the phase-3b drain and the honest PG_CATCH reporting.
   grep -q 'vectordb.tjs_open_max_examined' "$root/src/tjs_open_operator.cpp" 2>/dev/null \
     || die "TriDB tridb_tjs_open_workbound.patch NOT applied — tjs_open TR-1 work-bound GUC missing (DEV-1354); drift?"
+  # DEV-1354: plain HNSW scan TR-1 HARD work-bound. Two sentinels on the LOAD-BEARING GUC name — its
+  # presence in lib.cpp proves the GUC registration and in hnswindex.cpp proves the examined ceiling
+  # in the relaxed-order gettuple loop; a partial apply (one file only) misses one and die()s.
+  grep -q 'vectordb.hnsw_max_examined' "$root/src/lib.cpp" 2>/dev/null \
+    || die "TriDB tridb_hnsw_scan_workbound.patch NOT applied — plain HNSW scan work-bound GUC missing in lib.cpp (DEV-1354); drift?"
+  grep -q 'hnsw_max_examined_guc' "$root/src/hnswindex.cpp" 2>/dev/null \
+    || die "TriDB tridb_hnsw_scan_workbound.patch NOT applied — plain HNSW scan examined ceiling missing in hnswindex.cpp (DEV-1354); drift?"
   log "all MSVBASE + TriDB fork patches verified present"
 }
 
@@ -608,6 +615,29 @@ apply_tridb_fork_patches() {
     log "applying TriDB fork patch: tjs_open TR-1 hard work-bound + honest examined reporting (DEV-1354)"
     ( cd "$root" && git apply "$tjswb_patch" ) \
       || die "tridb_tjs_open_workbound.patch did not apply — tjs-chain drift? re-generate per DEV-1354"
+  fi
+
+  #   tridb_hnsw_scan_workbound.patch (DEV-1354): DEFENSIVE TR-1 work-bound for the PLAIN relaxed-order
+  #     HNSW scan — the analog of tjs_open_workbound for `SELECT ... ORDER BY embedding <-> q LIMIT k`.
+  #     Adds an `int64 examined` counter to HNSWScanOpaqueData and an absolute `vectordb.hnsw_max_examined`
+  #     ceiling (GUC, PGC_USERSET, default 1000, 0=disabled; registered in lib.cpp _PG_init) on
+  #     hnsw_gettuple's !hasRangeFilter path, so the scan is provably O(cap) regardless of whether the
+  #     FIXED range=86 emission-window flip trips. The executor's ORDER BY reorder still returns the true
+  #     top-k by distance among the examined candidates. NOTE (DEV-1354 verification): the scan does NOT
+  #     actually drain at N=1M — the xs_inorder flip trips and the UNBOUNDED (cap=0) scan finishes in
+  #     single-digit ms for member/non-member/midpoint queries (recall identical to capped). The real 1M
+  #     >600s cost is LoadIndex's O(heap) rebuild (DEV-1235), not the scan; this cap is a defensive net
+  #     for a future distribution where the flip might not trip, and is inert on the current corpus.
+  #     Range-filter branch untouched; below the cap behavior is byte-for-byte the legacy scan. Diffed
+  #     against the fully-patched hnswindex.cpp/hnswindex.hpp/lib.cpp, so it MUST apply LAST in the HNSW chain.
+  local hnswwb_patch="${_MSVBASE_LIB_DIR}/../patches/tridb_hnsw_scan_workbound.patch"
+  [[ -f "$hnswwb_patch" ]] || die "missing TriDB fork patch: $hnswwb_patch"
+  if grep -q 'hnsw_max_examined' "$root/src/lib.cpp" 2>/dev/null; then
+    log "TriDB fork patch (plain HNSW scan TR-1 work-bound GUC, DEV-1354) already applied"
+  else
+    log "applying TriDB fork patch: plain HNSW scan TR-1 hard work-bound (DEV-1354)"
+    ( cd "$root" && git apply "$hnswwb_patch" ) \
+      || die "tridb_hnsw_scan_workbound.patch did not apply — hnsw-chain drift? re-generate per DEV-1354"
   fi
 
   # ----------------------------------------------------------------------------
