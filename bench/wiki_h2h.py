@@ -91,6 +91,10 @@ class Cfg:
     pg_user: str = os.environ.get("WH_PGUSER", "postgres")
     pg_password: str = os.environ.get("WH_PGPASSWORD", "postgres")
     pg_table: str = os.environ.get("WH_PGTABLE", "wiki_article")
+    # TR-1 work cap — MUST match the C default `tjs_open_max_examined_guc` (4000). Used both to
+    # SET the GUC explicitly in the emitted SQL (disclosed, NOT swept) and as the CENSORED gate:
+    # a TriDB point whose median examined >= this cap is a truncated drain, not a natural finish.
+    tjs_max_examined: int = int(os.environ.get("WH_TJS_MAX_EXAMINED", "4000"))
 
 
 # ======================================================================================
@@ -287,6 +291,13 @@ def emit_tridb_sql(
     w("\\set ON_ERROR_STOP on")
     w("\\pset pager off")
     w("SET enable_seqscan = off;  -- NB: does NOT force HNSW here; gate on EXAMINED>0 (see docstring)")
+    # TRIDB DEV-1354 — TR-1 SAFETY bound, disclosed and NOT swept (reviewer finding: the cap is not a
+    # validated recall/latency tunable). A point whose examined reaches this ceiling is a truncated
+    # (censored) drain — the report gate flags median examined >= cap CENSORED and excludes it.
+    w(
+        f"SET vectordb.tjs_open_max_examined = {cfg.tjs_max_examined};"
+        "  -- TR-1 work cap; examined>=cap => CENSORED point, gated out of the matched comparison"
+    )
     w("\\timing off")
     for qid in qids:
         qv = _vec_lit(emb[qid])
@@ -584,6 +595,30 @@ def publication_gate(
             "WH_BOUNDARY_PARITY=1 to acknowledge it."
         )
 
+    # Finding 3 / HIGH (cherry-pick hazard): the HNSW index build is RANDOMIZED. The one flattering
+    # TriDB point (examined=90, ~3ms, recall 1.0) came from a single healthy build while FOUR fresh
+    # builds hung the vector leg (examined=0, statement-timeout). Reporting the lucky build and
+    # discarding the hung ones manufactures a win. Refuse any headline until the vector leg is
+    # reproducibly healthy across N>=3 fresh builds (or the failure rate is disclosed).
+    min_healthy = int(os.environ.get("WH_MIN_HEALTHY_BUILDS", "3"))
+    healthy = _int(oracle_meta.get("hnsw_healthy_builds"))
+    total = _int(oracle_meta.get("hnsw_total_builds"))
+    if healthy is None or total is None:
+        blockers.append(
+            "HNSW build health UNDECLARED: the vector-leg index build is randomized and was "
+            "observed to hang (examined=0, statement-timeout) on 4 of 5 fresh builds. Declare "
+            f"WH_HNSW_HEALTHY_BUILDS / WH_HNSW_TOTAL_BUILDS (need all of >= {min_healthy} healthy, "
+            "0 hung) before a latency/recall headline — a number from one lucky build is a cherry-pick."
+        )
+    elif total < min_healthy or healthy < total:
+        blockers.append(
+            f"HNSW build NON-REPRODUCIBLE: {healthy}/{total} fresh builds produced a healthy vector "
+            f"leg (need all of >= {min_healthy}); the rest hung before the first candidate "
+            "(examined=0). The examined-cap does NOT fix this — the hang is upstream of the first "
+            "examined++. Root-cause the HNSW relaxed-monotonicity / opclass binding in the fork's "
+            "vector iterator before quoting any TriDB latency/recall."
+        )
+
     if tp is None or bp is None:
         blockers.append(
             "no matched operating point: "
@@ -611,6 +646,21 @@ def publication_gate(
             "TriDB vector leg did NOT use the HNSW index: median candidates examined = 0 "
             "(seqscan / statement-timeout). No real fixed-recall latency point exists — fix "
             "the float8[] <-> opclass binding before quoting a number."
+        )
+
+    # Finding 5 / medium: a point whose examined hit the TR-1 cap is a TRUNCATED (censored) drain.
+    # Its recall is a censored FLOOR, not the operator's true recall, yet the pull-site returns NULL
+    # identically to a natural finish. examined >= cap IS the cap-engaged signal (a natural finish
+    # stops strictly below the cap; the C returns at examined>=cap). Never quote a latency win at a
+    # censored point, and never interpolate the recall curve through one.
+    cap = _int(oracle_meta.get("tjs_max_examined"))
+    if cap and ex is not None and ex == ex and ex >= cap:
+        blockers.append(
+            f"TriDB operating point is CENSORED: median examined = {ex:.0f} reached the TR-1 work "
+            f"cap (vectordb.tjs_open_max_examined = {cap}), so its recall is a truncated FLOOR, not "
+            "the true operator recall. Excluded from the matched comparison — raise the cap until "
+            "the drain finishes naturally (examined < cap), or interpolate around it, before "
+            "quoting a fixed-recall latency point."
         )
     return blockers
 
@@ -713,6 +763,22 @@ def render_md(
     w(
         "- **Warm** on both sides (engine buffers hot, Milvus/Neo4j collections loaded, PG "
         "cached). Reported consistently; no cold-cache number is mixed in."
+    )
+    w(
+        f"- **HNSW build reproducibility (reviewer BLOCKER).** The vector-leg index build is "
+        f"RANDOMIZED; healthy fresh builds declared: {oracle_meta.get('hnsw_healthy_builds', '?')}/"
+        f"{oracle_meta.get('hnsw_total_builds', '?')}. A latency/recall headline is gated "
+        "(comparison invalid) until the vector leg is healthy across ALL of >= 3 fresh builds — one "
+        "lucky build (the origin of the flattering examined=90 / ~3ms / recall 1.0 point) is a "
+        "cherry-pick, not a result. The four hung builds (examined=0) are disclosed, not discarded."
+    )
+    w(
+        f"- **TR-1 work cap = SAFETY bound, not a tunable (reviewer finding).** "
+        f"`vectordb.tjs_open_max_examined` (default {cfg.tjs_max_examined}) guarantees bounded "
+        "termination at any N; it is NOT a validated recall/latency knob and no cap->recall SM-4 "
+        "curve has been produced through it. In the observed healthy regime it is an UNEXERCISED "
+        "no-op (drains finish at examined~=90, ~44x under the cap). Any point that DOES reach the "
+        "cap is reported CENSORED (truncated recall floor) and excluded from the matched comparison."
     )
     w(
         f"- **Graph-set BLOCKER (not a caveat):** the engine's native graph reports "
@@ -842,6 +908,9 @@ def main(argv: list[str] | None = None) -> int:
             "hops": meta["oracle_hops"],
             "engine_edges": os.environ.get("WH_ENGINE_EDGES", "21,945,976"),
             "neo4j_edges": os.environ.get("WH_NEO4J_EDGES", "38,991,320"),
+            "tjs_max_examined": cfg.tjs_max_examined,
+            "hnsw_healthy_builds": os.environ.get("WH_HNSW_HEALTHY_BUILDS"),
+            "hnsw_total_builds": os.environ.get("WH_HNSW_TOTAL_BUILDS"),
         }
         md = render_md(
             cfg, tridb, baseline, k=k, target=args.target,

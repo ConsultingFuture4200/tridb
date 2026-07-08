@@ -19,8 +19,8 @@ index 6fc7089..5672db8 100644
 +// tjs_open phase-3b drain may pull, GUARANTEEING bounded termination at any corpus size even when the
 +// HNSW relaxed-monotonicity emission tail keeps sporadically improving the top-k within every
 +// <term_cond pulls (the failure mode that let the drain run unbounded at N=1M while N=200k terminated
-+// at examined=90). 0 disables the ceiling (legacy unbounded drain). PGC_USERSET so the benchmark can
-+// sweep the cap into the SM-4 curve with a plain SET, no rebuild. Registered lazily on the first
++// at examined=90). 0 disables the ceiling (legacy unbounded drain). PGC_USERSET = plain-SET session
++// knob, but a TR-1 SAFETY bound NOT a validated tunable: at default 4000 an UNEXERCISED no-op (healthy drains finish ~44x under it); no cap->recall SM-4 curve rides on it. Registered lazily on the first
 +// tjs_open call — the vectordb extension exposes no other GUC, so there is no _PG_init GUC block to
 +// join; PostgreSQL accepts `SET vectordb.tjs_open_max_examined` as a placeholder before registration
 +// and applies the value here, so a SET issued earlier in the session still takes effect.
