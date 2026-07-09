@@ -7,6 +7,11 @@
 > **shrinks** as hops deepen — it comes from eliminating fixed cross-system overhead, so it is
 > largest on cheap queries, NOT "grows with hops." Compute-regime (dim-384, RAM-resident); this
 > is not the I/O-bound thesis (which is structurally unsupported — see the co-location audit).
+>
+> **Credible-scale (N=1,000,000) update:** the 1M fused head-to-head was attempted and is **BLOCKED** —
+> TriDB's vector leg / `tjs_open` does not function at 1M (hang, `examined=0` at a 600 s ceiling; 0/2
+> fresh HNSW builds healthy). The batched edge loader (Wall 3) DID validate at 1M (38.99M edges in
+> ~35 s, reconciled). No 1M latency number is emitted. See "N=1,000,000 (credible scale)" below.
 
 ## TL;DR
 
@@ -31,6 +36,78 @@ hop-3 remains a single lean sample (a large-reach stress case, see caveats).
   whole cost → 11.5×. At hop=3 the intrinsic work (processing ~123k reached/bridge nodes) dominates
   *both* systems, so the fixed saving is a smaller fraction → 1.3×. TriDB still wins by avoiding the
   1.97 MB of cross-store shipping, but the gap narrows.
+
+## N=1,000,000 (credible scale) — attempted, BLOCKED on the vector leg (honest)
+
+**Verdict: the 1M fused head-to-head did NOT execute. TriDB's fused `tjs_open` (and even a plain
+ANN top-10) does not function at N=1,000,000 on the current engine build — the vector leg hangs
+before the first candidate.** No TriDB operating point exists at 1M, so there is nothing to compare
+the multi-store against at matched recall. Per the honesty gate, **no 1M latency number is emitted,
+and none is fabricated.** The 200k win above (11.5× / 3.26×) is unaffected and remains the credible
+operating point.
+
+### What DID validate at 1M — Wall 3 (the batched edge loader)
+
+The reason we could even attempt 1M is the batched `gph_insert_edges` path, and it **works exactly as
+designed at full 1M scale**, on *both* engine images tried:
+
+| stage | `gx10-v1-batchedge` | `gx10-v1-hnswcap` |
+|---|---:|---:|
+| COPY 1,000,000 articles | 62.8 s | 62.8 s |
+| HNSW index build (single-threaded pole) | 691 s (11:31) | 791 s (13:11) |
+| dense vertex materialize (1M) | 12.8 s | 13.1 s |
+| COPY 38,991,320 edges | 5.5 s | 5.6 s |
+| **batched `gph_insert_edges` (all edges)** | **35.1 s** | **34.1 s** |
+| reconcile | `gph_edge_count=38,991,320`, `gph_vertex_count=1,000,000` ✓ | same ✓ |
+
+38.99M edges loaded in ~35 s and reconciled byte-for-byte against the manifest-induced count — the
+Wall-3 payoff is real. The graph and relational legs load cleanly at 1M; **only the vector leg is
+broken.**
+
+### The blocker (measured, reproducible)
+
+- **`tjs_open('articles', 10, 64, 16, 1, …)` at 1M: `examined=0` after a 600 s ceiling** (canceled by
+  statement timeout). It never reaches the first candidate — this is a hang, not a slow-but-finishing
+  cold `LoadIndex`. The engine's own load-time sample `tjs_open` hung identically (killed after
+  3–11 min) on both images.
+- **A plain ANN top-10** — `SELECT id FROM articles ORDER BY embedding <-> '{v}' LIMIT 10`, the exact
+  form the vector-leg h2h uses — **also blocks** (15 s → timeout). `EXPLAIN` shows the planner puts a
+  **blocking `Sort` over ~1,000,000 rows** on top of the `articles_hnsw` index scan: at 1M it no longer
+  trusts the HNSW ordering, so the LIMIT can't push into the beam and the scan is forced to full-corpus.
+- **2 of 2 fresh HNSW builds** (batchedge, then hnswcap) produced an unusable vector leg. This is the
+  **standing `publication_gate` BLOCKER** carried in `bench/wiki_h2h.py` verbatim: *"the HNSW build is
+  RANDOMIZED and was observed to hang (examined=0, statement-timeout) on 4 of 5 fresh builds … the
+  examined-cap does NOT fix this — the hang is upstream of the first examined++. Root-cause the HNSW
+  relaxed-monotonicity / opclass binding in the fork's vector iterator before quoting any TriDB
+  latency/recall."* The one healthy 1M vector-leg result on record (`wiki_h2h_vecleg_1m.json`,
+  p50≈1.03 ms) came from a *lucky* build; quoting a fusion headline off such a build is exactly the
+  cherry-pick the gate forbids (it demands ≥3 healthy of 3 fresh builds). We got 0 of 2 here.
+
+### Does the fusion win hold / grow / shrink at 10× scale?
+
+**Undetermined — the experiment is blocked upstream of the comparison.** The mechanism (eliminating
+3 cross-system round-trips + MB of shipped intermediates) has no reason to reverse at 1M, and the
+baseline's per-hop shipped bytes only grow with corpus size, so the *expectation* is the advantage at
+least holds. But that is a hypothesis, not a measurement, and this document does not claim it. The
+credible, executed number remains the **200k** result.
+
+### Honest caveats specific to this attempt
+
+- **Baseline left at 200k.** With no working TriDB operating point at 1M, reloading the isolated
+  `tridb-wiki-*` stores (Milvus/Neo4j/pgvector) to 1M would have been pointless memory-heavy work; it
+  was skipped. SM-2 baseline untouched.
+- **The cold `LoadIndex` "~96 s at 1M" expectation was wrong.** At 200k it is ~95 s; at 1M the
+  `tjs_open` vector iterator does not complete a cold load at all (still `examined=0` at 10 min) — it
+  is a hang, not a longer-but-finite warm-up.
+- **Compute-regime caveat unchanged.** Even were the vector leg healthy, dim-384 f32 at 1M (~1.5 GB) is
+  still RAM-resident — the compute regime, not the spec's I/O-bound thesis.
+
+### Path to unblock (future work, not attempted here)
+
+Fix the fork's HNSW vector iterator so the index (a) is reproducibly monotonic at 1M (planner keeps the
+index ordering, no full-corpus `Sort`) and (b) `tjs_open`'s beam returns candidates at 1M. Then the
+matched-recall harness (`bench/wiki_fusion.py`) runs unchanged at `--n 1000000`. Gate: ≥3 healthy of 3
+fresh builds before any 1M headline. Raw evidence: `bench/results/wf1m_blocked.json`.
 
 ## Mechanism (what TriDB avoids)
 
