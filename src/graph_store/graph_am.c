@@ -847,6 +847,13 @@ gph_insert_edges(PG_FUNCTION_ARGS)
 		uint32		fill = Min((uint32) (nelems - k), slotcap);
 		uint32		i;
 
+		/* DEV-1354 (Linus review): keep a million-edge hub source interruptible —
+		 * without this, Ctrl-C / statement_timeout cannot fire for the whole run (the
+		 * scalar path got a CHECK per edge via gph_locate_vertex). Safe here: no
+		 * GenericXLog record is open yet, and an ERROR longjmp releases the held
+		 * meta/vbuf/tailbuf/newbuf locks via the resource owner. */
+		CHECK_FOR_INTERRUPTS();
+
 		state = GenericXLogStart(rel);
 		metapage = GenericXLogRegisterBuffer(state, metabuf, 0);
 		meta = (GphMeta *) GphPageRecordBase(metapage);
