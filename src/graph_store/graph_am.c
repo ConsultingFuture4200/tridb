@@ -47,6 +47,7 @@
 #include "storage/procarray.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
+#include "utils/guc.h"
 #include "utils/hsearch.h"
 #include "utils/inval.h"
 #include "utils/memutils.h"
@@ -115,6 +116,20 @@ static int64 gph_visit_counter = 0;
  * the probe that demonstrates that reduction.
  */
 static int64 gph_page_read_counter = 0;
+
+/*
+ * GUC: graph_store.assume_dense_open (advisor plan 048, ADR-0013 rider 1). OFF by default —
+ * `gs_open` (traversal Open) always takes the linear `gph_locate_vertex` chain walk, exactly the
+ * pre-048 behavior. A caller that KNOWS the store was materialized dense-in-order (the same
+ * precondition `gph_insert_edges` already trusts its caller to have verified — see identity_mode,
+ * graph_store_am--0.1.0.sql) can opt in per-session with `SET graph_store.assume_dense_open = on`
+ * to make `gs_open` try the O(1) `gph_locate_vertex_dense` fast path first. This is deliberately a
+ * session opt-in, NOT an auto-detected condition: `gph_locate_vertex_dense` hard-verifies the page
+ * it computes (page type + vid match) and ERRORs on any mismatch rather than silently reading the
+ * wrong vertex, so turning this on over a non-dense store fails loud, not wrong — but we never want
+ * a generic (possibly sparse) reader to pay that failure mode by default.
+ */
+static bool graph_store_assume_dense_open = false;
 
 /* ------------------------------------------------------------------ */
 /* Relation + metapage helpers                                         */
@@ -1369,6 +1384,14 @@ struct GraphScanDescData
  * inline. Callers that want the pre-038 behavior pass (GPH_EDGE_TYPE_RELATED_TO, GRAPHSTORE_INVALID_ID).
  * GRAPH_SCAN_INCOMING / GRAPH_SCAN_BOTH still raise: the adjacency list is out-edges only, so a
  * reverse (dst->src) lookup needs a new index / metapage field — deferred (see docs/decisions/0016).
+ *
+ * plan 048 (ADR-0013 rider 1): the vertex locate itself is the linear `gph_locate_vertex` chain walk
+ * (O(V) at chain position V) UNLESS the session has opted in with `graph_store.assume_dense_open`,
+ * in which case the O(1) `gph_locate_vertex_dense` fast path is tried first. A dense-locate "miss"
+ * (out of the assigned range, or a visible tombstone) is benign and reported exactly like a linear
+ * miss (false); a genuine layout violation is never silently swallowed — `gph_locate_vertex_dense`
+ * ERRORs on that case instead of returning, so we never fall through to a second (linear) attempt
+ * that could paper over a corrupt-looking read. See the GUC comment above for the opt-in contract.
  */
 static bool
 gs_open(GraphScanDesc *scan, Relation rel, GraphVertexId start, GraphScanDirection direction,
@@ -1377,6 +1400,7 @@ gs_open(GraphScanDesc *scan, Relation rel, GraphVertexId start, GraphScanDirecti
 	GphVertexRecord src_rec;
 	BlockNumber		vblk;
 	uint32			vslot;
+	bool			located;
 
 	if (direction != GRAPH_SCAN_OUTGOING)
 		ereport(ERROR,
@@ -1396,7 +1420,17 @@ gs_open(GraphScanDesc *scan, Relation rel, GraphVertexId start, GraphScanDirecti
 	scan->page_n = 0;
 	scan->page_i = 0;
 
-	if (!gph_locate_vertex(rel, start, &vblk, &vslot, &src_rec))
+	if (graph_store_assume_dense_open)
+	{
+		GphMeta		meta;
+
+		gph_read_meta(rel, &meta);
+		located = gph_locate_vertex_dense(rel, start, &meta, &vblk, &vslot, &src_rec);
+	}
+	else
+		located = gph_locate_vertex(rel, start, &vblk, &vslot, &src_rec);
+
+	if (!located)
 		return false;			/* absent => caller decides (empty scan vs raise) */
 	scan->cur_blk = src_rec.vr_adj_head;	/* Invalid if src has no edges => empty scan */
 	return true;
@@ -2167,4 +2201,26 @@ gph_edge_count(PG_FUNCTION_ARGS)
 	gph_read_meta(rel, &meta);
 	relation_close(rel, AccessShareLock);
 	PG_RETURN_INT64((int64) meta.gm_edge_count);
+}
+
+/* ------------------------------------------------------------------ */
+/* GUC registration                                                     */
+/* ------------------------------------------------------------------ */
+
+void _PG_init(void);
+void
+_PG_init(void)
+{
+	DefineCustomBoolVariable("graph_store.assume_dense_open",
+							 "Try the O(1) dense vertex locate on traversal Open before the linear chain walk.",
+							 "Session opt-in only (advisor plan 048, ADR-0013 rider 1): enable ONLY when the "
+							 "store is known to be materialized dense-in-order (the same precondition the "
+							 "batched gph_insert_edges loader already trusts). A layout violation ERRORs "
+							 "rather than silently mis-reading — never enable this over a store you have not "
+							 "verified is dense.",
+							 &graph_store_assume_dense_open,
+							 false,
+							 PGC_USERSET,
+							 0,
+							 NULL, NULL, NULL);
 }
