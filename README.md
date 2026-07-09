@@ -103,7 +103,7 @@ Head-to-head against the multi-system baseline (Milvus + Neo4j + Postgres, app-s
 
 | Metric | Meaning | Target | Result |
 |--------|---------|--------|--------|
-| **SM-1** | Intermediate-result reduction vs. baseline | ≥ 5× | **32×** |
+| **SM-1** | Intermediate-result reduction vs. baseline | ≥ 5× | **1.07× FAIL** (standin; corrected `max(k, reached)` — see [`docs/benchmark_results_v0.1.0.md`](docs/benchmark_results_v0.1.0.md); not restored by GX10) |
 | **SM-2** | Lower end-to-end latency than baseline | ≥ 80% of queries | **100% (12/12), median 15.1× (2k/dim-32, x86 standin; re-measure at corrected operating point = DEV-1284, pending)** |
 | **SM-3** | Corpus examined (k=5, worst case) | < 25% | **6.4%** |
 | **SM-4** | Answer-set parity vs. exact oracle | ≥ 99% | **curve, not a point** (see note ↓) |
