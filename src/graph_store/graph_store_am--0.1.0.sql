@@ -149,10 +149,20 @@ CREATE FUNCTION gph_freeze(horizon xid) RETURNS bigint
 -- filters visible tombstones so traversal stops emitting immediately. Idempotent (re-deleting or
 -- deleting an absent edge/vertex is a no-op). Physical slot reclamation is deferred to plan 036's
 -- freeze pass, so gm_edge_count is NOT decremented (raw monotone counter). gph_tombstone_vertex
--- also tombstones the vertex's OUT-edges; dangling IN-edges are filtered at read time (no reverse
--- index in v1 — full reverse-sweep is plan 038).
+-- also tombstones the vertex's OUT-edges (every type); dangling IN-edges are filtered at read time
+-- (no reverse index in v1 — full reverse-sweep is plan 038).
+--
+-- Typed tombstone (advisor plan 045 / DEV-1354 follow-up): the 2-arg form defaults type_id to
+-- GPH_EDGE_TYPE_RELATED_TO, so it ONLY tombstones :related_to edges between src/dst — before this
+-- fix it matched on dst alone and silently wiped any co-located typed edge (plan 038) between the
+-- same endpoints too. The 3-arg overload (same C symbol, PG_NARGS() branch, matching the
+-- gph_insert_edge pattern) lets a caller pass an explicit dictionary type id, or
+-- GPH_EDGE_TYPE_ANY (0) to explicitly request the old all-type wipe.
 CREATE FUNCTION gph_tombstone_edge(bigint, bigint) RETURNS void
   AS 'MODULE_PATHNAME' LANGUAGE C VOLATILE STRICT;
+
+CREATE FUNCTION gph_tombstone_edge(bigint, bigint, integer) RETURNS void
+  AS 'MODULE_PATHNAME', 'gph_tombstone_edge' LANGUAGE C VOLATILE STRICT;
 
 CREATE FUNCTION gph_tombstone_vertex(bigint) RETURNS void
   AS 'MODULE_PATHNAME' LANGUAGE C VOLATILE STRICT;
@@ -164,6 +174,7 @@ REVOKE EXECUTE ON FUNCTION gph_insert_vertex(), gph_insert_edge(bigint,bigint) F
 -- gph_freeze is a maintenance mutator (superuser/owner only, plan 026 discipline).
 REVOKE EXECUTE ON FUNCTION gph_freeze(xid) FROM PUBLIC;
 REVOKE EXECUTE ON FUNCTION gph_tombstone_edge(bigint,bigint), gph_tombstone_vertex(bigint) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION gph_tombstone_edge(bigint,bigint,integer) FROM PUBLIC;
 REVOKE EXECUTE ON FUNCTION gph_insert_edge(bigint,bigint,integer) FROM PUBLIC;
 REVOKE EXECUTE ON FUNCTION gph_insert_edges(bigint,bigint[]) FROM PUBLIC;
 
