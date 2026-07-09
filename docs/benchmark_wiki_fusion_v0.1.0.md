@@ -48,6 +48,25 @@ TriDB's `tjs_open` does the same fusion in ONE in-process call over libpq: ANN s
 injection + early termination — **0 bytes shipped between systems, 1 round-trip**. That eliminated
 per-query overhead is the entire source of the win.
 
+## Real-network split — the loopback numbers UNDERSTATE the win (measured)
+
+Loopback (all systems co-located) is the multi-store's best case. We re-ran with the **harness on a
+separate x86 box, and the TriDB engine + all three stores on the Spark box** — so every call
+(TriDB's single `tjs_open` *and* each of the baseline's 3 store round-trips) crosses the same LAN at
+equal distance. Same 200k data, same matched-recall protocol (80q×3 runs):
+
+| hop | loopback speedup | **real-network speedup** | TriDB p50 (loop → net) | baseline p50 (loop → net) |
+|---|---|---|---|---|
+| 1 | 11.5× | **16.7×** | 3.69 → 3.55 ms (flat) | 42.6 → **59.1 ms** |
+| 2 | 3.26× | **10.6×** | 96.6 → 90.8 ms (flat) | 314.9 → **960.8 ms** (3×) |
+
+TriDB's latency is **unchanged** — its single call barely notices one network hop. The baseline
+**balloons** — most at hop-2, where it ships ~324 KB of reached ids across 3 real round-trips (on
+loopback that shipping was ~free). So the advantage widens from 3.3–11.5× to **10.6–16.7×**. Since
+real multi-store deployments *are* distributed (the three engines rarely share a host at scale),
+the real-network numbers are arguably the more representative ones — and a higher-RTT network
+(cross-rack / cross-region / cloud) would widen the gap further still. (`wf200k_realnet.json`.)
+
 ## Method
 
 - **Matched scale:** N=200,000 articles, 8,208,179 induced edges, loaded identically into the engine
@@ -70,10 +89,11 @@ per-query overhead is the entire source of the win.
   transient memory spikes (Milvus `col.load()` colliding with the 13.4 GB reader under an aggressive
   OOM policy on the shared box); the reduced-grid tightened run above completed cleanly. A dedicated,
   reader-free box would allow the full high-stat sweep.
-- **Loopback favors the baseline.** All three stores run on localhost = minimal glue cost, the
-  multi-store's *best* case. A real-network (split-machine) deployment adds real latency to each of
-  the 3 round-trips → TriDB's advantage would only *grow*, most at shallow hops. So a loopback TriDB
-  win is conservative. (Real-network is the natural follow-up.)
+- **Loopback favors the baseline — now measured.** All three stores on localhost = the multi-store's
+  best case; the headline table uses that (conservative) setup. The real-network split (section above)
+  confirms the prediction: TriDB's advantage *grows* to 10.6–16.7× when the baseline pays real
+  round-trips + wire-shipping. Both are reported; loopback is the conservative floor. NOTE the
+  real-network test used a single fast LAN — higher-RTT networks would widen it further.
 - **Compute regime, dim-384, RAM-resident.** Not the spec's I/O-bound thesis (which the co-location
   audit found structurally unsupported). This measures the *fusion* mechanism, not page locality.
 - **hop-3 is a large-intermediate stress case** (reach ~123k ≈ 61% of the corpus). Realistic 2–3-hop
