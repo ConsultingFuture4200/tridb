@@ -1,0 +1,8 @@
+# Optional extras for the VectorDBBench adapter (bench/vdbb_tridb.py).
+# Not needed for `make test`/`make lint`/CI — only for running VDBB against TriDB directly.
+# Installs on top of the core floors: pip install -r requirements-vdbb.txt
+#
+# vectordb-bench pulls in a large transitive subtree (streamlit, altair, scikit-learn, polars,
+# pyarrow, aliyun/aws SDKs, ...) that has no place in the core lock — see advisor plan 058.
+-r requirements.txt
+vectordb-bench==1.0.22
