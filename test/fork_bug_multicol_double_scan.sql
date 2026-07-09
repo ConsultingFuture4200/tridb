@@ -35,8 +35,9 @@ CREATE INDEX entities_hnsw ON entities USING hnsw(embedding)
 
 SET enable_seqscan = off;  -- forces the planner onto the HNSW index for the unordered count(*)
 
--- CRASH line on stock; clean ERROR on the patched build:
-SELECT count(*) FROM entities;
+-- CRASH line on stock; clean ERROR on the patched build. Labeled so the harness can grep an
+-- exact tag instead of a bare row count that timing/plan-noise lines could coincidentally match:
+SELECT 'unordered_count|' || count(*) FROM entities;
 
 -- Liveness probe: prints 1 iff the backend survived (the fix is in). On the stock/crashed
 -- backend the connection is already gone and this never executes.
