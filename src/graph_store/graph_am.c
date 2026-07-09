@@ -45,6 +45,7 @@
 #include "storage/bufmgr.h"
 #include "storage/lmgr.h"
 #include "storage/procarray.h"
+#include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/hsearch.h"
 #include "utils/inval.h"
@@ -271,6 +272,84 @@ gph_locate_vertex(Relation rel, uint64 vid, BlockNumber *out_blk, uint32 *out_sl
 		blk = next;
 	}
 	return false;
+}
+
+/*
+ * gph_locate_vertex_dense — O(1) DENSE vertex locate (DEV-1354, the batched-edge fast path).
+ *
+ * The linear gph_locate_vertex above walks the vertex-page chain and costs O(V) at chain position
+ * V — which makes a whole-graph edge load O(E*V) (hours at 1M/39M). This is the constant-time
+ * alternative that makes the batched load O(E): when vertices are materialized dense-in-order with
+ * NO adjacency pages interleaved (the wiki bulk-load precondition — every gph_insert_vertex before
+ * the first edge), the vertex pages are physically CONTIGUOUS and fully packed, so vid V is at
+ * block gm_first_vertex_blk + V/perpage, slot V%perpage. One page read, no chain walk.
+ *
+ * SAFETY (never write to a mis-computed vertex — the golden guard): the computed page is HARD-
+ * verified to (a) be a GPH_PAGE_VERTEX page and (b) actually carry vr_vid == vid at the computed
+ * slot. If either fails the layout is NOT dense (sparse ids, or a vertex inserted AFTER edges broke
+ * contiguity) and we ereport ERROR rather than proceed — so a non-dense caller gets a hard failure,
+ * never silent corruption. `meta` is a caller-provided snapshot (bounds + gm_first_vertex_blk).
+ * Returns false only for the benign "vid never existed / store empty / tombstoned" cases (caller
+ * decides); the layout-violation cases ERROR.
+ */
+static bool
+gph_locate_vertex_dense(Relation rel, uint64 vid, const GphMeta *meta,
+						BlockNumber *out_blk, uint32 *out_slot, GphVertexRecord *out_rec)
+{
+	uint32		perpage = GphVerticesPerPage();
+	BlockNumber	blk;
+	uint32		slot;
+	Buffer		buf;
+	Page		page;
+	GphVertexRecord *vr;
+
+	if (meta->gm_first_vertex_blk == InvalidBlockNumber || vid >= meta->gm_next_vid)
+		return false;			/* store empty / vid never assigned => benign miss */
+
+	blk = meta->gm_first_vertex_blk + (BlockNumber) (vid / perpage);
+	slot = (uint32) (vid % perpage);
+	if (blk >= RelationGetNumberOfBlocks(rel))
+		ereport(ERROR,
+				(errmsg("graph_store: dense locate for vid " UINT64_FORMAT " computed block %u past EOF "
+						"(non-dense layout)", vid, blk)));
+
+	buf = ReadBufferExtended(rel, MAIN_FORKNUM, blk, RBM_NORMAL, NULL);
+	LockBuffer(buf, BUFFER_LOCK_SHARE);
+	page = BufferGetPage(buf);
+
+	if (GphPageSpecialPtr(page)->gph_page_type != GPH_PAGE_VERTEX ||
+		slot >= GphPageRecordCount(page, sizeof(GphVertexRecord)))
+	{
+		UnlockReleaseBuffer(buf);
+		ereport(ERROR,
+				(errmsg("graph_store: dense locate for vid " UINT64_FORMAT " hit page %u slot %u that is "
+						"not a packed vertex slot (non-dense layout — refusing to write)", vid, blk, slot)));
+	}
+
+	vr = GphPageGetRecord(page, slot, sizeof(GphVertexRecord));
+	if (vr->vr_vid != vid)
+	{
+		uint64		got = vr->vr_vid;
+
+		UnlockReleaseBuffer(buf);
+		ereport(ERROR,
+				(errmsg("graph_store: dense locate mismatch on page %u slot %u: found vid " UINT64_FORMAT
+						", wanted " UINT64_FORMAT " (non-dense layout — refusing to write to a mis-computed "
+						"vertex)", blk, slot, got, vid)));
+	}
+
+	/* Same visibility filter as the linear path: an aborted/tombstoned vertex is a benign miss. */
+	if (!gph_xmin_visible(vr->vr_xmin) || gph_deleted_visible(vr->vr_flags, vr->vr_xmax))
+	{
+		UnlockReleaseBuffer(buf);
+		return false;
+	}
+
+	*out_blk = blk;
+	*out_slot = slot;
+	memcpy(out_rec, vr, sizeof(GphVertexRecord));
+	UnlockReleaseBuffer(buf);
+	return true;
 }
 
 /* ------------------------------------------------------------------ */
@@ -563,6 +642,253 @@ gph_insert_edge(PG_FUNCTION_ARGS)
 	UnlockReleaseBuffer(metabuf);
 	relation_close(rel, RowExclusiveLock);
 	PG_RETURN_VOID();
+}
+
+PG_FUNCTION_INFO_V1(gph_insert_edges);
+
+/*
+ * gph_insert_edges(src bigint, dst bigint[]) RETURNS bigint — the BATCHED edge-append entry point
+ * (DEV-1354 / spec §2 "bulk edge loader"). Appends a whole adjacency run for ONE source in a single
+ * call, so the wiki-scale graph (1M vertices / 39M induced edges) loads in minutes instead of the
+ * O(E*V) hours that N x gph_insert_edge cost (each scalar call did TWO O(V) linear vertex locates).
+ * Returns the number of edges appended (== array length).
+ *
+ * The result is BYTE-IDENTICAL to N x gph_insert_edge(src, dst[i]) fed in array order (design §2
+ * parity contract): same append order, same slot layout, same page chaining. Only two things change
+ * vs the scalar path — both O(1) instead of O(V):
+ *   - src is located with gph_locate_vertex_dense (dense fast path; hard-verified, never corrupts);
+ *   - dst existence is a metapage bounds check (0 <= dst < gm_next_vid), valid because under the
+ *     dense-in-order load ext_id == vid so a dst is a real vertex iff it is in [0, next_vid).
+ *
+ * WAL (the delicate part): GenericXLog caps at MAX_GENERIC_XLOG_PAGES (4) buffers per record, and a
+ * multi-page adjacency run needs meta + vertex + old-tail + new-page = exactly 4 to chain ONE page.
+ * So a run that spans many new pages is committed one GenericXLogFinish PER new page (never a single
+ * record over the whole run). meta + the src vertex page are held EXCLUSIVE for the whole batch and
+ * re-registered in each record; gm_edge_count is bumped by that record's slot count, so every record
+ * is self-consistent and a crash mid-batch replays only completed page diffs. Abort atomicity is the
+ * same as the scalar path: every slot is stamped es_xmin = current xid, so a rolled-back batch's
+ * slots are all filtered out by gph_xmin_visible on read (=> zero visible edges), FR-7.
+ *
+ * Single-writer contract (graph_am.c header): the bulk loader is single-connection, so holding meta
+ * + the vertex page locked across the run, and reading gm_next_vid once for the bounds check, are
+ * safe (no concurrent vertex insert can move gm_next_vid mid-batch).
+ */
+Datum
+gph_insert_edges(PG_FUNCTION_ARGS)
+{
+	uint64		src = (uint64) PG_GETARG_INT64(0);
+	ArrayType  *dst_arr = PG_GETARG_ARRAYTYPE_P(1);
+	Relation	rel = gph_open_store(RowExclusiveLock);
+	GphMeta		meta0;
+	GphVertexRecord src_rec;
+	BlockNumber	vblk,
+				tailblk;
+	uint32		vslot;
+	uint32		slotcap = GphEdgeSlotsPerPage();
+	Buffer		metabuf,
+				vbuf,
+				tailbuf;
+	int64	   *dsts;
+	int			nelems,
+				k;
+	int64		appended = 0;
+	TransactionId xid;
+	GenericXLogState *state;
+	Page		metapage,
+				vpage,
+				tailpage,
+				newpage;
+	GphMeta    *meta;
+	GphVertexRecord *vr;
+
+	/* Array shape guards: 1-D, no NULL elements (the loader never produces either). int8 elements
+	 * are 8-byte, pass-by-value, stored inline and unaligned-safe to index as int64. */
+	if (ARR_NDIM(dst_arr) > 1)
+		ereport(ERROR,
+				(errmsg("graph_store: gph_insert_edges expects a 1-dimensional dst array")));
+	if (ARR_HASNULL(dst_arr))
+		ereport(ERROR,
+				(errmsg("graph_store: gph_insert_edges dst array must not contain NULLs")));
+	nelems = (ARR_NDIM(dst_arr) == 0) ? 0
+		: ArrayGetNItems(ARR_NDIM(dst_arr), ARR_DIMS(dst_arr));
+	dsts = (int64 *) ARR_DATA_PTR(dst_arr);
+
+	if (nelems == 0)
+	{
+		relation_close(rel, RowExclusiveLock);
+		PG_RETURN_INT64(0);
+	}
+
+	gph_ensure_meta(rel);
+	gph_read_meta(rel, &meta0);		/* snapshot: bounds (gm_next_vid) + gm_first_vertex_blk */
+
+	/* O(1) dst existence: under the dense load a dst is a vertex iff 0 <= dst < gm_next_vid. */
+	for (k = 0; k < nelems; k++)
+	{
+		if (dsts[k] < 0 || (uint64) dsts[k] >= meta0.gm_next_vid)
+			ereport(ERROR,
+					(errmsg("graph_store: destination vertex %lld out of dense range [0," UINT64_FORMAT ")",
+							(long long) dsts[k], meta0.gm_next_vid)));
+	}
+	if (src >= meta0.gm_next_vid)
+		ereport(ERROR,
+				(errmsg("graph_store: source vertex " UINT64_FORMAT " out of dense range [0," UINT64_FORMAT ")",
+						src, meta0.gm_next_vid)));
+
+	/* O(1) dense src locate (hard-verified; ERRORs on a non-dense layout — never mis-writes). */
+	if (!gph_locate_vertex_dense(rel, src, &meta0, &vblk, &vslot, &src_rec))
+		ereport(ERROR,
+				(errmsg("graph_store: source vertex " UINT64_FORMAT " not found (dense locate)", src)));
+
+	xid = GetCurrentTransactionId();
+
+	/* Lock meta + the src vertex page for the whole batch (meta -> vertex -> adj lock order). */
+	metabuf = ReadBufferExtended(rel, MAIN_FORKNUM, GPH_META_BLKNO, RBM_NORMAL, NULL);
+	LockBuffer(metabuf, BUFFER_LOCK_EXCLUSIVE);
+	vbuf = ReadBufferExtended(rel, MAIN_FORKNUM, vblk, RBM_NORMAL, NULL);
+	LockBuffer(vbuf, BUFFER_LOCK_EXCLUSIVE);
+	src_rec = *(GphVertexRecord *) GphPageGetRecord(BufferGetPage(vbuf), vslot,
+												   sizeof(GphVertexRecord));
+
+	k = 0;
+	tailblk = src_rec.vr_adj_tail;
+
+	if (tailblk == InvalidBlockNumber)
+	{
+		/* src has no edges yet: allocate its first adjacency page and fill it. meta+vbuf+new = 3. */
+		Buffer		newbuf = gph_extend_page(rel);
+		BlockNumber	newblk = BufferGetBlockNumber(newbuf);
+		uint32		fill = Min((uint32) (nelems - k), slotcap);
+		uint32		i;
+
+		state = GenericXLogStart(rel);
+		metapage = GenericXLogRegisterBuffer(state, metabuf, 0);
+		meta = (GphMeta *) GphPageRecordBase(metapage);
+		vpage = GenericXLogRegisterBuffer(state, vbuf, 0);
+		newpage = GenericXLogRegisterBuffer(state, newbuf, GENERIC_XLOG_FULL_IMAGE);
+
+		PageInit(newpage, BLCKSZ, GPH_SPECIAL_SIZE);
+		GphPageSpecialPtr(newpage)->gph_page_type = GPH_PAGE_ADJ;
+		GphPageSpecialPtr(newpage)->gph_unused = 0;
+		GphPageSpecialPtr(newpage)->gph_next_pageno = InvalidBlockNumber;
+		GphPageSpecialPtr(newpage)->gph_owner_vid = src;
+		for (i = 0; i < fill; i++)
+		{
+			GphEdgeSlot	es;
+
+			memset(&es, 0, sizeof(es));
+			es.es_src_vid = src;
+			es.es_dst_vid = (uint64) dsts[k + i];
+			es.es_edge_type_id = GPH_EDGE_TYPE_RELATED_TO;
+			es.es_flags = 0;
+			es.es_xmin = xid;
+			GphPageAppendRecord(newpage, &es, sizeof(GphEdgeSlot));
+		}
+		vr = GphPageGetRecord(vpage, vslot, sizeof(GphVertexRecord));
+		vr->vr_adj_head = newblk;
+		vr->vr_adj_tail = newblk;
+		meta->gm_edge_count += fill;
+		GenericXLogFinish(state);
+
+		tailbuf = newbuf;		/* keep pinned+locked as the current append target */
+		tailblk = newblk;
+		k += fill;
+		appended += fill;
+	}
+	else
+	{
+		/* Fill any remaining room on the current tail page first (meta+tail = 2). */
+		uint32		used,
+					room;
+
+		tailbuf = ReadBufferExtended(rel, MAIN_FORKNUM, tailblk, RBM_NORMAL, NULL);
+		LockBuffer(tailbuf, BUFFER_LOCK_EXCLUSIVE);
+		used = GphPageRecordCount(BufferGetPage(tailbuf), sizeof(GphEdgeSlot));
+		room = (slotcap > used) ? slotcap - used : 0;
+		if (room > 0)
+		{
+			uint32		fill = Min((uint32) (nelems - k), room);
+			uint32		i;
+
+			state = GenericXLogStart(rel);
+			metapage = GenericXLogRegisterBuffer(state, metabuf, 0);
+			meta = (GphMeta *) GphPageRecordBase(metapage);
+			tailpage = GenericXLogRegisterBuffer(state, tailbuf, 0);
+			for (i = 0; i < fill; i++)
+			{
+				GphEdgeSlot	es;
+
+				memset(&es, 0, sizeof(es));
+				es.es_src_vid = src;
+				es.es_dst_vid = (uint64) dsts[k + i];
+				es.es_edge_type_id = GPH_EDGE_TYPE_RELATED_TO;
+				es.es_flags = 0;
+				es.es_xmin = xid;
+				GphPageAppendRecord(tailpage, &es, sizeof(GphEdgeSlot));
+			}
+			meta->gm_edge_count += fill;
+			GenericXLogFinish(state);
+			k += fill;
+			appended += fill;
+		}
+	}
+
+	/*
+	 * Chain a new adjacency page for each remaining page-worth of dsts. Each iteration is ONE
+	 * GenericXLog record over exactly 4 buffers: meta + vbuf (vr_adj_tail) + old tail (its
+	 * gph_next_pageno) + new page (full image). Entering the loop the current tail is always FULL
+	 * (the branch above either filled it exactly or left it full), so every chained page is opened
+	 * fresh. The previous tail buffer is released only AFTER its next_pageno is durably linked.
+	 */
+	while (k < nelems)
+	{
+		Buffer		newbuf = gph_extend_page(rel);
+		BlockNumber	newblk = BufferGetBlockNumber(newbuf);
+		uint32		fill = Min((uint32) (nelems - k), slotcap);
+		uint32		i;
+
+		state = GenericXLogStart(rel);
+		metapage = GenericXLogRegisterBuffer(state, metabuf, 0);
+		meta = (GphMeta *) GphPageRecordBase(metapage);
+		vpage = GenericXLogRegisterBuffer(state, vbuf, 0);
+		tailpage = GenericXLogRegisterBuffer(state, tailbuf, 0);
+		newpage = GenericXLogRegisterBuffer(state, newbuf, GENERIC_XLOG_FULL_IMAGE);
+
+		PageInit(newpage, BLCKSZ, GPH_SPECIAL_SIZE);
+		GphPageSpecialPtr(newpage)->gph_page_type = GPH_PAGE_ADJ;
+		GphPageSpecialPtr(newpage)->gph_unused = 0;
+		GphPageSpecialPtr(newpage)->gph_next_pageno = InvalidBlockNumber;
+		GphPageSpecialPtr(newpage)->gph_owner_vid = src;
+		for (i = 0; i < fill; i++)
+		{
+			GphEdgeSlot	es;
+
+			memset(&es, 0, sizeof(es));
+			es.es_src_vid = src;
+			es.es_dst_vid = (uint64) dsts[k + i];
+			es.es_edge_type_id = GPH_EDGE_TYPE_RELATED_TO;
+			es.es_flags = 0;
+			es.es_xmin = xid;
+			GphPageAppendRecord(newpage, &es, sizeof(GphEdgeSlot));
+		}
+		GphPageSpecialPtr(tailpage)->gph_next_pageno = newblk;
+		vr = GphPageGetRecord(vpage, vslot, sizeof(GphVertexRecord));
+		vr->vr_adj_tail = newblk;
+		meta->gm_edge_count += fill;
+		GenericXLogFinish(state);
+
+		UnlockReleaseBuffer(tailbuf);	/* link durable => release old tail, advance */
+		tailbuf = newbuf;
+		tailblk = newblk;
+		k += fill;
+		appended += fill;
+	}
+
+	UnlockReleaseBuffer(tailbuf);
+	UnlockReleaseBuffer(vbuf);
+	UnlockReleaseBuffer(metabuf);
+	relation_close(rel, RowExclusiveLock);
+	PG_RETURN_INT64(appended);
 }
 
 /* ------------------------------------------------------------------ */

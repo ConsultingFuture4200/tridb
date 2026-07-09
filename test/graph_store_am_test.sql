@@ -62,6 +62,66 @@ BEGIN
     RAISE NOTICE 'PASS chaining (1500 edges, 2 adj pages) + early termination (LIMIT 5 => 5 steps, not 1500)';
 END $$;
 
+-- Batched edge-append (DEV-1354): gph_insert_edges(src, dst[]) must produce the SAME adjacency
+-- run (same emission order) as N x gph_insert_edge, in one call. Vertices 0..5 were materialized
+-- dense-in-order before any edge, so the O(1) dense src locate applies. Vertices 3 and 4 have no
+-- out-edges yet (only 0,1,5 do), so these are clean first-page + chaining cases.
+DO $$
+DECLARE r bigint; n bigint[]; total bigint;
+BEGIN
+    -- (a) small hand-checked run: first adjacency page for vertex 3.
+    SELECT gph_insert_edges(3, ARRAY[0,1,2,4,5]::bigint[]) INTO r;
+    IF r <> 5 THEN
+        RAISE EXCEPTION 'gph_insert_edges returned % (expected 5)', r;
+    END IF;
+    SELECT array_agg(x) INTO n FROM gph_neighbors(3) x;   -- emission (== insertion) order, NOT sorted
+    IF n IS DISTINCT FROM ARRAY[0,1,2,4,5]::bigint[] THEN
+        RAISE EXCEPTION 'neighbors(3)=% (expected {0,1,2,4,5} in array order)', n;
+    END IF;
+
+    -- (b) append MORE to the same vertex: exercises the fill-existing-tail-page path.
+    SELECT gph_insert_edges(3, ARRAY[5,4]::bigint[]) INTO r;
+    IF r <> 2 THEN
+        RAISE EXCEPTION 'gph_insert_edges append returned % (expected 2)', r;
+    END IF;
+    SELECT array_agg(x) INTO n FROM gph_neighbors(3) x;
+    IF n IS DISTINCT FROM ARRAY[0,1,2,4,5,5,4]::bigint[] THEN
+        RAISE EXCEPTION 'neighbors(3) after append=% (expected {0,1,2,4,5,5,4})', n;
+    END IF;
+
+    -- (c) multi-page batch: 1500 edges from vertex 4 span two 32KB adj pages in ONE call.
+    SELECT gph_insert_edges(4, (SELECT array_agg(g % 5) FROM generate_series(1,1500) g)) INTO r;
+    IF r <> 1500 THEN
+        RAISE EXCEPTION 'gph_insert_edges multipage returned % (expected 1500)', r;
+    END IF;
+    SELECT count(*) INTO total FROM gph_neighbors(4);
+    IF total <> 1500 THEN
+        RAISE EXCEPTION 'vertex 4 batched full scan = % (expected 1500; multi-page chain broken)', total;
+    END IF;
+    RAISE NOTICE 'PASS batched insert: hand-checked run + append + 1500-edge multi-page chain';
+END $$;
+
+-- Abort atomicity (FR-7): a rolled-back batch leaves ZERO visible edges (es_xmin filtered on read).
+BEGIN;
+SELECT gph_insert_edges(2, ARRAY[0,1,2,3,4,5]::bigint[]);
+DO $$
+BEGIN
+    IF (SELECT count(*) FROM gph_neighbors(2)) <> 6 THEN
+        RAISE EXCEPTION 'in-txn neighbors(2) count % <> 6 (own uncommitted batch should be visible to itself)',
+            (SELECT count(*) FROM gph_neighbors(2));
+    END IF;
+END $$;
+ROLLBACK;
+
+DO $$
+BEGIN
+    IF (SELECT count(*) FROM gph_neighbors(2)) <> 0 THEN
+        RAISE EXCEPTION 'after ROLLBACK neighbors(2) count % <> 0 (batched edges did not roll back atomically)',
+            (SELECT count(*) FROM gph_neighbors(2));
+    END IF;
+    RAISE NOTICE 'PASS batched abort-atomicity: batch visible in-txn (6), zero visible after ROLLBACK';
+END $$;
+
 -- FR-7 substrate: graph writes participate in the host transaction.
 BEGIN;
 SELECT gph_insert_vertex();		-- a 7th vertex, inside an uncommitted txn

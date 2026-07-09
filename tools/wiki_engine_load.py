@@ -427,19 +427,25 @@ def _build_load_sql(
     w("\\echo #WL VERTEX_MATERIALIZE_DONE")
     w("")
     w(
-        "-- COPY-stage the induced edges, then ONE set-oriented direct-by-vid insert ORDER BY src"
+        "-- COPY-stage the induced edges, then ONE set-oriented BATCHED insert: group by src (each"
     )
     w(
-        "-- (adjacency-chain locality). No gph_upsert_vertex per edge: src/dst ARE vids (design §2 step 3)."
+        "-- source's whole adjacency run in one gph_insert_edges call) ORDER BY src for chain locality."
+    )
+    w(
+        "-- gph_insert_edges is O(1)-per-edge (dense src locate + metapage dst bounds) vs the O(E*V) the"
+    )
+    w(
+        "-- per-edge gph_insert_edge cost at scale; src/dst ARE vids (design §2 step 3, dense load)."
     )
     w("CREATE TEMP TABLE edge_stage (src bigint, dst bigint);")
     w("\\echo #WL COPY_EDGES_START")
     w("\\copy edge_stage (src,dst) FROM '/data/edges.copy'")
     w("\\echo #WL COPY_EDGES_DONE")
     w("\\echo #WL EDGE_INSERT_START")
-    w("SELECT count(*) FROM (")
-    w("  SELECT graph_store.gph_insert_edge(src, dst) FROM edge_stage ORDER BY src")
-    w(") _;")
+    w("SELECT sum(graph_store.gph_insert_edges(src, dst_arr)) FROM (")
+    w("  SELECT src, array_agg(dst) AS dst_arr FROM edge_stage GROUP BY src ORDER BY src")
+    w(") g;")
     w("\\echo #WL EDGE_INSERT_DONE")
     w("DROP TABLE edge_stage;")
     w(

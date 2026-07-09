@@ -24,6 +24,17 @@ CREATE FUNCTION gph_insert_edge(bigint, bigint) RETURNS void
 CREATE FUNCTION gph_insert_edge(bigint, bigint, integer) RETURNS void
   AS 'MODULE_PATHNAME', 'gph_insert_edge' LANGUAGE C VOLATILE STRICT;
 
+-- Batched edge-append (DEV-1354 / design §2 "bulk edge loader"): append a whole adjacency run for
+-- ONE source in a single call, returning the number of edges appended. Byte-identical on-disk
+-- chains to N x gph_insert_edge(src, dst[i]) fed in array order, but O(1)-per-edge instead of
+-- O(V) (dense src locate + metapage dst bounds check), so the 1M/39M wiki graph loads in minutes
+-- not the O(E*V) hours the per-edge path costs. Requires the dense-in-order load precondition
+-- (vids 0..N-1 materialized before any edge); a non-dense layout is HARD-rejected in C (never
+-- mis-writes). Rides the host txn/WAL (golden rule 2); a rolled-back batch leaves ZERO visible
+-- edges (es_xmin filtered — FR-7). Owner-guarded (REVOKEd from PUBLIC below, plan 026).
+CREATE FUNCTION gph_insert_edges(bigint, bigint[]) RETURNS bigint
+  AS 'MODULE_PATHNAME' LANGUAGE C VOLATILE STRICT;
+
 -- ----------------------------------------------------------------------------
 -- Edge type dictionary (advisor plan 038): gBrain's typed link model (founded/
 -- founded_by, works_at/employs, mentions, attended, ...) maps link-type NAMES to
@@ -154,6 +165,7 @@ REVOKE EXECUTE ON FUNCTION gph_insert_vertex(), gph_insert_edge(bigint,bigint) F
 REVOKE EXECUTE ON FUNCTION gph_freeze(xid) FROM PUBLIC;
 REVOKE EXECUTE ON FUNCTION gph_tombstone_edge(bigint,bigint), gph_tombstone_vertex(bigint) FROM PUBLIC;
 REVOKE EXECUTE ON FUNCTION gph_insert_edge(bigint,bigint,integer) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION gph_insert_edges(bigint,bigint[]) FROM PUBLIC;
 
 -- ============================================================================
 -- ADR-0013 Stage A (advisor plan 025): the external-id mapping layer + the v0
@@ -199,9 +211,23 @@ GRANT SELECT ON gph_am_meta TO PUBLIC;
 -- dense-in-order load (ext ids 0..N-1 materialized in id order). Setting it ON
 -- when ext_id != vid would make gph_neighbors_ext return wrong ids — hence it is
 -- REVOKEd from PUBLIC like the other mutators (plan 026 discipline).
+-- DEV-1352 latent guard: setting identity_mode ON while the map is NON-identity (any ext_id <> vid)
+-- would make gph_neighbors_ext return WRONG ids (the identity fast-path treats src/dst as vids). The
+-- loader only flips it on after a dense-in-order load (ext_id == vid), so refuse the corrupting case
+-- outright rather than trust the caller — a mismatched map RAISES instead of silently mis-mapping
+-- reads at scale. Turning it OFF is always allowed (the safe direction).
 CREATE FUNCTION gph_set_identity_mode(p_on boolean) RETURNS void
-LANGUAGE sql VOLATILE STRICT
-AS $$ UPDATE graph_store.gph_am_meta SET identity_mode = p_on WHERE only_row $$;
+LANGUAGE plpgsql VOLATILE STRICT
+AS $$
+BEGIN
+    IF p_on AND EXISTS (SELECT 1 FROM graph_store.gph_vid_map WHERE ext_id <> vid) THEN
+        RAISE EXCEPTION 'gph_set_identity_mode(true) refused: id map is non-identity '
+            '(a row has ext_id <> vid) — the dense-in-order load precondition is violated (DEV-1352). '
+            'Reads would return wrong ids under the identity fast-path.';
+    END IF;
+    UPDATE graph_store.gph_am_meta SET identity_mode = p_on WHERE only_row;
+END
+$$;
 REVOKE EXECUTE ON FUNCTION gph_set_identity_mode(boolean) FROM PUBLIC;
 
 -- gph_upsert_vertex(ext_id) RETURNS bigint — THE id-mapping layer (ADR-0013).

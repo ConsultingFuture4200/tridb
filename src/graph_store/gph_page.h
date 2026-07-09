@@ -179,4 +179,18 @@ GphEdgeSlotsPerPage(void)
 	return (uint32) ((BLCKSZ - SizeOfPageHeaderData - GPH_SPECIAL_SIZE) / sizeof(GphEdgeSlot));
 }
 
+/*
+ * Capacity, in VertexRecords, of one vertex page — the exact max the append path (GphPageHasRoom
+ * gate in gph_insert_vertex) packs per page. This is the divisor the O(1) DENSE vertex locate uses:
+ * when vertices are materialized dense-in-order with NO adjacency pages interleaved, vertex page
+ * blocks are contiguous and fully packed, so vid V lives at block gm_first_vertex_blk + V/perpage,
+ * slot V%perpage (gph_insert_edges dense fast-path, DEV-1354). Same geometry as GphEdgeSlotsPerPage
+ * (both records are 32 bytes), spelled separately for intent. Pure geometry; no layout assumption.
+ */
+static inline uint32
+GphVerticesPerPage(void)
+{
+	return (uint32) ((BLCKSZ - SizeOfPageHeaderData - GPH_SPECIAL_SIZE) / sizeof(GphVertexRecord));
+}
+
 #endif							/* TRIDB_GRAPH_STORE_GPH_PAGE_H */
