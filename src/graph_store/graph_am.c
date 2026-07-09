@@ -2144,13 +2144,16 @@ PG_FUNCTION_INFO_V1(gph_edge_count);
 
 /*
  * gph_edge_count() RETURNS bigint — the store-wide directed-edge count carried on the metapage
- * (gm_edge_count), read under a share lock. This is the raw counter, not an MVCC-visible count:
- * v1 has no edge-delete path so the counter only grows, and it is maintained under GenericXLog so
- * a crashed/aborted txn's increments roll back with the page image (full-image WAL). Like
- * gph_vertex_count's metapage counter it is NOT abort-aware for the in-process-abort case — but
- * there is no edge analogue of gph_vertex_count's per-record visibility scan because edge slots are
- * not enumerated here; this exposes gm_edge_count directly for the avg_out_degree derivation and the
- * crash-recovery assertion. (See plan 006 "Abort accounting caveat".)
+ * (gm_edge_count), read under a share lock. This is the RAW insert counter, not an MVCC-visible
+ * count: it is bumped once per edge slot ever inserted and is NEVER decremented — neither by
+ * gph_tombstone_edge/gph_tombstone_vertex's out-edge sweep (plan 037, physical reclamation rides
+ * plan 036's freeze pass) nor by anything else, so after any delete this OVERCOUNTS the live
+ * topology (advisor plan 055). It is maintained under GenericXLog so a crashed/aborted txn's
+ * increments roll back with the page image (full-image WAL), but — like gph_vertex_count's metapage
+ * counter — it is NOT abort-aware for the in-process-abort case. Use gph_visible_edge_count() when
+ * an MVCC-visible, delete-aware edge count is needed; this raw counter remains the source for the
+ * crash-recovery assertion and (documented as an upper bound after deletes) the avg_out_degree
+ * EXPLAIN-only derivation. (See plan 006 "Abort accounting caveat".)
  */
 Datum
 gph_edge_count(PG_FUNCTION_ARGS)
@@ -2167,4 +2170,99 @@ gph_edge_count(PG_FUNCTION_ARGS)
 	gph_read_meta(rel, &meta);
 	relation_close(rel, AccessShareLock);
 	PG_RETURN_INT64((int64) meta.gm_edge_count);
+}
+
+PG_FUNCTION_INFO_V1(gph_visible_edge_count);
+
+/*
+ * gph_visible_edge_count() RETURNS bigint — count of VISIBLE directed edges: walks the vertex-page
+ * chain and, for every vertex record found (its own tombstone state does not matter here — a
+ * tombstoned vertex's out-edges were already individually tombstoned by gph_tombstone_vertex, so
+ * they are filtered below like any other deleted slot), walks that vertex's adjacency-page chain
+ * (vr_adj_head) summing edge slots that are MVCC-visible and not tombstoned (gph_xmin_visible &&
+ * !gph_deleted_visible — the same predicate the traversal read path applies). Unlike gph_edge_count
+ * this reflects deletes (plan 055): insert 3 edges then tombstone 1 and this returns 2, while
+ * gph_edge_count stays 3. O(vertices + edges) — a full scan, not a metapage read; use gph_edge_count
+ * for the cheap raw upper bound when an exact live count is not required.
+ *
+ * Each vertex page's vr_adj_head values are copied out to a palloc'd array BEFORE its buffer is
+ * released, so the adjacency-chain walk below never holds the vertex buffer and an adjacency buffer
+ * at the same time (the same "never two buffers at once" discipline gph_tombstone_vertex documents).
+ */
+Datum
+gph_visible_edge_count(PG_FUNCTION_ARGS)
+{
+	Relation	rel = gph_open_store(AccessShareLock);
+	GphMeta		meta;
+	BlockNumber	vblk;
+	int64		n = 0;
+
+	if (RelationGetNumberOfBlocks(rel) == 0)
+	{
+		relation_close(rel, AccessShareLock);
+		PG_RETURN_INT64(0);
+	}
+
+	gph_read_meta(rel, &meta);
+	vblk = meta.gm_first_vertex_blk;
+	while (vblk != InvalidBlockNumber)
+	{
+		Buffer		vbuf;
+		Page		vpage;
+		uint32		vcount,
+					vi;
+		BlockNumber	vnext;
+		BlockNumber *adj_heads;
+
+		CHECK_FOR_INTERRUPTS();
+		vbuf = ReadBufferExtended(rel, MAIN_FORKNUM, vblk, RBM_NORMAL, NULL);
+		LockBuffer(vbuf, BUFFER_LOCK_SHARE);
+		vpage = BufferGetPage(vbuf);
+		vcount = GphPageRecordCount(vpage, sizeof(GphVertexRecord));
+		adj_heads = (BlockNumber *) palloc(sizeof(BlockNumber) * Max(vcount, 1));
+		for (vi = 0; vi < vcount; vi++)
+		{
+			GphVertexRecord *vr = GphPageGetRecord(vpage, vi, sizeof(GphVertexRecord));
+
+			adj_heads[vi] = vr->vr_adj_head;
+		}
+		vnext = GphPageSpecialPtr(vpage)->gph_next_pageno;
+		UnlockReleaseBuffer(vbuf);		/* release before the adjacency walk: never two buffers at once */
+
+		for (vi = 0; vi < vcount; vi++)
+		{
+			BlockNumber	ablk = adj_heads[vi];
+
+			while (ablk != InvalidBlockNumber)
+			{
+				Buffer		abuf;
+				Page		apage;
+				uint32		acount,
+							ai;
+				BlockNumber	anext;
+
+				CHECK_FOR_INTERRUPTS();
+				abuf = ReadBufferExtended(rel, MAIN_FORKNUM, ablk, RBM_NORMAL, NULL);
+				LockBuffer(abuf, BUFFER_LOCK_SHARE);
+				apage = BufferGetPage(abuf);
+				acount = GphPageRecordCount(apage, sizeof(GphEdgeSlot));
+				for (ai = 0; ai < acount; ai++)
+				{
+					GphEdgeSlot *s = GphPageGetRecord(apage, ai, sizeof(GphEdgeSlot));
+
+					if (gph_xmin_visible(s->es_xmin) &&
+						!gph_deleted_visible(s->es_flags, s->es_xmax))
+						n++;
+				}
+				anext = GphPageSpecialPtr(apage)->gph_next_pageno;
+				UnlockReleaseBuffer(abuf);
+				ablk = anext;
+			}
+		}
+		pfree(adj_heads);
+		vblk = vnext;
+	}
+
+	relation_close(rel, AccessShareLock);
+	PG_RETURN_INT64(n);
 }

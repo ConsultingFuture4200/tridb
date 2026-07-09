@@ -117,10 +117,20 @@ CREATE FUNCTION gph_vertex_count() RETURNS bigint
   AS 'MODULE_PATHNAME' LANGUAGE C VOLATILE;
 
 -- Store-wide directed-edge count (plan 006): the metapage gm_edge_count counter, the
--- avg_out_degree source for the FR-6 join-order heuristic. Raw (non-MVCC) counter — v1 has no
--- edge-delete path so it only grows; maintained under GenericXLog so aborts/crashes roll it back
--- with the page image. Used by the crash-recovery edge-count assertion.
+-- avg_out_degree source for the FR-6 join-order heuristic. Raw (non-MVCC) INSERT counter — it is
+-- bumped once per edge ever inserted and is NEVER decremented, including by gph_tombstone_edge/
+-- gph_tombstone_vertex (plan 037): after any delete this OVERCOUNTS live topology (advisor plan
+-- 055). Maintained under GenericXLog so aborts/crashes roll it back with the page image. Used by
+-- the crash-recovery edge-count assertion; see gph_visible_edge_count() below for a delete-aware
+-- (but O(vertices+edges) scanning) live count.
 CREATE FUNCTION gph_edge_count() RETURNS bigint
+  AS 'MODULE_PATHNAME' LANGUAGE C VOLATILE;
+
+-- MVCC-visible, delete-aware directed-edge count (advisor plan 055): scans every vertex's
+-- adjacency chain and counts only edge slots that are inserted-visible and not tombstoned. Reflects
+-- gph_tombstone_edge/gph_tombstone_vertex immediately, unlike the raw gph_edge_count() above. Use
+-- this when an exact live count is required; use gph_edge_count() for the O(1) raw upper bound.
+CREATE FUNCTION gph_visible_edge_count() RETURNS bigint
   AS 'MODULE_PATHNAME' LANGUAGE C VOLATILE;
 
 -- gph_freeze(horizon) RETURNS bigint — manual anti-wraparound freeze pass (advisor plan 036 /

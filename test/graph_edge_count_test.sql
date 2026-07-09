@@ -4,6 +4,10 @@
 -- and that the counter rolls back atomically with the edge on transaction ABORT (it is bumped
 -- under GenericXLog alongside the edge slot). gm_edge_count is the FR-6 avg_out_degree source.
 --
+-- Also covers gph_visible_edge_count() (advisor plan 055): the raw gm_edge_count counter never
+-- decrements on tombstone, so after a delete it diverges from the MVCC-visible live edge count;
+-- the section below asserts raw vs visible after a tombstone, and after a rolled-back tombstone.
+--
 -- UNBUILT-HERE (GX10-gated): the graph store access method compiles only inside the MSVBASE fork
 -- (PG 13.4, --with-blocksize=32). Run by scripts/graph_am_test.sh / a graph-test harness on target.
 
@@ -94,4 +98,65 @@ BEGIN
     RAISE NOTICE 'PASS abort (v1 semantics): 2 edges visible in-txn (1506); clean ROLLBACK does not revert the raw counter (no GenericXLog UNDO) — crash-recovery abort-safety is proven by crash_recovery_test.sh';
 END $$;
 
-\echo '============ graph_store gm_edge_count (plan 006): ALL TESTS PASSED ============'
+-- ============================================================================
+-- gph_visible_edge_count() (advisor plan 055): MVCC-visible, delete-aware count.
+-- Right after the ROLLBACK above, raw gm_edge_count is stuck at 1506 (the documented
+-- v1 in-process-abort quirk), but the two rolled-back edges' xmin is NOT visible, so
+-- the visible scan correctly reports 1504 — proving the new function is genuinely
+-- MVCC-visible, not merely "raw minus tombstones".
+-- ============================================================================
+DO $$
+BEGIN
+    IF gph_visible_edge_count() <> 1504 THEN
+        RAISE EXCEPTION 'visible_edge_count()=% after ROLLBACK (expected 1504: raw stuck at 1506, visible correctly excludes the 2 rolled-back edges)',
+            gph_visible_edge_count();
+    END IF;
+    IF gph_edge_count() <> 1506 THEN
+        RAISE EXCEPTION 'sanity: gph_edge_count()=% (expected still 1506)', gph_edge_count();
+    END IF;
+    RAISE NOTICE 'PASS visible vs raw (abort): raw=1506 (stuck), visible=1504 (correct)';
+END $$;
+
+-- ============================================================================
+-- gph_visible_edge_count() after a committed tombstone (advisor plan 055 headline
+-- case, "insert 3, tombstone 1 -> visible 2, raw 3" scaled to this file's counts):
+-- tombstone one of vertex 0's live edges (0->3). The raw count is UNCHANGED
+-- (documented, plan 037); the visible count drops by exactly 1.
+-- ============================================================================
+SELECT gph_tombstone_edge(0, 3);
+
+DO $$
+BEGIN
+    IF gph_edge_count() <> 1506 THEN
+        RAISE EXCEPTION 'after tombstone raw edge_count=% (expected 1506 unchanged)', gph_edge_count();
+    END IF;
+    IF gph_visible_edge_count() <> 1503 THEN
+        RAISE EXCEPTION 'after tombstone visible_edge_count()=% (expected 1503: 1504 - 1 tombstoned)',
+            gph_visible_edge_count();
+    END IF;
+    RAISE NOTICE 'PASS visible vs raw (tombstone): raw stays 1506, visible drops to 1503';
+END $$;
+
+-- FR-7: a tombstone inside a rolled-back txn leaves the visible count reverted, matching the
+-- gph_neighbors self-visible-then-reverted semantics proven in test/graph_delete_test.sql.
+BEGIN;
+    SELECT gph_tombstone_edge(0, 1);
+    DO $$
+    BEGIN
+        IF gph_visible_edge_count() <> 1502 THEN
+            RAISE EXCEPTION 'in-txn visible_edge_count()=% (expected 1502: own tombstone self-visible)',
+                gph_visible_edge_count();
+        END IF;
+    END $$;
+ROLLBACK;
+
+DO $$
+BEGIN
+    IF gph_visible_edge_count() <> 1503 THEN
+        RAISE EXCEPTION 'after ROLLBACK visible_edge_count()=% (expected 1503: tombstone rolled back, edge live again)',
+            gph_visible_edge_count();
+    END IF;
+    RAISE NOTICE 'PASS visible (FR-7): tombstone in a rolled-back txn left the edge live, visible count back to 1503';
+END $$;
+
+\echo '============ graph_store gm_edge_count + gph_visible_edge_count (plans 006/055): ALL TESTS PASSED ============'
