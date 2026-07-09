@@ -12,11 +12,15 @@
 
 Matched recall@10 (~0.997 TriDB vs 1.000 baseline), p50 latency, N=200,000, loopback baseline:
 
-| hop | TriDB `tjs_open` p50 | Multi-store p50 | **TriDB speedup** | graph reach / bridges | baseline bytes shipped |
-|---|---|---|---|---|---|
-| 1 | **3.7 ms** | 41.9 ms | **11.5×** | ~515 | 9.9 KB |
-| 2 | **94.1 ms** | 322.7 ms | **3.4×** | ~21,000 | 337 KB |
-| 3 | **1,729 ms** | 2,227 ms | **1.29×** | ~123,000 | 1.97 MB |
+| hop | TriDB `tjs_open` p50 (p95) | Multi-store p50 (p95) | **TriDB speedup** | graph reach / bridges | baseline bytes shipped | samples |
+|---|---|---|---|---|---|---|
+| 1 | **3.69 ms** (5.05) | 42.57 ms (49.9) | **11.5×** | ~515 | 9.9 KB | 240 (80q×3) |
+| 2 | **96.6 ms** (149) | 314.9 ms (508) | **3.26×** | ~21,000 | 324 KB | 240 (80q×3) |
+| 3 | **1,729 ms** | 2,227 ms | **1.29×** | ~123,000 | 1.97 MB | 30 (lean) |
+
+hop-1/2 confirmed on a tightened run (80 queries × 3 runs = 240 samples/config, recall matched ~0.995
+both sides); the lean 30-query run gave the same magnitudes (11.5× / 3.4×), so the wins are robust.
+hop-3 remains a single lean sample (a large-reach stress case, see caveats).
 
 - **TriDB wins at every hop.** This is the first benchmark win in this project attributable to the
   *fused operator* — TriDB avoiding the vector→graph→filter round-trips the multi-store must pay —
@@ -59,9 +63,13 @@ per-query overhead is the entire source of the win.
 
 ## Honest caveats
 
-- **Lean run** (30 queries, 1 run/config) — a first-cut signal, not a tight-CI publication number.
-  The trend is large and monotone across hops and both grid points, but a fuller sweep (more queries,
-  ≥3 runs) should confirm the magnitudes before any external claim.
+- **Sample size:** hop-1/2 are confirmed at 240 samples/config (80q×3 runs, `wf200k_tight.json`) and
+  match the initial 30-query lean run (`wf200k_lean.json`) — the wins are robust. hop-3 is still a
+  single 30-query lean sample (the `*1..3` baseline traversal makes a high-stat hop-3 sweep cost
+  hours). Note: a full 8-config × 200q × 5-run sweep was attempted but SIGKILL'd twice mid-baseline —
+  transient memory spikes (Milvus `col.load()` colliding with the 13.4 GB reader under an aggressive
+  OOM policy on the shared box); the reduced-grid tightened run above completed cleanly. A dedicated,
+  reader-free box would allow the full high-stat sweep.
 - **Loopback favors the baseline.** All three stores run on localhost = minimal glue cost, the
   multi-store's *best* case. A real-network (split-machine) deployment adds real latency to each of
   the 3 round-trips → TriDB's advantage would only *grow*, most at shallow hops. So a loopback TriDB
