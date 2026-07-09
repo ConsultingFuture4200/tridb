@@ -17,12 +17,17 @@ measured separately). No fabricated win — if TriDB loses at equal recall, it i
     python bench/wiki_h2h_vecrun.py --queryset bench/results/wiki_h2h_queryset.json \
         --engine-port 5446 --milvus-port 19531 --milvus-collection wiki_articles \
         --runs 5 --out bench/results/wiki_h2h_vecleg_1m.json
+
+The engine (scripts/wiki_engine_serve.sh, advisor 044) requires a password over TCP. Pass it via
+--engine-password or the TRIDB_ENGINE_PGPASSWORD env var (read from the serve script's
+$OUT/pg_password); omit both only against an older trust-auth engine.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import statistics
 import time
 from pathlib import Path
@@ -37,10 +42,11 @@ def _lit(v):
     return "{" + ",".join(repr(float(x)) for x in v) + "}"
 
 
-def run_tridb(port, host, queries, k, runs):
+def run_tridb(port, host, queries, k, runs, password=None):
     import psycopg
 
-    conn = psycopg.connect(host=host, port=port, dbname="postgres", user="postgres")
+    conn = psycopg.connect(host=host, port=port, dbname="postgres", user="postgres",
+                            password=password)
     conn.autocommit = True
     cur = conn.cursor()
     cur.execute("SET enable_seqscan = off;")
@@ -105,6 +111,8 @@ def main(argv=None):
     ap.add_argument("--queryset", required=True)
     ap.add_argument("--engine-port", type=int, required=True)
     ap.add_argument("--engine-host", default="localhost")
+    ap.add_argument("--engine-password",
+                     default=os.environ.get("TRIDB_ENGINE_PGPASSWORD", ""))
     ap.add_argument("--milvus-host", default="localhost")
     ap.add_argument("--milvus-port", default="19531")
     ap.add_argument("--milvus-collection", default="wiki_articles")
@@ -120,7 +128,8 @@ def main(argv=None):
     print(f"[vecrun] {len(queries)} held-out queries (k={k}) types={qs['counts']}", flush=True)
 
     t0 = time.time()
-    tridb = run_tridb(args.engine_port, args.engine_host, queries, k, args.runs)
+    tridb = run_tridb(args.engine_port, args.engine_host, queries, k, args.runs,
+                       args.engine_password or None)
     print(f"[vecrun] TriDB recall={tridb['recall']:.4f} p50={tridb['p50_ms']:.3f}ms "
           f"p95={tridb['p95_ms']:.3f}ms ({time.time()-t0:.1f}s)", flush=True)
 

@@ -46,12 +46,17 @@ HONESTY (may become a public claim; every prior review's finding is a hard gate 
         --out bench/results/wiki_fusion_200k.json
     python -m bench.wiki_fusion report --results bench/results/wiki_fusion_200k.json \
         --md-out docs/benchmark_wiki_fusion_v0.1.0.md
+
+The engine (scripts/wiki_engine_serve.sh, advisor 044) requires a password over TCP. Pass it via
+--engine-password or the TRIDB_ENGINE_PGPASSWORD env var (read from the serve script's
+$OUT/pg_password); omit both only against an older trust-auth engine.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import statistics
 import time
 from pathlib import Path
@@ -89,7 +94,7 @@ def _pct(xs, p):
 
 
 def run_tridb(cfg: Cfg, port: int, host: str, emb, qids, oracle_by_hop, *, k, hops_list,
-              grid, runs, cold_probe=True):
+              grid, runs, cold_probe=True, password=None):
     """Sweep (m_seeds, term_cond) at each hop; client-timed p50/p95 + examined/bridges/pages.
 
     Returns {hop: {combo_tag: {recall, p50_ms, p95_ms, examined, bridges, pages, n}}} plus a
@@ -97,7 +102,8 @@ def run_tridb(cfg: Cfg, port: int, host: str, emb, qids, oracle_by_hop, *, k, ho
     connection (the disclosed HNSW LoadIndex the multi-store does not pay)."""
     import psycopg
 
-    conn = psycopg.connect(host=host, port=port, dbname="postgres", user="postgres")
+    conn = psycopg.connect(host=host, port=port, dbname="postgres", user="postgres",
+                            password=password)
     conn.autocommit = True
     cur = conn.cursor()
     cur.execute("SET enable_seqscan = off;")
@@ -327,6 +333,8 @@ def main(argv=None):
     r = sub.add_parser("run")
     r.add_argument("--engine-port", type=int, required=True)
     r.add_argument("--engine-host", default="localhost")
+    r.add_argument("--engine-password",
+                    default=os.environ.get("TRIDB_ENGINE_PGPASSWORD", ""))
     r.add_argument("--milvus-port", default="19531")
     r.add_argument("--pg-port", default="5434")
     r.add_argument("--neo4j-uri", default="bolt://localhost:7688")
@@ -373,7 +381,8 @@ def main(argv=None):
 
     print("[fusion] running TriDB tjs_open sweep ...", flush=True)
     tridb = run_tridb(cfg, a.engine_port, a.engine_host, emb, qids, oracle_by_hop,
-                      k=a.k, hops_list=hops_list, grid=tgrid, runs=a.runs)
+                      k=a.k, hops_list=hops_list, grid=tgrid, runs=a.runs,
+                      password=a.engine_password or None)
     print(f"[fusion] TriDB cold LoadIndex = {tridb['cold_loadindex_ms']:.0f} ms", flush=True)
     for hop in hops_list:
         for tag, c in tridb["by_hop"][hop].items():
