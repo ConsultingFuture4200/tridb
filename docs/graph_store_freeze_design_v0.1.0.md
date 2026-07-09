@@ -57,6 +57,36 @@ A SQL-callable maintenance pass, same family as the other `gph_*` entry points:
   for `gstore` to the horizon (as vacuum would), which is what actually resets
   `age(relfrozenxid)` and disarms the forced anti-wraparound vacuum.
 
+### 1a. `es_xmax` / `vr_xmax` freeze rules (advisor plan 040, layers on plan 037)
+
+Plan 037 added a soft-delete (tombstone) path that repurposes the same fields this design
+freezes: `GphEdgeSlot.es_xmax` / `GphVertexRecord.vr_xmax`, honored only when
+`GPH_FLAG_DELETED` is set AND that xid is visible (`gph_deleted_visible()`). Freezing `xmin`
+alone left a committed delete's `xmax` unfrozen — it could outlive `relfrozenxid` and hit the
+same truncated-clog failure §Problem describes for `xmin`. `gph_freeze` now rewrites `xmax`
+too, per record/slot, using the table below (`gph_freeze_xmax()` in `src/graph_store/graph_am.c`):
+
+| `xmax` state | action |
+|---|---|
+| `GPH_FLAG_DELETED` clear (live record) | leave `xmax` alone — it carries no visibility meaning |
+| `GPH_FLAG_DELETED` set, `xmax` committed, `xmax` precedes horizon | `xmax` → `FrozenTransactionId`; `GPH_FLAG_DELETED` stays set (tombstone stays visible-deleted forever) |
+| `GPH_FLAG_DELETED` set, `xmax` aborted, `xmax` precedes horizon | `xmax` → `InvalidTransactionId`; `GPH_FLAG_DELETED` is **cleared** (the delete never committed, so the record comes back LIVE — matching the FR-7 rollback semantics `gph_deleted_visible` already gives an in-flight abort) |
+| `xmax` at/after horizon (in-progress or future) | left untouched — still needs its real clog entry |
+
+**Why `relfrozenxid` can never advance past an unresolved `xmax`:** the existing horizon
+validation (§1, "Horizon validation") already requires `horizon` to precede
+`GetOldestXmin`. Any xid that precedes `horizon` therefore precedes every currently-running
+transaction — including the one that would still be holding an "in-progress" `xmax` — so an
+unresolved (in-progress) `xmax` below `horizon` cannot exist. No second horizon/guard was
+introduced; the same check that protects `xmin` protects `xmax` for free. One consequence:
+attempting to freeze past a still-open transaction's own tombstone (e.g. mid-transaction) is
+rejected by this same guard, since that transaction's own xid is itself part of the oldest
+running xmin (advisor plan 040, STOP-condition analysis).
+
+Freezing `xmax` does **not** reclaim the tombstoned slot (no page compaction, no
+`gm_edge_count` decrement) — it only makes the delete's visibility permanent (or reverses it,
+for an aborted delete). Physical reclamation of tombstoned slots is plan 055.
+
 ### 2. Metapage field: `gm_frozen_horizon`
 
 Record the last completed horizon in the metapage. `TransactionId` is 32-bit in PG 13, so the
@@ -104,3 +134,9 @@ Freeze a populated store, assert: (a) pre-freeze answers == post-freeze answers 
 + WAL replay preserves frozen pages (crash-recovery harness pattern); (d) `pg_class.relfrozenxid`
 advanced; (e) rerun is a no-op. The 2^31-scale clock itself is not testable in CI — (a)–(e) plus
 the code-level argument above are the evidence.
+
+Plan 040 adds the tombstone/`xmax` half of this sketch (§1a): (f) a committed delete stays
+deleted after freeze with no clog error, and both its `xmin` and `xmax` are counted as frozen;
+(g) freezing past a still-open transaction's own tombstone is rejected by the existing
+oldest-xmin guard; (h) an aborted delete (tombstone written then rolled back) stays LIVE both
+before and after a freeze that walks past it.

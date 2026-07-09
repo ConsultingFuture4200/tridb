@@ -933,10 +933,57 @@ gph_freeze_xid(TransactionId *xid, TransactionId horizon)
 }
 
 /*
+ * Freeze ONE stored deleting xid (es_xmax / vr_xmax) in place if its tombstone PRECEDES `horizon`.
+ * The field only carries visibility meaning while GPH_FLAG_DELETED is set (gph_deleted_visible); on
+ * a live record xmax is InvalidTransactionId from the insert-path memset, so !TransactionIdIsNormal
+ * short-circuits it here exactly like gph_freeze_xid — a live record's xmax is left untouched.
+ *
+ * For a tombstoned record whose xmax precedes horizon:
+ *   committed -> FrozenTransactionId, GPH_FLAG_DELETED stays SET    (tombstone visible-deleted
+ *                                                                    forever, gph_xmin_visible short-
+ *                                                                    circuits Frozen to committed)
+ *   aborted   -> InvalidTransactionId, GPH_FLAG_DELETED is CLEARED  (the delete never committed, so
+ *                                                                    gph_deleted_visible must now see
+ *                                                                    a live record — matching the
+ *                                                                    in-flight-abort behavior FR-7
+ *                                                                    already gives gph_xmin_visible)
+ *
+ * There is no "unresolved xmax below horizon" case to guard: gph_freeze()'s caller already checked
+ * TransactionIdPrecedes(horizon, oldest-running-xmin) before any freezing starts, so every xid that
+ * precedes horizon precedes every in-progress transaction too and is therefore already resolved
+ * (committed or aborted) in clog. relfrozenxid can advance to horizon once the walk completes: any
+ * xmax >= horizon is left alone here (still needs its real clog entry) and is by construction not
+ * older than the horizon vac_update_relstats advances relfrozenxid to.
+ *
+ * Returns true iff it rewrote xmax (mirrors gph_freeze_xid's counting contract; xmax freezes are
+ * folded into the same frozen-slot counter as xmin freezes — see gph_freeze_adj_chain / gph_freeze).
+ */
+static bool
+gph_freeze_xmax(uint32 *flags, TransactionId *xmax, TransactionId horizon)
+{
+	TransactionId x = *xmax;
+
+	if (!(*flags & GPH_FLAG_DELETED))
+		return false;			/* live record: xmax carries no visibility meaning */
+	if (!TransactionIdIsNormal(x))
+		return false;			/* already permanent (re-run over an already-frozen tombstone) */
+	if (!TransactionIdPrecedes(x, horizon))
+		return false;			/* at/after horizon: still needs its real clog entry */
+	if (TransactionIdDidCommit(x))
+		*xmax = FrozenTransactionId;
+	else
+	{
+		*flags &= ~GPH_FLAG_DELETED;	/* delete never committed: record is LIVE again */
+		*xmax = InvalidTransactionId;
+	}
+	return true;
+}
+
+/*
  * Freeze every edge slot on ONE adjacency-page chain, one page per GenericXLog record (a chain can
  * exceed GenericXLog's 4-buffer/record cap, so pages are NOT batched). Returns the number of slots
- * frozen. A page with nothing to freeze is GenericXLogAbort'd (no WAL churn), so a re-run over an
- * already-frozen store is cheap (idempotency).
+ * frozen (es_xmin freezes + es_xmax freezes, see gph_freeze_xmax). A page with nothing to freeze is
+ * GenericXLogAbort'd (no WAL churn), so a re-run over an already-frozen store is cheap (idempotency).
  */
 static int64
 gph_freeze_adj_chain(Relation rel, BlockNumber head, TransactionId horizon)
@@ -967,6 +1014,8 @@ gph_freeze_adj_chain(Relation rel, BlockNumber head, TransactionId horizon)
 
 			if (gph_freeze_xid(&es->es_xmin, horizon))
 				frozen_here++;
+			if (gph_freeze_xmax(&es->es_flags, &es->es_xmax, horizon))
+				frozen_here++;
 		}
 		next = GphPageSpecialPtr(apage)->gph_next_pageno;
 
@@ -986,11 +1035,14 @@ PG_FUNCTION_INFO_V1(gph_freeze);
 
 /*
  * gph_freeze(horizon xid) RETURNS bigint — the manual anti-wraparound freeze pass (design:
- * docs/graph_store_freeze_design_v0.1.0.md, advisor 026). Walks the vertex-page chain and, for
+ * docs/graph_store_freeze_design_v0.1.0.md, advisor 026 + 040). Walks the vertex-page chain and, for
  * every vertex, its adjacency-page chain, rewriting each stored xid that PRECEDES `horizon` to a
  * permanent one (committed -> Frozen, aborted -> Invalid) while it is still resolvable in clog,
- * records gm_frozen_horizon on the metapage, and advances the container's relfrozenxid. Returns the
- * number of records frozen.
+ * records gm_frozen_horizon on the metapage, and advances the container's relfrozenxid. This covers
+ * both the inserting xid (xmin, gph_freeze_xid) and, for a tombstoned record, the deleting xid
+ * (xmax, gph_freeze_xmax) — a tombstone whose xmax committed stays deleted forever, one whose xmax
+ * aborted has GPH_FLAG_DELETED cleared and comes back LIVE (plan 040). Returns the number of records
+ * frozen.
  *
  * WAL / atomicity: every page is rewritten under GenericXLog in the CALLER's transaction (one WAL,
  * one txn manager — golden rule 2), so a crash mid-pass replays only the completed page diffs and
@@ -1086,6 +1138,8 @@ gph_freeze(PG_FUNCTION_ARGS)
 			GphVertexRecord *vr = GphPageGetRecord(vpage, i, sizeof(GphVertexRecord));
 
 			if (gph_freeze_xid(&vr->vr_xmin, horizon))
+				frozen_here++;
+			if (gph_freeze_xmax(&vr->vr_flags, &vr->vr_xmax, horizon))
 				frozen_here++;
 			/* Descend EVERY vertex's adjacency chain — including a now-frozen aborted vertex,
 			 * whose adj pages carry the SAME old xids and must be frozen too. vr_adj_head is not
@@ -1236,8 +1290,9 @@ PG_FUNCTION_INFO_V1(gph_tombstone_edge);
  * the host txn; FR-7). Idempotent: tombstoning an already-deleted or absent edge (or an absent src)
  * is a no-op, not an error. The read path already filters visible tombstones (gph_deleted_visible),
  * so traversal stops emitting the edge immediately; the store-wide gm_edge_count is a raw
- * monotone counter and is deliberately NOT decremented (physical reclamation rides plan 036's freeze
- * pass). Owner-guarded (REVOKEd from PUBLIC, plan 026).
+ * monotone counter and is deliberately NOT decremented (freeze, plans 036/040, only immortalizes or
+ * resurrects the xmax stamp in place — it never reclaims the slot; physical reclamation is plan 055).
+ * Owner-guarded (REVOKEd from PUBLIC, plan 026).
  */
 Datum
 gph_tombstone_edge(PG_FUNCTION_ARGS)
