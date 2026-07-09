@@ -9,6 +9,74 @@ conditions, update your row when done. The repo builds in two layers: the **Pyth
 native graph AM) builds only via Docker and the GX10 — plans touching `vendor/MSVBASE` or `src/graph_store`
 C are **GX10-gated** (author + review here, build/verify on the GX10).
 
+## 2026-07-09 batch — post-DEV-1354 deep audit (planned against `c216750`)
+
+Deep `/improve` audit (5 parallel category auditors + advisor re-vet) after wiki fusion speed (200k),
+consistency demo, batched `gph_insert_edges`, and wiki-reader landed. Prior plans 001–039 treated as
+landed; these 20 plans are **residuals only**. All findings re-opened against live code at `c216750`.
+
+| Plan | Title | Priority | Effort | Risk | Depends on | Verify here? | Status |
+|------|-------|----------|--------|------|------------|--------------|--------|
+| 041 | Fix README SM-1 headline to honest 1.07× FAIL | P1 | S | LOW | — | YES | TODO |
+| 053 | Multicol fork harness: labeled marker, not bare `2000` | P2 | S | LOW | — | partial (engine) | TODO |
+| 054 | `make clean` must not wipe `data/` | P2 | S | LOW | — | YES | TODO |
+| 051 | wiki-reader: token + body cap on mutating POSTs | P1 | S | LOW | — | YES | TODO |
+| 045 | Type-filter `gph_tombstone_edge` (typed edges) | P1 | S | LOW | — | engine | TODO |
+| 046 | `gph_insert_edges` rejects tombstoned dst (parity) | P1 | S–M | LOW–MED | — | engine | TODO |
+| 047 | `gph_neighbors_ext_cached` honors `identity_mode` | P1 | S–M | LOW | — | engine | TODO |
+| 040 | Freeze **xmax** so tombstones survive clog truncation | P1 | M | MED | — | engine | TODO |
+| 042 | Wiki extract shard rotate: never truncate on revisit | P1 | M | MED | — | YES | TODO |
+| 044 | wiki_engine_serve: no published trust-auth Postgres | P1 | M | MED | — | bash -n + manual | TODO |
+| 050 | Host unit tests for DEV-1354 harness gates | P1 | M | LOW | — | YES | TODO |
+| 048 | Dense O(1) locate on traversal `gs_open` | P1 | M | MED | — | engine | TODO |
+| 049 | Hold `Relation` across neighbor `Next()` | P1 | M | MED | 048 optional | engine | TODO |
+| 057 | `tjs_open` expand via `gph_neighbors_ext_cached` | P2 | M | MED | **047** | patch CI + engine | TODO |
+| 055 | Honest edge-count semantics after deletes | P2 | M | MED | — | engine | TODO |
+| 052 | HNSW `vector_index_map` invalidation (ADR-0014 A) | P2 | M–L | MED | coord. 043 | patch CI + engine | TODO |
+| 058 | Core `requirements.lock` vs optional extras | P2 | M | MED | — | YES | TODO |
+| 059 | ADR-0013 Stage C: archive v0 `graph_store_ext` | P2 | M | MED | Stage A/B done | engine | TODO |
+| 043 | Unblock 1M fused vector/HNSW leg | P1 | L | HIGH | — | GX10 | TODO |
+| 056 | Graph-leg snapshot isolation (DEV-1166 residual) | P2 | L | HIGH | **040** | engine + live S3 | TODO |
+
+### Recommended execution order
+
+**Wave A — host-only quick wins (parallel-safe):**  
+`041 → 054 → 053 → 051 → 050 → 042 → 058`
+
+**Wave B — graph_am correctness cluster (serialize or one PR):**  
+`045 → 046 → 047 → 040 → 055`  
+then `048 → 049 → 057` (perf path; 057 needs 047)
+
+**Wave C — security serve + archive:**  
+`044` ‖ `059` (disjoint)
+
+**Wave D — fork HNSW (serialize patches):**  
+`052` then/or with care `043` (both touch HNSW; do not weaken publication gates)
+
+**Wave E — large correctness:**  
+`056` only after `040` green
+
+### Dependency notes
+- **047 → 057**: identity-mode parity must hold before `tjs_open` switches to cached expand.
+- **040 → 056**: freeze xmax before snapshot SI reworks visibility (else clog + SI compose badly).
+- **043** is the publication gate for any 1M fusion claim; do not fabricate latency if blocked.
+- **048/049** are independent of 043; they help expand cost after the vector leg works.
+
+### Findings considered and rejected this batch (do not re-plan)
+- Concurrent multi-writer adjacency races — explicit single-writer contract in `graph_am.c` header.
+- Batch WAL multi-record as partial-visible bug — uncommitted xmin filter is sound.
+- Baseline `testpassword` / compose tags — local fixtures; digest pin residual only.
+- Re-running PG17 spike — ADR-0015 complete; decision hygiene only if desired later.
+- GPU batched top-k / GraphBLAS frontier — TR-1 violations (prior reject list).
+- Plans 001–039 items as open bugs — assumed landed unless residual evidence above.
+
+### Direction (not separate plan files; covered by 043/056 + existing ADRs)
+- D2 PPR+FR+RRF into engine — still ADR-0012 next iteration (not re-planned; host ref done in 007).
+- D4 gBrain reverse adjacency — ADR-0016; D5 PERF-08 last mile — gpu_index_build design.
+- D6 streaming graph predicate / SM-1 redesign — called out in 041 maintenance; full L effort later.
+
+---
+
 ## 2026-07-03 batch — post-DEV-1290 deep audit + persona review + landscape research (planned against `e345998`)
 
 Sources: 7-category deep `/improve` audit + Fabio/Linus/Liotta persona reviews + 4-angle landscape
