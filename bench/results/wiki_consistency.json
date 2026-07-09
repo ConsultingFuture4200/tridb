@@ -1,0 +1,128 @@
+{
+  "meta": {
+    "generated": "2026-07-09T06:13:01Z",
+    "edim": 8,
+    "engine_container": "tridb-consistency",
+    "engine": "tridb/msvbase:gx10-v1-batchedge (one Postgres process, one WAL)",
+    "multistore": "Milvus 19531 (STRONG reads) + Neo4j 7688 + pgvector 5434 (isolated tridb-wiki-*)",
+    "note": "small entity set: consistency is correctness, not scale"
+  },
+  "scenario1_atomicity": {
+    "M": 100,
+    "fail_rate": 0.5,
+    "n_injected": 42,
+    "tridb_inconsistency_count": 0,
+    "tridb_wrong_state_count": 0,
+    "multistore_inconsistency_count": 42,
+    "tridb_inconsistency_rate": 0.0,
+    "multistore_inconsistency_rate": 0.42,
+    "multistore_torn_examples": [
+      {
+        "id": 1,
+        "milvus": 1,
+        "neo4j": 0,
+        "pg": 0
+      },
+      {
+        "id": 3,
+        "milvus": 1,
+        "neo4j": 0,
+        "pg": 0
+      },
+      {
+        "id": 4,
+        "milvus": 1,
+        "neo4j": 0,
+        "pg": 0
+      },
+      {
+        "id": 7,
+        "milvus": 1,
+        "neo4j": 0,
+        "pg": 0
+      }
+    ]
+  },
+  "scenario2_crash": {
+    "M": 100,
+    "tridb_uncommitted_legs": [
+      0,
+      0,
+      0
+    ],
+    "tridb_committed_legs": [
+      1,
+      1,
+      1
+    ],
+    "tridb_crash_recovery_pass": true,
+    "multistore_partial_legs": [
+      1,
+      0,
+      0
+    ],
+    "multistore_torn_after_crash": true,
+    "transcript": [
+      "  entity 1: multi-modal update to v=1 COMMITTED",
+      "  entity 0: multi-modal update to v=1 written but NOT committed (txn in flight)",
+      "  [crash] pg_ctl -m immediate stop (SIGQUIT; no shutdown checkpoint)",
+      "  [restart] server started",
+      "  [recovery] [260] LOG:  database system was not properly shut down; automatic recovery in progress",
+      "  [recovery] [260] LOG:  redo starts at 0/23938F8",
+      "  [recovery] [260] LOG:  redo done at 0/24EA5C0",
+      "  post-recovery entity 0 (vector,graph,rel) = (0, 0, 0)  -> PASS all-old (atomic rollback)",
+      "  post-recovery entity 1 (vector,graph,rel) = (1, 1, 1)  -> PASS all-new (durable)",
+      "  multi-store entity 0: crash after Milvus write -> (milvus,neo4j,pg)=(1, 0, 0) -> TORN orphan persists (no cross-store WAL to recover it)"
+    ]
+  },
+  "scenario3_torn_reads": {
+    "n_reads": 300,
+    "writer_gap_ms": 5.0,
+    "tridb_torn_reads": 3,
+    "tridb_torn_rate": 0.01,
+    "tridb_heap_leg_torn_reads": 0,
+    "tridb_heap_leg_torn_rate": 0.0,
+    "tridb_torn_examples": [
+      {
+        "vector": 1,
+        "graph": 0,
+        "relational": 1
+      },
+      {
+        "vector": 0,
+        "graph": 1,
+        "relational": 0
+      },
+      {
+        "vector": 0,
+        "graph": 1,
+        "relational": 0
+      }
+    ],
+    "tridb_note": "vector+relational are heap-resident and share one MVCC snapshot -> never tear; residual TriDB tears are the native graph leg only, whose v1 read path is commit-visible (gph_xmin_visible = TransactionIdDidCommit) not snapshot-isolated (full per-tuple snapshot isolation is deferred to DEV-1166). Narrow intra-statement window.",
+    "multistore_torn_reads": 230,
+    "multistore_torn_rate": 0.7666666666666667,
+    "multistore_torn_examples": [
+      {
+        "milvus": 1,
+        "neo4j": 0,
+        "pg": 0
+      },
+      {
+        "milvus": 0,
+        "neo4j": 1,
+        "pg": 0
+      },
+      {
+        "milvus": 1,
+        "neo4j": 0,
+        "pg": 1
+      },
+      {
+        "milvus": 0,
+        "neo4j": 1,
+        "pg": 0
+      }
+    ]
+  }
+}

@@ -1,5 +1,24 @@
 # DEV-1354 wiki-scale — actions #1 & #2 combined summary
 
+> **FINAL VERDICT (2026-07-08) — the wiki value story, both halves.** After #1/#2 (below), the
+> fusion head-to-head and the consistency demonstrator close the investigation:
+> - **Fusion SPEED — PROVEN at N=200,000** (`docs/benchmark_wiki_fusion_v0.1.0.md`): fused `tjs_open`
+>   beats the app-side Milvus→Neo4j→pgvector pipeline at matched recall@10 — **loopback 11.5× /
+>   3.26×** (hop-1/2), **real-network 16.7× / 10.6×**. Win = eliminating cross-system round-trips.
+> - **1M BLOCKED** on the fork's single-threaded / non-reproducible HNSW vector iterator
+>   (`examined=0`; 0/2 fresh builds healthy) — documented future work, unblock path in the fusion
+>   doc. The **Wall-3 batched edge loader validated at 1M** (38.99M edges, ~35 s, reconciled).
+> - **I/O-locality thesis DEAD at this scale**: dim-384 is RAM-resident on the 128 GB Spark, so the
+>   SM-3 page-locality thesis is untestable here (see the Milestone-B memo below). The speed win
+>   carries the story, not page-locality.
+> - **Consistency DEMONSTRATED** (`docs/benchmark_wiki_consistency_v0.1.0.md`,
+>   `bench/wiki_consistency.py`): S1 atomicity TriDB **0** vs multi-store **42/42** injected torn;
+>   S2 crash → TriDB atomic+durable vs multi-store torn orphan; S3 torn reads TriDB **1.0%** (heap
+>   legs **0.0%**) vs multi-store **76.7%**. Multi-store tear is **inherent** (no cross-system txn)
+>   and mitigable app-side at real cost; residual TriDB graph-leg tears are the v1 commit-visible
+>   read path (snapshot isolation = DEV-1166). **Total value = fusion speed (3–17×) + cross-modal
+>   consistency — one story, two halves; ADR-0017 prior stands, consistency half now MEASURED.**
+
 TL;DR (2026-07-07). Two follow-ups on the real 6.9M-article enwiki corpus:
 
 - **#1 fused-vs-cosine link recovery** — topology adds a **small but statistically

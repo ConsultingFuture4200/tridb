@@ -1,7 +1,39 @@
 # TriDB Build Status — per-issue gating
 
-Updated: 2026-07-04. Legend: 🟢 unblocked here · 🟡 partial (design here,
+Updated: 2026-07-08. Legend: 🟢 unblocked here · 🟡 partial (design here,
 build on GX10) · 🔴 GX10-gated (needs live MSVBASE build).
+
+> **🟢 DEV-1354 WIKI VALUE STORY — FINAL VERDICT (2026-07-08): two measured halves, speed + consistency.**
+> The wiki-scale investigation closes with TriDB's value quantified on both axes it claims, plus an
+> honest list of what is blocked.
+> - **(1) FUSION SPEED — PROVEN at N=200k** (`docs/benchmark_wiki_fusion_v0.1.0.md`). The in-process
+>   fused `tjs_open` beats an app-side Milvus→Neo4j→pgvector pipeline at matched recall@10:
+>   **loopback 11.5× (hop-1) / 3.26× (hop-2)**, **real-network 16.7× / 10.6×** (the baseline pays
+>   real serialization + RTT). The win is eliminating cross-system round-trips (largest on cheap
+>   queries, shrinks with hop depth), NOT HNSW-vs-HNSW.
+> - **(1M BLOCKED, documented future work.** The 1M fused h2h does not execute: the fork's vector
+>   leg / `tjs_open` hangs (`examined=0`, non-reproducible single-threaded HNSW build; 0/2 fresh
+>   builds healthy). Unblock path in the fusion doc §"Path to unblock". The **Wall-3 batched edge
+>   loader DID validate at 1M** (38,991,320 edges in ~35 s, reconciled). No 1M latency fabricated.)
+> - **I/O-LOCALITY THESIS DEAD at this scale.** dim-384 float32 is RAM-resident on the 128 GB Spark
+>   (~1.5 GB @ 1M), so the spec's I/O-bound early-termination thesis (SM-3 "3 pages vs 85") is
+>   structurally untestable here — the fusion speed win carries the story, not page-locality.
+>   Milestone-B decision memo (chunk-level > 128 GB) in `bench/results/wiki_scale_1_2_summary.md`.
+> - **(2) FUSION CONSISTENCY — DEMONSTRATED live (`docs/benchmark_wiki_consistency_v0.1.0.md`,
+>   `bench/wiki_consistency.py`).** The other half of ADR-0017's value story, on the isolated
+>   `tridb-wiki-*` stores + a throwaway crashable engine: **(S1 atomicity)** injected failure →
+>   TriDB **0** torn vs multi-store **42/42** injected torn; **(S2 crash)** unclean shutdown + WAL
+>   recovery → TriDB uncommitted rolls back atomically (all-old) + committed durable (all-new) vs
+>   multi-store torn orphan persists (Milvus=new, Neo4j/pg=old, nothing reconciles); **(S3 torn
+>   reads)** TriDB **1.0%** total (heap legs vector+relational **0.0%** — one MVCC snapshot) vs
+>   multi-store **76.7%**. Honest caveats: the residual TriDB tears are the **native graph leg only**
+>   (commit-visible, not yet snapshot-isolated — DEV-1166); the multi-store tear is **inherent**
+>   (no cross-system txn), not a Milvus/Neo4j bug, and **mitigable** app-side (2PC/sagas/outbox) at
+>   real complexity/latency cost — TriDB gets cross-modal ACID for free (one txn mgr, one WAL).
+>
+> **Net: TriDB's total value = the measured fusion SPEED win (3–17×) PLUS this cross-modal
+> CONSISTENCY — one story, two halves.** ADR-0017 prior (value is architectural, not a raw-speed
+> claim in this regime) stands, now with the consistency half MEASURED rather than only asserted.
 
 > **🟡 DEV-1354 WIKI-SCALE #1 + #2 SYNTHESIZED (2026-07-07) — one real signal win, one honest blocker.**
 > Two follow-ups on the real **6,900,039-article / 224,475,283-edge** enwiki corpus (near-full;
