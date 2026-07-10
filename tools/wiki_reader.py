@@ -805,10 +805,12 @@ class Reader:
                 r"(?<![0-9A-Za-z])(?:" + alt + r")(?![0-9A-Za-z])", re.IGNORECASE
             )
 
+        gmap = self._ensure_global()
+
         def link(frag: str) -> str:
             return self._linkify(frag, a_surf, a_rx, aid)
 
-        san = _HtmlSanitizer(title2id, norm2id, link)
+        san = _HtmlSanitizer(title2id, norm2id, link, gmap)
         san.feed(raw_html)
         san.close()
         return san.result()
@@ -1912,6 +1914,8 @@ _HTML_DROP_BLOCK = {
 }
 _HTML_DROP_VOID = {"input", "embed", "link", "meta", "source", "track"}
 _IMG_OK = re.compile(r"^(?:https?:)?//upload\.wikimedia\.org/")
+_NS_DROP = {"File", "Image", "Category", "Template", "Help", "Wikipedia",
+            "Portal", "Special", "Module", "Draft", "MediaWiki", "Talk", "User"}
 
 
 def _norm_title(t: str) -> str:
@@ -1927,11 +1931,12 @@ class _HtmlSanitizer(HTMLParser):
     only integer ids, escaped class tokens, and whitelisted image URLs reach any
     attribute value."""
 
-    def __init__(self, title2id, norm2id, link_fn=None):
+    def __init__(self, title2id, norm2id, link_fn=None, gmap=None):
         super().__init__(convert_charrefs=True)
         self.title2id = title2id
         self.norm2id = norm2id
         self.link_fn = link_fn
+        self.gmap = gmap
         self.out = []
         self.skip = 0
         self.astack = []
@@ -2025,9 +2030,15 @@ class _HtmlSanitizer(HTMLParser):
     def _open_a(self, attrs):
         wt = attrs.get("data-wiki-title")
         if wt:
+            ns = wt.split(":", 1)[0] if ":" in wt else ""
+            if ns in _NS_DROP:
+                self.astack.append(False)  # File:/Category:/... -> plain text, no link
+                return
             tid = self.title2id.get(wt)
             if tid is None:
                 tid = self.norm2id.get(_norm_title(wt))
+            if tid is None and self.gmap is not None:
+                tid = self.gmap.get(_norm_ws(wt).lower())
             if tid is not None:
                 self.out.append(
                     f'<a href="/article/{int(tid)}" class="wl" data-id="{int(tid)}">'
