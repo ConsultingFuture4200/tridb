@@ -90,7 +90,7 @@ then `048 → 049 → 057` (perf path; 057 needs 047)
 
 | Plan | Title | Priority | Effort | Risk | Depends on | Verify here? | Status |
 |------|-------|----------|--------|------|------------|--------------|--------|
-| 060 | Wikidata-on-TriDB spike — prove the differentiator at ~16× wiki scale | P1 | L | MED | 038 (hard); 043 (vector-first mode only) | ingest+harness lint/host; 10M run GX10 | TODO |
+| 060 | Wikidata-on-TriDB spike — prove the differentiator at ~16× wiki scale | P1 | L | MED | 038 (hard); 043 (vector-first mode only) | ingest+harness lint/host; 10M run GX10 | **HOST-DONE** (`71bdcfa`..`1a94eee`) — ADR-0018 + `tools/wikidata_ingest.py` + Harness A `bench/wikidata_consistency.py` + Harness B `bench/wikidata_h2h.py` + 32 host tests + `docs/wikidata_spike_v0.1.0.md`; `make test` 314 / `make lint` green. Verdict INCONCLUSIVE (GO-pending one GX10 measurement pass: ingest a pinned truthy slice, Harness A `--live`, Harness B `report` through the reused gate) |
 
 Rationale: Wikidata (~110M entities / ~1.5B **typed** statements) is the natively-tri-modal, mutation-heavy
 public corpus that lets TriDB prove its **demonstrated** value (one-WAL cross-modal consistency + fused
