@@ -41,14 +41,14 @@ footer { margin-top: 2rem; color: var(--muted); font-size: .8rem; border-top: 1p
 (Neo4j + Milvus + Postgres, merged app-side) on the canonical query (spec §5).</p>
 
 <div class="meta">
-  <span><b>Generated</b> 2026-06-25 23:55:33 UTC</span>
+  <span><b>Generated</b> 2026-07-04 02:16:48 UTC</span>
   <span><b>Engine mode</b> <code>live</code></span>
   <span><b>k</b> 5</span>
   <span><b>Corpus</b> 2000 entities</span>
   <span><b>Queries</b> 12</span>
 </div>
 
-<div class="verdict pass">Overall: ALL METRICS PASS</div>
+<div class="verdict fail">Overall: ONE OR MORE METRICS FAIL</div>
 
 <h2>Success metrics (SM-1..SM-5 vs spec §7 targets)</h2>
 <table>
@@ -57,8 +57,8 @@ footer { margin-top: 2rem; color: var(--muted); font-size: .8rem; border-top: 1p
   <th class="num">Target</th><th>Verdict</th><th>Detail</th>
 </tr></thead>
 <tbody>
-<tr><td class='sm'>SM-1</td><td>Intermediate-result reduction</td><td class='num'>32.0 x</td><td class='num'>5.0 x</td><td><span class="badge pass">PASS</span></td><td class='detail'>baseline materialized 1920 intermediate rows vs TriDB 60 (32.00x reduction; target &gt;= 5x)</td></tr>
-<tr><td class='sm'>SM-2</td><td>Latency (TriDB-side only; head-to-head GATED)</td><td class='num'>1.161 ms (TriDB-side)</td><td class='num'>0.8 ms (TriDB-side)</td><td><span class="badge pass">PASS</span></td><td class='detail'>live TriDB mean Execution Time 1.161 ms over 12 queries (EXPLAIN ANALYZE). NOT a fair SM-2: the baseline here is the in-process model (no runtime). A real SM-2 head-to-head needs the multi-system stack (make baseline-up) or the GX10 128 GB headline run — TABLED for this standin.</td></tr>
+<tr><td class='sm'>SM-1</td><td>Intermediate-result reduction</td><td class='num'>1.067 x</td><td class='num'>5.0 x</td><td><span class="badge fail">FAIL</span></td><td class='detail'>baseline materialized 1920 intermediate rows vs TriDB 1799 (1.07x reduction; target &gt;= 5x)</td></tr>
+<tr><td class='sm'>SM-2</td><td>Latency (TriDB-side only; head-to-head GATED)</td><td class='num'>1.486 ms (TriDB-side)</td><td class='num'>0.8 ms (TriDB-side)</td><td><span class="badge pass">PASS</span></td><td class='detail'>live TriDB mean Execution Time 1.486 ms over 12 queries (EXPLAIN ANALYZE). NOT a fair SM-2: the baseline here is the in-process model (no runtime). A real SM-2 head-to-head needs the multi-system stack (make baseline-up) or the GX10 128 GB headline run — TABLED for this standin.</td></tr>
 <tr><td class='sm'>SM-3</td><td>Corpus examined (k=5, worst case)</td><td class='num'>0.064 fraction</td><td class='num'>0.25 fraction</td><td><span class="badge pass">PASS</span></td><td class='detail'>worst-case 6.4% of corpus examined (target &lt; 25%)</td></tr>
 <tr><td class='sm'>SM-4</td><td>Answer-set parity</td><td class='num'>1.0 fraction</td><td class='num'>0.99 fraction</td><td><span class="badge pass">PASS</span></td><td class='detail'>mean answer-set parity 100.0% across 12 queries (target &gt;= 99%)</td></tr>
 <tr><td class='sm'>SM-5</td><td>Transaction atomicity</td><td class='num'>1.0 fraction</td><td class='num'>1.0 fraction</td><td><span class="badge pass">PASS</span></td><td class='detail'>12/12 queries atomic (100%; target 100%)</td></tr>
@@ -74,25 +74,24 @@ footer { margin-top: 2rem; color: var(--muted); font-size: .8rem; border-top: 1p
   <th class="num">corpus seen</th><th class="num">parity</th>
 </tr></thead>
 <tbody>
-<tr><td class='num'>0</td><td class='num'>0.81</td><td class='num'>0.00</td><td class='num lat-loss'>loss</td><td class='num'>5</td><td class='num'>160</td><td class='num'>32.0x</td><td class='num'>3.5%</td><td class='num'>100%</td></tr>
-<tr><td class='num'>1</td><td class='num'>0.79</td><td class='num'>0.00</td><td class='num lat-loss'>loss</td><td class='num'>5</td><td class='num'>160</td><td class='num'>32.0x</td><td class='num'>3.7%</td><td class='num'>100%</td></tr>
-<tr><td class='num'>2</td><td class='num'>1.37</td><td class='num'>0.00</td><td class='num lat-loss'>loss</td><td class='num'>5</td><td class='num'>160</td><td class='num'>32.0x</td><td class='num'>6.4%</td><td class='num'>100%</td></tr>
-<tr><td class='num'>3</td><td class='num'>0.98</td><td class='num'>0.00</td><td class='num lat-loss'>loss</td><td class='num'>5</td><td class='num'>160</td><td class='num'>32.0x</td><td class='num'>4.7%</td><td class='num'>100%</td></tr>
-<tr><td class='num'>4</td><td class='num'>1.23</td><td class='num'>0.00</td><td class='num lat-loss'>loss</td><td class='num'>5</td><td class='num'>160</td><td class='num'>32.0x</td><td class='num'>4.0%</td><td class='num'>100%</td></tr>
-<tr><td class='num'>5</td><td class='num'>1.27</td><td class='num'>0.00</td><td class='num lat-loss'>loss</td><td class='num'>5</td><td class='num'>160</td><td class='num'>32.0x</td><td class='num'>3.8%</td><td class='num'>100%</td></tr>
-<tr><td class='num'>6</td><td class='num'>1.09</td><td class='num'>0.00</td><td class='num lat-loss'>loss</td><td class='num'>5</td><td class='num'>160</td><td class='num'>32.0x</td><td class='num'>3.2%</td><td class='num'>100%</td></tr>
-<tr><td class='num'>7</td><td class='num'>0.88</td><td class='num'>0.00</td><td class='num lat-loss'>loss</td><td class='num'>5</td><td class='num'>160</td><td class='num'>32.0x</td><td class='num'>3.5%</td><td class='num'>100%</td></tr>
-<tr><td class='num'>8</td><td class='num'>1.61</td><td class='num'>0.00</td><td class='num lat-loss'>loss</td><td class='num'>5</td><td class='num'>160</td><td class='num'>32.0x</td><td class='num'>5.0%</td><td class='num'>100%</td></tr>
-<tr><td class='num'>9</td><td class='num'>1.41</td><td class='num'>0.00</td><td class='num lat-loss'>loss</td><td class='num'>5</td><td class='num'>160</td><td class='num'>32.0x</td><td class='num'>5.1%</td><td class='num'>100%</td></tr>
-<tr><td class='num'>10</td><td class='num'>0.81</td><td class='num'>0.00</td><td class='num lat-loss'>loss</td><td class='num'>5</td><td class='num'>160</td><td class='num'>32.0x</td><td class='num'>3.2%</td><td class='num'>100%</td></tr>
-<tr><td class='num'>11</td><td class='num'>1.69</td><td class='num'>0.00</td><td class='num lat-loss'>loss</td><td class='num'>5</td><td class='num'>160</td><td class='num'>32.0x</td><td class='num'>3.5%</td><td class='num'>100%</td></tr>
+<tr><td class='num'>0</td><td class='num'>1.59</td><td class='num'>0.00</td><td class='num lat-loss'>loss</td><td class='num'>150</td><td class='num'>160</td><td class='num'>1.1x</td><td class='num'>3.6%</td><td class='num'>100%</td></tr>
+<tr><td class='num'>1</td><td class='num'>2.09</td><td class='num'>0.00</td><td class='num lat-loss'>loss</td><td class='num'>150</td><td class='num'>160</td><td class='num'>1.1x</td><td class='num'>3.8%</td><td class='num'>100%</td></tr>
+<tr><td class='num'>2</td><td class='num'>1.22</td><td class='num'>0.00</td><td class='num lat-loss'>loss</td><td class='num'>150</td><td class='num'>160</td><td class='num'>1.1x</td><td class='num'>6.4%</td><td class='num'>100%</td></tr>
+<tr><td class='num'>3</td><td class='num'>2.27</td><td class='num'>0.00</td><td class='num lat-loss'>loss</td><td class='num'>150</td><td class='num'>160</td><td class='num'>1.1x</td><td class='num'>4.8%</td><td class='num'>100%</td></tr>
+<tr><td class='num'>4</td><td class='num'>0.96</td><td class='num'>0.00</td><td class='num lat-loss'>loss</td><td class='num'>149</td><td class='num'>160</td><td class='num'>1.1x</td><td class='num'>4.0%</td><td class='num'>100%</td></tr>
+<tr><td class='num'>5</td><td class='num'>0.97</td><td class='num'>0.00</td><td class='num lat-loss'>loss</td><td class='num'>150</td><td class='num'>160</td><td class='num'>1.1x</td><td class='num'>3.9%</td><td class='num'>100%</td></tr>
+<tr><td class='num'>6</td><td class='num'>1.62</td><td class='num'>0.00</td><td class='num lat-loss'>loss</td><td class='num'>150</td><td class='num'>160</td><td class='num'>1.1x</td><td class='num'>3.3%</td><td class='num'>100%</td></tr>
+<tr><td class='num'>7</td><td class='num'>1.15</td><td class='num'>0.00</td><td class='num lat-loss'>loss</td><td class='num'>150</td><td class='num'>160</td><td class='num'>1.1x</td><td class='num'>3.6%</td><td class='num'>100%</td></tr>
+<tr><td class='num'>8</td><td class='num'>2.41</td><td class='num'>0.00</td><td class='num lat-loss'>loss</td><td class='num'>150</td><td class='num'>160</td><td class='num'>1.1x</td><td class='num'>5.0%</td><td class='num'>100%</td></tr>
+<tr><td class='num'>9</td><td class='num'>1.38</td><td class='num'>0.00</td><td class='num lat-loss'>loss</td><td class='num'>150</td><td class='num'>160</td><td class='num'>1.1x</td><td class='num'>5.1%</td><td class='num'>100%</td></tr>
+<tr><td class='num'>10</td><td class='num'>1.15</td><td class='num'>0.00</td><td class='num lat-loss'>loss</td><td class='num'>150</td><td class='num'>160</td><td class='num'>1.1x</td><td class='num'>3.4%</td><td class='num'>100%</td></tr>
+<tr><td class='num'>11</td><td class='num'>1.01</td><td class='num'>0.00</td><td class='num lat-loss'>loss</td><td class='num'>150</td><td class='num'>160</td><td class='num'>1.1x</td><td class='num'>3.5%</td><td class='num'>100%</td></tr>
 </tbody>
 </table>
 
 <h2>v2 recommendations (DEV-1173)</h2>
 <ul class="recs">
-<li><b>SM-1 holds.</b> The early-terminating fused plan keeps the working set bounded. v2: extend the same pushdown discipline to the BM25 seam (currently architected-but-closed) without regressing the bound.</li>
-<li><b>All five metrics pass on this corpus.</b> v2 priorities shift from the core thesis to breadth: the deferred cost-based optimizer, multi-hop / typed edges beyond a single <code>:related_to</code>, the BM25 fourth store, and the 128 GB headline benchmark on the GX10.</li>
+<li><b>SM-1 (intermediate reduction) under target.</b> The fused plan is still materializing too much in flight. v2: push the relational time predicate into the graph-expansion iterator (predicate pushdown into the adjacency walk) so non-qualifying neighbours are never emitted; revisit the TJS working-set bound.</li>
 </ul>
 
 <footer>
