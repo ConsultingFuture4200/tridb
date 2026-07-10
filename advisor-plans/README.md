@@ -9,6 +9,98 @@ conditions, update your row when done. The repo builds in two layers: the **Pyth
 native graph AM) builds only via Docker and the GX10 — plans touching `vendor/MSVBASE` or `src/graph_store`
 C are **GX10-gated** (author + review here, build/verify on the GX10).
 
+## 2026-07-09 batch — post-DEV-1354 deep audit (planned against `c216750`)
+
+Deep `/improve` audit (5 parallel category auditors + advisor re-vet) after wiki fusion speed (200k),
+consistency demo, batched `gph_insert_edges`, and wiki-reader landed. Prior plans 001–039 treated as
+landed; these 20 plans are **residuals only**. All findings re-opened against live code at `c216750`.
+
+| Plan | Title | Priority | Effort | Risk | Depends on | Verify here? | Status |
+|------|-------|----------|--------|------|------------|--------------|--------|
+| 041 | Fix README SM-1 headline to honest 1.07× FAIL | P1 | S | LOW | — | YES | **DONE** (`advisor/041-…` `8752349`) — SM-1→1.07× FAIL; advisor spot-verified |
+| 053 | Multicol fork harness: labeled marker, not bare `2000` | P2 | S | LOW | — | partial (engine) | **PENDING-GX10** (`f094dea`) — labeled tag marker + fixture, static-clean |
+| 054 | `make clean` must not wipe `data/` | P2 | S | LOW | — | YES | **DONE** (`103fabb`) — `clean` preserves `data/`; new `clean-data` needs `CONFIRM=1`; spot-verified |
+| 051 | wiki-reader: token + body cap on mutating POSTs | P1 | S | LOW | — | YES | **DONE** (`4f6a023`) — token + body cap + 60-line tests; spot-verified |
+| 045 | Type-filter `gph_tombstone_edge` (typed edges) | P1 | S | LOW | — | engine | **PENDING-GX10** (`da9b807`) — authored + static-clean |
+| 046 | `gph_insert_edges` rejects tombstoned dst (parity) | P1 | S–M | LOW–MED | — | engine | **REVISE** (`0a8aae8`) — C fix correct; FIX: `graph_store_am_persist.sql` vertex_count 6→5 + re-run `graph_am_test` |
+| 047 | `gph_neighbors_ext_cached` honors `identity_mode` | P1 | S–M | LOW | — | engine | **PENDING-GX10** (`c3a81e4`) — authored + static-clean (no real defects) |
+| 040 | Freeze **xmax** so tombstones survive clog truncation | P1 | M | MED | — | engine | **PENDING-GX10** (`7cc3b41`) — xmax freeze authored; add vertex-tombstone test on GX10 |
+| 042 | Wiki extract shard rotate: never truncate on revisit | P1 | M | MED | — | YES | **DONE** (`98c392d`) — never-truncate on rotate + test; spot-verified |
+| 044 | wiki_engine_serve: no published trust-auth Postgres | P1 | M | MED | — | bash -n + manual | **DONE** (`8f19ede`) — loopback-default bind + per-run scram password; `pg_hba 0.0.0.0/0` documented residual |
+| 050 | Host unit tests for DEV-1354 harness gates | P1 | M | LOW | — | YES | **DONE** (`f29b0cf`) — 16 tests, `publication_gate` matrix + `torn`/`vec` |
+| 048 | Dense O(1) locate on traversal `gs_open` | P1 | M | MED | — | engine | **PENDING-GX10** (`73d8e29`) — default-off GUC, zero behavior change |
+| 049 | Hold `Relation` across neighbor `Next()` | P1 | M | MED | 048 optional | engine | **REVISE** (`7394b2d`) — FIX: cleanup path for early SRF abandonment (relcache-leak on undrained scan) |
+| 057 | `tjs_open` expand via `gph_neighbors_ext_cached` | P2 | M | MED | **047** | patch CI + engine | TODO (deferred — do after 047 lands) |
+| 055 | Honest edge-count semantics after deletes | P2 | M | MED | — | engine | **PENDING-GX10** (`1a43863`) — authored + static-clean |
+| 052 | HNSW `vector_index_map` invalidation (ADR-0014 A) | P2 | M–L | MED | coord. 043 | patch CI + engine | **PENDING-GX10** (`0db7d3b`) — patch authored; `ci_check_patches` green |
+| 058 | Core `requirements.lock` vs optional extras | P2 | M | MED | — | YES | **DONE** (`05ba1b1`) — core lock + `requirements-vdbb.txt` extras; spot-verified |
+| 059 | ADR-0013 Stage C: archive v0 `graph_store_ext` | P2 | M | MED | Stage A/B done | engine | **BLOCKED** — v0-only ENGINE_TESTS still wired (`graph_store_test.sql`, `graph_v0v1_parity_test.sql`) + ADR-0013 defers Stage C; plan needs rework before re-run |
+| 043 | Unblock 1M fused vector/HNSW leg | P1 | L | HIGH | — | GX10 | TODO (excluded from fan-out — GX10 HNSW-iterator debugging, not mechanical) |
+| 056 | Graph-leg snapshot isolation (DEV-1166 residual) | P2 | L | HIGH | **040** | engine + live S3 | TODO (excluded — needs 040 landed first) |
+
+**Fan-out `wf_2c0131ff-31a` (2026-07-09):** all 16 executed in isolated worktrees, scope-clean across the board. 6 host-plans **DONE** (spot-verified), 7 engine/patch plans **PENDING-GX10** (authored + static-clean, build deferred to the GX10), 2 real **REVISE** defects (046, 049), 1 **BLOCKED** (059 needs plan rework). Branches persist as `advisor/NNN-*`; nothing merged.
+
+**Engine-verification pass (2026-07-10, `tridb/msvbase:dev` x86 image):** built + ran `make graph-test` per plan.
+- **ENGINE-VERIFIED GREEN (mergeable):** 040, 047, 048, 052 (+`ci_check_patches`), 053, 055 — and **046** after the agent fixed the stale `persist.sql` vertex_count 6→5 (commit `7a70b3c` on `advisor/046`).
+- **045 — GREEN after re-diagnosis:** the "regression" was a MISDIAGNOSIS — the C type-filter (`da9b807`) is correct; the failure was a **stale vertex-numbering bug in plan 045's own test** (Test E's `add_edge` auto-created vids 6,7,8; Test F wrongly assumed 6,7 were fresh). Fixed the test (`f94a23a`, retarget to fresh vids 9,10); `make graph-test` exit 0 with F1/F2/F3 green (typed semantics confirmed). Agent correctly pushed back on the dictated diagnosis.
+- **049 — RED, deferred:** confirmed real `relcache reference leak` on early-abandon paths (3 WARNINGs; needs an abort-safe cleanup + a new abort-path test — do not merge; write a dedicated plan).
+
+**Merged into `dustin/dev-1354` (2026-07-10):** all **8 GREEN engine plans** — 053, 052, 040, 046, 047, 048, 055, **045** — merged (055 + 045 needed graph_am.c conflict resolution, both clean; `_PG_init`+`gph_visible_edge_count` and the tombstone docstring reconciled). Combined-tree `make graph-test` re-verified green. Host merges earlier: 050, 042, 041, 054, 058, 051. **044 now MERGED too** (2026-07-10, `5fc8b0e`) after the other agent's `bench/wiki_h2h_vecrun.py` WIP was committed + reconciled — secures `wiki_engine_serve.sh` (loopback-default bind + scram). Still unmerged: **049** (needs the abort-path fix — now specced as **plan 061**, do NOT merge 049 without it), **059** (BLOCKED, needs rework). Branch pushed to `origin/dustin/dev-1354` (`5fc8b0e`); not merged to master.
+
+**Plan 061 (2026-07-10, `e550e05`):** abort-safe Relation cleanup for the graph traversal SRFs — fixes the relcache-reference leak plan 049 introduced (3 confirmed WARNINGs on early-abandon/LIMIT/abort paths). Engine-gated; writes the missing abort-path leak test first, then an abort-safe release (recommended: don't hold the ref across `Next()`). TODO.
+
+### Recommended execution order
+
+**Wave A — host-only quick wins (parallel-safe):**  
+`041 → 054 → 053 → 051 → 050 → 042 → 058`
+
+**Wave B — graph_am correctness cluster (serialize or one PR):**  
+`045 → 046 → 047 → 040 → 055`  
+then `048 → 049 → 057` (perf path; 057 needs 047)
+
+**Wave C — security serve + archive:**  
+`044` ‖ `059` (disjoint)
+
+**Wave D — fork HNSW (serialize patches):**  
+`052` then/or with care `043` (both touch HNSW; do not weaken publication gates)
+
+**Wave E — large correctness:**  
+`056` only after `040` green
+
+### Dependency notes
+- **047 → 057**: identity-mode parity must hold before `tjs_open` switches to cached expand.
+- **040 → 056**: freeze xmax before snapshot SI reworks visibility (else clog + SI compose badly).
+- **043** is the publication gate for any 1M fusion claim; do not fabricate latency if blocked.
+- **048/049** are independent of 043; they help expand cost after the vector leg works.
+
+### Findings considered and rejected this batch (do not re-plan)
+- Concurrent multi-writer adjacency races — explicit single-writer contract in `graph_am.c` header.
+- Batch WAL multi-record as partial-visible bug — uncommitted xmin filter is sound.
+- Baseline `testpassword` / compose tags — local fixtures; digest pin residual only.
+- Re-running PG17 spike — ADR-0015 complete; decision hygiene only if desired later.
+- GPU batched top-k / GraphBLAS frontier — TR-1 violations (prior reject list).
+- Plans 001–039 items as open bugs — assumed landed unless residual evidence above.
+
+### Direction (not separate plan files; covered by 043/056 + existing ADRs)
+- D2 PPR+FR+RRF into engine — still ADR-0012 next iteration (not re-planned; host ref done in 007).
+- D4 gBrain reverse adjacency — ADR-0016; D5 PERF-08 last mile — gpu_index_build design.
+- D6 streaming graph predicate / SM-1 redesign — called out in 041 maintenance; full L effort later.
+
+### Direction plan added 2026-07-09 (planned against `1f0628f`)
+
+| Plan | Title | Priority | Effort | Risk | Depends on | Verify here? | Status |
+|------|-------|----------|--------|------|------------|--------------|--------|
+| 060 | Wikidata-on-TriDB spike — prove the differentiator at ~16× wiki scale | P1 | L | MED | 038 (hard); 043 (vector-first mode only) | ingest+harness lint/host; 10M run GX10 | TODO |
+
+Rationale: Wikidata (~110M entities / ~1.5B **typed** statements) is the natively-tri-modal, mutation-heavy
+public corpus that lets TriDB prove its **demonstrated** value (one-WAL cross-modal consistency + fused
+early-terminating retrieval, ADR-0017) at a scale a stranger can reproduce, against the exact
+Milvus+Neo4j+Postgres stack people run today. Primary experiments use the **filter-first** path (green at
+1M, DEV-1290), so they do NOT depend on the blocked seedless-fusion leg (043). This is a DESIGN+SPIKE
+plan alongside 043/056 — not part of the autonomous execute fan-out.
+
+---
+
 ## 2026-07-03 batch — post-DEV-1290 deep audit + persona review + landscape research (planned against `e345998`)
 
 Sources: 7-category deep `/improve` audit + Fabio/Linus/Liotta persona reviews + 4-angle landscape

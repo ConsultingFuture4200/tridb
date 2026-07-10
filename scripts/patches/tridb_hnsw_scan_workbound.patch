@@ -1,0 +1,185 @@
+# tridb_hnsw_scan_workbound.patch — DEV-1354 (plain HNSW scan TR-1 defensive work bound)
+#
+# STATUS: BUILT AND VERIFIED on the DGX Spark (GX10, aarch64+CUDA). vectordb rebuilt incrementally
+#   into tridb/msvbase:gx10-v1-hnswcap. Verified functional at small N (cap=3 -> exactly 3 rows) and
+#   at N=1,000,000 (enwiki dense_id_aligned.npy, 384-dim, HNSW distmethod=l2_distance).
+#
+# WHAT THIS ADDS: an ABSOLUTE bounded-work ceiling on the plain relaxed-order HNSW ORDER BY scan
+#   (`SELECT ... ORDER BY embedding <-> q LIMIT k`). hnsw_gettuple's !hasRangeFilter path buffers a
+#   FIXED range=86 window and flips xs_inorder when the window fills and the next candidate is worse.
+#   This patch counts candidates examined and returns end-of-scan once `vectordb.hnsw_max_examined`
+#   is exceeded, so the scan is provably O(cap) regardless of whether the 86-window flip ever trips —
+#   a defensive TR-1 guarantee (golden rule #1) and the exact analog of the shipped tjs_open work
+#   bound (tridb_tjs_open_workbound.patch). APPROXIMATE-kNN SEMANTICS (not "true top-k"): a cap set
+#   below the ~86 emission window truncates before xs_inorder stabilizes and lowers recall below 1.0,
+#   and a cap below k returns FEWER than k rows. Above the window the cap is inert (see below).
+#
+# IMPORTANT — VERIFICATION FINDING (the diagnosis premise was NOT reproduced): with a WARM in-RAM
+#   index (vector_index_map cached), the UNBOUNDED (cap=0) plain scan at N=1M terminates in single-
+#   digit ms for every query type tested — exact corpus member 2.0ms, random non-member 7.4ms,
+#   in-manifold midpoint 10.2ms — with recall IDENTICAL to the capped runs. The xs_inorder flip DOES
+#   trip at 1M. The plain scan is therefore NOT unbounded and does NOT drain ~all N nodes. The real
+#   >600s "hang" at 1M is HNSWIndexScan::LoadIndex's O(heap) rebuild (DEV-1235 rebuild-on-recovery)
+#   that runs on the FIRST query of every cold backend — measured 776-850s at 1M, NOT the scan, and
+#   NOT addressed here. Consequently this cap is an INERT safety net for the current corpus (the flip
+#   trips at ~86, far below any sane cap, so cap=0 and cap=1000 are byte-identical); it exists to make
+#   the scan provably bounded for a future/pathological distribution where the flip might not trip.
+#
+# FIX (three hunks, no new query surface):
+#   1. hnswindex.hpp: add `int64 examined` to HNSWScanOpaqueData (per-scan candidate counter).
+#   2. hnswindex.cpp: on the relaxed-order (!hasRangeFilter) branch, count each candidate pulled and
+#      `return false` once it exceeds `vectordb.hnsw_max_examined`. Range-filter branch untouched;
+#      counter reset on first call. Below the cap, behavior is byte-for-byte the legacy scan.
+#   3. lib.cpp: register the GUC `vectordb.hnsw_max_examined` (PGC_USERSET, default 1000, 0=disabled)
+#      in _PG_init, next to the HNSW reloption kinds. Plain-scan analog of vectordb.tjs_open_max_examined.
+#
+# TUNING: default 1000 is chosen ABOVE the range=86 emission window so it never truncates the existing
+#   flip-terminated scan. NOTE ON RECALL (do NOT quote this GUC as an SM-4 recall/latency knob): this
+#   cap is NOT a recall tradeoff on the current corpus. Above the ~86 flip it is INERT — cap>=86 gives
+#   byte-identical results to cap=0 (a FLAT curve, not a tradeoff); below ~86 recall falls off a cliff
+#   (cap=3 -> literally 3 rows). The only honest "no-regression" statement is that cap>=86 == cap=0.
+#   The regression check here was NOT a recall@10 over a held-out query set — it was one exact corpus
+#   member (found at 1.0 by construction) plus two ad-hoc probes; any recall number to be SHIPPED must
+#   be re-measured recall@10 over >=100-1000 held-out queries vs the brute-force L2 oracle. The real
+#   recall knob is the range=86 emission window (or tjs_open's term_cond), NOT this cap. tjs_open (with
+#   its own vectordb.tjs_open_max_examined bound) drains ~45-90 examined and is NOT regressed here.
+#
+# Sentinel for verify_patches: "vectordb.hnsw_max_examined" in src/lib.cpp AND "hnsw_max_examined_guc"
+#   in src/hnswindex.cpp. Depends-on: apply LAST in the HNSW chain — after tridb_hnsw_am_entry_guards,
+#   tridb_hnsw_reloptions, tridb_hnsw_costestimate_no_orderby. Diffed against the fully-patched tree.
+--- a/src/hnswindex.hpp
++++ b/src/hnswindex.hpp
+@@ -36,6 +36,7 @@
+         bool hasRangeFilter;
+         bool inRange;
+         float range;
++        int64 examined;   // TRIDB DEV-1354: relaxed-order candidates pulled this scan (TR-1 work bound)
+         HNSWIndexScan::WorkSpace *workSpace;
+     } HNSWScanOpaqueData;
+ 
+--- a/src/hnswindex.cpp
++++ b/src/hnswindex.cpp
+@@ -22,6 +22,12 @@
+ 
+ extern relopt_kind hnsw_para_relopt_kind;
+ 
++// TRIDB DEV-1354 — TR-1 HARD WORK-BOUND for the plain relaxed-order HNSW scan. Defined + registered
++// as the GUC `vectordb.hnsw_max_examined` in lib.cpp's _PG_init (mirrors hnsw_para_relopt_kind above).
++// Caps the candidates a plain `ORDER BY embedding <-> q LIMIT k` scan may pull from the VBASE
++// iterative iterator, so it terminates even when the xs_inorder emission-window flip never trips.
++extern int hnsw_max_examined_guc;
++
+ bytea *hnsw_para_options(Datum reloptions, bool validate) {
+ 
+   static const relopt_parse_elt tab[] = {
+@@ -366,6 +372,7 @@
+         }
+         scan->xs_inorder = false;
+         scanState->first = false;
++        scanState->examined = 0;   // TRIDB DEV-1354: reset the relaxed-order work-bound counter
+     }
+ 
+     int i = 0;
+@@ -420,19 +427,36 @@
+                 scanState->inRange = true;
+             }
+         }
+-        else if(!scan->xs_inorder){
+-         if (scanState->workSpace->distanceQueue.size() == scanState->range &&
+-             scanState->workSpace->distanceQueue.top() < result->GetDistance())
+-         {
+-             scan->xs_inorder=true;
+-         }
+-         else
+-         {
+-                    if (scanState->workSpace->distanceQueue.size() == scanState->range)
+-                    {
+-                    scanState->workSpace->distanceQueue.pop();
+-                    }
+-                    scanState->workSpace->distanceQueue.push(result->GetDistance());
++        else {
++         // TRIDB DEV-1354 — TR-1 HARD WORK-BOUND on the relaxed-order ORDER BY path. The VBASE
++         // hnswlib iterative iterator (searchBaseLayerSTIterative / ResultIterator::Next) ignores
++         // ef_ and expands the whole graph, emitting sporadic distance improvements — so the
++         // xs_inorder flip below (queue full AND next candidate worse than the buffered max) never
++         // trips at large N, and a plain `ORDER BY embedding <-> q LIMIT k` scan drains ~all N nodes
++         // (the deterministic 1M hang; N=200k flips at ~86 and is unaffected). This absolute ceiling
++         // guarantees the scan ALWAYS terminates: after `hnsw_max_examined_guc` candidates we signal
++         // end-of-scan (return false). APPROXIMATE-kNN SEMANTICS (not "true top-k"): a cap below the
++         // ~86 emission window truncates before xs_inorder stabilizes so recall drops below 1.0, and a
++         // cap below k returns FEWER than k rows; above the window it is inert (cap>=86 == cap=0 here).
++         // 0 disables (legacy). Range-filter branch above keeps its own thresholds and is untouched.
++         if (hnsw_max_examined_guc > 0 &&
++             ++scanState->examined > (int64) hnsw_max_examined_guc)
++             return false;
++
++         if(!scan->xs_inorder){
++          if (scanState->workSpace->distanceQueue.size() == scanState->range &&
++              scanState->workSpace->distanceQueue.top() < result->GetDistance())
++          {
++              scan->xs_inorder=true;
++          }
++          else
++          {
++                     if (scanState->workSpace->distanceQueue.size() == scanState->range)
++                     {
++                     scanState->workSpace->distanceQueue.pop();
++                     }
++                     scanState->workSpace->distanceQueue.push(result->GetDistance());
++          }
+          }
+         }
+ 
+--- a/src/lib.cpp
++++ b/src/lib.cpp
+@@ -15,6 +15,8 @@
+ #include <fmgr.h>
+ #include <omp.h>
+ #include <access/reloptions.h>
++#include <utils/guc.h>   // TRIDB DEV-1354: DefineCustomIntVariable for the HNSW scan work-bound
++#include <limits.h>      // TRIDB DEV-1354: INT_MAX
+ }
+ 
+ extern "C"
+@@ -29,6 +31,15 @@
+ relopt_kind hnsw_para_relopt_kind;
+ relopt_kind pase_hnsw_para_relopt_kind;
+ 
++// TRIDB DEV-1354 — TR-1 HARD WORK-BOUND for the plain relaxed-order HNSW scan (hnsw_gettuple).
++// The VBASE iterative iterator ignores ef_ and can expand the whole graph, so a plain
++// `ORDER BY embedding <-> q LIMIT k` scan whose xs_inorder emission-window flip never trips
++// drains ~all N nodes (the deterministic 1M hang). This GUC caps the candidates such a scan may
++// examine, guaranteeing bounded termination at any corpus size. APPROXIMATE-kNN: a cap below the
++// ~86 window lowers recall <1.0, a cap below k returns <k rows. 0 disables (legacy unbounded scan).
++// Read via `extern int hnsw_max_examined_guc;` in hnswindex.cpp (the hnsw_gettuple hot loop).
++int hnsw_max_examined_guc = 1000;
++
+ #ifdef WITH_SPTAG
+ relopt_enum_elt_def sptag_DistCalcMethodValues[] =
+ {
+@@ -83,4 +94,24 @@
+                         "Valid values are \"inner_product\" and \"l2_distance\".",
+                         AccessExclusiveLock);
+ 
++    // TRIDB DEV-1354 — register the plain relaxed-order HNSW scan TR-1 work-bound. PGC_USERSET so a
++    // plain `SET vectordb.hnsw_max_examined = N` tunes the recall/latency knob per session with no
++    // rebuild. Default 1000; 0 disables (legacy unbounded scan). This is the plain-scan analog of
++    // vectordb.tjs_open_max_examined (registered lazily in tjs_open_operator.cpp).
++    DefineCustomIntVariable(
++        "vectordb.hnsw_max_examined",
++        "Absolute ceiling on candidates a plain relaxed-order HNSW ORDER BY scan may examine (TR-1 work bound).",
++        "The VBASE relaxed-monotonicity iterator ignores ef_ and can expand the whole graph; at large N "
++        "the xs_inorder emission-window flip never trips, so a plain ORDER BY <-> LIMIT k scan drains the "
++        "entire corpus (unbounded work, a TR-1 violation). This caps examined candidates so the scan always "
++        "terminates. Approximate-kNN: a cap below the emission window (~86 on current data) reduces recall "
++        "below 1.0, and a cap below k returns fewer than k rows. 0 disables. Range-filter branch is untouched.",
++        &hnsw_max_examined_guc,
++        1000,       /* boot / default */
++        0,          /* min: 0 = unbounded */
++        INT_MAX,    /* max */
++        PGC_USERSET,
++        0,
++        NULL, NULL, NULL);
++
+ }
+\ No newline at end of file

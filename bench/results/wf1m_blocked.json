@@ -1,0 +1,47 @@
+{
+  "n": 1000000,
+  "dim": 384,
+  "k": 10,
+  "status": "BLOCKED",
+  "blocker": "TriDB vector leg / fused tjs_open does not function at N=1,000,000: examined=0 after a 600s ceiling (hang before the first candidate), on 2 of 2 fresh HNSW builds (images gx10-v1-batchedge and gx10-v1-hnswcap). A plain ANN top-10 (ORDER BY embedding <-> lit LIMIT 10) also blocks on a full-corpus Sort (planner does not trust the HNSW ordering at 1M => Sort over ~1M rows). This is the standing publication_gate BLOCKER (HNSW relaxed-monotonicity / opclass binding in the fork's vector iterator; historically ~4/5 fresh builds hang). No TriDB operating point exists at 1M, so no matched-recall latency comparison could be run. Per the honesty guard, no headline number is emitted.",
+  "loader_validated": {
+    "note": "Wall 3 (batched gph_insert_edges) IS validated at 1M on BOTH images — this part of the thread's payoff holds.",
+    "articles_loaded": 1000000,
+    "induced_edges": 38991320,
+    "gph_edge_count_asserted": 38991320,
+    "gph_vertex_count_asserted": 1000000,
+    "batchedge_image": {
+      "copy_articles_s": 62.78,
+      "hnsw_build_s": 691.38,
+      "vertex_materialize_s": 12.84,
+      "copy_edges_s": 5.54,
+      "batched_edge_insert_s": 35.11,
+      "reconcile": "edges=38991320 vertices=1000000 OK"
+    },
+    "hnswcap_image": {
+      "copy_articles_s": 62.84,
+      "hnsw_build_s": 791.20,
+      "vertex_materialize_s": 13.11,
+      "copy_edges_s": 5.58,
+      "batched_edge_insert_s": 34.15,
+      "reconcile": "edges=38991320 vertices=1000000 OK"
+    }
+  },
+  "vector_leg_evidence": {
+    "load_time_sample_tjs_open": "hung on both images (killed after 3-11 min, examined never printed)",
+    "tjs_open_m16_h1_t64_ceiling_600s": {"examined": 0, "bridges": 0, "result": "canceling statement due to statement timeout"},
+    "plain_ann_top10_no_cast_ceiling_15s": {"result": "canceling statement due to statement timeout", "plan": "Limit -> Sort(rows=1000000) -> Index Scan using articles_hnsw (planner adds a blocking Sort; HNSW order not trusted at 1M)"},
+    "fresh_builds_attempted": 2,
+    "fresh_builds_healthy": 0
+  },
+  "baseline_1m": {
+    "status": "NOT reloaded",
+    "reason": "left at 200k — with no working TriDB operating point at 1M there is nothing to compare against; reloading the isolated tridb-wiki-* stores to 1M was skipped to avoid pointless memory-heavy work."
+  },
+  "reference_200k_win_stands": {
+    "hop1_tridb_faster_x": 11.54,
+    "hop2_tridb_faster_x": 3.26,
+    "source": "bench/results/wf200k_tight.json (tjs_open is healthy at 200k: examined=192, recall~0.995)"
+  },
+  "compare_to_200k": "cannot compute — the 1M fused comparison did not execute (vector-leg blocker). The 200k win (11.5x/3.26x) is unaffected and remains the credible operating point until the 1M vector iterator is fixed."
+}

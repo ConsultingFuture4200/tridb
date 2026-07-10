@@ -1,4 +1,4 @@
-.PHONY: test lint graph-test smoke-test test-all baseline-up baseline-down seed bench bench-live sweep sm2 fetch-dataset bench-public bench-repro fetch-hotpot graphrag graphrag-live bench-filtered ablation recall-decay tjs-open-ref tjs-open-live graphrag-h2h rabitq-sim gpu-build-index lock clean
+.PHONY: test lint graph-test smoke-test test-all baseline-up baseline-down seed bench bench-live sweep sm2 fetch-dataset bench-public bench-repro fetch-hotpot graphrag graphrag-live bench-filtered ablation recall-decay tjs-open-ref tjs-open-live graphrag-h2h rabitq-sim gpu-build-index wiki-fetch wiki-extract wiki-scale wiki-neo4j wiki-subgraph wiki-linkpred lock clean clean-data
 
 PUBLIC_DATASET ?= gist-960-euclidean
 
@@ -13,7 +13,8 @@ ENGINE_TESTS := test/graph_store_test.sql test/trimodal_compose.sql \
                 test/tjs_open_smoke.sql test/hnsw_am_guards.sql \
                 test/pgmain_rewriter_removed.sql test/relaxed_order_guard.sql \
                 test/tjs_filter_first_test.sql test/tjs_arg_guards_test.sql \
-                test/graph_v0v1_parity_test.sql test/graph_vid_cache_test.sql
+                test/graph_v0v1_parity_test.sql test/graph_vid_cache_test.sql \
+                test/graph_dense_open_test.sql
 
 test:
 	$(PY) -m pytest tests/ -q
@@ -23,16 +24,20 @@ lint:
 
 # Regenerate the pinned lockfile from the current .venv (deliberate dep bumps: edit the
 # requirements.txt floor, then `make lock`, then commit both). Uses uv if present, else pip.
+# .venv must hold ONLY requirements.txt (core floors) — a venv with extras (e.g.
+# requirements-vdbb.txt) installed on top will bake them back into the core lock (advisor plan 058).
 lock:
 	@if command -v uv >/dev/null 2>&1; then \
 	  { echo "# Auto-generated pinned lockfile — do NOT edit by hand. Regenerate with: make lock"; \
 	    echo "# Reproducible installs: pip install -r requirements.lock"; \
-	    echo "# Pins the full transitive closure of the validated .venv (advisor plan 015)."; \
+	    echo "# Pins the full transitive closure of requirements.txt (core floors only)."; \
+	    echo "# For VectorDBBench/streamlit/etc. use requirements-vdbb.txt instead (advisor plan 058)."; \
 	    VIRTUAL_ENV=.venv uv pip freeze; } > requirements.lock; \
 	else \
 	  { echo "# Auto-generated pinned lockfile — do NOT edit by hand. Regenerate with: make lock"; \
 	    echo "# Reproducible installs: pip install -r requirements.lock"; \
-	    echo "# Pins the full transitive closure of the validated .venv (advisor plan 015)."; \
+	    echo "# Pins the full transitive closure of requirements.txt (core floors only)."; \
+	    echo "# For VectorDBBench/streamlit/etc. use requirements-vdbb.txt instead (advisor plan 058)."; \
 	    $(PY) -m pip freeze --exclude-editable; } > requirements.lock; \
 	fi
 	@echo "wrote requirements.lock ($$(wc -l < requirements.lock) lines)"
@@ -285,6 +290,97 @@ gpu-build-index:
 	@test -n "$(DATASET)" || { echo "set DATASET=<.npy/.fvecs/.hdf5> (the corpus to index)"; exit 1; }
 	bash scripts/gpu_build_index.sh --vectors $(DATASET) --out $(INDEX_OUT)
 
+# =============================================================================
+# FULL-WIKIPEDIA SCALE BENCHMARK (docs/wiki_scale_benchmark_spec_v0.1.0.md, DEV-1354)
+# Phase 0 (extract) + Phase 3 (retrieve-from-all-wiki recall) are hardware-independent
+# and run HERE; the LIVE tjs_open latency / HNSW build / COPY load are GX10/Spark-gated
+# (docs/wiki_scale_load_design_v0.1.0.md). These guards mirror fetch-hotpot/graphrag.
+# =============================================================================
+WIKI ?= simple                                   # simple | full
+SIMPLEWIKI_URL ?= https://dumps.wikimedia.org/simplewiki/latest/simplewiki-latest-pages-articles.xml.bz2
+ENWIKI_URL     ?= https://dumps.wikimedia.org/enwiki/latest/enwiki-latest-pages-articles.xml.bz2
+WIKI_DUMP ?= data/wiki/simplewiki-latest-pages-articles.xml.bz2
+WIKI_OUT  ?= data/wiki/simplewiki_slice
+WIKI_MAX  ?= 20000                               # articles to index/emit (slice); unset for full
+
+# Network-gated: download a MediaWiki pages-articles dump to data/wiki/. NOT run by
+# tests/CI (same policy as fetch-dataset). WIKI=full pulls enwiki (~20 GB compressed,
+# ~90 GB extracted) — LONG. Skips a dump that is already present.
+wiki-fetch:
+	@mkdir -p data/wiki
+	@if [ "$(WIKI)" = "full" ]; then URL="$(ENWIKI_URL)"; else URL="$(SIMPLEWIKI_URL)"; fi; \
+	  DEST="data/wiki/$$(basename $$URL)"; \
+	  if [ -s "$$DEST" ]; then echo "[wiki-fetch] $$DEST already present — skipping"; \
+	  else echo "[wiki-fetch] downloading $$URL (resumable; enwiki is LONG)"; \
+	    curl -L -C - -o "$$DEST" "$$URL"; fi
+
+# Phase 0 extraction (hardware-independent): stream a dump into a portable corpus
+# manifest (tools/wiki_extract). Slice by default (WIKI_MAX); a FULL run is
+# `make wiki-extract WIKI_DUMP=data/wiki/enwiki-...xml.bz2 WIKI_OUT=data/wiki/enwiki WIKI_MAX=`.
+wiki-extract:
+	@test -f "$(WIKI_DUMP)" || \
+	  { echo "dump $(WIKI_DUMP) missing — run: make wiki-fetch (WIKI=simple|full)"; exit 1; }
+	$(PY) -m tools.wiki_extract --dump "$(WIKI_DUMP)" --out "$(WIKI_OUT)" \
+	  $(if $(WIKI_MAX),--max-articles $(WIKI_MAX),)
+
+# Host-side full-wiki HotpotQA retrieve-from-ALL recall (bench/wiki_scale_report).
+# Grades multi-hop joint evidence recall@k over the whole corpus, gold resolved via
+# tools/wiki_hotpot_link. Guards on BOTH the wiki manifest (make wiki-extract) and the
+# HotpotQA dev slice (make fetch-hotpot). At 6.8M pass GPU-precomputed embeddings via
+# WIKI_CORPUS_EMB/WIKI_QUERY_EMB. The LIVE tjs_open latency is a SEPARATE GX10-gated
+# note: `make wiki-scale ... ` emits the SQL with --emit-sql; run it on the Spark
+# (scripts/graph_test.sh) — this target NEVER fabricates a live latency here.
+wiki-scale:
+	@test -f "$(WIKI_OUT)/manifest.json" || \
+	  { echo "wiki manifest $(WIKI_OUT)/manifest.json missing — run: make wiki-extract"; exit 1; }
+	@test -f data/hotpot/dev_slice.json || \
+	  { echo "no HotpotQA dev slice — run: make fetch-hotpot"; exit 1; }
+	$(PY) -m bench.wiki_scale_report --wiki-manifest-dir "$(WIKI_OUT)" \
+	  --slice data/hotpot/dev_slice.json \
+	  $(if $(WIKI_CORPUS_EMB),--corpus-emb $(WIKI_CORPUS_EMB) --query-emb $(WIKI_QUERY_EMB),)
+
+# =============================================================================
+# OFFLINE-WIKI VISUAL TRACK (DEV-1354): load the wiki graph into the baseline
+# Neo4j (image neo4j:5.20 COMMUNITY) and render a k-hop neighborhood as a
+# self-contained, CDN-free interactive HTML. Community-compatible (NO Bloom).
+# Guards mirror sm2: the neo4j container must be up (make baseline-up) and the
+# wiki manifest must exist. Full corpus by default; WIKI_NEO4J_LIMIT=50000 smoke.
+# =============================================================================
+WIKI_NEO4J_MANIFEST ?= data/wiki/simplewiki_full
+WIKI_NEO4J_LIMIT    ?=                  # cap edges for a smoke load; empty = full
+WIKI_SEED           ?= April
+WIKI_HOPS           ?= 2
+WIKI_SUBGRAPH_LIMIT ?= 150
+
+wiki-neo4j:
+	@docker ps --filter name=tridb-baseline-neo4j --format '{{.Names}}' | grep -q tridb-baseline-neo4j || \
+	  { echo "neo4j not up — run: make baseline-up (or docker compose -f baseline/docker-compose.yml up -d neo4j)"; exit 1; }
+	@test -f "$(WIKI_NEO4J_MANIFEST)/manifest.json" || \
+	  { echo "wiki manifest $(WIKI_NEO4J_MANIFEST)/manifest.json missing — run: make wiki-extract"; exit 1; }
+	$(PY) -m tools.wiki_neo4j_load --manifest-dir "$(WIKI_NEO4J_MANIFEST)" \
+	  $(if $(WIKI_NEO4J_LIMIT),--limit $(WIKI_NEO4J_LIMIT),)
+
+wiki-subgraph:
+	@docker ps --filter name=tridb-baseline-neo4j --format '{{.Names}}' | grep -q tridb-baseline-neo4j || \
+	  { echo "neo4j not up — run: make baseline-up (or docker compose -f baseline/docker-compose.yml up -d neo4j)"; exit 1; }
+	$(PY) -m tools.wiki_subgraph --seed "$(WIKI_SEED)" --hops $(WIKI_HOPS) --limit $(WIKI_SUBGRAPH_LIMIT)
+
+# Link prediction over the offline-wiki corpus (DEV-1354): embed articles (fastembed
+# BGE, CPU here), hnswlib ANN, cosine-neighbors-MINUS-existing-edges -> ranked predicted
+# connections + an overlap sanity metric. This is the cosine-only LOWER BOUND; the
+# production predictor fuses this with graph structure via tjs_open (GX10-gated). Full
+# enwiki (~7M) embedding is the Spark GPU step; WIKI_LP_LIMIT=0 runs the whole corpus.
+WIKI_LP_MANIFEST ?= data/wiki/simplewiki_full
+WIKI_LP_LIMIT    ?= 30000
+WIKI_LP_SAMPLE   ?= 2000
+WIKI_LP_EMB_OUT  ?=
+wiki-linkpred:
+	@test -f "$(WIKI_LP_MANIFEST)/manifest.json" || \
+	  { echo "wiki manifest $(WIKI_LP_MANIFEST)/manifest.json missing — run: make wiki-extract"; exit 1; }
+	$(PY) -m tools.wiki_linkpredict --corpus "$(WIKI_LP_MANIFEST)" \
+	  --limit $(WIKI_LP_LIMIT) --sample $(WIKI_LP_SAMPLE) --print-n 15 \
+	  $(if $(WIKI_LP_EMB_OUT),--emb-out "$(WIKI_LP_EMB_OUT)")
+
 baseline-up:
 	docker compose -f baseline/docker-compose.yml up -d
 
@@ -292,4 +388,10 @@ baseline-down:
 	docker compose -f baseline/docker-compose.yml down -v
 
 clean:
-	rm -rf data/ bench/out/ .pytest_cache/
+	rm -rf bench/out/ .pytest_cache/
+
+clean-data:
+ifneq ($(CONFIRM),1)
+	$(error This deletes data/ (seed corpora, ANN sets, HotpotQA, wiki artifacts). Re-run as: make clean-data CONFIRM=1)
+endif
+	rm -rf data/

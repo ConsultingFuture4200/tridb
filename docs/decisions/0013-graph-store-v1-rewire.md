@@ -167,3 +167,16 @@ explicit precondition for DIRECTION-04.
 
 **Stage C (archive v0) deliberately deferred** one release cycle: v0 is the parity oracle's
 counterparty and the rollback safety net (golden rule 9 exception with an explicit contract).
+
+**Rider 1 addendum (advisor plan 048, engine-authored/GX10-unbuilt).** Rider 1 was previously
+discharged only for the *ingest* side (`gph_insert_edges`'s O(1) `gph_locate_vertex_dense`, DEV-1354).
+It now also lands for the *open* side: `gs_open` (the traversal Open of Open/Next/Close) tries the
+same O(1) dense locate first when the session opts in with `SET graph_store.assume_dense_open = on`
+(default off — a pre-existing sparse/non-dense reader is byte-identical to before this plan). This is
+a session GUC, not an auto-detected or metapage-persisted condition: there is no cheap, general way to
+tell a dense store from a sparse one without either an O(1) trust-the-caller flag or an O(V) scan, and
+`gph_locate_vertex_dense` already hard-verifies the page it computes and ERRORs (never silently
+mis-reads) if the layout turns out not to be dense — so an incorrect opt-in fails loud, not wrong.
+Parity is asserted by `test/graph_dense_open_test.sql` (linear vs dense digest over every vid, incl.
+a tombstoned vid and one out-of-range vid). Rider 1 is now closed for both the write and the read
+path; riders 2/3 (traversal snapshot stability) remain open per the paragraph above.

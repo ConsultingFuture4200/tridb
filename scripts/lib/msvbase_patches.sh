@@ -155,6 +155,28 @@ verify_patches() {
   # translator. Sentinel on the LOAD-BEARING SPI token (gph_neighbors_ext_cached) in tjs_operator.cpp.
   grep -q 'gph_neighbors_ext_cached' "$root/src/tjs_operator.cpp" 2>/dev/null \
     || die "TriDB tridb_graph_vid_cache.patch NOT applied — TJS graph probe still on the uncached shim (advisor plan 034); drift?"
+  # DEV-1354: tjs_open TR-1 HARD work-bound. Sentinel on the LOAD-BEARING GUC name — its presence
+  # proves both the absolute examined ceiling in the phase-3b drain and the honest PG_CATCH reporting.
+  grep -q 'vectordb.tjs_open_max_examined' "$root/src/tjs_open_operator.cpp" 2>/dev/null \
+    || die "TriDB tridb_tjs_open_workbound.patch NOT applied — tjs_open TR-1 work-bound GUC missing (DEV-1354); drift?"
+  # DEV-1354: plain HNSW scan TR-1 HARD work-bound. Two sentinels on the LOAD-BEARING GUC name — its
+  # presence in lib.cpp proves the GUC registration and in hnswindex.cpp proves the examined ceiling
+  # in the relaxed-order gettuple loop; a partial apply (one file only) misses one and die()s.
+  grep -q 'vectordb.hnsw_max_examined' "$root/src/lib.cpp" 2>/dev/null \
+    || die "TriDB tridb_hnsw_scan_workbound.patch NOT applied — plain HNSW scan work-bound GUC missing in lib.cpp (DEV-1354); drift?"
+  grep -q 'hnsw_max_examined_guc' "$root/src/hnswindex.cpp" 2>/dev/null \
+    || die "TriDB tridb_hnsw_scan_workbound.patch NOT applied — plain HNSW scan examined ceiling missing in hnswindex.cpp (DEV-1354); drift?"
+  # ADR-0014 (advisor plan 052): HNSW vector_index_map relcache invalidation. Three sentinels on
+  # LOAD-BEARING code tokens (not comment phrases) across the three touched call sites — a partial
+  # apply (e.g. the callback wired but no scan-site keepalive, or vice versa) misses one and die()s.
+  grep -q 'RegisterInvalidationCallback' "$root/src/hnswindex_scan.hpp" 2>/dev/null \
+    || die "TriDB tridb_hnsw_index_cache_inval.patch NOT applied — relcache invalidation callback declaration missing in hnswindex_scan.hpp (ADR-0014 / advisor plan 052); drift?"
+  grep -q 'HNSWIndexScan::RegisterInvalidationCallback' "$root/src/lib.cpp" 2>/dev/null \
+    || die "TriDB tridb_hnsw_index_cache_inval.patch NOT applied — callback not registered in lib.cpp _PG_init (ADR-0014 / advisor plan 052); drift?"
+  grep -q 'relid_to_path_map' "$root/src/hnswindex_scan.cpp" 2>/dev/null \
+    || die "TriDB tridb_hnsw_index_cache_inval.patch NOT applied — relid->path side map missing in hnswindex_scan.cpp (ADR-0014 / advisor plan 052); drift?"
+  grep -q 'indexKeepalive' "$root/src/tridb_vector_iter.cpp" 2>/dev/null \
+    || die "TriDB tridb_hnsw_index_cache_inval.patch INCOMPLETE — shared_ptr keepalive missing in tridb_vector_iter.cpp (ADR-0014 ownership rule / advisor plan 052); drift?"
   log "all MSVBASE + TriDB fork patches verified present"
 }
 
@@ -584,6 +606,79 @@ apply_tridb_fork_patches() {
     log "applying TriDB fork patch: operator graph probe -> cached reverse translator (advisor plan 034 / DEV-1345)"
     ( cd "$root" && git apply "$vidcache_patch" ) \
       || die "tridb_graph_vid_cache.patch did not apply — tjs-chain drift? re-generate per advisor plan 034"
+  fi
+
+  #   tridb_tjs_open_workbound.patch (DEV-1354): TR-1 HARD work-bound for tjs_open. Adds the
+  #     vectordb.tjs_open_max_examined GUC (PGC_USERSET, lazy-registered — the extension has no other
+  #     GUC/_PG_init block to join) and an ABSOLUTE examined ceiling in execTJSOpen's phase-3b drain,
+  #     so termination is GUARANTEED bounded at any N. Without it the HNSW relaxed-monotonicity tail
+  #     sporadically improves the top-k within every <term_cond pulls, so the consecutive_drops bound
+  #     never fires at 1M and the drain runs unbounded (200k terminated at examined=90; 1M hung). The
+  #     ceiling does NOT touch the drop counter, so below the cap the streaming top-k/bridge semantics
+  #     are unchanged. Also publishes tjs_open_last_examined/bridges in the PG_CATCH so a cancelled or
+  #     statement_timeout'd scan reports true work, not the stale post-drain 0. Diffed against the
+  #     post-vid-cache tree, so it MUST apply LAST in the tjs chain.
+  local tjswb_patch="${_MSVBASE_LIB_DIR}/../patches/tridb_tjs_open_workbound.patch"
+  [[ -f "$tjswb_patch" ]] || die "missing TriDB fork patch: $tjswb_patch"
+  if grep -q 'tjs_open_max_examined' "$root/src/tjs_open_operator.cpp" 2>/dev/null; then
+    log "TriDB fork patch (tjs_open TR-1 work-bound GUC, DEV-1354) already applied"
+  else
+    log "applying TriDB fork patch: tjs_open TR-1 hard work-bound + honest examined reporting (DEV-1354)"
+    ( cd "$root" && git apply "$tjswb_patch" ) \
+      || die "tridb_tjs_open_workbound.patch did not apply — tjs-chain drift? re-generate per DEV-1354"
+  fi
+
+  #   tridb_hnsw_scan_workbound.patch (DEV-1354): DEFENSIVE TR-1 work-bound for the PLAIN relaxed-order
+  #     HNSW scan — the analog of tjs_open_workbound for `SELECT ... ORDER BY embedding <-> q LIMIT k`.
+  #     Adds an `int64 examined` counter to HNSWScanOpaqueData and an absolute `vectordb.hnsw_max_examined`
+  #     ceiling (GUC, PGC_USERSET, default 1000, 0=disabled; registered in lib.cpp _PG_init) on
+  #     hnsw_gettuple's !hasRangeFilter path, so the scan is provably O(cap) regardless of whether the
+  #     FIXED range=86 emission-window flip trips. APPROXIMATE-kNN (not "true top-k"): a cap below the ~86
+  #     window lowers recall <1.0 and a cap below k returns <k rows. NOTE (DEV-1354 verification): the scan does NOT
+  #     actually drain at N=1M — the xs_inorder flip trips and the UNBOUNDED (cap=0) scan finishes in
+  #     single-digit ms for member/non-member/midpoint queries (recall identical to capped). The real 1M
+  #     >600s cost is LoadIndex's O(heap) rebuild (DEV-1235), not the scan; this cap is a defensive net
+  #     for a future distribution where the flip might not trip, and is inert on the current corpus.
+  #     Range-filter branch untouched; below the cap behavior is byte-for-byte the legacy scan. Diffed
+  #     against the fully-patched hnswindex.cpp/hnswindex.hpp/lib.cpp, so it MUST apply LAST in the HNSW chain.
+  local hnswwb_patch="${_MSVBASE_LIB_DIR}/../patches/tridb_hnsw_scan_workbound.patch"
+  [[ -f "$hnswwb_patch" ]] || die "missing TriDB fork patch: $hnswwb_patch"
+  if grep -q 'hnsw_max_examined' "$root/src/lib.cpp" 2>/dev/null; then
+    log "TriDB fork patch (plain HNSW scan TR-1 work-bound GUC, DEV-1354) already applied"
+  else
+    log "applying TriDB fork patch: plain HNSW scan TR-1 hard work-bound (DEV-1354)"
+    ( cd "$root" && git apply "$hnswwb_patch" ) \
+      || die "tridb_hnsw_scan_workbound.patch did not apply — hnsw-chain drift? re-generate per DEV-1354"
+  fi
+
+  #   tridb_hnsw_index_cache_inval.patch (ADR-0014 Option A, advisor plan 052): the process-global
+  #     vector_index_map/distanceFunction_map (src/hnswindex_scan.cpp) are never erased, so a
+  #     pooled backend serves a STALE (or, on a dimension change, wrong-dimension/OOB, the plan-019
+  #     class defect) graph after DROP INDEX + CREATE (same name), REINDEX, or recreate-at-new-
+  #     dimension. Adds a CacheRegisterRelcacheCallback registered once from _PG_init (lib.cpp),
+  #     which erases the stale map entry on relcache invalidation (DROP/REINDEX/rewrite; InvalidOid
+  #     means flush everything) so the very next LoadIndex cache-misses and the existing DEV-1235
+  #     rebuild-on-recovery path repopulates from the live heap. Since the invalidation callback
+  #     receives only an Oid, a side map `relid_to_path_map` (Oid -> p_path) — populated in
+  #     LoadIndex — lets the callback find which name-keyed entry to erase without re-keying the
+  #     whole cache (the ADR-sanctioned Option A variant). Ownership rule (mandatory, ADR-0014):
+  #     the callback ONLY erases map entries, never frees/mutates the graph directly — BeginScan
+  #     now also copies the map's shared_ptr into a caller-held "keepalive" (WorkSpace::
+  #     indexKeepalive / TridbVectorIter::indexKeepalive) BEFORE constructing the iterator, so an
+  #     eviction racing a long-lived scan only drops the map's own reference; the graph itself is
+  #     freed only once every keepalive copy is also released. Diffed against the fully-patched
+  #     hnswindex.cpp/hnswindex_scan.{hpp,cpp}/tridb_vector_iter.cpp/lib.cpp, so it MUST apply LAST
+  #     in the HNSW chain (after tridb_hnsw_scan_workbound.patch). GX10/Docker-gated: authored and
+  #     apply/sentinel-verified on the x86 standin only — NOT compiled or run; the repro
+  #     (scripts/hnsw_stale_index_repro.sh) is the acceptance test once it is built on the engine.
+  local hnswinval_patch="${_MSVBASE_LIB_DIR}/../patches/tridb_hnsw_index_cache_inval.patch"
+  [[ -f "$hnswinval_patch" ]] || die "missing TriDB fork patch: $hnswinval_patch"
+  if grep -q 'RegisterInvalidationCallback' "$root/src/hnswindex_scan.hpp" 2>/dev/null; then
+    log "TriDB fork patch (HNSW vector_index_map relcache invalidation, ADR-0014 / advisor plan 052) already applied"
+  else
+    log "applying TriDB fork patch: HNSW vector_index_map relcache invalidation (ADR-0014 Option A / advisor plan 052)"
+    ( cd "$root" && git apply "$hnswinval_patch" ) \
+      || die "tridb_hnsw_index_cache_inval.patch did not apply — hnsw-chain drift? re-generate per ADR-0014 / advisor plan 052"
   fi
 
   # ----------------------------------------------------------------------------

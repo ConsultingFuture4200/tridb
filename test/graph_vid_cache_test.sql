@@ -1,5 +1,5 @@
 -- graph_vid_cache_test.sql — ASSERTING test for the backend-local reverse vid cache
--- (advisor plan 034 / DEV-1345, PERF-03). Two oracles:
+-- (advisor plan 034 / DEV-1345, PERF-03) and its identity_mode fast-path (plan 047). Oracles:
 --   (1) PARITY   — gph_neighbors_ext_cached is byte-identical to the gph_neighbors_ext shim
 --                  over every mapped source vertex (sorted neighbor multiset digest).
 --   (2) HOOK     — the relcache-invalidation callback flushes the cache on a gph_vid_map
@@ -7,6 +7,11 @@
 --                  rebuilds from the fresh map and surfaces the NEW external ids. If the hook
 --                  did NOT fire, the cached probe would keep serving the OLD ids and diverge
 --                  from the shim — a silently-stale id cache (plan 034 STOP condition).
+--   (3) IDENTITY — identity_mode ON with an EMPTY gph_vid_map: gph_neighbors_ext_cached must
+--                  match gph_neighbors_ext (both take the identity fast-path), not silently
+--                  return empty (plan 047's bug: the C twin used to always SPI-probe the map).
+--   (4) IDENTITY — identity_mode ON with the map POPULATED with identity rows (ext_id == vid):
+--                  same equality, and the result must be independent of the map's contents.
 --
 -- Run: bash scripts/graph_test.sh tridb/msvbase:dev test/graph_vid_cache_test.sql
 -- (graph_test.sh installs graph_store_am; this file runs as superuser.) Single backend/session,
@@ -96,4 +101,96 @@ BEGIN
     RAISE NOTICE 'PASS 2: relcache-invalidation hook flushed the cache on gph_vid_map reload; fresh digest %', cached2;
 END $$;
 
-\echo === graph vid cache (plan 034): cached==uncached + invalidation hook ALL PASS ===
+-- (3)+(4) IDENTITY-MODE PARITY (advisor plan 047): gph_neighbors_ext_cached must honor
+-- gph_am_meta.identity_mode exactly like the gph_neighbors_ext SQL shim (plan 033's CASE
+-- guards). Pre-047 the C twin ALWAYS SPI-probed gph_vid_map regardless of identity_mode, so
+-- under identity ON with an empty/incomplete map it silently returned EMPTY where the shim
+-- returned full adjacency (the bug plan 047 fixes). A SEPARATE fresh database/extension so
+-- native vids start dense at 0 with an EMPTY gph_vid_map.
+CREATE DATABASE vidcache_identity;
+\connect vidcache_identity
+CREATE EXTENSION graph_store_am;
+
+-- 501 native vertices (vid 0..500, dense from a fresh install). Hub (vid 0) fans out to every
+-- vertex in [1,300]; a pseudo-random tail wires up the rest -- same non-trivial shape as the
+-- sparse-map test above, addressed by native vid directly (no gph_vid_map involved yet).
+CREATE TEMP TABLE ident_vids (vid bigint);
+INSERT INTO ident_vids SELECT graph_store.gph_insert_vertex() FROM generate_series(1, 501);
+
+SELECT count(*) FROM (
+    SELECT graph_store.gph_insert_edge(0, g) FROM generate_series(1, 300) g
+) s;
+SELECT count(*) FROM (
+    SELECT graph_store.gph_insert_edge(1 + (i % 500),
+                                       1 + ((i::bigint * 2654435761 + 40503) % 500))
+    FROM generate_series(1, 400) i
+) s;
+
+-- gph_vid_map is EMPTY here -- the exact scenario the bug lived in. Allowed by the
+-- gph_set_identity_mode guard (DEV-1352) because an empty map has no ext_id <> vid row.
+SELECT graph_store.gph_set_identity_mode(true);
+
+SELECT md5(string_agg(line, E'\n' ORDER BY v)) AS ident_shim_digest FROM (
+    SELECT vid AS v,
+           vid || ':' || coalesce((SELECT string_agg(d::text, ',' ORDER BY d)
+                                   FROM graph_store.gph_neighbors_ext(vid) d), '') AS line
+    FROM ident_vids
+) s \gset
+SELECT md5(string_agg(line, E'\n' ORDER BY v)) AS ident_cached_digest FROM (
+    SELECT vid AS v,
+           vid || ':' || coalesce((SELECT string_agg(d::text, ',' ORDER BY d)
+                                   FROM graph_store.gph_neighbors_ext_cached(vid) d), '') AS line
+    FROM ident_vids
+) s \gset
+
+-- (4) Same topology, but NOW populate gph_vid_map with identity rows (ext_id = vid) for every
+-- vertex -- plan 047 test 3: identity ON with map rows PRESENT must still equal, proving the
+-- cached path truly ignores the map under identity_mode rather than happening to agree only
+-- because the map was empty.
+INSERT INTO graph_store.gph_vid_map (ext_id, vid) SELECT vid, vid FROM ident_vids;
+
+SELECT md5(string_agg(line, E'\n' ORDER BY v)) AS ident_shim_digest2 FROM (
+    SELECT vid AS v,
+           vid || ':' || coalesce((SELECT string_agg(d::text, ',' ORDER BY d)
+                                   FROM graph_store.gph_neighbors_ext(vid) d), '') AS line
+    FROM ident_vids
+) s \gset
+SELECT md5(string_agg(line, E'\n' ORDER BY v)) AS ident_cached_digest2 FROM (
+    SELECT vid AS v,
+           vid || ':' || coalesce((SELECT string_agg(d::text, ',' ORDER BY d)
+                                   FROM graph_store.gph_neighbors_ext_cached(vid) d), '') AS line
+    FROM ident_vids
+) s \gset
+
+SELECT set_config('vc.ident_shim',    :'ident_shim_digest',    false),
+       set_config('vc.ident_cached',  :'ident_cached_digest',  false),
+       set_config('vc.ident_shim2',   :'ident_shim_digest2',   false),
+       set_config('vc.ident_cached2', :'ident_cached_digest2', false);
+
+DO $$
+DECLARE
+    shim    text := current_setting('vc.ident_shim');
+    cached  text := current_setting('vc.ident_cached');
+    shim2   text := current_setting('vc.ident_shim2');
+    cached2 text := current_setting('vc.ident_cached2');
+BEGIN
+    IF cached <> shim THEN
+        RAISE EXCEPTION 'CACHED != UNCACHED under identity_mode ON + EMPTY map (plan 047): shim % vs cached % -- gph_neighbors_ext_cached does not honor identity_mode',
+            shim, cached;
+    END IF;
+    RAISE NOTICE 'PASS 3: identity ON + empty map -- cached matches shim: %', cached;
+
+    IF cached2 <> shim2 THEN
+        RAISE EXCEPTION 'CACHED != UNCACHED under identity_mode ON + POPULATED identity map (plan 047): shim % vs cached %',
+            shim2, cached2;
+    END IF;
+    RAISE NOTICE 'PASS 4: identity ON + populated identity map -- cached matches shim: %', cached2;
+
+    IF cached2 <> cached THEN
+        RAISE EXCEPTION 'IDENTITY RESULT CHANGED after populating gph_vid_map (plan 047): empty-map digest % vs populated-map digest % -- the cached path is not ignoring the map under identity_mode',
+            cached, cached2;
+    END IF;
+    RAISE NOTICE 'PASS 5: identity-mode result independent of gph_vid_map contents: %', cached2;
+END $$;
+
+\echo === graph vid cache (plan 034) + identity_mode parity (plan 047): ALL PASS ===

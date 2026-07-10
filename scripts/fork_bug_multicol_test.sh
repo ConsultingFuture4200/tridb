@@ -52,8 +52,9 @@ echo "$OUT" | grep -qiE 'server (closed the connection|process was terminated)|c
 if echo "$OUT" | grep -qiE 'ERROR:.*ORDER BY'; then
   : # (b) runtime-guard path
 else
-  echo "$OUT" | grep -qE '(^| )2000( |$)' \
-    || fail "neither defense fired: no clean ORDER BY ERROR and count(*) did not return the correct 2000 (silent-wrong-answer regression?)"
+  # Exact tag match — a bare 2000 could false-PASS on timing lines, row counts, or plan noise.
+  echo "$OUT" | grep -q 'unordered_count|2000' \
+    || fail "neither defense fired: no clean ORDER BY ERROR and count(*) did not return the correct unordered_count|2000 (silent-wrong-answer regression?)"
 fi
 
 # Required: the backend survived the ERROR (the liveness probe ran and returned 1).

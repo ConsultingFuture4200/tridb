@@ -1,0 +1,85 @@
+{
+  "source": "enwiki (real, offline-wiki extraction)",
+  "corpus": "data/wiki/enwiki",
+  "articles_embedded": 6900039,
+  "corpus_truth": {
+    "articles": 6900039,
+    "edges": 224475283
+  },
+  "embed_model": "BAAI/bge-small-en-v1.5",
+  "embed_dim": 384,
+  "embed_dtype": "float32 (bge-small; NOT the spec dim-768 float8 I/O basis)",
+  "k": 10,
+  "pool": 50,
+  "sampled": 5000,
+  "seed": 42,
+  "candidate_generation": "cosine kNN via cuVS CAGRA (bounded pool, TR-1 respected)",
+  "topological_scorers": {
+    "common_neighbors": "|succ(A) ∩ succ(B)| (bibliographic coupling)",
+    "adamic_adar": "Σ_{z∈succ(A)∩succ(B)} 1/log(indeg z)",
+    "node2vec_included": false,
+    "node2vec_skip_reason": "training node2vec on 6.9M nodes / 224M edges = multi-billion-token walk corpus + skip-gram training, multi-hour job, out of scope for the cheapest-test remit; CN/AA are training-free"
+  },
+  "fusion": "reciprocal-rank fusion(cosine, adamic_adar_corrected), rrf_k=60",
+  "metric_kind": "link RECOVERY / precision@k on the cosine pool (reconstruction proxy), NOT held-out link prediction",
+  "overlap_at_k": {
+    "cosine_only": 0.11,
+    "cosine_only_unrounded": 0.10996,
+    "popularity_indeg_only": 0.0955,
+    "common_neighbor_only": 0.1222,
+    "adamic_adar_only": 0.1246,
+    "fused": 0.1261,
+    "baseline_cosine_lower_bound": 0.1101,
+    "pool_base_rate": 0.0423,
+    "mean_out_degree": 31.5206,
+    "leaky_common_neighbor_only": 0.1275,
+    "leaky_adamic_adar_only": 0.1328,
+    "note": "fraction of each source's top-k reranked candidates that are already out-edges (link recovery / precision@k, a reconstruction proxy — NOT held-out prediction); candidate pool is the cosine top-`pool` for ALL columns, so cosine_only reproduces the 0.1101 lower bound and the rest are pure reranks of the identical pool. common_neighbor_only / adamic_adar_only are the LEAKAGE-CORRECTED numbers (leave-out-the-positives); leaky_* are the uncorrected versions kept for comparison. popularity_indeg_only is a degree-prior control. pool_base_rate is the linked fraction over the whole pool (ceiling on recovery)."
+  },
+  "leakage_control": {
+    "protocol": "leave-out-the-positives: A's out-edges that are also candidates in the pool (== the test positives) are removed from succ(A) before computing CN/AA, so scoring A->B cannot borrow A's OTHER pooled true out-edges as shared neighbours",
+    "adamic_adar_leaky": 0.1328,
+    "adamic_adar_corrected": 0.1246,
+    "reconstruction_inflation": 0.0082,
+    "note": "corrected is the honest number; (leaky - corrected) is the reconstruction inflation from interlinked pooled positives"
+  },
+  "popularity_control": {
+    "reranker": "order the pool by candidate global in-degree indeg(B)",
+    "overlap_at_k": 0.0955,
+    "note": "if this matches/beats Adamic-Adar the topological claim collapses to a degree prior; if AA clears it, structure adds signal beyond popularity"
+  },
+  "significance": {
+    "test": "paired bootstrap (4000 resamples) + Wilcoxon signed-rank over the 5000 per-source (AA_corrected - cosine) overlap@10 deltas",
+    "mean_delta": 0.0146,
+    "ci95": [
+      0.0118,
+      0.0176
+    ],
+    "wilcoxon_p": 2.6425021556065045e-24,
+    "significant": true
+  },
+  "orthogonality": {
+    "spearman_cosine_vs_aa": 0.1721,
+    "spearman_n": 4775,
+    "spearman_note": "rank correlation of the cosine vs Adamic-Adar orderings within each pool; high => the two rank the SAME topical-proximity construct, i.e. AA is a sharper ranker of the same signal, not an orthogonal modality",
+    "mean_links_aa_top_not_cosine_top": 0.4984,
+    "mean_links_cosine_top_not_aa_top": 0.352,
+    "recovery_note": "per-source count of true out-edges each ranker surfaces in its top-k that the other misses; a nonzero AA-unique count means topology recovers some links the embedding buries"
+  },
+  "fused_vs_cosine_delta": 0.0161,
+  "verdict": "MODEST SIGNAL: leakage-corrected Adamic-Adar 0.1246 beats cosine 0.11 (Δ+0.0146, 13.3% relative; paired 95% CI [+0.0118, +0.0176] excludes 0, Wilcoxon p=2.64e-24) and clears a popularity-only reranker (0.0955).",
+  "index": {
+    "backend": "cuvs_cagra",
+    "metric": "sqeuclidean (== cosine on unit vectors)",
+    "graph_degree": 32,
+    "build_seconds": 49.97
+  },
+  "adjacency": {
+    "edge_rows_read": 224475283,
+    "edge_rows_valid": 221135287,
+    "needed_sources": 245928,
+    "succ_nodes_materialized": 245783,
+    "adjacency_seconds": 29.3
+  },
+  "gating": "compute-bound-ish (dim-384 f32) link-recovery / reranking test (reconstruction proxy), NOT a latency claim (ADR-0017: I/O regime is expected-fail) and NOT held-out prediction. Real 224M-edge graph, bounded reranking pool."
+}

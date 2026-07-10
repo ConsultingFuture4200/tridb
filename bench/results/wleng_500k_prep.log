@@ -1,0 +1,26 @@
+### wleng_500k host-side prep log (retained from Spark /tmp/WLENG.log) ###
+=== PREPARE 2026-07-07T10:57:16-07:00 ===
+[prepare] N=500000 articles (106.3s), induced_edges=20469892 (11.3s), dim=384, vectors=synthetic
+[prepare] out=/tmp/wleng_500k (articles.copy, edges.copy, load.sql, prep.json)
+PREPARE_RC=0
+=== ENGINE LOAD 2026-07-07T10:59:13-07:00 ===
+[wiki_load] loading /tmp/wleng_500k into LIVE engine (tridb/msvbase:gx10-v1)
+
+### prep.json ###
+{
+  "manifest": "/home/bob/code/tridb/data/wiki/enwiki",
+  "articles_loaded": 500000,
+  "articles_total": 6900039,
+  "graph_vertices": 500000,
+  "induced_edges": 20469892,
+  "dim": 384,
+  "vector_source": "synthetic",
+  "seed_id": 0,
+  "seed_out_neighbor": 11208,
+  "prepare_articles_secs": 106.3,
+  "prepare_edges_secs": 11.35,
+  "k": 10,
+  "term_cond": 64,
+  "m_seeds": 8,
+  "hops": 1
+}

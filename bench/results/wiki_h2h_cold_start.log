@@ -1,0 +1,9 @@
+[0.0] queryset counts={'member': 160, 'midpoint': 80, 'nonmember': 80, 'total': 320} k=10 n=1000000
+[0.0] connected engine, issuing FIRST ANN query (cold LoadIndex if any)...
+[823.0] FIRST-QUERY ms=822962.6 got=[147448, 30914, 805079, 505011, 690058] oracle=[147448, 30914, 805079, 505011, 690058]
+[823.0] SECOND-QUERY(warm) ms=1.43
+[823.0]   EXPLAIN: Buffers: shared hit=86
+[823.0]   EXPLAIN: Buffers: shared hit=86
+[823.0]   EXPLAIN: ->  Index Scan using articles_hnsw on articles  (cost=0.00..48200.00 rows=1000000 width=16) (actual rows=87 loops=1)
+[823.0]   EXPLAIN: Buffers: shared hit=86
+[823.0] DONE-tridb

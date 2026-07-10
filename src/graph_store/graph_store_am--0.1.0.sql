@@ -24,6 +24,17 @@ CREATE FUNCTION gph_insert_edge(bigint, bigint) RETURNS void
 CREATE FUNCTION gph_insert_edge(bigint, bigint, integer) RETURNS void
   AS 'MODULE_PATHNAME', 'gph_insert_edge' LANGUAGE C VOLATILE STRICT;
 
+-- Batched edge-append (DEV-1354 / design §2 "bulk edge loader"): append a whole adjacency run for
+-- ONE source in a single call, returning the number of edges appended. Byte-identical on-disk
+-- chains to N x gph_insert_edge(src, dst[i]) fed in array order, but O(1)-per-edge instead of
+-- O(V) (dense src locate + metapage dst bounds check), so the 1M/39M wiki graph loads in minutes
+-- not the O(E*V) hours the per-edge path costs. Requires the dense-in-order load precondition
+-- (vids 0..N-1 materialized before any edge); a non-dense layout is HARD-rejected in C (never
+-- mis-writes). Rides the host txn/WAL (golden rule 2); a rolled-back batch leaves ZERO visible
+-- edges (es_xmin filtered — FR-7). Owner-guarded (REVOKEd from PUBLIC below, plan 026).
+CREATE FUNCTION gph_insert_edges(bigint, bigint[]) RETURNS bigint
+  AS 'MODULE_PATHNAME' LANGUAGE C VOLATILE STRICT;
+
 -- ----------------------------------------------------------------------------
 -- Edge type dictionary (advisor plan 038): gBrain's typed link model (founded/
 -- founded_by, works_at/employs, mentions, attended, ...) maps link-type NAMES to
@@ -106,10 +117,20 @@ CREATE FUNCTION gph_vertex_count() RETURNS bigint
   AS 'MODULE_PATHNAME' LANGUAGE C VOLATILE;
 
 -- Store-wide directed-edge count (plan 006): the metapage gm_edge_count counter, the
--- avg_out_degree source for the FR-6 join-order heuristic. Raw (non-MVCC) counter — v1 has no
--- edge-delete path so it only grows; maintained under GenericXLog so aborts/crashes roll it back
--- with the page image. Used by the crash-recovery edge-count assertion.
+-- avg_out_degree source for the FR-6 join-order heuristic. Raw (non-MVCC) INSERT counter — it is
+-- bumped once per edge ever inserted and is NEVER decremented, including by gph_tombstone_edge/
+-- gph_tombstone_vertex (plan 037): after any delete this OVERCOUNTS live topology (advisor plan
+-- 055). Maintained under GenericXLog so aborts/crashes roll it back with the page image. Used by
+-- the crash-recovery edge-count assertion; see gph_visible_edge_count() below for a delete-aware
+-- (but O(vertices+edges) scanning) live count.
 CREATE FUNCTION gph_edge_count() RETURNS bigint
+  AS 'MODULE_PATHNAME' LANGUAGE C VOLATILE;
+
+-- MVCC-visible, delete-aware directed-edge count (advisor plan 055): scans every vertex's
+-- adjacency chain and counts only edge slots that are inserted-visible and not tombstoned. Reflects
+-- gph_tombstone_edge/gph_tombstone_vertex immediately, unlike the raw gph_edge_count() above. Use
+-- this when an exact live count is required; use gph_edge_count() for the O(1) raw upper bound.
+CREATE FUNCTION gph_visible_edge_count() RETURNS bigint
   AS 'MODULE_PATHNAME' LANGUAGE C VOLATILE;
 
 -- gph_freeze(horizon) RETURNS bigint — manual anti-wraparound freeze pass (advisor plan 036 /
@@ -138,10 +159,20 @@ CREATE FUNCTION gph_freeze(horizon xid) RETURNS bigint
 -- filters visible tombstones so traversal stops emitting immediately. Idempotent (re-deleting or
 -- deleting an absent edge/vertex is a no-op). Physical slot reclamation is deferred to plan 036's
 -- freeze pass, so gm_edge_count is NOT decremented (raw monotone counter). gph_tombstone_vertex
--- also tombstones the vertex's OUT-edges; dangling IN-edges are filtered at read time (no reverse
--- index in v1 — full reverse-sweep is plan 038).
+-- also tombstones the vertex's OUT-edges (every type); dangling IN-edges are filtered at read time
+-- (no reverse index in v1 — full reverse-sweep is plan 038).
+--
+-- Typed tombstone (advisor plan 045 / DEV-1354 follow-up): the 2-arg form defaults type_id to
+-- GPH_EDGE_TYPE_RELATED_TO, so it ONLY tombstones :related_to edges between src/dst — before this
+-- fix it matched on dst alone and silently wiped any co-located typed edge (plan 038) between the
+-- same endpoints too. The 3-arg overload (same C symbol, PG_NARGS() branch, matching the
+-- gph_insert_edge pattern) lets a caller pass an explicit dictionary type id, or
+-- GPH_EDGE_TYPE_ANY (0) to explicitly request the old all-type wipe.
 CREATE FUNCTION gph_tombstone_edge(bigint, bigint) RETURNS void
   AS 'MODULE_PATHNAME' LANGUAGE C VOLATILE STRICT;
+
+CREATE FUNCTION gph_tombstone_edge(bigint, bigint, integer) RETURNS void
+  AS 'MODULE_PATHNAME', 'gph_tombstone_edge' LANGUAGE C VOLATILE STRICT;
 
 CREATE FUNCTION gph_tombstone_vertex(bigint) RETURNS void
   AS 'MODULE_PATHNAME' LANGUAGE C VOLATILE STRICT;
@@ -153,7 +184,9 @@ REVOKE EXECUTE ON FUNCTION gph_insert_vertex(), gph_insert_edge(bigint,bigint) F
 -- gph_freeze is a maintenance mutator (superuser/owner only, plan 026 discipline).
 REVOKE EXECUTE ON FUNCTION gph_freeze(xid) FROM PUBLIC;
 REVOKE EXECUTE ON FUNCTION gph_tombstone_edge(bigint,bigint), gph_tombstone_vertex(bigint) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION gph_tombstone_edge(bigint,bigint,integer) FROM PUBLIC;
 REVOKE EXECUTE ON FUNCTION gph_insert_edge(bigint,bigint,integer) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION gph_insert_edges(bigint,bigint[]) FROM PUBLIC;
 
 -- ============================================================================
 -- ADR-0013 Stage A (advisor plan 025): the external-id mapping layer + the v0
@@ -199,9 +232,23 @@ GRANT SELECT ON gph_am_meta TO PUBLIC;
 -- dense-in-order load (ext ids 0..N-1 materialized in id order). Setting it ON
 -- when ext_id != vid would make gph_neighbors_ext return wrong ids — hence it is
 -- REVOKEd from PUBLIC like the other mutators (plan 026 discipline).
+-- DEV-1352 latent guard: setting identity_mode ON while the map is NON-identity (any ext_id <> vid)
+-- would make gph_neighbors_ext return WRONG ids (the identity fast-path treats src/dst as vids). The
+-- loader only flips it on after a dense-in-order load (ext_id == vid), so refuse the corrupting case
+-- outright rather than trust the caller — a mismatched map RAISES instead of silently mis-mapping
+-- reads at scale. Turning it OFF is always allowed (the safe direction).
 CREATE FUNCTION gph_set_identity_mode(p_on boolean) RETURNS void
-LANGUAGE sql VOLATILE STRICT
-AS $$ UPDATE graph_store.gph_am_meta SET identity_mode = p_on WHERE only_row $$;
+LANGUAGE plpgsql VOLATILE STRICT
+AS $$
+BEGIN
+    IF p_on AND EXISTS (SELECT 1 FROM graph_store.gph_vid_map WHERE ext_id <> vid) THEN
+        RAISE EXCEPTION 'gph_set_identity_mode(true) refused: id map is non-identity '
+            '(a row has ext_id <> vid) — the dense-in-order load precondition is violated (DEV-1352). '
+            'Reads would return wrong ids under the identity fast-path.';
+    END IF;
+    UPDATE graph_store.gph_am_meta SET identity_mode = p_on WHERE only_row;
+END
+$$;
 REVOKE EXECUTE ON FUNCTION gph_set_identity_mode(boolean) FROM PUBLIC;
 
 -- gph_upsert_vertex(ext_id) RETURNS bigint — THE id-mapping layer (ADR-0013).
@@ -268,6 +315,12 @@ $$;
 -- correct under the v1 single-writer bulk-load-then-query contract (plan 034 / DEV-1345,
 -- PERF-03; see the header comment in graph_am.c). This is the probe the TJS operator's
 -- reachable-set resolution (graphReachableT) SPI-calls instead of gph_neighbors_ext.
+-- Also honors gph_am_meta.identity_mode (plan 047 / DEV-1354 follow-up): reads the flag
+-- ONCE per Open (graph_am.c gph_read_identity_mode) and, when ON, skips BOTH the forward
+-- map probe and the reverse hash lookup exactly like gph_neighbors_ext's CASE guards above
+-- — before plan 047 this C twin ALWAYS hit gph_vid_map regardless of identity_mode, so
+-- under identity ON with an empty/incomplete map it silently returned empty where the SQL
+-- shim returned full adjacency (the bug this plan fixes).
 CREATE FUNCTION gph_neighbors_ext_cached(bigint) RETURNS SETOF bigint
   AS 'MODULE_PATHNAME' LANGUAGE C VOLATILE STRICT;
 

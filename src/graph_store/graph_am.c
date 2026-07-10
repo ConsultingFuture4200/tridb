@@ -45,7 +45,9 @@
 #include "storage/bufmgr.h"
 #include "storage/lmgr.h"
 #include "storage/procarray.h"
+#include "utils/array.h"
 #include "utils/builtins.h"
+#include "utils/guc.h"
 #include "utils/hsearch.h"
 #include "utils/inval.h"
 #include "utils/memutils.h"
@@ -114,6 +116,20 @@ static int64 gph_visit_counter = 0;
  * the probe that demonstrates that reduction.
  */
 static int64 gph_page_read_counter = 0;
+
+/*
+ * GUC: graph_store.assume_dense_open (advisor plan 048, ADR-0013 rider 1). OFF by default —
+ * `gs_open` (traversal Open) always takes the linear `gph_locate_vertex` chain walk, exactly the
+ * pre-048 behavior. A caller that KNOWS the store was materialized dense-in-order (the same
+ * precondition `gph_insert_edges` already trusts its caller to have verified — see identity_mode,
+ * graph_store_am--0.1.0.sql) can opt in per-session with `SET graph_store.assume_dense_open = on`
+ * to make `gs_open` try the O(1) `gph_locate_vertex_dense` fast path first. This is deliberately a
+ * session opt-in, NOT an auto-detected condition: `gph_locate_vertex_dense` hard-verifies the page
+ * it computes (page type + vid match) and ERRORs on any mismatch rather than silently reading the
+ * wrong vertex, so turning this on over a non-dense store fails loud, not wrong — but we never want
+ * a generic (possibly sparse) reader to pay that failure mode by default.
+ */
+static bool graph_store_assume_dense_open = false;
 
 /* ------------------------------------------------------------------ */
 /* Relation + metapage helpers                                         */
@@ -271,6 +287,84 @@ gph_locate_vertex(Relation rel, uint64 vid, BlockNumber *out_blk, uint32 *out_sl
 		blk = next;
 	}
 	return false;
+}
+
+/*
+ * gph_locate_vertex_dense — O(1) DENSE vertex locate (DEV-1354, the batched-edge fast path).
+ *
+ * The linear gph_locate_vertex above walks the vertex-page chain and costs O(V) at chain position
+ * V — which makes a whole-graph edge load O(E*V) (hours at 1M/39M). This is the constant-time
+ * alternative that makes the batched load O(E): when vertices are materialized dense-in-order with
+ * NO adjacency pages interleaved (the wiki bulk-load precondition — every gph_insert_vertex before
+ * the first edge), the vertex pages are physically CONTIGUOUS and fully packed, so vid V is at
+ * block gm_first_vertex_blk + V/perpage, slot V%perpage. One page read, no chain walk.
+ *
+ * SAFETY (never write to a mis-computed vertex — the golden guard): the computed page is HARD-
+ * verified to (a) be a GPH_PAGE_VERTEX page and (b) actually carry vr_vid == vid at the computed
+ * slot. If either fails the layout is NOT dense (sparse ids, or a vertex inserted AFTER edges broke
+ * contiguity) and we ereport ERROR rather than proceed — so a non-dense caller gets a hard failure,
+ * never silent corruption. `meta` is a caller-provided snapshot (bounds + gm_first_vertex_blk).
+ * Returns false only for the benign "vid never existed / store empty / tombstoned" cases (caller
+ * decides); the layout-violation cases ERROR.
+ */
+static bool
+gph_locate_vertex_dense(Relation rel, uint64 vid, const GphMeta *meta,
+						BlockNumber *out_blk, uint32 *out_slot, GphVertexRecord *out_rec)
+{
+	uint32		perpage = GphVerticesPerPage();
+	BlockNumber	blk;
+	uint32		slot;
+	Buffer		buf;
+	Page		page;
+	GphVertexRecord *vr;
+
+	if (meta->gm_first_vertex_blk == InvalidBlockNumber || vid >= meta->gm_next_vid)
+		return false;			/* store empty / vid never assigned => benign miss */
+
+	blk = meta->gm_first_vertex_blk + (BlockNumber) (vid / perpage);
+	slot = (uint32) (vid % perpage);
+	if (blk >= RelationGetNumberOfBlocks(rel))
+		ereport(ERROR,
+				(errmsg("graph_store: dense locate for vid " UINT64_FORMAT " computed block %u past EOF "
+						"(non-dense layout)", vid, blk)));
+
+	buf = ReadBufferExtended(rel, MAIN_FORKNUM, blk, RBM_NORMAL, NULL);
+	LockBuffer(buf, BUFFER_LOCK_SHARE);
+	page = BufferGetPage(buf);
+
+	if (GphPageSpecialPtr(page)->gph_page_type != GPH_PAGE_VERTEX ||
+		slot >= GphPageRecordCount(page, sizeof(GphVertexRecord)))
+	{
+		UnlockReleaseBuffer(buf);
+		ereport(ERROR,
+				(errmsg("graph_store: dense locate for vid " UINT64_FORMAT " hit page %u slot %u that is "
+						"not a packed vertex slot (non-dense layout — refusing to write)", vid, blk, slot)));
+	}
+
+	vr = GphPageGetRecord(page, slot, sizeof(GphVertexRecord));
+	if (vr->vr_vid != vid)
+	{
+		uint64		got = vr->vr_vid;
+
+		UnlockReleaseBuffer(buf);
+		ereport(ERROR,
+				(errmsg("graph_store: dense locate mismatch on page %u slot %u: found vid " UINT64_FORMAT
+						", wanted " UINT64_FORMAT " (non-dense layout — refusing to write to a mis-computed "
+						"vertex)", blk, slot, got, vid)));
+	}
+
+	/* Same visibility filter as the linear path: an aborted/tombstoned vertex is a benign miss. */
+	if (!gph_xmin_visible(vr->vr_xmin) || gph_deleted_visible(vr->vr_flags, vr->vr_xmax))
+	{
+		UnlockReleaseBuffer(buf);
+		return false;
+	}
+
+	*out_blk = blk;
+	*out_slot = slot;
+	memcpy(out_rec, vr, sizeof(GphVertexRecord));
+	UnlockReleaseBuffer(buf);
+	return true;
 }
 
 /* ------------------------------------------------------------------ */
@@ -565,6 +659,279 @@ gph_insert_edge(PG_FUNCTION_ARGS)
 	PG_RETURN_VOID();
 }
 
+PG_FUNCTION_INFO_V1(gph_insert_edges);
+
+/*
+ * gph_insert_edges(src bigint, dst bigint[]) RETURNS bigint — the BATCHED edge-append entry point
+ * (DEV-1354 / spec §2 "bulk edge loader"). Appends a whole adjacency run for ONE source in a single
+ * call, so the wiki-scale graph (1M vertices / 39M induced edges) loads in minutes instead of the
+ * O(E*V) hours that N x gph_insert_edge cost (each scalar call did TWO O(V) linear vertex locates).
+ * Returns the number of edges appended (== array length).
+ *
+ * The result is BYTE-IDENTICAL to N x gph_insert_edge(src, dst[i]) fed in array order (design §2
+ * parity contract): same append order, same slot layout, same page chaining. Only two things change
+ * vs the scalar path — both O(1) instead of O(V):
+ *   - src is located with gph_locate_vertex_dense (dense fast path; hard-verified, never corrupts);
+ *   - dst existence + visibility is a metapage bounds check (0 <= dst < gm_next_vid) followed by
+ *     gph_locate_vertex_dense (advisor plan 046): under the dense-in-order load ext_id == vid, so
+ *     a dst is a candidate vertex iff it is in [0, next_vid), and the dense locate's visibility
+ *     filter rejects a tombstoned dst the same way the scalar gph_locate_vertex does — this keeps
+ *     scalar/batch parity (a tombstoned dst is rejected either way) while staying O(1) per dst.
+ *
+ * WAL (the delicate part): GenericXLog caps at MAX_GENERIC_XLOG_PAGES (4) buffers per record, and a
+ * multi-page adjacency run needs meta + vertex + old-tail + new-page = exactly 4 to chain ONE page.
+ * So a run that spans many new pages is committed one GenericXLogFinish PER new page (never a single
+ * record over the whole run). meta + the src vertex page are held EXCLUSIVE for the whole batch and
+ * re-registered in each record; gm_edge_count is bumped by that record's slot count, so every record
+ * is self-consistent and a crash mid-batch replays only completed page diffs. Abort atomicity is the
+ * same as the scalar path: every slot is stamped es_xmin = current xid, so a rolled-back batch's
+ * slots are all filtered out by gph_xmin_visible on read (=> zero visible edges), FR-7.
+ *
+ * Single-writer contract (graph_am.c header): the bulk loader is single-connection, so holding meta
+ * + the vertex page locked across the run, and reading gm_next_vid once for the bounds check, are
+ * safe (no concurrent vertex insert can move gm_next_vid mid-batch).
+ */
+Datum
+gph_insert_edges(PG_FUNCTION_ARGS)
+{
+	uint64		src = (uint64) PG_GETARG_INT64(0);
+	ArrayType  *dst_arr = PG_GETARG_ARRAYTYPE_P(1);
+	Relation	rel = gph_open_store(RowExclusiveLock);
+	GphMeta		meta0;
+	GphVertexRecord src_rec;
+	BlockNumber	vblk,
+				tailblk;
+	uint32		vslot;
+	uint32		slotcap = GphEdgeSlotsPerPage();
+	Buffer		metabuf,
+				vbuf,
+				tailbuf;
+	int64	   *dsts;
+	int			nelems,
+				k;
+	int64		appended = 0;
+	TransactionId xid;
+	GenericXLogState *state;
+	Page		metapage,
+				vpage,
+				tailpage,
+				newpage;
+	GphMeta    *meta;
+	GphVertexRecord *vr;
+
+	/* Array shape guards: 1-D, no NULL elements (the loader never produces either). int8 elements
+	 * are 8-byte, pass-by-value, stored inline and unaligned-safe to index as int64. */
+	if (ARR_NDIM(dst_arr) > 1)
+		ereport(ERROR,
+				(errmsg("graph_store: gph_insert_edges expects a 1-dimensional dst array")));
+	if (ARR_HASNULL(dst_arr))
+		ereport(ERROR,
+				(errmsg("graph_store: gph_insert_edges dst array must not contain NULLs")));
+	nelems = (ARR_NDIM(dst_arr) == 0) ? 0
+		: ArrayGetNItems(ARR_NDIM(dst_arr), ARR_DIMS(dst_arr));
+	dsts = (int64 *) ARR_DATA_PTR(dst_arr);
+
+	if (nelems == 0)
+	{
+		relation_close(rel, RowExclusiveLock);
+		PG_RETURN_INT64(0);
+	}
+
+	gph_ensure_meta(rel);
+	gph_read_meta(rel, &meta0);		/* snapshot: bounds (gm_next_vid) + gm_first_vertex_blk */
+
+	/*
+	 * O(1) dst existence + visibility (advisor plan 046): the scalar gph_insert_edge locates
+	 * BOTH endpoints via gph_locate_vertex, which is visibility-checked (rejects a tombstoned
+	 * dst). The batch path previously only bounds-checked dst against gm_next_vid, so a live
+	 * src could append edges to a tombstoned dst — phantom adjacency. gph_locate_vertex_dense
+	 * is the O(1) dense-layout equivalent of gph_locate_vertex (same visibility filter, same
+	 * hard-ERROR on a non-dense layout as the src locate below), so this restores scalar/batch
+	 * parity without giving up the O(1) dense fast path.
+	 */
+	for (k = 0; k < nelems; k++)
+	{
+		BlockNumber	dst_blk;
+		uint32		dst_slot;
+		GphVertexRecord dst_rec;
+
+		if (dsts[k] < 0 || (uint64) dsts[k] >= meta0.gm_next_vid)
+			ereport(ERROR,
+					(errmsg("graph_store: destination vertex %lld out of dense range [0," UINT64_FORMAT ")",
+							(long long) dsts[k], meta0.gm_next_vid)));
+		if (!gph_locate_vertex_dense(rel, (uint64) dsts[k], &meta0, &dst_blk, &dst_slot, &dst_rec))
+			ereport(ERROR,
+					(errmsg("graph_store: destination vertex %lld does not exist (or has been deleted)",
+							(long long) dsts[k])));
+	}
+	if (src >= meta0.gm_next_vid)
+		ereport(ERROR,
+				(errmsg("graph_store: source vertex " UINT64_FORMAT " out of dense range [0," UINT64_FORMAT ")",
+						src, meta0.gm_next_vid)));
+
+	/* O(1) dense src locate (hard-verified; ERRORs on a non-dense layout — never mis-writes). */
+	if (!gph_locate_vertex_dense(rel, src, &meta0, &vblk, &vslot, &src_rec))
+		ereport(ERROR,
+				(errmsg("graph_store: source vertex " UINT64_FORMAT " not found (dense locate)", src)));
+
+	xid = GetCurrentTransactionId();
+
+	/* Lock meta + the src vertex page for the whole batch (meta -> vertex -> adj lock order). */
+	metabuf = ReadBufferExtended(rel, MAIN_FORKNUM, GPH_META_BLKNO, RBM_NORMAL, NULL);
+	LockBuffer(metabuf, BUFFER_LOCK_EXCLUSIVE);
+	vbuf = ReadBufferExtended(rel, MAIN_FORKNUM, vblk, RBM_NORMAL, NULL);
+	LockBuffer(vbuf, BUFFER_LOCK_EXCLUSIVE);
+	src_rec = *(GphVertexRecord *) GphPageGetRecord(BufferGetPage(vbuf), vslot,
+												   sizeof(GphVertexRecord));
+
+	k = 0;
+	tailblk = src_rec.vr_adj_tail;
+
+	if (tailblk == InvalidBlockNumber)
+	{
+		/* src has no edges yet: allocate its first adjacency page and fill it. meta+vbuf+new = 3. */
+		Buffer		newbuf = gph_extend_page(rel);
+		BlockNumber	newblk = BufferGetBlockNumber(newbuf);
+		uint32		fill = Min((uint32) (nelems - k), slotcap);
+		uint32		i;
+
+		state = GenericXLogStart(rel);
+		metapage = GenericXLogRegisterBuffer(state, metabuf, 0);
+		meta = (GphMeta *) GphPageRecordBase(metapage);
+		vpage = GenericXLogRegisterBuffer(state, vbuf, 0);
+		newpage = GenericXLogRegisterBuffer(state, newbuf, GENERIC_XLOG_FULL_IMAGE);
+
+		PageInit(newpage, BLCKSZ, GPH_SPECIAL_SIZE);
+		GphPageSpecialPtr(newpage)->gph_page_type = GPH_PAGE_ADJ;
+		GphPageSpecialPtr(newpage)->gph_unused = 0;
+		GphPageSpecialPtr(newpage)->gph_next_pageno = InvalidBlockNumber;
+		GphPageSpecialPtr(newpage)->gph_owner_vid = src;
+		for (i = 0; i < fill; i++)
+		{
+			GphEdgeSlot	es;
+
+			memset(&es, 0, sizeof(es));
+			es.es_src_vid = src;
+			es.es_dst_vid = (uint64) dsts[k + i];
+			es.es_edge_type_id = GPH_EDGE_TYPE_RELATED_TO;
+			es.es_flags = 0;
+			es.es_xmin = xid;
+			GphPageAppendRecord(newpage, &es, sizeof(GphEdgeSlot));
+		}
+		vr = GphPageGetRecord(vpage, vslot, sizeof(GphVertexRecord));
+		vr->vr_adj_head = newblk;
+		vr->vr_adj_tail = newblk;
+		meta->gm_edge_count += fill;
+		GenericXLogFinish(state);
+
+		tailbuf = newbuf;		/* keep pinned+locked as the current append target */
+		tailblk = newblk;
+		k += fill;
+		appended += fill;
+	}
+	else
+	{
+		/* Fill any remaining room on the current tail page first (meta+tail = 2). */
+		uint32		used,
+					room;
+
+		tailbuf = ReadBufferExtended(rel, MAIN_FORKNUM, tailblk, RBM_NORMAL, NULL);
+		LockBuffer(tailbuf, BUFFER_LOCK_EXCLUSIVE);
+		used = GphPageRecordCount(BufferGetPage(tailbuf), sizeof(GphEdgeSlot));
+		room = (slotcap > used) ? slotcap - used : 0;
+		if (room > 0)
+		{
+			uint32		fill = Min((uint32) (nelems - k), room);
+			uint32		i;
+
+			state = GenericXLogStart(rel);
+			metapage = GenericXLogRegisterBuffer(state, metabuf, 0);
+			meta = (GphMeta *) GphPageRecordBase(metapage);
+			tailpage = GenericXLogRegisterBuffer(state, tailbuf, 0);
+			for (i = 0; i < fill; i++)
+			{
+				GphEdgeSlot	es;
+
+				memset(&es, 0, sizeof(es));
+				es.es_src_vid = src;
+				es.es_dst_vid = (uint64) dsts[k + i];
+				es.es_edge_type_id = GPH_EDGE_TYPE_RELATED_TO;
+				es.es_flags = 0;
+				es.es_xmin = xid;
+				GphPageAppendRecord(tailpage, &es, sizeof(GphEdgeSlot));
+			}
+			meta->gm_edge_count += fill;
+			GenericXLogFinish(state);
+			k += fill;
+			appended += fill;
+		}
+	}
+
+	/*
+	 * Chain a new adjacency page for each remaining page-worth of dsts. Each iteration is ONE
+	 * GenericXLog record over exactly 4 buffers: meta + vbuf (vr_adj_tail) + old tail (its
+	 * gph_next_pageno) + new page (full image). Entering the loop the current tail is always FULL
+	 * (the branch above either filled it exactly or left it full), so every chained page is opened
+	 * fresh. The previous tail buffer is released only AFTER its next_pageno is durably linked.
+	 */
+	while (k < nelems)
+	{
+		Buffer		newbuf = gph_extend_page(rel);
+		BlockNumber	newblk = BufferGetBlockNumber(newbuf);
+		uint32		fill = Min((uint32) (nelems - k), slotcap);
+		uint32		i;
+
+		/* DEV-1354 (Linus review): keep a million-edge hub source interruptible —
+		 * without this, Ctrl-C / statement_timeout cannot fire for the whole run (the
+		 * scalar path got a CHECK per edge via gph_locate_vertex). Safe here: no
+		 * GenericXLog record is open yet, and an ERROR longjmp releases the held
+		 * meta/vbuf/tailbuf/newbuf locks via the resource owner. */
+		CHECK_FOR_INTERRUPTS();
+
+		state = GenericXLogStart(rel);
+		metapage = GenericXLogRegisterBuffer(state, metabuf, 0);
+		meta = (GphMeta *) GphPageRecordBase(metapage);
+		vpage = GenericXLogRegisterBuffer(state, vbuf, 0);
+		tailpage = GenericXLogRegisterBuffer(state, tailbuf, 0);
+		newpage = GenericXLogRegisterBuffer(state, newbuf, GENERIC_XLOG_FULL_IMAGE);
+
+		PageInit(newpage, BLCKSZ, GPH_SPECIAL_SIZE);
+		GphPageSpecialPtr(newpage)->gph_page_type = GPH_PAGE_ADJ;
+		GphPageSpecialPtr(newpage)->gph_unused = 0;
+		GphPageSpecialPtr(newpage)->gph_next_pageno = InvalidBlockNumber;
+		GphPageSpecialPtr(newpage)->gph_owner_vid = src;
+		for (i = 0; i < fill; i++)
+		{
+			GphEdgeSlot	es;
+
+			memset(&es, 0, sizeof(es));
+			es.es_src_vid = src;
+			es.es_dst_vid = (uint64) dsts[k + i];
+			es.es_edge_type_id = GPH_EDGE_TYPE_RELATED_TO;
+			es.es_flags = 0;
+			es.es_xmin = xid;
+			GphPageAppendRecord(newpage, &es, sizeof(GphEdgeSlot));
+		}
+		GphPageSpecialPtr(tailpage)->gph_next_pageno = newblk;
+		vr = GphPageGetRecord(vpage, vslot, sizeof(GphVertexRecord));
+		vr->vr_adj_tail = newblk;
+		meta->gm_edge_count += fill;
+		GenericXLogFinish(state);
+
+		UnlockReleaseBuffer(tailbuf);	/* link durable => release old tail, advance */
+		tailbuf = newbuf;
+		tailblk = newblk;
+		k += fill;
+		appended += fill;
+	}
+
+	UnlockReleaseBuffer(tailbuf);
+	UnlockReleaseBuffer(vbuf);
+	UnlockReleaseBuffer(metabuf);
+	relation_close(rel, RowExclusiveLock);
+	PG_RETURN_INT64(appended);
+}
+
 /* ------------------------------------------------------------------ */
 /* Maintenance: gph_freeze() — long-lived-store anti-wraparound gate    */
 /* (advisor plan 036 / DEV-1347; docs/graph_store_freeze_design_v0.1.0.md) */
@@ -600,10 +967,57 @@ gph_freeze_xid(TransactionId *xid, TransactionId horizon)
 }
 
 /*
+ * Freeze ONE stored deleting xid (es_xmax / vr_xmax) in place if its tombstone PRECEDES `horizon`.
+ * The field only carries visibility meaning while GPH_FLAG_DELETED is set (gph_deleted_visible); on
+ * a live record xmax is InvalidTransactionId from the insert-path memset, so !TransactionIdIsNormal
+ * short-circuits it here exactly like gph_freeze_xid — a live record's xmax is left untouched.
+ *
+ * For a tombstoned record whose xmax precedes horizon:
+ *   committed -> FrozenTransactionId, GPH_FLAG_DELETED stays SET    (tombstone visible-deleted
+ *                                                                    forever, gph_xmin_visible short-
+ *                                                                    circuits Frozen to committed)
+ *   aborted   -> InvalidTransactionId, GPH_FLAG_DELETED is CLEARED  (the delete never committed, so
+ *                                                                    gph_deleted_visible must now see
+ *                                                                    a live record — matching the
+ *                                                                    in-flight-abort behavior FR-7
+ *                                                                    already gives gph_xmin_visible)
+ *
+ * There is no "unresolved xmax below horizon" case to guard: gph_freeze()'s caller already checked
+ * TransactionIdPrecedes(horizon, oldest-running-xmin) before any freezing starts, so every xid that
+ * precedes horizon precedes every in-progress transaction too and is therefore already resolved
+ * (committed or aborted) in clog. relfrozenxid can advance to horizon once the walk completes: any
+ * xmax >= horizon is left alone here (still needs its real clog entry) and is by construction not
+ * older than the horizon vac_update_relstats advances relfrozenxid to.
+ *
+ * Returns true iff it rewrote xmax (mirrors gph_freeze_xid's counting contract; xmax freezes are
+ * folded into the same frozen-slot counter as xmin freezes — see gph_freeze_adj_chain / gph_freeze).
+ */
+static bool
+gph_freeze_xmax(uint32 *flags, TransactionId *xmax, TransactionId horizon)
+{
+	TransactionId x = *xmax;
+
+	if (!(*flags & GPH_FLAG_DELETED))
+		return false;			/* live record: xmax carries no visibility meaning */
+	if (!TransactionIdIsNormal(x))
+		return false;			/* already permanent (re-run over an already-frozen tombstone) */
+	if (!TransactionIdPrecedes(x, horizon))
+		return false;			/* at/after horizon: still needs its real clog entry */
+	if (TransactionIdDidCommit(x))
+		*xmax = FrozenTransactionId;
+	else
+	{
+		*flags &= ~GPH_FLAG_DELETED;	/* delete never committed: record is LIVE again */
+		*xmax = InvalidTransactionId;
+	}
+	return true;
+}
+
+/*
  * Freeze every edge slot on ONE adjacency-page chain, one page per GenericXLog record (a chain can
  * exceed GenericXLog's 4-buffer/record cap, so pages are NOT batched). Returns the number of slots
- * frozen. A page with nothing to freeze is GenericXLogAbort'd (no WAL churn), so a re-run over an
- * already-frozen store is cheap (idempotency).
+ * frozen (es_xmin freezes + es_xmax freezes, see gph_freeze_xmax). A page with nothing to freeze is
+ * GenericXLogAbort'd (no WAL churn), so a re-run over an already-frozen store is cheap (idempotency).
  */
 static int64
 gph_freeze_adj_chain(Relation rel, BlockNumber head, TransactionId horizon)
@@ -634,6 +1048,8 @@ gph_freeze_adj_chain(Relation rel, BlockNumber head, TransactionId horizon)
 
 			if (gph_freeze_xid(&es->es_xmin, horizon))
 				frozen_here++;
+			if (gph_freeze_xmax(&es->es_flags, &es->es_xmax, horizon))
+				frozen_here++;
 		}
 		next = GphPageSpecialPtr(apage)->gph_next_pageno;
 
@@ -653,11 +1069,14 @@ PG_FUNCTION_INFO_V1(gph_freeze);
 
 /*
  * gph_freeze(horizon xid) RETURNS bigint — the manual anti-wraparound freeze pass (design:
- * docs/graph_store_freeze_design_v0.1.0.md, advisor 026). Walks the vertex-page chain and, for
+ * docs/graph_store_freeze_design_v0.1.0.md, advisor 026 + 040). Walks the vertex-page chain and, for
  * every vertex, its adjacency-page chain, rewriting each stored xid that PRECEDES `horizon` to a
  * permanent one (committed -> Frozen, aborted -> Invalid) while it is still resolvable in clog,
- * records gm_frozen_horizon on the metapage, and advances the container's relfrozenxid. Returns the
- * number of records frozen.
+ * records gm_frozen_horizon on the metapage, and advances the container's relfrozenxid. This covers
+ * both the inserting xid (xmin, gph_freeze_xid) and, for a tombstoned record, the deleting xid
+ * (xmax, gph_freeze_xmax) — a tombstone whose xmax committed stays deleted forever, one whose xmax
+ * aborted has GPH_FLAG_DELETED cleared and comes back LIVE (plan 040). Returns the number of records
+ * frozen.
  *
  * WAL / atomicity: every page is rewritten under GenericXLog in the CALLER's transaction (one WAL,
  * one txn manager — golden rule 2), so a crash mid-pass replays only the completed page diffs and
@@ -754,6 +1173,8 @@ gph_freeze(PG_FUNCTION_ARGS)
 
 			if (gph_freeze_xid(&vr->vr_xmin, horizon))
 				frozen_here++;
+			if (gph_freeze_xmax(&vr->vr_flags, &vr->vr_xmax, horizon))
+				frozen_here++;
 			/* Descend EVERY vertex's adjacency chain — including a now-frozen aborted vertex,
 			 * whose adj pages carry the SAME old xids and must be frozen too. vr_adj_head is not
 			 * touched by the freeze, so reading it from the scratch page copy is exact. */
@@ -823,16 +1244,19 @@ gph_freeze(PG_FUNCTION_ARGS)
 /*
  * gph_tombstone_adjacency — walk vertex `adj_head`'s adjacency-page chain and set GPH_FLAG_DELETED +
  * es_xmax = `xid` on every LIVE (visibly inserted, not-already-tombstoned) edge slot whose
- * es_dst_vid == `match_dst`, OR on every live slot when `match_all` is true (the vertex out-edge
- * sweep). Adjacency pages are per-vertex (gph_owner_vid == the source), so every slot on the chain
- * already has es_src_vid == the source — no src check needed. Each page that actually has a slot to
- * flip is rewritten ONCE under GenericXLog in the caller's txn (crash-safe, atomic with the host txn,
- * one WAL); pages with nothing to flip are left untouched (no WAL record), so the pass is idempotent.
+ * es_dst_vid == `match_dst` AND es_edge_type_id == `type_filter` (GPH_EDGE_TYPE_ANY = no type
+ * filter, matches every type), OR on every live slot matching `type_filter` when `match_all` is
+ * true (the vertex out-edge sweep — gph_tombstone_vertex passes GPH_EDGE_TYPE_ANY here so a vertex
+ * delete still sweeps ALL of its out-edges regardless of type; advisor plan 045). Adjacency pages
+ * are per-vertex (gph_owner_vid == the source), so every slot on the chain already has
+ * es_src_vid == the source — no src check needed. Each page that actually has a slot to flip is
+ * rewritten ONCE under GenericXLog in the caller's txn (crash-safe, atomic with the host txn, one
+ * WAL); pages with nothing to flip are left untouched (no WAL record), so the pass is idempotent.
  * Caller holds RowExclusiveLock on `rel`.
  */
 static void
 gph_tombstone_adjacency(Relation rel, BlockNumber adj_head, uint64 match_dst, bool match_all,
-						TransactionId xid)
+						uint32 type_filter, TransactionId xid)
 {
 	BlockNumber	blk = adj_head;
 
@@ -863,6 +1287,8 @@ gph_tombstone_adjacency(Relation rel, BlockNumber adj_head, uint64 match_dst, bo
 				continue;			/* already tombstoned — idempotent no-op */
 			if (!match_all && s->es_dst_vid != match_dst)
 				continue;
+			if (type_filter != GPH_EDGE_TYPE_ANY && s->es_edge_type_id != type_filter)
+				continue;			/* different edge type — not this tombstone's target (plan 045) */
 			any = true;
 			break;
 		}
@@ -884,6 +1310,8 @@ gph_tombstone_adjacency(Relation rel, BlockNumber adj_head, uint64 match_dst, bo
 					continue;
 				if (!match_all && s->es_dst_vid != match_dst)
 					continue;
+				if (type_filter != GPH_EDGE_TYPE_ANY && s->es_edge_type_id != type_filter)
+					continue;
 				s->es_flags |= GPH_FLAG_DELETED;
 				s->es_xmax = xid;
 			}
@@ -898,29 +1326,45 @@ gph_tombstone_adjacency(Relation rel, BlockNumber adj_head, uint64 match_dst, bo
 PG_FUNCTION_INFO_V1(gph_tombstone_edge);
 
 /*
- * gph_tombstone_edge(src bigint, dst bigint) RETURNS void — soft-delete every visible src->dst
- * :related_to edge by setting GPH_FLAG_DELETED + es_xmax under GenericXLog (crash-safe, atomic with
- * the host txn; FR-7). Idempotent: tombstoning an already-deleted or absent edge (or an absent src)
- * is a no-op, not an error. The read path already filters visible tombstones (gph_deleted_visible),
- * so traversal stops emitting the edge immediately; the store-wide gm_edge_count is a raw
- * monotone counter and is deliberately NOT decremented (physical reclamation rides plan 036's freeze
- * pass). Owner-guarded (REVOKEd from PUBLIC, plan 026).
+ * gph_tombstone_edge(src bigint, dst bigint [, type_id integer]) RETURNS void — soft-delete every
+ * visible src->dst edge of the given type by setting GPH_FLAG_DELETED + es_xmax under GenericXLog
+ * (crash-safe, atomic with the host txn; FR-7). Idempotent: tombstoning an already-deleted or
+ * absent edge (or an absent src) is a no-op, not an error. The read path already filters visible
+ * tombstones (gph_deleted_visible), so traversal stops emitting the edge immediately; the store-wide
+ * gm_edge_count is a raw monotone counter and is deliberately NOT decremented (freeze in plans
+ * 036/040 only re-stamps the xmax in place; physical reclamation is plan 055). Owner-guarded (REVOKEd from PUBLIC, plan 026).
+ *
+ * Backs BOTH SQL declarations (2-arg and the plan-045 3-arg overload) at the same C symbol,
+ * matching the gph_insert_edge PG_NARGS() pattern. The 2-arg form defaults type_id to
+ * GPH_EDGE_TYPE_RELATED_TO — before typed edges (plan 038) this was the ONLY edge type, so this is
+ * byte-identical to the pre-045 behavior for every untyped caller. Before this fix, gph_tombstone_edge
+ * matched on dst ALONE, so a related_to delete between two vertices also wiped any co-located typed
+ * edge between the same endpoints (silent multi-type data loss). The 3-arg overload lets a caller
+ * pass an explicit dictionary type id, or GPH_EDGE_TYPE_ANY (0) to explicitly request the old
+ * all-type wipe (documented migration path for any caller that depended on it).
  */
 Datum
 gph_tombstone_edge(PG_FUNCTION_ARGS)
 {
 	uint64		src = (uint64) PG_GETARG_INT64(0);
 	uint64		dst = (uint64) PG_GETARG_INT64(1);
+	uint32		type_id = GPH_EDGE_TYPE_RELATED_TO;
 	Relation	rel = gph_open_store(RowExclusiveLock);
 	GphVertexRecord	src_rec;
 	BlockNumber	vblk;
 	uint32		vslot;
 
+	/* Optional 3rd arg (plan 045): the dictionary edge type id to tombstone, or GPH_EDGE_TYPE_ANY
+	 * for an explicit all-type wipe. Absent => default RELATED_TO (2-arg overload). The 3-arg
+	 * overload is STRICT, so a passed arg is never NULL. */
+	if (PG_NARGS() >= 3)
+		type_id = (uint32) PG_GETARG_INT32(2);
+
 	/* vr_adj_head is stable once set (only vr_adj_tail moves on chaining) and the single-writer
 	 * contract excludes a concurrent mutator, so the head read here drives a correct chain walk;
 	 * each page is re-read under its own exclusive lock inside gph_tombstone_adjacency. */
 	if (gph_locate_vertex(rel, src, &vblk, &vslot, &src_rec))
-		gph_tombstone_adjacency(rel, src_rec.vr_adj_head, dst, false,
+		gph_tombstone_adjacency(rel, src_rec.vr_adj_head, dst, false, type_id,
 								GetCurrentTransactionId());
 
 	relation_close(rel, RowExclusiveLock);
@@ -977,8 +1421,9 @@ gph_tombstone_vertex(PG_FUNCTION_ARGS)
 	GenericXLogFinish(state);
 	UnlockReleaseBuffer(buf);	/* release before the out-edge sweep: never two buffers at once */
 
-	/* 2. Tombstone all of the vertex's out-edges so traversal FROM it yields nothing. */
-	gph_tombstone_adjacency(rel, src_rec.vr_adj_head, 0, true, xid);
+	/* 2. Tombstone all of the vertex's out-edges (every type — GPH_EDGE_TYPE_ANY, plan 045) so
+	 * traversal FROM it yields nothing regardless of edge type. */
+	gph_tombstone_adjacency(rel, src_rec.vr_adj_head, 0, true, GPH_EDGE_TYPE_ANY, xid);
 
 	relation_close(rel, RowExclusiveLock);
 	PG_RETURN_VOID();
@@ -1036,6 +1481,14 @@ struct GraphScanDescData
  * inline. Callers that want the pre-038 behavior pass (GPH_EDGE_TYPE_RELATED_TO, GRAPHSTORE_INVALID_ID).
  * GRAPH_SCAN_INCOMING / GRAPH_SCAN_BOTH still raise: the adjacency list is out-edges only, so a
  * reverse (dst->src) lookup needs a new index / metapage field — deferred (see docs/decisions/0016).
+ *
+ * plan 048 (ADR-0013 rider 1): the vertex locate itself is the linear `gph_locate_vertex` chain walk
+ * (O(V) at chain position V) UNLESS the session has opted in with `graph_store.assume_dense_open`,
+ * in which case the O(1) `gph_locate_vertex_dense` fast path is tried first. A dense-locate "miss"
+ * (out of the assigned range, or a visible tombstone) is benign and reported exactly like a linear
+ * miss (false); a genuine layout violation is never silently swallowed — `gph_locate_vertex_dense`
+ * ERRORs on that case instead of returning, so we never fall through to a second (linear) attempt
+ * that could paper over a corrupt-looking read. See the GUC comment above for the opt-in contract.
  */
 static bool
 gs_open(GraphScanDesc *scan, Relation rel, GraphVertexId start, GraphScanDirection direction,
@@ -1044,6 +1497,7 @@ gs_open(GraphScanDesc *scan, Relation rel, GraphVertexId start, GraphScanDirecti
 	GphVertexRecord src_rec;
 	BlockNumber		vblk;
 	uint32			vslot;
+	bool			located;
 
 	if (direction != GRAPH_SCAN_OUTGOING)
 		ereport(ERROR,
@@ -1063,7 +1517,17 @@ gs_open(GraphScanDesc *scan, Relation rel, GraphVertexId start, GraphScanDirecti
 	scan->page_n = 0;
 	scan->page_i = 0;
 
-	if (!gph_locate_vertex(rel, start, &vblk, &vslot, &src_rec))
+	if (graph_store_assume_dense_open)
+	{
+		GphMeta		meta;
+
+		gph_read_meta(rel, &meta);
+		located = gph_locate_vertex_dense(rel, start, &meta, &vblk, &vslot, &src_rec);
+	}
+	else
+		located = gph_locate_vertex(rel, start, &vblk, &vslot, &src_rec);
+
+	if (!located)
 		return false;			/* absent => caller decides (empty scan vs raise) */
 	scan->cur_blk = src_rec.vr_adj_head;	/* Invalid if src has no edges => empty scan */
 	return true;
@@ -1476,6 +1940,46 @@ gph_vid_cache_ensure(void)
 	gph_vid_cache = h;			/* publish the fully-built table */
 }
 
+/*
+ * gph_read_identity_mode() -- read graph_store.gph_am_meta.identity_mode via SPI (single-row
+ * config table, gph_set_identity_mode's counterpart reader). Mirrors gph_vid_cache_ensure's SPI
+ * usage pattern. FAILS LOUD if the meta table is missing or not exactly one row: an install that
+ * lacks gph_am_meta is a schema mismatch (plan 047 STOP condition) — silently defaulting to
+ * false/OFF here would make gph_neighbors_ext_cached take the map path while gph_neighbors_ext
+ * (which reads the same table via plain SQL and would itself ERROR on a missing table) takes
+ * whatever a broken install does; better to ERROR clearly than diverge.
+ */
+static bool
+gph_read_identity_mode(void)
+{
+	bool	identity_mode = false;
+	bool	isnull;
+
+	if (SPI_connect() != SPI_OK_CONNECT)
+		elog(ERROR, "graph_store identity_mode read: SPI_connect failed");
+	if (SPI_execute("SELECT identity_mode FROM graph_store.gph_am_meta", true, 0) != SPI_OK_SELECT)
+		elog(ERROR, "graph_store identity_mode read: gph_am_meta query failed (meta table missing?)");
+	if (SPI_processed != 1)
+		elog(ERROR, "graph_store identity_mode read: gph_am_meta has " UINT64_FORMAT " rows, expected exactly 1",
+			 (uint64) SPI_processed);
+	identity_mode = DatumGetBool(SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isnull));
+	if (isnull)
+		elog(ERROR, "graph_store identity_mode read: identity_mode is NULL (violates NOT NULL)");
+	SPI_finish();
+
+	return identity_mode;
+}
+
+/*
+ * Per-Open context for gph_neighbors_ext_cached (plan 047): wraps the scan cursor with the
+ * identity_mode flag read ONCE on FIRSTCALL, so Next() never re-queries gph_am_meta.
+ */
+typedef struct GphNeighborsExtCachedCtx
+{
+	GraphScanDesc  *scan;
+	bool			identity_mode;
+} GphNeighborsExtCachedCtx;
+
 PG_FUNCTION_INFO_V1(gph_neighbors_ext_cached);
 
 /*
@@ -1485,12 +1989,18 @@ PG_FUNCTION_INFO_V1(gph_neighbors_ext_cached);
  * (absent src => empty set; an unmapped neighbor vid => a NULL row, matching the shim's scalar
  * subquery) — but the per-neighbor reverse translation hits the backend-local hash instead of a
  * correlated btree + SPI subquery. Byte-identical to gph_neighbors_ext (parity oracle).
+ *
+ * IDENTITY FAST-PATH (plan 047, matching gph_neighbors_ext's plan-033 CASE guards): identity_mode
+ * is read ONCE per Open and cached on the funcctx. When ON, src is already the vid (skip the
+ * forward map probe) and every emitted neighbor vid is already the external id (skip the reverse
+ * hash lookup too) — the cache warm (gph_vid_cache_ensure) is skipped entirely since its reverse
+ * map is unused under identity. When OFF, behavior is byte-identical to the pre-047 body.
  */
 Datum
 gph_neighbors_ext_cached(PG_FUNCTION_ARGS)
 {
 	FuncCallContext *funcctx;
-	GraphScanDesc  *scan;
+	GphNeighborsExtCachedCtx *ctx;
 	Relation		rel;
 	GraphElement	elem;
 
@@ -1504,43 +2014,54 @@ gph_neighbors_ext_cached(PG_FUNCTION_ARGS)
 		funcctx = SRF_FIRSTCALL_INIT();
 		oldctx = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
 
-		scan = (GraphScanDesc *) palloc0(sizeof(GraphScanDesc));
+		ctx = (GphNeighborsExtCachedCtx *) palloc0(sizeof(GphNeighborsExtCachedCtx));
+		ctx->scan = (GraphScanDesc *) palloc0(sizeof(GraphScanDesc));
+		ctx->identity_mode = gph_read_identity_mode();
 
-		/* Warm the reverse cache (also registers the invalidation hook). */
-		gph_vid_cache_ensure();
-
-		/*
-		 * Forward ext_id -> vid: ONE scalar probe per call (the reverse per-neighbor direction is
-		 * what the cache accelerates, not this). ext_src is a bigint from PG_GETARG, so the %lld
-		 * interpolation carries no injection risk (same pattern the TJS operator's SPI probe uses).
-		 */
-		if (SPI_connect() != SPI_OK_CONNECT)
-			elog(ERROR, "graph_store vid cache: SPI_connect failed");
+		if (ctx->identity_mode)
 		{
-			char	cmd[128];
+			/* ON: src is already the native vid — no map probe, no reverse-cache warm. */
+			vid = ext_src;
+			have_vid = true;
+		}
+		else
+		{
+			/* Warm the reverse cache (also registers the invalidation hook). */
+			gph_vid_cache_ensure();
 
-			snprintf(cmd, sizeof(cmd),
-					 "SELECT vid FROM graph_store.gph_vid_map WHERE ext_id = %lld",
-					 (long long) ext_src);
-			if (SPI_execute(cmd, true, 1) == SPI_OK_SELECT && SPI_processed == 1)
+			/*
+			 * Forward ext_id -> vid: ONE scalar probe per call (the reverse per-neighbor direction is
+			 * what the cache accelerates, not this). ext_src is a bigint from PG_GETARG, so the %lld
+			 * interpolation carries no injection risk (same pattern the TJS operator's SPI probe uses).
+			 */
+			if (SPI_connect() != SPI_OK_CONNECT)
+				elog(ERROR, "graph_store vid cache: SPI_connect failed");
 			{
-				bool	isnull;
-				int64	v = DatumGetInt64(SPI_getbinval(SPI_tuptable->vals[0],
-													   SPI_tuptable->tupdesc, 1, &isnull));
+				char	cmd[128];
 
-				if (!isnull)
+				snprintf(cmd, sizeof(cmd),
+						 "SELECT vid FROM graph_store.gph_vid_map WHERE ext_id = %lld",
+						 (long long) ext_src);
+				if (SPI_execute(cmd, true, 1) == SPI_OK_SELECT && SPI_processed == 1)
 				{
-					vid = v;
-					have_vid = true;
+					bool	isnull;
+					int64	v = DatumGetInt64(SPI_getbinval(SPI_tuptable->vals[0],
+														   SPI_tuptable->tupdesc, 1, &isnull));
+
+					if (!isnull)
+					{
+						vid = v;
+						have_vid = true;
+					}
 				}
 			}
+			SPI_finish();
 		}
-		SPI_finish();
 
 		if (have_vid)
 		{
 			rel = gph_open_store(AccessShareLock);
-			(void) gs_open(scan, rel, (GraphVertexId) vid, GRAPH_SCAN_OUTGOING,
+			(void) gs_open(ctx->scan, rel, (GraphVertexId) vid, GRAPH_SCAN_OUTGOING,
 						   GPH_EDGE_TYPE_RELATED_TO, (GraphVertexId) GRAPHSTORE_INVALID_ID);
 			relation_close(rel, AccessShareLock);
 		}
@@ -1551,37 +2072,44 @@ gph_neighbors_ext_cached(PG_FUNCTION_ARGS)
 			 * absent vertex (page_buf allocated, cur_blk Invalid) so gs_getnext returns false — do
 			 * NOT rely on palloc0's zeroed cur_blk (block 0 is the metapage, not "no pages").
 			 */
-			scan->page_buf = (GphEdgeSlot *) palloc(sizeof(GphEdgeSlot) * GphEdgeSlotsPerPage());
-			scan->cur_blk = InvalidBlockNumber;
-			scan->type_filter = GPH_EDGE_TYPE_RELATED_TO;
-			scan->source_scope = (GraphVertexId) GRAPHSTORE_INVALID_ID;
-			scan->page_n = 0;
-			scan->page_i = 0;
+			ctx->scan->page_buf = (GphEdgeSlot *) palloc(sizeof(GphEdgeSlot) * GphEdgeSlotsPerPage());
+			ctx->scan->cur_blk = InvalidBlockNumber;
+			ctx->scan->type_filter = GPH_EDGE_TYPE_RELATED_TO;
+			ctx->scan->source_scope = (GraphVertexId) GRAPHSTORE_INVALID_ID;
+			ctx->scan->page_n = 0;
+			ctx->scan->page_i = 0;
 		}
 
-		funcctx->user_fctx = scan;
+		funcctx->user_fctx = ctx;
 		MemoryContextSwitchTo(oldctx);
 	}
 
 	funcctx = SRF_PERCALL_SETUP();	/* === Next === */
-	scan = (GraphScanDesc *) funcctx->user_fctx;
+	ctx = (GphNeighborsExtCachedCtx *) funcctx->user_fctx;
 
 	rel = gph_open_store(AccessShareLock);
-	if (gs_getnext(rel, scan, &elem))
+	if (gs_getnext(rel, ctx->scan, &elem))
 	{
 		int64		nvid = (int64) elem.edge_dst;
-		GphVidCacheEntry *e;
-		bool		found;
 
 		relation_close(rel, AccessShareLock);
-		gph_vid_cache_ensure();		/* re-warm if an invalidation flushed it between Next() calls */
-		e = (GphVidCacheEntry *) hash_search(gph_vid_cache, &nvid, HASH_FIND, &found);
-		if (found)
-			SRF_RETURN_NEXT(funcctx, Int64GetDatum(e->ext_id));
-		SRF_RETURN_NEXT_NULL(funcctx);	/* unmapped vid => NULL (shim parity) */
+
+		if (ctx->identity_mode)
+			SRF_RETURN_NEXT(funcctx, Int64GetDatum(nvid));	/* vid IS the ext id under identity */
+
+		{
+			GphVidCacheEntry *e;
+			bool		found;
+
+			gph_vid_cache_ensure();		/* re-warm if an invalidation flushed it between Next() calls */
+			e = (GphVidCacheEntry *) hash_search(gph_vid_cache, &nvid, HASH_FIND, &found);
+			if (found)
+				SRF_RETURN_NEXT(funcctx, Int64GetDatum(e->ext_id));
+			SRF_RETURN_NEXT_NULL(funcctx);	/* unmapped vid => NULL (shim parity) */
+		}
 	}
 	relation_close(rel, AccessShareLock);	/* === Close === */
-	gs_close(scan);
+	gs_close(ctx->scan);
 	SRF_RETURN_DONE(funcctx);
 }
 
@@ -1811,13 +2339,16 @@ PG_FUNCTION_INFO_V1(gph_edge_count);
 
 /*
  * gph_edge_count() RETURNS bigint — the store-wide directed-edge count carried on the metapage
- * (gm_edge_count), read under a share lock. This is the raw counter, not an MVCC-visible count:
- * v1 has no edge-delete path so the counter only grows, and it is maintained under GenericXLog so
- * a crashed/aborted txn's increments roll back with the page image (full-image WAL). Like
- * gph_vertex_count's metapage counter it is NOT abort-aware for the in-process-abort case — but
- * there is no edge analogue of gph_vertex_count's per-record visibility scan because edge slots are
- * not enumerated here; this exposes gm_edge_count directly for the avg_out_degree derivation and the
- * crash-recovery assertion. (See plan 006 "Abort accounting caveat".)
+ * (gm_edge_count), read under a share lock. This is the RAW insert counter, not an MVCC-visible
+ * count: it is bumped once per edge slot ever inserted and is NEVER decremented — neither by
+ * gph_tombstone_edge/gph_tombstone_vertex's out-edge sweep (plan 037, physical reclamation rides
+ * plan 036's freeze pass) nor by anything else, so after any delete this OVERCOUNTS the live
+ * topology (advisor plan 055). It is maintained under GenericXLog so a crashed/aborted txn's
+ * increments roll back with the page image (full-image WAL), but — like gph_vertex_count's metapage
+ * counter — it is NOT abort-aware for the in-process-abort case. Use gph_visible_edge_count() when
+ * an MVCC-visible, delete-aware edge count is needed; this raw counter remains the source for the
+ * crash-recovery assertion and (documented as an upper bound after deletes) the avg_out_degree
+ * EXPLAIN-only derivation. (See plan 006 "Abort accounting caveat".)
  */
 Datum
 gph_edge_count(PG_FUNCTION_ARGS)
@@ -1834,4 +2365,121 @@ gph_edge_count(PG_FUNCTION_ARGS)
 	gph_read_meta(rel, &meta);
 	relation_close(rel, AccessShareLock);
 	PG_RETURN_INT64((int64) meta.gm_edge_count);
+}
+
+/* ------------------------------------------------------------------ */
+/* GUC registration                                                     */
+/* ------------------------------------------------------------------ */
+
+void _PG_init(void);
+void
+_PG_init(void)
+{
+	DefineCustomBoolVariable("graph_store.assume_dense_open",
+							 "Try the O(1) dense vertex locate on traversal Open before the linear chain walk.",
+							 "Session opt-in only (advisor plan 048, ADR-0013 rider 1): enable ONLY when the "
+							 "store is known to be materialized dense-in-order (the same precondition the "
+							 "batched gph_insert_edges loader already trusts). A layout violation ERRORs "
+							 "rather than silently mis-reading — never enable this over a store you have not "
+							 "verified is dense.",
+							 &graph_store_assume_dense_open,
+							 false,
+							 PGC_USERSET,
+							 0,
+							 NULL, NULL, NULL);
+}
+
+PG_FUNCTION_INFO_V1(gph_visible_edge_count);
+
+/*
+ * gph_visible_edge_count() RETURNS bigint — count of VISIBLE directed edges: walks the vertex-page
+ * chain and, for every vertex record found (its own tombstone state does not matter here — a
+ * tombstoned vertex's out-edges were already individually tombstoned by gph_tombstone_vertex, so
+ * they are filtered below like any other deleted slot), walks that vertex's adjacency-page chain
+ * (vr_adj_head) summing edge slots that are MVCC-visible and not tombstoned (gph_xmin_visible &&
+ * !gph_deleted_visible — the same predicate the traversal read path applies). Unlike gph_edge_count
+ * this reflects deletes (plan 055): insert 3 edges then tombstone 1 and this returns 2, while
+ * gph_edge_count stays 3. O(vertices + edges) — a full scan, not a metapage read; use gph_edge_count
+ * for the cheap raw upper bound when an exact live count is not required.
+ *
+ * Each vertex page's vr_adj_head values are copied out to a palloc'd array BEFORE its buffer is
+ * released, so the adjacency-chain walk below never holds the vertex buffer and an adjacency buffer
+ * at the same time (the same "never two buffers at once" discipline gph_tombstone_vertex documents).
+ */
+Datum
+gph_visible_edge_count(PG_FUNCTION_ARGS)
+{
+	Relation	rel = gph_open_store(AccessShareLock);
+	GphMeta		meta;
+	BlockNumber	vblk;
+	int64		n = 0;
+
+	if (RelationGetNumberOfBlocks(rel) == 0)
+	{
+		relation_close(rel, AccessShareLock);
+		PG_RETURN_INT64(0);
+	}
+
+	gph_read_meta(rel, &meta);
+	vblk = meta.gm_first_vertex_blk;
+	while (vblk != InvalidBlockNumber)
+	{
+		Buffer		vbuf;
+		Page		vpage;
+		uint32		vcount,
+					vi;
+		BlockNumber	vnext;
+		BlockNumber *adj_heads;
+
+		CHECK_FOR_INTERRUPTS();
+		vbuf = ReadBufferExtended(rel, MAIN_FORKNUM, vblk, RBM_NORMAL, NULL);
+		LockBuffer(vbuf, BUFFER_LOCK_SHARE);
+		vpage = BufferGetPage(vbuf);
+		vcount = GphPageRecordCount(vpage, sizeof(GphVertexRecord));
+		adj_heads = (BlockNumber *) palloc(sizeof(BlockNumber) * Max(vcount, 1));
+		for (vi = 0; vi < vcount; vi++)
+		{
+			GphVertexRecord *vr = GphPageGetRecord(vpage, vi, sizeof(GphVertexRecord));
+
+			adj_heads[vi] = vr->vr_adj_head;
+		}
+		vnext = GphPageSpecialPtr(vpage)->gph_next_pageno;
+		UnlockReleaseBuffer(vbuf);		/* release before the adjacency walk: never two buffers at once */
+
+		for (vi = 0; vi < vcount; vi++)
+		{
+			BlockNumber	ablk = adj_heads[vi];
+
+			while (ablk != InvalidBlockNumber)
+			{
+				Buffer		abuf;
+				Page		apage;
+				uint32		acount,
+							ai;
+				BlockNumber	anext;
+
+				CHECK_FOR_INTERRUPTS();
+				abuf = ReadBufferExtended(rel, MAIN_FORKNUM, ablk, RBM_NORMAL, NULL);
+				LockBuffer(abuf, BUFFER_LOCK_SHARE);
+				apage = BufferGetPage(abuf);
+				acount = GphPageRecordCount(apage, sizeof(GphEdgeSlot));
+				for (ai = 0; ai < acount; ai++)
+				{
+					GphEdgeSlot *s = GphPageGetRecord(apage, ai, sizeof(GphEdgeSlot));
+
+					if (gph_xmin_visible(s->es_xmin) &&
+						!gph_deleted_visible(s->es_flags, s->es_xmax))
+						n++;
+				}
+				anext = GphPageSpecialPtr(apage)->gph_next_pageno;
+				UnlockReleaseBuffer(abuf);
+				ablk = anext;
+			}
+		}
+		pfree(adj_heads);
+		vblk = vnext;
+	}
+
+	relation_close(rel, AccessShareLock);
+	PG_RETURN_INT64(n);
 }

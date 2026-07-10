@@ -1,0 +1,109 @@
+diff --git a/src/tjs_open_operator.cpp b/src/tjs_open_operator.cpp
+index 6fc7089..5672db8 100644
+--- a/src/tjs_open_operator.cpp
++++ b/src/tjs_open_operator.cpp
+@@ -100,6 +100,8 @@ extern "C"
+ 
+ #include "libpq/pqformat.h"
+ #include <utils/builtins.h>
++#include <utils/guc.h>   // TRIDB DEV-1354: tjs_open TR-1 work-bound GUC (DefineCustomIntVariable)
++#include <limits.h>      // INT_MAX
+ }
+ 
+ extern "C"
+@@ -356,6 +358,36 @@ typedef struct{
+ static int64 tjs_open_last_examined = 0;
+ static int64 tjs_open_last_bridges  = 0;
+ 
++// TRIDB DEV-1354 — TR-1 HARD WORK-BOUND. `vectordb.tjs_open_max_examined` caps the ANN candidates a
++// tjs_open phase-3b drain may pull, GUARANTEEING bounded termination at any corpus size even when the
++// HNSW relaxed-monotonicity emission tail keeps sporadically improving the top-k within every
++// <term_cond pulls (the failure mode that let the drain run unbounded at N=1M while N=200k terminated
++// at examined=90). 0 disables the ceiling (legacy unbounded drain). PGC_USERSET = plain-SET session
++// knob, but a TR-1 SAFETY bound NOT a validated tunable: at default 4000 an UNEXERCISED no-op (healthy drains finish ~44x under it); no cap->recall SM-4 curve rides on it. Registered lazily on the first
++// tjs_open call — the vectordb extension exposes no other GUC, so there is no _PG_init GUC block to
++// join; PostgreSQL accepts `SET vectordb.tjs_open_max_examined` as a placeholder before registration
++// and applies the value here, so a SET issued earlier in the session still takes effect.
++static int  tjs_open_max_examined_guc = 4000;
++static bool tjs_open_guc_registered   = false;
++static void registerTJSOpenGUCs(void){
++	if (tjs_open_guc_registered)
++		return;
++	DefineCustomIntVariable(
++		"vectordb.tjs_open_max_examined",
++		"Absolute ceiling on ANN candidates examined by a tjs_open phase-3b drain (TR-1 work bound).",
++		"Guarantees the seedless multi-seed drain terminates at any corpus size regardless of HNSW "
++		"relaxed monotonicity. 0 disables the ceiling. The streaming top-k / bridge-injection "
++		"contract is otherwise unchanged; below the cap behavior is identical to the legacy drain.",
++		&tjs_open_max_examined_guc,
++		4000,       /* boot / default */
++		0,          /* min: 0 = unbounded */
++		INT_MAX,    /* max */
++		PGC_USERSET,
++		0,
++		NULL, NULL, NULL);
++	tjs_open_guc_registered = true;
++}
++
+ // ---------------------------------------------------------------------------
+ // TRIDB: operator arg hardening (advisor plan 024) — error-path memory release, the exact twin
+ // of tjs_operator.cpp's releaseTJSStateMemory: an ereport(ERROR) after state init longjmps past
+@@ -414,6 +446,20 @@ static TupleTableSlot* pullOneCandidateO(TJSOpenState* estate, IndexScanState* c
+ 			return NULL;
+ 		estate->examined++;
+ 
++		// TRIDB DEV-1354 — TR-1 HARD WORK-BOUND enforced at the PULL SITE. The HNSW relaxed-monotonicity
++		// iterator can emit long runs of already-seen heap tids at large N, so this duplicate-skip loop
++		// (and the phase-1 seed window) can itself drain unbounded — a ceiling checked only in the
++		// phase-3b OUTER loop would never be reached (the 1M hang reproduced even at cap=4000). Bounding
++		// `examined` here guarantees termination regardless of emission pattern: when the ceiling is hit
++		// we signal stream-end (NULL) so the caller sets finish, and publish the honest count. The
++		// ceiling never touches the drop counter, so below it the streaming top-k/bridge semantics are
++		// unchanged (200k still terminates naturally at examined=90). 0 disables the ceiling.
++		if (tjs_open_max_examined_guc > 0 &&
++			estate->examined >= (int64) tjs_open_max_examined_guc) {
++			tjs_open_last_examined = estate->examined;
++			return NULL;
++		}
++
+ 		ItemPointerData tid = child->iss_ScanDesc->xs_heaptid_orig;
+ 		uint64_t tid_uint = castToUint64O(tid);
+ 		if ( estate->seenSet->find(tid_uint) != estate->seenSet->end() )
+@@ -745,12 +791,28 @@ extern "C" TupleTableSlot* execTJSOpen(PlanState* node){
+ 
+ 				if (consecutive_drops >= term_cond)
+ 					estate->finish = true;
++
++				// TRIDB DEV-1354 — TR-1 HARD WORK-BOUND. The consecutive_drops bound above can fail to
++				// fire at large N because the HNSW relaxed-monotonicity tail sporadically improves the
++				// top-k within every <term_cond pulls, draining the whole corpus (the 1M hang). This
++				// absolute examined ceiling is an INDEPENDENT upper bound that guarantees termination
++				// at any N. It does NOT touch the drop counter — a bridge past the frontier still does
++				// not reset drops (TR-1 contract preserved) — so below the cap the streaming top-k /
++				// bridge semantics are byte-for-byte unchanged (200k still terminates at examined=90).
++				if (tjs_open_max_examined_guc > 0 &&
++					estate->examined >= (int64) tjs_open_max_examined_guc)
++					estate->finish = true;
+ 			}
+ 
+ 			MemoryContextSwitchTo(loopctx);
+ 		}
+ 		PG_CATCH();
+ 		{
++			// TRIDB DEV-1354 — honest reporting: publish the TRUE examined/bridge counts before
++			// unwinding so a cancelled or statement_timeout'd scan reports real work, not the stale
++			// post-drain 0 (the counters were previously written only AFTER a full drain).
++			tjs_open_last_examined = estate->examined;
++			tjs_open_last_bridges  = estate->bridges_injected;
+ 			PopActiveSnapshot();
+ 			PG_RE_THROW();
+ 		}
+@@ -871,6 +933,8 @@ Datum tjs_open(PG_FUNCTION_ARGS) {
+ 		funcctx = SRF_FIRSTCALL_INIT();
+ 		oldcontext = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
+ 
++		registerTJSOpenGUCs();   // TRIDB DEV-1354: ensure the TR-1 work-bound GUC exists this backend.
++
+ 		/* STRICT already rejects NULL args, but guard explicitly per the repo convention
+ 		 * (join_order.c): PG_GETARG_TEXT_PP on a NULL datum is UB. Belt-and-braces. */
+ 		for (int _i = 0; _i < PG_NARGS(); _i++)

@@ -1,0 +1,28 @@
+
+=== SCENARIO 1: atomicity under injected failure (M=100, fail_rate=0.5) ===
+  injected failures: 42/100
+  TriDB (one txn/one WAL): torn=0, wrong-state=0  -> all injected atomically rolled back
+  Multi-store (3 stores):  torn=42  -> every injected op left a partial write nothing reconciles
+  example torn entities (multi-store): [{'id': 1, 'milvus': 1, 'neo4j': 0, 'pg': 0}, {'id': 3, 'milvus': 1, 'neo4j': 0, 'pg': 0}, {'id': 4, 'milvus': 1, 'neo4j': 0, 'pg': 0}, {'id': 7, 'milvus': 1, 'neo4j': 0, 'pg': 0}]
+
+=== SCENARIO 2: crash consistency (real unclean shutdown + WAL recovery) ===
+  entity 1: multi-modal update to v=1 COMMITTED
+  entity 0: multi-modal update to v=1 written but NOT committed (txn in flight)
+  [crash] pg_ctl -m immediate stop (SIGQUIT; no shutdown checkpoint)
+  [restart] server started
+  [recovery] [260] LOG:  database system was not properly shut down; automatic recovery in progress
+  [recovery] [260] LOG:  redo starts at 0/23938F8
+  [recovery] [260] LOG:  redo done at 0/24EA5C0
+  post-recovery entity 0 (vector,graph,rel) = (0, 0, 0)  -> PASS all-old (atomic rollback)
+  post-recovery entity 1 (vector,graph,rel) = (1, 1, 1)  -> PASS all-new (durable)
+  multi-store entity 0: crash after Milvus write -> (milvus,neo4j,pg)=(1, 0, 0) -> TORN orphan persists (no cross-store WAL to recover it)
+
+=== SCENARIO 3: torn reads under concurrency (n_reads=300, writer inter-store gap=5.0ms) ===
+  TriDB total torn reads = 3/300 (1.0%); of these the heap legs (vector,relational) tore 0/300 (0.0%)
+    -> vector+relational (heap, one MVCC snapshot) NEVER tear; residual tears are the GRAPH leg only,
+       whose v1 read path is commit-visible not snapshot-isolated (DEV-1166) -> a narrow intra-stmt window.
+    example TriDB torn reads: [{'vector': 1, 'graph': 0, 'relational': 1}, {'vector': 0, 'graph': 1, 'relational': 0}, {'vector': 0, 'graph': 1, 'relational': 0}]
+  Multi-store (3 reads, 3 instants):    torn reads = 230/300 (76.7%)
+    example torn reads (multi-store): [{'milvus': 1, 'neo4j': 0, 'pg': 0}, {'milvus': 0, 'neo4j': 1, 'pg': 0}, {'milvus': 1, 'neo4j': 0, 'pg': 1}, {'milvus': 0, 'neo4j': 1, 'pg': 0}]
+
+[wiki_consistency] raw results -> /home/bob/code/tridb/bench/results/wiki_consistency.json

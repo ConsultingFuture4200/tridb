@@ -1,7 +1,70 @@
 # TriDB Build Status — per-issue gating
 
-Updated: 2026-07-04. Legend: 🟢 unblocked here · 🟡 partial (design here,
+Updated: 2026-07-08. Legend: 🟢 unblocked here · 🟡 partial (design here,
 build on GX10) · 🔴 GX10-gated (needs live MSVBASE build).
+
+> **🟢 DEV-1354 WIKI VALUE STORY — FINAL VERDICT (2026-07-08): two measured halves, speed + consistency.**
+> The wiki-scale investigation closes with TriDB's value quantified on both axes it claims, plus an
+> honest list of what is blocked.
+> - **(1) FUSION SPEED — PROVEN at N=200k** (`docs/benchmark_wiki_fusion_v0.1.0.md`). The in-process
+>   fused `tjs_open` beats an app-side Milvus→Neo4j→pgvector pipeline at matched recall@10:
+>   **loopback 11.5× (hop-1) / 3.26× (hop-2)**, **real-network 16.7× / 10.6×** (the baseline pays
+>   real serialization + RTT). The win is eliminating cross-system round-trips (largest on cheap
+>   queries, shrinks with hop depth), NOT HNSW-vs-HNSW.
+> - **(1M BLOCKED, documented future work.** The 1M fused h2h does not execute: the fork's vector
+>   leg / `tjs_open` hangs (`examined=0`, non-reproducible single-threaded HNSW build; 0/2 fresh
+>   builds healthy). Unblock path in the fusion doc §"Path to unblock". The **Wall-3 batched edge
+>   loader DID validate at 1M** (38,991,320 edges in ~35 s, reconciled). No 1M latency fabricated.)
+> - **I/O-LOCALITY THESIS DEAD at this scale.** dim-384 float32 is RAM-resident on the 128 GB Spark
+>   (~1.5 GB @ 1M), so the spec's I/O-bound early-termination thesis (SM-3 "3 pages vs 85") is
+>   structurally untestable here — the fusion speed win carries the story, not page-locality.
+>   Milestone-B decision memo (chunk-level > 128 GB) in `bench/results/wiki_scale_1_2_summary.md`.
+> - **(2) FUSION CONSISTENCY — DEMONSTRATED live (`docs/benchmark_wiki_consistency_v0.1.0.md`,
+>   `bench/wiki_consistency.py`).** The other half of ADR-0017's value story, on the isolated
+>   `tridb-wiki-*` stores + a throwaway crashable engine: **(S1 atomicity)** injected failure →
+>   TriDB **0** torn vs multi-store **42/42** injected torn; **(S2 crash)** unclean shutdown + WAL
+>   recovery → TriDB uncommitted rolls back atomically (all-old) + committed durable (all-new) vs
+>   multi-store torn orphan persists (Milvus=new, Neo4j/pg=old, nothing reconciles); **(S3 torn
+>   reads)** TriDB **1.0%** total (heap legs vector+relational **0.0%** — one MVCC snapshot) vs
+>   multi-store **76.7%**. Honest caveats: the residual TriDB tears are the **native graph leg only**
+>   (commit-visible, not yet snapshot-isolated — DEV-1166); the multi-store tear is **inherent**
+>   (no cross-system txn), not a Milvus/Neo4j bug, and **mitigable** app-side (2PC/sagas/outbox) at
+>   real complexity/latency cost — TriDB gets cross-modal ACID for free (one txn mgr, one WAL).
+>
+> **Net: TriDB's total value = the measured fusion SPEED win (3–17×) PLUS this cross-modal
+> CONSISTENCY — one story, two halves.** ADR-0017 prior (value is architectural, not a raw-speed
+> claim in this regime) stands, now with the consistency half MEASURED rather than only asserted.
+
+> **🟡 DEV-1354 WIKI-SCALE #1 + #2 SYNTHESIZED (2026-07-07) — one real signal win, one honest blocker.**
+> Two follow-ups on the real **6,900,039-article / 224,475,283-edge** enwiki corpus (near-full;
+> ~4% / 3 shards lost to the extractor clobber, fixed forward). Combined summary:
+> `bench/results/wiki_scale_1_2_summary.md`.
+> **#1 fused-vs-cosine link recovery** (`docs/benchmark_wiki_linkpred_fused_v0.1.0.md`, `e106409`):
+> topology adds a **small but statistically significant** signal. RRF-fused cosine+Adamic-Adar
+> recovers **overlap@10 = 0.1261 vs the 0.1101 cosine lower bound (+14.6%)**; AA-corrected 0.1246,
+> CN-corrected 0.1222, popularity/in-degree **0.0955 (below cosine → confound ruled out)**. Paired
+> bootstrap 95% CI **[+0.0118, +0.0176]**, Wilcoxon **p=2.6e-24**; Spearman(cos,AA)=0.172 (partly
+> orthogonal). A leave-out-the-positives leakage control moved the headline from a leaky raw +21% to
+> the honest **corrected +14.6%**, and reversed the old "AA-alone beats fusion" claim (leaky-AA
+> artifact). **Predictive-signal test only — dim-384 f32, reconstruction proxy, NO latency claim.**
+> **#2 `tjs_open` vs multi-store head-to-head — MILESTONE A (executed spike)**
+> (`docs/benchmark_wiki_scale_h2h_v0.2.0.md`, supersedes v0.1.0): **BLOCKED-AT-SPIKE (partial) —
+> load ran + baseline reconciled at N=1M, but NO matched head-to-head, at any N.** Baseline now
+> reconciles at **N=1,000,000 on all three legs** (Milvus 1M + Neo4j 1M nodes/**38,991,320** rels +
+> pgvector 1M; ~90 ms e2e, recall@10=0.80 vs exact oracle — baseline executing at parity, NOT a
+> TriDB result). Engine **vector leg durable at N=1M**; full tri-modal (both legs + `tjs_open` +
+> reconciliation) verified only at **N=200,000 / 8,208,179 edges**. The engine produces **no
+> `tjs_open` latency@recall point at any N**: the `float8[] <->` leg seqscans 1M×384 and cancels at
+> the statement timeout (`examined=0`). The 1M graph holds only **21,945,976 edges vs
+> 38,991,320** induced (~44% missing; 38.99M insert unfinished >117 min). Two walls: the fork
+> `vectordb` AM has **no external-index ingest** (Phase-1 49 s cuVS CAGRA index **not reusable** —
+> only single-threaded `CREATE INDEX … USING hnsw`), and per-row `gph_insert_edge` is super-linear.
+> Harness `bench/wiki_h2h.py` now **hard-gates** the headline ratio on graph-leg reconciliation,
+> timer-boundary parity, matched (not thresholded) recall, and `examined>0`. ADR-0017 prior
+> (value = **architectural** one-WAL consistency, expected-fail on raw speed) stands, **unrefuted
+> and untested at wiki scale**. No latency@fixed-accuracy table fabricated. **Caveat on every
+> count: dim-384 (not dim-768) = RAM-resident on the 128 GB Spark = wrong regime for the I/O-bound
+> thesis; the decisive test is Milestone B (chunk-level, > 128 GB) — decision memo in the summary.**
 
 > **🟢 gBRAIN-ON-TriDB: pgvector shim PROVEN + Phase C adapter TYPECHECKS (2026-07-04).**
 > The chosen vector-path integration is a **pgvector-compat shim** (advisor plan 039, `scripts/add_pgvector.sh`):
@@ -310,6 +373,7 @@ build on GX10) · 🔴 GX10-gated (needs live MSVBASE build).
 | DEV-1171 | Multi-system baseline harness | 3 | 🟢 | **LIVE multi-system baseline complete + FAIR SM-2 run on the x86 standin.** `baseline/` docker-compose (Milvus+Neo4j+Postgres) + `baseline/sm2.py` (realized-canonical query across all three live systems, merged app-side). `make sm2` (`scripts/bench_sm2.sh` + `tools/bench_sm2_corpus.py` + `bench/sm2_compare.py`) loads the IDENTICAL corpus into both sides (shared deterministic generator, seed 42, 2000 entities/dim 32, 12 queries k=5) and measures both the SAME way (client-side end-to-end wall-clock, warm conns, median of 7 runs, load/index excluded). Result: **SM-2 = 100% (12/12), median latency ratio 15.1× (2k/dim-32 corpus, x86 standin, term_cond=0), answer parity 12/12 exact (Jaccard 1.0)**. `bench/results/sm2_metrics.json` + `docs/benchmark_sm2_v0.1.0.md`. Original `baseline/harness.py` merge skeleton retained (unit-tested) |
 | DEV-1172 | TriDB benchmark harness | 3 | 🟢 | **LIVE run done on the x86 standin.** `make bench-live` (`scripts/bench_live.sh` + `tools/bench_corpus.py` + `bench/live_report.py`) drives the canonical query on the REAL `tridb/msvbase:dev` engine over a 2000-entity/dim-32 corpus × 12 queries (k=5), capturing actual `tjs()` answer sets, `tjs_candidates_examined()`, and EXPLAIN ANALYZE latency, vs the in-process baseline model. Stub path (`bench/`, `make bench`) still green + unit-tested. Live TriDB side measured here; SM-2 head-to-head + 128 GB headline stay GX10/stack-gated |
 | DEV-1173 | Benchmark results report | 3 | 🟢 | **Reports REAL live numbers.** `bench/results/{bench_live_metrics.json,report_live.html,bench_live_raw.txt}` + `docs/benchmark_results_v0.1.0.md` from a live run: SM-3 **6.4%**, SM-4 **100%** (12/12 exact, triple-verified vs in-DB oracle + baseline model), SM-5 **100%** — PASS. **SM-1 corrected 2026-07-03: 1.07× (FAIL, ≥5× target) on the 2k/dim-32 standin under the honest `max(k, reached)` accounting — the earlier 32.0× recorded peak as `k`; SM-1 is a hardware-independent row-count ratio so the GX10 does not restore it; a real ≥5× needs the streaming-graph-predicate redesign (see benchmark_results note).** SM-2 reported TriDB-side only (mean 1.2 ms) and explicitly GATED; 128 GB headline GX10-only |
+| DEV-1354 | Full-Wikipedia scale benchmark | wiki | 🟡 | **Phase-0 extraction + Phase-3 harness built + validated HERE; live run GX10/Spark-gated.** Spec `docs/wiki_scale_benchmark_spec_v0.1.0.md`. Streaming two-pass extractor `tools/wiki_extract.py` (bounded RAM; validated on a real 40k simplewiki slice → 40k articles / 727,808 edges / 15,490 redirects, manifest reconciles). HotpotQA→full-wiki title linker `tools/wiki_hotpot_link.py` (redirect-resolved, real-wiki id space; honest 40k-slice coverage = 9% gold titles hit, 0 fully-resolved — a slice resolves few, full enwiki is the corpus). Retrieve-from-ALL-wiki recall harness `bench/wiki_scale_report.py` (reuses `graphrag_report` retrievers; end-to-end validated on a controlled micro-corpus; grades multi-hop joint recall@k over the whole corpus, emits GX10-gated `tjs_open` SQL, never fabricates latency). Makefile `wiki-fetch`/`wiki-extract`/`wiki-scale` (network/engine-gated, not in CI). GX10/Spark LOAD contracts `docs/wiki_scale_load_design_v0.1.0.md` (COPY PERF-11, bulk native-graph via dense-id identity-mode, GPU-CAGRA HNSW PERF-08, RaBitQ PERF-10). Results/plan `docs/benchmark_wiki_scale_v0.1.0.md` — NO latency win pre-announced (honest failure mode stands). **Phase-2 AT-SCALE LOADER built + VERIFIED bounded on the real engine (2026-07-06):** `tools/wiki_engine_load.py` + `scripts/wiki_engine_load.sh` load a wiki manifest into all three legs — articles via `\copy` (PERF-11), induced edges via COPY-staged **direct-by-vid `gph_insert_edge`** under identity mode (NOT per-edge `add_edge`; the batched `gph_insert_edges` C entry point is unbuilt in the images), vectors + HNSW. Ran bounded on `tridb/msvbase:gx10-v1` (Spark GB10): **100,000 articles + 3,444,031 induced edges + 100k-vec HNSW, ALL asserts passed, exit 0** — native `gph_edge_count=3444031`/`gph_vertex_count=100000` == slice, `tjs_open` examined **128 ≪ 100k** (TR-1), `gph_neighbors_ext(0)` correct under identity mode (DEV-1352 not triggered), `bridges_injected=148`. Measured native edge insert **18.9k edges/s → ~3.4 h extrapolated for 224M** (the gating cost; motivates the unbuilt batched entry point). Real embeddings BLOCKED here: onnxruntime on Blackwell/sbsa has no CUDAExecutionProvider (CPU 23.7 docs/s → ~84 h/6.9M) → bounded proof used synthetic dim-64 vectors (proves loader+fusion+early-term, not recall). Evidence `bench/out/wiki_engine_load_100k_gx10v1.log`; addendum A in the results doc. At-scale SM-2 head-to-head still gated (baseline stack not stood up at 6.9M). **DATA-INTEGRITY (2026-07-07):** the enwiki extractor's sharded writer clobbered shard indices 28/49/71 (reopened in truncate mode across articles/edges/categories), losing 289,614 articles / 7.58M edges / 1.59M categories; the manifest overstated (claimed 7,189,653/232,055,532) and its self-reconciliation never checked files. **Real corpus = 6,900,039 articles / 224,475,283 edges / 40,178,200 categories.** `tools/wiki_manifest_verify.py` added (verify + `--rebuild`); manifests rebuilt to truth; hybrid embedder `tools/wiki_embed_hybrid.py` now reads real files (not manifest counts). Extractor root-cause fix (writer + built-in files-vs-manifest check) = follow-up. **MILESTONE A h2h (2026-07-07, `docs/benchmark_wiki_scale_h2h_v0.2.0.md`):** baseline reconciled at N=1M all 3 legs (Neo4j 38,991,320 rels); engine vector leg durable @ 1M, full tri-modal verified only @ 200k/8.2M edges; `tjs_open` walls @ 1M (`float8[] <->` seqscans, examined=0) and the 1M graph holds 21.9M vs 38.99M edges → **no matched h2h at any N (blocked-at-spike)**. Fork AM has no CAGRA ingest (49s Phase-1 index not reusable). Harness `bench/wiki_h2h.py` hard-gates the headline. Milestone B decision memo (dim-768 vs chunk-level) in `bench/results/wiki_scale_1_2_summary.md`. |
 
 ## What "done autonomously" means here
 

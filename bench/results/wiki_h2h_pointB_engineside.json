@@ -1,0 +1,13 @@
+{
+  "point": "B_fused_tjs_open",
+  "status": "BLOCKED_engine_side_at_1M",
+  "matched_200k_baseline": false,
+  "reason": "tjs_open's fused vector leg does not bind the HNSW opclass at N=1M on image tridb/msvbase:gx10-v1-hnswcap; the float8[] <-> distance seqscans 1M x 384 (measured >25s per query, no natural termination). This is the known DEV-1354 opclass-binding blocker (Blocker 3 in benchmark_wiki_scale_h2h_v0.1.0). No 200k-loaded engine exists (the running engine wiki-eng-1m holds N=1,000,000), so matched_200k_baseline is false and no equal-recall fused comparison could be produced.",
+  "evidence": {
+    "observed_per_query_seconds_min": 25,
+    "statement_timeout_s": 60,
+    "hnsw_bound": false,
+    "examined_via_counter": "unreadable (backend cancelled mid-seqscan)"
+  },
+  "note": "Point A's plain relaxed-order HNSW scan DOES bind the index (~87 candidates examined, ~86 index-scan buffers). Only the tjs_open fused operator's vector leg fails to bind at 1M. A matched fused number requires either (a) fixing the tjs_open opclass binding, or (b) a dedicated 200k engine so the seqscan cost is bounded."
+}
