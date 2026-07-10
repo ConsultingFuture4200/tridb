@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import argparse
 import html
+from html.parser import HTMLParser
 import json
 import os
 import random
@@ -562,7 +563,7 @@ class Reader:
             ).fetchall()
         return {r[0]: r[1] for r in rows}
 
-    def article(self, aid: int) -> dict | None:
+    def article(self, aid: int, with_html: bool = False) -> dict | None:
         with self.db_lock:
             row = self.db.execute(
                 "SELECT title, shard, byte_offset FROM articles WHERE id=?", (aid,)
@@ -574,7 +575,10 @@ class Reader:
         with path.open("rb") as fh:
             fh.seek(off)
             obj = json.loads(fh.readline())
-        return {"id": aid, "title": title, "body": _clean_body(obj.get("text", ""))}
+        out = {"id": aid, "title": title, "body": _clean_body(obj.get("text", ""))}
+        if with_html:
+            out["html"] = obj.get("html") or ""
+        return out
 
     def random_article(self) -> dict | None:
         """A random existing article via the PK index — O(log n), no full scan.
@@ -773,6 +777,20 @@ class Reader:
             pos = e
         out.append(html.escape(frag[pos:]))
         return "".join(out)
+
+    def render_html_body(self, aid: int, raw_html: str) -> str:
+        """Sanitise the structured article HTML (dump-sourced -> safe subset) and
+        rewire its data-wiki-title links to in-app navigation. Out-edge targets
+        resolve to a direct article link; unresolved titles become a title-search
+        link. Used when a record carries an `html` field; link_body (plain text)
+        is the fallback for the older text-only corpus."""
+        id2title = self._out_target_titles(aid)
+        title2id = {t: i for i, t in id2title.items()}
+        norm2id = {_norm_title(t): i for i, t in id2title.items()}
+        san = _HtmlSanitizer(title2id, norm2id)
+        san.feed(raw_html)
+        san.close()
+        return san.result()
 
     def link_body(self, aid: int, body: str) -> str:
         """Render the plain-text body to safe HTML: comprehensive inline links plus
@@ -1293,6 +1311,117 @@ class Reader:
         ]
         return {**base, "pre_count": pre_count, "post_count": len(cand), "results": results}
 
+    def search_trimodal(
+        self,
+        q: str,
+        seed: int = 40,
+        pool: int = 150,
+        expand: bool = True,
+        min_indeg: int = 0,
+        min_len: int = 0,
+        max_len: int = 0,
+        cat: str = "",
+    ) -> dict:
+        """All three legs in ONE query — the reader-side mirror of TriDB's tjs_open:
+        (1) VECTOR seed: the `seed` nearest articles by meaning (cuVS cosine);
+        (2) GRAPH expand: fold in the seeds' out-link neighbours (native adjacency);
+        (3) RELATIONAL filter: prune by inbound-degree / length / category;
+        then rank the survivors by a fused cosine + graph-proximity score."""
+        q = (q or "").strip()
+        base = {
+            "query": q,
+            "seed": seed,
+            "expand": expand,
+            "cats_available": self._has_cats,
+            "filters": {
+                "min_indeg": min_indeg,
+                "min_len": min_len,
+                "max_len": max_len,
+                "category": cat,
+            },
+        }
+        if not q:
+            return {**base, "seed_count": 0, "expanded_count": 0,
+                    "pre_count": 0, "post_count": 0, "results": []}
+        qvec = self._embed_query(q)
+        # (1) VECTOR seed
+        with self.index_lock:
+            labels, _ = self.index.knn_query(qvec, k=seed)
+        seed_ids: list[int] = []
+        seed_set: set[int] = set()
+        for lab in labels[0]:
+            a = int(lab)
+            if a not in seed_set:
+                seed_set.add(a)
+                seed_ids.append(a)
+        # (2) GRAPH expand — out-neighbours of the seeds (native CSR adjacency)
+        graph_hits: dict[int, int] = {}
+        if expand:
+            cap_out = 200  # bound per-seed fan-out on hub pages
+            for sid in seed_ids:
+                if sid + 1 >= len(self.csr_off):
+                    continue
+                lo, hi = int(self.csr_off[sid]), int(self.csr_off[sid + 1])
+                for x in self.csr_dst[lo:hi][:cap_out].tolist():
+                    x = int(x)
+                    if x in seed_set:
+                        continue
+                    graph_hits[x] = graph_hits.get(x, 0) + 1
+        expanded_ids = [i for i, _ in sorted(graph_hits.items(), key=lambda t: -t[1])[:pool]]
+        cand = list(dict.fromkeys(seed_ids + expanded_ids))  # de-dup, order-stable
+        titles = self._titles(cand)
+        cand = [a for a in cand if a in titles]
+        seed_count, expanded_count, pre_count = len(seed_ids), len(expanded_ids), len(cand)
+        # (3) RELATIONAL filter
+        indeg = self._ensure_indeg()
+        n_indeg = len(indeg)
+
+        def deg(a: int) -> int:
+            return int(indeg[a]) if a < n_indeg else 0
+
+        if min_indeg > 0:
+            cand = [a for a in cand if deg(a) >= min_indeg]
+        if cat and self._has_cats:
+            keep = self._filter_by_category(cand, cat)
+            cand = [a for a in cand if a in keep]
+        lengths: dict[int, int] = {}
+        if min_len > 0 or max_len > 0:
+            filt: list[int] = []
+            for a in cand:
+                art = self.article(a)
+                if art is None:
+                    continue
+                length = len(art["body"])
+                if min_len and length < min_len:
+                    continue
+                if max_len and length > max_len:
+                    continue
+                lengths[a] = length
+                filt.append(a)
+            cand = filt
+        # RANK — fuse cosine (vector) with normalised graph proximity (seed in-links)
+        cos = self._score_by_query(qvec, cand)
+        max_hits = max(graph_hits.values()) if graph_hits else 1
+        results = []
+        for a in cand:
+            c = float(cos.get(a, 0.0))
+            g = graph_hits.get(a, 0) / max_hits
+            in_seed, in_graph = a in seed_set, a in graph_hits
+            prov = ("meaning + linked" if in_seed and in_graph
+                    else "meaning" if in_seed else "linked")
+            results.append({
+                "id": a, "title": titles[a],
+                "score": round(c + 0.25 * g, 4), "cos": round(c, 4),
+                "graph": graph_hits.get(a, 0), "indeg": deg(a),
+                "length": lengths.get(a), "prov": prov,
+            })
+        results.sort(key=lambda r: (-r["score"], r["id"]))
+        cats_by = self._cats_for([r["id"] for r in results[:40]]) if self._has_cats else {}
+        for r in results:
+            r["cats"] = cats_by.get(r["id"], [])
+        return {**base, "seed_count": seed_count, "expanded_count": expanded_count,
+                "pre_count": pre_count, "post_count": len(results), "results": results}
+
     def _llm_answer(self, q: str, passages: list[dict]) -> str:
         """Grounded generation via the local ollama HTTP API. The model is told to
         answer ONLY from the numbered passages and to cite them; num_ctx is set
@@ -1748,6 +1877,146 @@ class Reader:
         return {"ok": True}
 
 
+_HTML_OK = {
+    "p", "div", "span", "section", "br", "hr", "b", "strong", "i", "em", "u", "s",
+    "small", "sub", "sup", "abbr", "cite", "q", "code", "pre", "blockquote", "kbd",
+    "h2", "h3", "h4", "h5", "h6", "ul", "ol", "li", "dl", "dt", "dd",
+    "table", "thead", "tbody", "tfoot", "tr", "td", "th", "caption", "colgroup", "col",
+    "figure", "figcaption", "img", "a",
+}
+_HTML_VOID = {"br", "hr", "col"}
+_HTML_DROP_BLOCK = {
+    "script", "style", "iframe", "object", "form", "noscript", "svg", "math",
+    "button", "select", "textarea", "audio", "video",
+}
+_HTML_DROP_VOID = {"input", "embed", "link", "meta", "source", "track"}
+_IMG_OK = re.compile(r"^(?:https?:)?//upload\.wikimedia\.org/")
+
+
+def _norm_title(t: str) -> str:
+    return (t or "").strip().lower().replace("_", " ")
+
+
+class _HtmlSanitizer(HTMLParser):
+    """Whitelist-sanitise the extractor's dump-sourced article HTML into a safe,
+    Wikipedia-like subset. Drops script/style/iframe/form/... (with their content),
+    strips every attribute except `class` (for styling), colspan/rowspan on cells,
+    and an <img> `src` whitelisted to upload.wikimedia.org. `data-wiki-title` links
+    are rewired to in-app navigation. Injection-safe: text is html.escape()'d and
+    only integer ids, escaped class tokens, and whitelisted image URLs reach any
+    attribute value."""
+
+    def __init__(self, title2id, norm2id):
+        super().__init__(convert_charrefs=True)
+        self.title2id = title2id
+        self.norm2id = norm2id
+        self.out = []
+        self.skip = 0
+        self.astack = []
+
+    def _attrs(self, tag, attrs):
+        d = dict(attrs)
+        out = ""
+        cls = d.get("class")
+        if cls:
+            out += f' class="{html.escape(cls, quote=True)}"'
+        if tag in ("td", "th", "col", "colgroup"):
+            for k in ("colspan", "rowspan", "span"):
+                v = d.get(k)
+                if v and v.isdigit():
+                    out += f' {k}="{v}"'
+        return out
+
+    def _img(self, d):
+        src = d.get("src") or d.get("data-src") or ""
+        if not _IMG_OK.match(src):
+            return
+        if src.startswith("//"):
+            src = "https:" + src
+        a = f' src="{html.escape(src, quote=True)}" loading="lazy"'
+        for k in ("width", "height"):
+            v = d.get(k) or d.get("data-" + k)
+            if v and str(v).isdigit():
+                a += f' {k}="{v}"'
+        alt = d.get("alt")
+        if alt:
+            a += f' alt="{html.escape(alt, quote=True)}"'
+        cls = d.get("class")
+        if cls:
+            a += f' class="{html.escape(cls, quote=True)}"'
+        self.out.append(f"<img{a}>")
+
+    def handle_starttag(self, tag, attrs):
+        if self.skip:
+            if tag in _HTML_DROP_BLOCK:
+                self.skip += 1
+            return
+        if tag in _HTML_DROP_BLOCK:
+            self.skip = 1
+            return
+        if tag in _HTML_DROP_VOID:
+            return
+        if tag == "a":
+            self._open_a(dict(attrs))
+            return
+        if tag == "img":
+            self._img(dict(attrs))
+            return
+        if tag in _HTML_VOID:
+            self.out.append(f"<{tag}{self._attrs(tag, attrs)}>")
+            return
+        if tag in _HTML_OK:
+            self.out.append(f"<{tag}{self._attrs(tag, attrs)}>")
+        # unknown tag -> unwrap (children kept)
+
+    def handle_startendtag(self, tag, attrs):
+        if self.skip:
+            return
+        if tag == "img":
+            self._img(dict(attrs))
+            return
+        if tag in _HTML_VOID:
+            self.out.append(f"<{tag}>")
+
+    def handle_endtag(self, tag):
+        if self.skip:
+            if tag in _HTML_DROP_BLOCK:
+                self.skip -= 1
+            return
+        if tag == "a":
+            if self.astack and self.astack.pop():
+                self.out.append("</a>")
+            return
+        if tag in _HTML_OK and tag not in _HTML_VOID and tag != "img":
+            self.out.append(f"</{tag}>")
+
+    def handle_data(self, data):
+        if not self.skip:
+            self.out.append(html.escape(data))
+
+    def _open_a(self, attrs):
+        wt = attrs.get("data-wiki-title")
+        if wt:
+            tid = self.title2id.get(wt)
+            if tid is None:
+                tid = self.norm2id.get(_norm_title(wt))
+            if tid is not None:
+                self.out.append(
+                    f'<a href="/article/{int(tid)}" class="wl" data-id="{int(tid)}">'
+                )
+                self.astack.append(True)
+                return
+            self.out.append(
+                f'<a class="wl-title" data-title="{html.escape(wt, quote=True)}">'
+            )
+            self.astack.append(True)
+            return
+        self.astack.append(False)
+
+    def result(self):
+        return "".join(self.out)
+
+
 def _clean_body(text: str) -> str:
     """Light wikitext-residue cleanup — the extractor already stripped most markup.
 
@@ -2021,6 +2290,36 @@ main { display:grid; grid-template-columns:260px 1fr 300px; gap:0; height:calc(1
 #related { border-right:0; border-left:1px solid #ddd; }
 #article { overflow-y:auto; padding:20px 32px; max-width:820px; }
 #article h2 { margin-top:0; }
+/* --- structured-HTML article rendering (Wikipedia-style) --- */
+#article .infobox { float:right; clear:right; width:300px; max-width:44%; margin:2px 0 14px 18px;
+  border:1px solid #a2a9b1; background:#f8f9fa; font-size:12.5px; line-height:1.5; border-collapse:collapse; }
+#article .infobox tr > th[colspan], #article .infobox caption { font-weight:700; text-align:center;
+  background:#eaecf0; padding:6px; font-size:13.5px; }
+#article .infobox td, #article .infobox th { border:0; padding:3px 8px; vertical-align:top; text-align:left; }
+#article .infobox-label { font-weight:600; padding-right:8px; white-space:nowrap; }
+#article .infobox img, #article figure img, #article .thumb img { max-width:100%; height:auto; }
+#article .hatnote { font-style:italic; color:#54595d; padding:2px 0 4px 20px; font-size:13.5px; }
+#article .thumb { border:1px solid #c8ccd1; background:#f8f9fa; padding:4px; margin:6px 0 6px 14px;
+  max-width:320px; float:right; clear:right; }
+#article .thumbcaption, #article figcaption { font-size:12px; color:#54595d; padding:3px 2px 0; }
+#article .references, #article .reflist, #article ol.references { font-size:12px; color:#444; }
+#article ol.references li { margin:2px 0; }
+#article sup.reference, #article sup { font-size:.72em; line-height:0; }
+#article table:not(.infobox) { border-collapse:collapse; margin:10px 0; font-size:13.5px; max-width:100%; }
+#article table:not(.infobox) th, #article table:not(.infobox) td { border:1px solid #ccd; padding:4px 8px;
+  text-align:left; vertical-align:top; }
+#article table:not(.infobox) th { background:#f4f6fb; }
+#article .mw-editsection, #article .Z3988, #article .mw-cite-backlink, #article .noprint,
+#article .mw-empty-elt, #article style { display:none; }
+#article img { max-width:100%; height:auto; }
+#article a.wl-title { color:#36c; text-decoration:none; cursor:pointer; border-bottom:1px dotted #9bb; }
+#article a.wl-title:hover { background:#eef3ff; }
+#article blockquote { border-left:3px solid #ddd; margin:8px 0; padding:2px 12px; color:#555; }
+/* collapsible section headers */
+#artbody h2.collap, #artbody h3.collap { cursor:pointer; user-select:none;
+  border-bottom:1px solid #a2a9b1; padding-bottom:3px; }
+#artbody h2.collap:hover, #artbody h3.collap:hover { color:#36c; }
+#artbody .ctri { display:inline-block; width:14px; color:#888; font-size:.75em; vertical-align:middle; }
 .item { padding:6px 8px; cursor:pointer; border-radius:4px; font-size:14px; line-height:1.3; }
 .item:hover { background:#eef3ff; }
 .secttl { font-size:12px; text-transform:uppercase; letter-spacing:.05em; color:#888;
@@ -2056,6 +2355,32 @@ p { line-height:1.6; }
   font-size:13px; background:#fff; }
 #sq { flex:1; min-width:180px; }
 #sembar input.numf { width:90px; }
+#tribar { display:flex; gap:8px; align-items:center; padding:6px 16px;
+  background:#eafaf1; border-bottom:1px solid #cdeede; flex-wrap:wrap; }
+#tribar input { padding:6px 10px; border:1px solid #bfe3cd; border-radius:4px;
+  font-size:13px; background:#fff; }
+#tribar input.numf { width:90px; }
+#tribar .tlbl { font-weight:600; color:#127a4a; font-size:13px; white-space:nowrap; }
+#tribar label { font-size:12.5px; color:#555; display:flex; align-items:center; gap:4px; }
+#tribar button { padding:6px 16px; border:0; border-radius:4px; background:#127a4a; color:#fff;
+  cursor:pointer; font-size:13px; }
+#tribar button:hover { background:#0e6a3f; }
+.prov { font-size:10.5px; color:#127a4a; margin-left:6px; font-weight:600; }
+.ex { display:inline-block; width:15px; height:15px; line-height:15px; text-align:center;
+  border-radius:50%; background:rgba(255,255,255,.30); color:#fff; font-size:11px; font-weight:700;
+  cursor:help; position:relative; margin-left:5px; font-style:normal; vertical-align:middle; }
+#connectbar .ex, #sembar .ex, #tribar .ex { background:#c7d2e6; color:#3355bb; }
+.ex .win { display:none; position:absolute; top:20px; left:0; width:300px; background:#fff; color:#222;
+  border:1px solid #d0d4da; border-radius:8px; padding:11px 13px; box-shadow:0 6px 22px rgba(0,0,0,.16);
+  z-index:60; font-size:12.5px; line-height:1.55; font-weight:400; text-transform:none;
+  letter-spacing:normal; text-align:left; white-space:normal; }
+.ex:hover .win { display:block; }
+.ex .win b { color:#111; }
+.ex .win code { background:#f2f2f4; border-radius:3px; padding:0 4px; font-size:11.5px; }
+.ex .win .legs { margin-top:7px; }
+.ex .win .legs i { font-style:normal; padding:1px 7px; border-radius:10px; margin-right:4px;
+  color:#fff; font-size:10.5px; }
+.leg-v { background:#0f8b7c; } .leg-g { background:#6f4fd0; } .leg-r { background:#b8790f; }
 #sbtn { padding:6px 16px; border:0; border-radius:4px; background:#7a4aa0; color:#fff;
   cursor:pointer; font-size:13px; }
 #sbtn:hover { background:#653c88; }
@@ -2090,6 +2415,13 @@ p { line-height:1.6; }
    underline, no blue. A faint tint + underline appears ONLY on :hover, so links
    stay discoverable without disrupting reading. */
 #article a.wl { color:inherit; text-decoration:none; cursor:pointer; }
+#article a.wl-title { color:#36c; text-decoration:none; cursor:pointer; border-bottom:1px dotted #9bb; }
+#article a.wl-title:hover { background:#eef3ff; }
+#article table { border-collapse:collapse; margin:10px 0; font-size:13.5px; max-width:100%; }
+#article th, #article td { border:1px solid #ccd; padding:4px 8px; text-align:left; vertical-align:top; }
+#article th { background:#f4f6fb; }
+#article blockquote { border-left:3px solid #ddd; margin:8px 0; padding:2px 12px; color:#555; }
+#article figure { margin:8px 0; } #article figcaption { font-size:12px; color:#777; }
 #article a.wl:hover { background:#eef3ff; text-decoration:underline;
   text-decoration-color:#9db6e0; text-underline-offset:2px; }
 /* section headings + lists recovered from the plain text */
@@ -2144,27 +2476,37 @@ p { line-height:1.6; }
   <button id="back" onclick="goBack()" title="Back (also works with the browser Back button)">&larr; Back</button>
   <button id="home" onclick="goHome()" title="Home — jump to a fresh random article">&#127968; Home</button>
   <h1 onclick="goHome()" title="Home — a fresh random article">Offline Wikipedia</h1>
-  <input id="q" placeholder="Search titles (e.g. Ada Lovelace) — Enter" autofocus>
-  <input id="ask" placeholder="Ask a question (RAG over 6.9M articles) — Enter">
+  <input id="q" placeholder="Search titles (e.g. Ada Lovelace) — Enter" autofocus><span class="ex">&#9432;<span class="win"><b>Title search.</b> Matches your text against article <em>titles</em> (full-text index) — fast exact/prefix lookup. Use it when you know the name. Press Enter.</span></span>
+  <input id="ask" placeholder="Ask a question (RAG over 6.9M articles) — Enter"><span class="ex">&#9432;<span class="win"><b>Ask (RAG).</b> Type a natural-language <em>question</em>: it retrieves relevant passages and a local LLM writes a <em>cited</em> answer. The <b>graph</b> box expands along links first, so multi-hop questions are grounded in the link chain.<span class="legs"><i class="leg-v">vector</i><i class="leg-g">graph</i></span></span></span>
   <label class="gexp" title="Graph-aware RAG: expand along hyperlinks before answering">
     <input type="checkbox" id="gexp" checked> graph
   </label>
 </header>
 <div id="connectbar">
-  <span class="cblabel">How are these connected?</span>
+  <span class="cblabel">How are these connected?<span class="ex">&#9432;<span class="win"><b>Connect.</b> Finds the shortest <em>path</em> of links between two articles — pure graph traversal over the 448M-edge adjacency. Great for &ldquo;how is X related to Y?&rdquo;.<span class="legs"><i class="leg-g">graph</i></span></span></span></span>
   <input id="from" placeholder="From (e.g. Ada Lovelace)">
   <span class="cbarrow">&rarr;</span>
   <input id="to" placeholder="To (e.g. Charles Babbage)">
   <button id="cbtn" onclick="connect()">Connect</button>
 </div>
 <div id="sembar">
-  <span class="cblabel">Semantic search</span>
+  <span class="cblabel">Semantic search<span class="ex">&#9432;<span class="win"><b>Semantic search.</b> Finds articles by <em>meaning</em> (vector similarity), then prunes by relational filters (inbound links / length / category). Semantic first, filter second.<span class="legs"><i class="leg-v">vector</i><i class="leg-r">relational</i></span></span></span></span>
   <input id="sq" placeholder="Meaning query (e.g. quantum computing)">
   <input id="minlinks" class="numf" type="number" min="0" placeholder="min links">
   <input id="minlen" class="numf" type="number" min="0" placeholder="min chars">
   <input id="maxlen" class="numf" type="number" min="0" placeholder="max chars">
   <input id="scat" placeholder="category contains…">
   <button id="sbtn" onclick="semSearch()">Search</button>
+</div>
+<div id="tribar">
+  <span class="tlbl">Tri-modal<span class="ex">&#9432;<span class="win"><b>Tri-modal search.</b> All three TriDB legs in one query: seed by <em>meaning</em>, walk the <em>link graph</em> out of those seeds, then <em>filter</em> — the reader-side mirror of the engine's <code>tjs_open</code>. Results tag their provenance (meaning / linked / both).<span class="legs"><i class="leg-v">vector</i><i class="leg-g">graph</i><i class="leg-r">relational</i></span></span></span></span>
+  <input id="tq" placeholder="Meaning + links + filters (e.g. cryptography)">
+  <label title="Expand along out-links from the semantic seeds (the graph leg)"><input type="checkbox" id="texpand" checked> expand links</label>
+  <input id="tminlinks" class="numf" type="number" min="0" placeholder="min links">
+  <input id="tminlen" class="numf" type="number" min="0" placeholder="min chars">
+  <input id="tmaxlen" class="numf" type="number" min="0" placeholder="max chars">
+  <input id="tcat" placeholder="category contains…">
+  <button id="tbtn" onclick="triSearch()">Search</button>
 </div>
 <main>
   <div id="results"><div class="hint">Type a query and press Enter.</div></div>
@@ -2229,6 +2571,21 @@ let _curId = null;
 // open_ = in-app navigation to an article: render + push a history entry so the
 // browser Back/Forward buttons and the header "← Back" walk the article sequence.
 async function open_(id){ await loadArticle(id); pushView({view:'article', id:id}); }
+function makeCollapsible(){
+  document.querySelectorAll('#artbody h2, #artbody h3').forEach(hd => {
+    if(hd.dataset.collap) return;
+    hd.dataset.collap = '1'; hd.classList.add('collap');
+    hd.insertAdjacentHTML('afterbegin', '<span class="ctri">&#9662;</span> ');
+    hd.addEventListener('click', () => toggleSection(hd));
+  });
+}
+function toggleSection(hd){
+  const collapsed = hd.classList.toggle('collapsed');
+  const tri = hd.querySelector('.ctri'); if(tri) tri.innerHTML = collapsed ? '&#9656;' : '&#9662;';
+  const stop = (hd.tagName === 'H3') ? ['H2','H3'] : ['H2'];
+  let el = hd.nextElementSibling;
+  while(el){ if(stop.includes(el.tagName)) break; el.style.display = collapsed ? 'none' : ''; el = el.nextElementSibling; }
+}
 async function loadArticle(id){   // render only, no history push (used by popstate)
   _curId = id;
   const a = await j('/article/'+id);
@@ -2245,8 +2602,9 @@ async function loadArticle(id){   // render only, no history push (used by popst
       '<span id="enrichmsg" class="subtle" style="margin-left:8px"></span></div>'+
     '<div id="enrichaccepted">'+renderEnrichments(a.enrichments)+'</div>'+
     '<div id="enrichsug"></div>'+
-    body;
+    '<div id="artbody">'+body+'</div>';
   art.scrollTop = 0;
+  makeCollapsible();
   loadRelated(id);
 }
 // -- Enrichment (on-demand, reviewed, CITED) ----------------------------------
@@ -2483,6 +2841,53 @@ function renderSem(r){
   if(!r.results.length){ el.innerHTML = h+'<div class="hint">No results after filtering.</div>'; return; }
   el.innerHTML = h + r.results.map(semRow).join('');
 }
+
+// -- Tri-modal search: vector seed -> graph expand -> relational filter (reader-side tjs_open) --
+function triParams(){
+  return { q: $('#tq').value.trim(), expand: $('#texpand').checked ? 1 : 0,
+    min_indeg: $('#tminlinks').value.trim(), min_len: $('#tminlen').value.trim(),
+    max_len: $('#tmaxlen').value.trim(), cat: $('#tcat').value.trim() };
+}
+async function triSearch(){
+  const p = triParams();
+  if(!p.q) return;
+  await loadTri(p);
+  pushView({view:'tri', p:p});
+}
+async function loadTri(p){
+  $('#tq').value=p.q||''; $('#texpand').checked = p.expand!=0;
+  $('#tminlinks').value=p.min_indeg||''; $('#tminlen').value=p.min_len||'';
+  $('#tmaxlen').value=p.max_len||''; $('#tcat').value=p.cat||'';
+  const el = $('#results');
+  el.innerHTML = '<div class="hint">Vector seed &rarr; graph expand &rarr; relational filter…</div>';
+  const qs = '/search_trimodal?q='+encodeURIComponent(p.q)+
+    '&expand='+encodeURIComponent(p.expand)+
+    '&min_indeg='+encodeURIComponent(p.min_indeg||0)+
+    '&min_len='+encodeURIComponent(p.min_len||0)+
+    '&max_len='+encodeURIComponent(p.max_len||0)+
+    '&cat='+encodeURIComponent(p.cat||'');
+  let r;
+  try { r = await j(qs); } catch(e){ el.innerHTML='<div class="hint">Search failed.</div>'; return; }
+  renderTri(r);
+}
+function triRow(a){
+  const meta=[a.indeg.toLocaleString()+' links'];
+  if(a.length!=null) meta.push(a.length.toLocaleString()+' chars');
+  const cats = (a.cats&&a.cats.length)
+    ? '<div>'+a.cats.map(c=>'<span class="catpill">'+esc(c)+'</span>').join('')+'</div>' : '';
+  return '<div class="item" onclick="open_('+a.id+')"><div class="rtitle">'+esc(a.title)+
+    '<span class="prov">'+esc(a.prov)+'</span></div>'+
+    relInd(a.cos)+'<div class="meta">'+meta.join(' · ')+'</div>'+cats+'</div>';
+}
+function renderTri(r){
+  const el = $('#results');
+  let h = '<div class="countbar"><b>'+r.seed_count+'</b> seeds by meaning &rarr; <b>'+
+    r.expanded_count+'</b> via links &rarr; <b>'+r.pre_count+'</b> pooled &rarr; <b>'+
+    r.post_count+'</b> after filter<br><span style="color:#999">filters: '+
+    esc(fdesc(r.filters, r.cats_available))+'</span></div>';
+  if(!r.results.length){ el.innerHTML = h+'<div class="hint">No results after filtering.</div>'; return; }
+  el.innerHTML = h + r.results.map(triRow).join('');
+}
 // -- inline-link clicks + hovercards (page previews) --------------------------
 const _sumCache = {};        // id -> {title, lead}, cached per session
 let _hcTimer = null, _hcId = null;
@@ -2533,6 +2938,13 @@ $('#article').addEventListener('click', e => {   // intercept inline links -> op
   e.preventDefault();
   hideHover();
   open_(parseInt(a.getAttribute('data-id'), 10));
+});
+$('#article').addEventListener('click', e => {   // unresolved html links -> title search, open top hit
+  const a = e.target.closest('a.wl-title');
+  if(!a) return;
+  e.preventDefault(); hideHover();
+  const t = a.getAttribute('data-title') || '';
+  loadSearch(t).then(() => { const top = document.querySelector('#results .item'); if(top) top.click(); });
 });
 $('#hovercard').addEventListener('mouseleave', hideHover);
 
@@ -2585,21 +2997,27 @@ function renderState(st){   // restore a view for a popstate (no new push)
   else if(st.view==='connect'){ loadConnect(st.f, st.t); }
   else if(st.view==='ask'){ loadAsk(st.q); }
   else if(st.view==='sem'){ loadSem(st.p); }
+  else if(st.view==='tri'){ loadTri(st.p); }
   else if(st.view==='search'){ loadSearch(st.q); }
   updateBack();
 }
 window.addEventListener('popstate', e => renderState(e.state));
 history.replaceState({view:'home'}, '', location.pathname);   // base state
 updateBack();
-loadHome();   // landing view: a fresh random article
+(function(){   // boot: a ?q= handoff from the portal landing runs the search and opens the top hit; else random landing
+  const _bq = new URLSearchParams(location.search).get('q');
+  if(_bq){ $('#q').value = _bq; loadSearch(_bq).then(() => { const top = document.querySelector('#results .item'); if(top) top.click(); }); }
+  else { loadHome(); }
+})();
 
 $('#q').addEventListener('keydown', e => { if(e.key==='Enter') search(); });
-(function(){var _q=new URLSearchParams(location.search).get('q');if(_q){$('#q').value=_q;search();}})();
 $('#ask').addEventListener('keydown', e => { if(e.key==='Enter') ask(); });
 $('#from').addEventListener('keydown', e => { if(e.key==='Enter') connect(); });
 $('#to').addEventListener('keydown', e => { if(e.key==='Enter') connect(); });
 ['#sq','#minlinks','#minlen','#maxlen','#scat'].forEach(sel =>
   $(sel).addEventListener('keydown', e => { if(e.key==='Enter') semSearch(); }));
+[['#tq','#tminlinks','#tminlen','#tmaxlen','#tcat']][0].forEach(sel =>
+  $(sel).addEventListener('keydown', e => { if(e.key==='Enter') triSearch(); }));
 </script>
 </body></html>"""
 
@@ -2691,13 +3109,40 @@ def make_handler(reader: Reader, token: str):
                             cat=qs.get("cat", [""])[0].strip(),
                         )
                     )
+                elif path == "/search_trimodal":
+                    qs = parse_qs(u.query)
+
+                    def _ti(name: str, dv: int = 0) -> int:
+                        try:
+                            return int(qs.get(name, [str(dv)])[0] or dv)
+                        except ValueError:
+                            return dv
+
+                    self._json(
+                        reader.search_trimodal(
+                            qs.get("q", [""])[0],
+                            seed=_ti("seed", 40) or 40,
+                            expand=qs.get("expand", ["1"])[0] != "0",
+                            min_indeg=_ti("min_indeg"),
+                            min_len=_ti("min_len"),
+                            max_len=_ti("max_len"),
+                            cat=qs.get("cat", [""])[0].strip(),
+                        )
+                    )
                 elif path.startswith("/article/"):
                     aid = int(unquote(path.split("/")[-1]))
-                    art = reader.article(aid)
+                    art = reader.article(aid, with_html=True)
                     if art is None:
                         self._json({"error": "not found"})
                     else:
-                        art["body_html"] = reader.link_body(aid, art["body"])
+                        if art.get("html"):
+                            try:
+                                art["body_html"] = reader.render_html_body(aid, art["html"])
+                            except Exception:
+                                art["body_html"] = reader.link_body(aid, art["body"])
+                        else:
+                            art["body_html"] = reader.link_body(aid, art["body"])
+                        art.pop("html", None)
                         # cheap indexed overlay lookup — accepted enrichments render
                         # on the page without a second round-trip (never mutates body)
                         art["enrichments"] = reader.overlay_facts(aid)
