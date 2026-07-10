@@ -28,6 +28,8 @@ violates one will be rejected on design grounds, not style:
 ```bash
 python3 -m venv .venv && . .venv/bin/activate && pip install -r requirements.txt
 # (if python3-venv is unavailable, `uv venv .venv && uv pip install -r requirements.txt` also works)
+# Optional: `pip install -r requirements-vdbb.txt` for the VectorDBBench adapter (bench/vdbb_tridb.py) —
+# not needed for make test/make lint.
 make test      # pytest — fast, no Docker
 make lint      # ruff check + format --check
 ```

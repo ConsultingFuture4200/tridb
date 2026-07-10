@@ -160,6 +160,7 @@ The repository has two layers. The hardware-independent layer (design, tooling, 
 ```bash
 python3 -m venv .venv && . .venv/bin/activate
 pip install -r requirements.lock   # pinned, reproducible; requirements.txt holds floors only
+# pip install -r requirements-vdbb.txt   # optional: only for the VectorDBBench adapter (bench/vdbb_tridb.py)
 cp .env.example .env               # documents every env var the tooling reads
 make test          # Python + lint layer — fast, no Docker
 make lint

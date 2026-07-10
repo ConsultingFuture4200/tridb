@@ -23,16 +23,20 @@ lint:
 
 # Regenerate the pinned lockfile from the current .venv (deliberate dep bumps: edit the
 # requirements.txt floor, then `make lock`, then commit both). Uses uv if present, else pip.
+# .venv must hold ONLY requirements.txt (core floors) — a venv with extras (e.g.
+# requirements-vdbb.txt) installed on top will bake them back into the core lock (advisor plan 058).
 lock:
 	@if command -v uv >/dev/null 2>&1; then \
 	  { echo "# Auto-generated pinned lockfile — do NOT edit by hand. Regenerate with: make lock"; \
 	    echo "# Reproducible installs: pip install -r requirements.lock"; \
-	    echo "# Pins the full transitive closure of the validated .venv (advisor plan 015)."; \
+	    echo "# Pins the full transitive closure of requirements.txt (core floors only)."; \
+	    echo "# For VectorDBBench/streamlit/etc. use requirements-vdbb.txt instead (advisor plan 058)."; \
 	    VIRTUAL_ENV=.venv uv pip freeze; } > requirements.lock; \
 	else \
 	  { echo "# Auto-generated pinned lockfile — do NOT edit by hand. Regenerate with: make lock"; \
 	    echo "# Reproducible installs: pip install -r requirements.lock"; \
-	    echo "# Pins the full transitive closure of the validated .venv (advisor plan 015)."; \
+	    echo "# Pins the full transitive closure of requirements.txt (core floors only)."; \
+	    echo "# For VectorDBBench/streamlit/etc. use requirements-vdbb.txt instead (advisor plan 058)."; \
 	    $(PY) -m pip freeze --exclude-editable; } > requirements.lock; \
 	fi
 	@echo "wrote requirements.lock ($$(wc -l < requirements.lock) lines)"

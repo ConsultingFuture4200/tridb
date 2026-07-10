@@ -12,6 +12,9 @@ it needs a RUNNING TriDB Postgres (the engine container started with a published
 and the Cohere-1M dataset download. Runbook at the bottom. The host-side filtered recall/
 latency curve is already produced live by scripts/bench_filtered.sh (make bench-filtered);
 this adapter is the bridge to the recognized tool for the multi-client QPS headline.
+
+DEP NOTE: vectordb-bench is NOT in the core requirements.lock (advisor plan 058). Install
+`requirements-vdbb.txt` before importing this module.
 """
 
 from __future__ import annotations
