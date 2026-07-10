@@ -40,6 +40,13 @@ landed; these 20 plans are **residuals only**. All findings re-opened against li
 
 **Fan-out `wf_2c0131ff-31a` (2026-07-09):** all 16 executed in isolated worktrees, scope-clean across the board. 6 host-plans **DONE** (spot-verified), 7 engine/patch plans **PENDING-GX10** (authored + static-clean, build deferred to the GX10), 2 real **REVISE** defects (046, 049), 1 **BLOCKED** (059 needs plan rework). Branches persist as `advisor/NNN-*`; nothing merged.
 
+**Engine-verification pass (2026-07-10, `tridb/msvbase:dev` x86 image):** built + ran `make graph-test` per plan.
+- **ENGINE-VERIFIED GREEN (mergeable):** 040, 047, 048, 052 (+`ci_check_patches`), 053, 055 — and **046** after the agent fixed the stale `persist.sql` vertex_count 6→5 (commit `7a70b3c` on `advisor/046`).
+- **045 — GREEN after re-diagnosis:** the "regression" was a MISDIAGNOSIS — the C type-filter (`da9b807`) is correct; the failure was a **stale vertex-numbering bug in plan 045's own test** (Test E's `add_edge` auto-created vids 6,7,8; Test F wrongly assumed 6,7 were fresh). Fixed the test (`f94a23a`, retarget to fresh vids 9,10); `make graph-test` exit 0 with F1/F2/F3 green (typed semantics confirmed). Agent correctly pushed back on the dictated diagnosis.
+- **049 — RED, deferred:** confirmed real `relcache reference leak` on early-abandon paths (3 WARNINGs; needs an abort-safe cleanup + a new abort-path test — do not merge; write a dedicated plan).
+
+**Merged into `dustin/dev-1354` (2026-07-10):** all **8 GREEN engine plans** — 053, 052, 040, 046, 047, 048, 055, **045** — merged (055 + 045 needed graph_am.c conflict resolution, both clean; `_PG_init`+`gph_visible_edge_count` and the tombstone docstring reconciled). Combined-tree `make graph-test` re-verified green. Host merges earlier: 050, 042, 041, 054, 058, 051. Still unmerged: **044** (blocked on another agent's uncommitted `bench/wiki_h2h_vecrun.py`), **049** (needs the abort-path fix), **059** (BLOCKED, needs rework). Nothing pushed to master.
+
 ### Recommended execution order
 
 **Wave A — host-only quick wins (parallel-safe):**  
