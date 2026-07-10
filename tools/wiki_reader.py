@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import argparse
 import html
+import math
 from html.parser import HTMLParser
 import json
 import os
@@ -542,16 +543,42 @@ class Reader:
         # quote each token; prefix-match the last so partial words still hit
         parts = [f'"{t}"' for t in tokens[:-1]] + [f'"{tokens[-1]}"*']
         match = " ".join(parts)
+        pool = max(limit * 5, 200)  # over-fetch by FTS rank, then re-rank by notability
         with self.db_lock:
             try:
                 rows = self.db.execute(
                     "SELECT rowid, title FROM titles_fts WHERE titles_fts MATCH ? "
                     "ORDER BY rank LIMIT ?",
-                    (match, limit),
+                    (match, pool),
                 ).fetchall()
             except sqlite3.OperationalError:
                 return []
-        return [{"id": r[0], "title": r[1]} for r in rows]
+        if not rows:
+            return []
+        # Bias toward EXACT + MOST-NOTABLE titles: in-degree (log) dominates, with a
+        # nudge for an exact / prefix / whole-word title match. So "Einstein" -> the
+        # heavily-linked person, not a short-but-obscure "Einsteinhaus".
+        indeg = self._ensure_indeg()
+        n_indeg = len(indeg)
+        ql = q.strip().lower()
+        qword = re.compile(r"(?<!\w)" + re.escape(ql) + r"(?!\w)")
+
+        def score(fts_pos: int, aid: int, title: str) -> float:
+            tl = title.lower()
+            deg = int(indeg[aid]) if aid < n_indeg else 0
+            s = math.log1p(deg)                 # notability, log-scaled — dominant
+            if tl == ql:
+                s += 2.5                        # exact title match
+            elif tl.startswith(ql):
+                s += 1.0                        # title starts with the query
+            elif qword.search(tl):
+                s += 0.5                        # query is a whole word in the title
+            return s - fts_pos * 1e-4           # stable FTS-order tiebreak
+
+        ranked = sorted(
+            enumerate(rows), key=lambda t: -score(t[0], t[1][0], t[1][1])
+        )
+        return [{"id": r[0], "title": r[1]} for _, r in ranked[:limit]]
 
     def _titles(self, ids: list[int]) -> dict[int, str]:
         if not ids:
