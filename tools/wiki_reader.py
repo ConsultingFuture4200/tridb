@@ -170,10 +170,14 @@ def build_articles(conn: sqlite3.Connection, corpus: Path) -> int:
                     pass  # tolerate a truncated final line in a clobbered shard
                 off += ln
                 if len(batch) >= 50000:
-                    conn.executemany("INSERT OR IGNORE INTO articles VALUES (?,?,?,?)", batch)
+                    conn.executemany(
+                        "INSERT OR IGNORE INTO articles VALUES (?,?,?,?)", batch
+                    )
                     n += len(batch)
                     batch.clear()
-        print(f"[build] articles: shard {shard} ({name}) done, {n + len(batch)} rows so far")
+        print(
+            f"[build] articles: shard {shard} ({name}) done, {n + len(batch)} rows so far"
+        )
     if batch:
         conn.executemany("INSERT OR IGNORE INTO articles VALUES (?,?,?,?)", batch)
         n += len(batch)
@@ -216,8 +220,12 @@ def build_edge_csr(corpus: Path) -> None:
         if not path.exists() or path.stat().st_size == 0:
             continue
         df = pd.read_csv(
-            path, sep="\t", header=None, names=["src", "dst"],
-            dtype={"src": np.int32, "dst": np.int32}, engine="c",
+            path,
+            sep="\t",
+            header=None,
+            names=["src", "dst"],
+            dtype={"src": np.int32, "dst": np.int32},
+            engine="c",
         )
         srcs.append(df["src"].to_numpy())
         dsts.append(df["dst"].to_numpy())
@@ -230,7 +238,9 @@ def build_edge_csr(corpus: Path) -> None:
     dst_sorted = np.ascontiguousarray(dst[order])
     max_id = int(src_sorted[-1]) if len(src_sorted) else 0
     # off[i] = first index in src_sorted whose src == i (searchsorted left)
-    off = np.searchsorted(src_sorted, np.arange(max_id + 2), side="left").astype(np.int64)
+    off = np.searchsorted(src_sorted, np.arange(max_id + 2), side="left").astype(
+        np.int64
+    )
     np.save(corpus / CSR_DST_NAME, dst_sorted)
     np.save(corpus / CSR_OFF_NAME, off)
     print(f"[build] edges CSR: {len(dst_sorted)} edges, max src id {max_id}")
@@ -262,9 +272,9 @@ def build_undirected_csr(corpus: Path) -> None:
     u_sorted = u[order]
     v_sorted = np.ascontiguousarray(v[order])
     del u, v, order
-    new_off = np.searchsorted(
-        u_sorted, np.arange(max_id + 2), side="left"
-    ).astype(np.int64)
+    new_off = np.searchsorted(u_sorted, np.arange(max_id + 2), side="left").astype(
+        np.int64
+    )
     np.save(corpus / UNDIR_DST_NAME, v_sorted)
     np.save(corpus / UNDIR_OFF_NAME, new_off)
     mb = (
@@ -482,7 +492,9 @@ class Reader:
 
         print(f"[serve] memmapping {self.n}x{self.dim} vectors ...")
         self.vecs = np.memmap(
-            corpus / "emb" / "vectors.f32", dtype=np.float32, mode="r",
+            corpus / "emb" / "vectors.f32",
+            dtype=np.float32,
+            mode="r",
             shape=(self.n, self.dim),
         )
 
@@ -508,7 +520,9 @@ class Reader:
                     "SELECT name FROM sqlite_master WHERE type='table' AND name='redir'"
                 ).fetchone()
             )
-        print(f"[serve] redirect alias index: {'present' if self._has_redir else 'absent'}")
+        print(
+            f"[serve] redirect alias index: {'present' if self._has_redir else 'absent'}"
+        )
         with self.db_lock:
             self._has_cats = bool(
                 self.db.execute(
@@ -566,18 +580,16 @@ class Reader:
         def score(fts_pos: int, aid: int, title: str) -> float:
             tl = title.lower()
             deg = int(indeg[aid]) if aid < n_indeg else 0
-            s = math.log1p(deg)                 # notability, log-scaled — dominant
+            s = math.log1p(deg)  # notability, log-scaled — dominant
             if tl == ql:
-                s += 2.5                        # exact title match
+                s += 2.5  # exact title match
             elif tl.startswith(ql):
-                s += 1.0                        # title starts with the query
+                s += 1.0  # title starts with the query
             elif qword.search(tl):
-                s += 0.5                        # query is a whole word in the title
-            return s - fts_pos * 1e-4           # stable FTS-order tiebreak
+                s += 0.5  # query is a whole word in the title
+            return s - fts_pos * 1e-4  # stable FTS-order tiebreak
 
-        ranked = sorted(
-            enumerate(rows), key=lambda t: -score(t[0], t[1][0], t[1][1])
-        )
+        ranked = sorted(enumerate(rows), key=lambda t: -score(t[0], t[1][0], t[1][1]))
         return [{"id": r[0], "title": r[1]} for _, r in ranked[:limit]]
 
     def _titles(self, ids: list[int]) -> dict[int, str]:
@@ -900,7 +912,9 @@ class Reader:
                     if len(items) >= 2:  # conservative: only a real run becomes a list
                         flush()
                         parts.append(
-                            "<ul>" + "".join(f"<li>{link(it)}</li>" for it in items) + "</ul>"
+                            "<ul>"
+                            + "".join(f"<li>{link(it)}</li>" for it in items)
+                            + "</ul>"
                         )
                         i = j
                     else:
@@ -1115,9 +1129,16 @@ class Reader:
         cos_score = {d["id"]: d["score"] for d in sem}
 
         # -- graph-proximity ranking (1-hop then 2-hop by co-citation) --
-        direct_ids = [int(x) for x in self.csr_dst[
-            int(self.csr_off[aid]): int(self.csr_off[aid + 1])
-        ]] if aid + 1 < len(self.csr_off) else []
+        direct_ids = (
+            [
+                int(x)
+                for x in self.csr_dst[
+                    int(self.csr_off[aid]) : int(self.csr_off[aid + 1])
+                ]
+            ]
+            if aid + 1 < len(self.csr_off)
+            else []
+        )
         direct_set = set(direct_ids)
         cocite: Counter = Counter()
         cap_direct, cap_out = 300, 64  # bound the 2-hop fan-out
@@ -1166,14 +1187,16 @@ class Reader:
                 prov = "linked (1-hop)"
             else:
                 prov = "linked (2-hop)"
-            fused.append({
-                "id": i,
-                "title": titles[i],
-                "rrf": round(s, 5),
-                "prov": prov,
-                "cos": cos_score.get(i),  # cosine similarity if semantically ranked
-                "cocite": cocite.get(i) or None,  # 2-hop co-citation count if any
-            })
+            fused.append(
+                {
+                    "id": i,
+                    "title": titles[i],
+                    "rrf": round(s, 5),
+                    "prov": prov,
+                    "cos": cos_score.get(i),  # cosine similarity if semantically ranked
+                    "cocite": cocite.get(i) or None,  # 2-hop co-citation count if any
+                }
+            )
             if len(fused) >= k:
                 break
         return {
@@ -1359,7 +1382,12 @@ class Reader:
             }
             for a, s in cand
         ]
-        return {**base, "pre_count": pre_count, "post_count": len(cand), "results": results}
+        return {
+            **base,
+            "pre_count": pre_count,
+            "post_count": len(cand),
+            "results": results,
+        }
 
     def search_trimodal(
         self,
@@ -1391,8 +1419,14 @@ class Reader:
             },
         }
         if not q:
-            return {**base, "seed_count": 0, "expanded_count": 0,
-                    "pre_count": 0, "post_count": 0, "results": []}
+            return {
+                **base,
+                "seed_count": 0,
+                "expanded_count": 0,
+                "pre_count": 0,
+                "post_count": 0,
+                "results": [],
+            }
         qvec = self._embed_query(q)
         # (1) VECTOR seed
         with self.index_lock:
@@ -1417,11 +1451,17 @@ class Reader:
                     if x in seed_set:
                         continue
                     graph_hits[x] = graph_hits.get(x, 0) + 1
-        expanded_ids = [i for i, _ in sorted(graph_hits.items(), key=lambda t: -t[1])[:pool]]
+        expanded_ids = [
+            i for i, _ in sorted(graph_hits.items(), key=lambda t: -t[1])[:pool]
+        ]
         cand = list(dict.fromkeys(seed_ids + expanded_ids))  # de-dup, order-stable
         titles = self._titles(cand)
         cand = [a for a in cand if a in titles]
-        seed_count, expanded_count, pre_count = len(seed_ids), len(expanded_ids), len(cand)
+        seed_count, expanded_count, pre_count = (
+            len(seed_ids),
+            len(expanded_ids),
+            len(cand),
+        )
         # (3) RELATIONAL filter
         indeg = self._ensure_indeg()
         n_indeg = len(indeg)
@@ -1457,26 +1497,47 @@ class Reader:
             c = float(cos.get(a, 0.0))
             g = graph_hits.get(a, 0) / max_hits
             in_seed, in_graph = a in seed_set, a in graph_hits
-            prov = ("meaning + linked" if in_seed and in_graph
-                    else "meaning" if in_seed else "linked")
-            results.append({
-                "id": a, "title": titles[a],
-                "score": round(c + 0.25 * g, 4), "cos": round(c, 4),
-                "graph": graph_hits.get(a, 0), "indeg": deg(a),
-                "length": lengths.get(a), "prov": prov,
-            })
+            prov = (
+                "meaning + linked"
+                if in_seed and in_graph
+                else "meaning"
+                if in_seed
+                else "linked"
+            )
+            results.append(
+                {
+                    "id": a,
+                    "title": titles[a],
+                    "score": round(c + 0.25 * g, 4),
+                    "cos": round(c, 4),
+                    "graph": graph_hits.get(a, 0),
+                    "indeg": deg(a),
+                    "length": lengths.get(a),
+                    "prov": prov,
+                }
+            )
         results.sort(key=lambda r: (-r["score"], r["id"]))
-        cats_by = self._cats_for([r["id"] for r in results[:40]]) if self._has_cats else {}
+        cats_by = (
+            self._cats_for([r["id"] for r in results[:40]]) if self._has_cats else {}
+        )
         for r in results:
             r["cats"] = cats_by.get(r["id"], [])
-        return {**base, "seed_count": seed_count, "expanded_count": expanded_count,
-                "pre_count": pre_count, "post_count": len(results), "results": results}
+        return {
+            **base,
+            "seed_count": seed_count,
+            "expanded_count": expanded_count,
+            "pre_count": pre_count,
+            "post_count": len(results),
+            "results": results,
+        }
 
     def _llm_answer(self, q: str, passages: list[dict]) -> str:
         """Grounded generation via the local ollama HTTP API. The model is told to
         answer ONLY from the numbered passages and to cite them; num_ctx is set
         explicitly because ollama otherwise defaults to 2048 and would truncate."""
-        ctx = "\n\n".join(f"[{i + 1}] {p['title']}\n{p['body']}" for i, p in enumerate(passages))
+        ctx = "\n\n".join(
+            f"[{i + 1}] {p['title']}\n{p['body']}" for i, p in enumerate(passages)
+        )
         system = (
             "You answer questions using ONLY the provided Wikipedia passages. "
             "Cite the passage numbers you rely on inline, like [1] or [2]. "
@@ -1832,7 +1893,11 @@ class Reader:
             if art is None:
                 continue
             sources.append(
-                {"id": i, "title": art["title"], "text": art["body"][:ENRICH_SOURCE_CHARS]}
+                {
+                    "id": i,
+                    "title": art["title"],
+                    "text": art["body"][:ENRICH_SOURCE_CHARS],
+                }
             )
         raw = self._enrich_extract(target, sources) if sources else []
         by_src = {s["id"]: s for s in sources}
@@ -1928,21 +1993,87 @@ class Reader:
 
 
 _HTML_OK = {
-    "p", "div", "span", "section", "br", "hr", "b", "strong", "i", "em", "u", "s",
-    "small", "sub", "sup", "abbr", "cite", "q", "code", "pre", "blockquote", "kbd",
-    "h2", "h3", "h4", "h5", "h6", "ul", "ol", "li", "dl", "dt", "dd",
-    "table", "thead", "tbody", "tfoot", "tr", "td", "th", "caption", "colgroup", "col",
-    "figure", "figcaption", "img", "a",
+    "p",
+    "div",
+    "span",
+    "section",
+    "br",
+    "hr",
+    "b",
+    "strong",
+    "i",
+    "em",
+    "u",
+    "s",
+    "small",
+    "sub",
+    "sup",
+    "abbr",
+    "cite",
+    "q",
+    "code",
+    "pre",
+    "blockquote",
+    "kbd",
+    "h2",
+    "h3",
+    "h4",
+    "h5",
+    "h6",
+    "ul",
+    "ol",
+    "li",
+    "dl",
+    "dt",
+    "dd",
+    "table",
+    "thead",
+    "tbody",
+    "tfoot",
+    "tr",
+    "td",
+    "th",
+    "caption",
+    "colgroup",
+    "col",
+    "figure",
+    "figcaption",
+    "img",
+    "a",
 }
 _HTML_VOID = {"br", "hr", "col"}
 _HTML_DROP_BLOCK = {
-    "script", "style", "iframe", "object", "form", "noscript", "svg", "math",
-    "button", "select", "textarea", "audio", "video",
+    "script",
+    "style",
+    "iframe",
+    "object",
+    "form",
+    "noscript",
+    "svg",
+    "math",
+    "button",
+    "select",
+    "textarea",
+    "audio",
+    "video",
 }
 _HTML_DROP_VOID = {"input", "embed", "link", "meta", "source", "track"}
 _IMG_OK = re.compile(r"^(?:https?:)?//upload\.wikimedia\.org/")
-_NS_DROP = {"File", "Image", "Category", "Template", "Help", "Wikipedia",
-            "Portal", "Special", "Module", "Draft", "MediaWiki", "Talk", "User"}
+_NS_DROP = {
+    "File",
+    "Image",
+    "Category",
+    "Template",
+    "Help",
+    "Wikipedia",
+    "Portal",
+    "Special",
+    "Module",
+    "Draft",
+    "MediaWiki",
+    "Talk",
+    "User",
+}
 
 
 def _norm_title(t: str) -> str:
@@ -3090,7 +3221,9 @@ $('#to').addEventListener('keydown', e => { if(e.key==='Enter') connect(); });
 </body></html>"""
 
 
-MAX_BODY_BYTES = 64 * 1024  # cap mutating POST bodies (accept/dismiss payloads are small)
+MAX_BODY_BYTES = (
+    64 * 1024
+)  # cap mutating POST bodies (accept/dismiss payloads are small)
 
 
 def check_token(headers, expected: str) -> bool:
@@ -3140,9 +3273,13 @@ def make_handler(reader: Reader, token: str):
             path = u.path
             try:
                 if path == "/":
-                    self._send(200, LANDING_HTML.encode("utf-8"), "text/html; charset=utf-8")
+                    self._send(
+                        200, LANDING_HTML.encode("utf-8"), "text/html; charset=utf-8"
+                    )
                 elif path in ("/read", "/read/"):
-                    self._send(200, index_html.encode("utf-8"), "text/html; charset=utf-8")
+                    self._send(
+                        200, index_html.encode("utf-8"), "text/html; charset=utf-8"
+                    )
                 elif path == "/random":
                     r = reader.random_article()
                     self._json(r if r is not None else {"error": "no articles"})
@@ -3205,7 +3342,9 @@ def make_handler(reader: Reader, token: str):
                     else:
                         if art.get("html"):
                             try:
-                                art["body_html"] = reader.render_html_body(aid, art["html"])
+                                art["body_html"] = reader.render_html_body(
+                                    aid, art["html"]
+                                )
                             except Exception:
                                 art["body_html"] = reader.link_body(aid, art["body"])
                         else:
@@ -3225,7 +3364,10 @@ def make_handler(reader: Reader, token: str):
                 elif path.startswith("/related/"):
                     aid = int(path.split("/")[-1])
                     self._json(
-                        {"semantic": reader.semantic(aid), "hyperlinks": reader.hyperlinks(aid)}
+                        {
+                            "semantic": reader.semantic(aid),
+                            "hyperlinks": reader.hyperlinks(aid),
+                        }
                     )
                 elif path.startswith("/related_fused/"):
                     aid = int(path.split("/")[-1])
@@ -3235,11 +3377,14 @@ def make_handler(reader: Reader, token: str):
                     frm = reader.resolve(qs.get("from", [""])[0])
                     to = reader.resolve(qs.get("to", [""])[0])
                     if frm is None or to is None:
-                        self._json({
-                            "found": False,
-                            "reason": "could not resolve one or both articles",
-                            "from": frm, "to": to,
-                        })
+                        self._json(
+                            {
+                                "found": False,
+                                "reason": "could not resolve one or both articles",
+                                "from": frm,
+                                "to": to,
+                            }
+                        )
                     else:
                         res = reader.path(frm["id"], to["id"])
                         if res.get("found") and qs.get("narrate", ["0"])[0] == "1":

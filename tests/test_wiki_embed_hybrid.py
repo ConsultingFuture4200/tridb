@@ -45,7 +45,10 @@ def test_layout_cumulative_offsets(tmp_path):
     )
     layout, total = shard_file_layout(corpus)
     assert total == 5
-    assert layout == [("articles-00000.jsonl", 0, 3), ("articles-00001.jsonl", 3, 2)]
+    assert layout == [
+        ("articles-00000.jsonl", 0, 3, 0),
+        ("articles-00001.jsonl", 3, 2, 0),
+    ]
 
 
 def test_read_rows_spans_file_boundary(tmp_path):

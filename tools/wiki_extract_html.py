@@ -77,6 +77,7 @@ _MULTINL = re.compile(r"\n{3,}")
 # --- title / edge helpers (copied from tools.wiki_extract to stay stdlib-only; that
 # --- module imports mwparserfromhell at top level and we deliberately avoid the dep) --
 
+
 def normalize_title(title: str) -> str:
     """MediaWiki-faithful title key: strip, '_'->' ', collapse ws, upper-case first."""
     t = _WS.sub(" ", title.replace("_", " ")).strip()
@@ -127,34 +128,136 @@ def resolve_edge(
 
 _VOID = {"img", "br", "hr", "col", "wbr"}
 _ALLOWED = {
-    "h1", "h2", "h3", "h4", "h5", "h6", "p", "ul", "ol", "li", "dl", "dt", "dd",
-    "table", "thead", "tbody", "tfoot", "tr", "th", "td", "caption", "colgroup", "col",
-    "b", "strong", "i", "em", "blockquote", "figure", "figcaption", "img", "a",
-    "sup", "sub", "br", "hr", "abbr", "code", "pre", "cite", "span", "mark", "small",
-    "u", "s", "time", "ins", "del", "kbd", "samp", "var",
+    "h1",
+    "h2",
+    "h3",
+    "h4",
+    "h5",
+    "h6",
+    "p",
+    "ul",
+    "ol",
+    "li",
+    "dl",
+    "dt",
+    "dd",
+    "table",
+    "thead",
+    "tbody",
+    "tfoot",
+    "tr",
+    "th",
+    "td",
+    "caption",
+    "colgroup",
+    "col",
+    "b",
+    "strong",
+    "i",
+    "em",
+    "blockquote",
+    "figure",
+    "figcaption",
+    "img",
+    "a",
+    "sup",
+    "sub",
+    "br",
+    "hr",
+    "abbr",
+    "code",
+    "pre",
+    "cite",
+    "span",
+    "mark",
+    "small",
+    "u",
+    "s",
+    "time",
+    "ins",
+    "del",
+    "kbd",
+    "samp",
+    "var",
 }
 # Drop the element AND its subtree entirely.
 _DROP = {
-    "head", "script", "style", "link", "meta", "title", "base", "noscript",
-    "nav", "aside", "form", "button", "input", "iframe", "object", "embed",
-    "audio", "video", "map", "svg",
+    "head",
+    "script",
+    "style",
+    "link",
+    "meta",
+    "title",
+    "base",
+    "noscript",
+    "nav",
+    "aside",
+    "form",
+    "button",
+    "input",
+    "iframe",
+    "object",
+    "embed",
+    "audio",
+    "video",
+    "map",
+    "svg",
 }
 # Elements whose class marks them as chrome/maintenance cruft -> drop subtree.
 _CRUFT_CLASS = (
-    "mw-editsection", "navbox", "noprint", "ambox", "metadata", "mbox-",
-    "mw-empty-elt", "mw-indicators", "shortdescription", "printfooter",
-    "catlinks", "mw-jump-link", "vector-", "sistersitebox", "navbar",
+    "mw-editsection",
+    "navbox",
+    "noprint",
+    "ambox",
+    "metadata",
+    "mbox-",
+    "mw-empty-elt",
+    "mw-indicators",
+    "shortdescription",
+    "printfooter",
+    "catlinks",
+    "mw-jump-link",
+    "vector-",
+    "sistersitebox",
+    "navbar",
 )
 # Tags we preserve a (single) class attribute on — lets the reader style infoboxes,
 # wikitables and the references list without us keeping Parsoid's id/data-mw noise.
 _KEEP_CLASS = {
-    "table", "td", "th", "tr", "caption", "figure", "figcaption",
-    "span", "ol", "ul", "blockquote", "sup", "div",
+    "table",
+    "td",
+    "th",
+    "tr",
+    "caption",
+    "figure",
+    "figcaption",
+    "span",
+    "ol",
+    "ul",
+    "blockquote",
+    "sup",
+    "div",
 }
 # block tags that get a newline in the plain-text projection
 _TEXT_BLOCK = {
-    "p", "li", "tr", "h1", "h2", "h3", "h4", "h5", "h6", "blockquote",
-    "table", "caption", "figcaption", "dd", "dt", "div", "br", "hr",
+    "p",
+    "li",
+    "tr",
+    "h1",
+    "h2",
+    "h3",
+    "h4",
+    "h5",
+    "h6",
+    "blockquote",
+    "table",
+    "caption",
+    "figcaption",
+    "dd",
+    "dt",
+    "div",
+    "br",
+    "hr",
 }
 
 
@@ -268,6 +371,7 @@ def sanitize(html: str) -> tuple[str, str, list[str]]:
 
 # ------------------------------- dump streaming ----------------------------------------
 
+
 def _iter_members(
     source: Path, warnings: list | None = None
 ) -> Iterator[tuple[int, str, "tarfile.ExFileObject | None"]]:
@@ -340,6 +444,7 @@ def _is_ns0_article(obj: dict) -> bool:
 
 
 # ------------------------------------ passes -------------------------------------------
+
 
 def load_redirects(path: Path | None) -> dict[str, str]:
     """Load a source_title\\ttarget_title redirects.tsv into a normalized dict."""
@@ -440,9 +545,11 @@ def second_pass(
         ep = out / f"edges-{idx:05d}.tsv"
         cp = out / f"categories-{idx:05d}.tsv"
         arows = erows = crows = 0
-        with ap.open("w", encoding="utf-8") as af, \
-             ep.open("w", encoding="utf-8") as ef, \
-             cp.open("w", encoding="utf-8") as cf:
+        with (
+            ap.open("w", encoding="utf-8") as af,
+            ep.open("w", encoding="utf-8") as ef,
+            cp.open("w", encoding="utf-8") as cf,
+        ):
             for obj in _iter_json_lines(fh, warnings):
                 if not _is_ns0_article(obj):
                     continue
@@ -467,31 +574,45 @@ def second_pass(
                     if ck:
                         cf.write(f"{aid}\t{_copy_text_escape(ck)}\n")
                         crows += 1
-                af.write(json.dumps(
-                    {
-                        "id": aid,
-                        "title": title,
-                        "html": html_frag,
-                        "text": text,
-                        "ts": obj.get("date_modified", "") or "",
-                    },
-                    ensure_ascii=False,
-                ) + "\n")
+                af.write(
+                    json.dumps(
+                        {
+                            "id": aid,
+                            "title": title,
+                            "html": html_frag,
+                            "text": text,
+                            "ts": obj.get("date_modified", "") or "",
+                        },
+                        ensure_ascii=False,
+                    )
+                    + "\n"
+                )
                 arows += 1
                 emitted_total += 1
                 if max_articles is not None and emitted_total >= max_articles:
                     break
-        member_complete = not (max_articles is not None and emitted_total >= max_articles)
+        member_complete = not (
+            max_articles is not None and emitted_total >= max_articles
+        )
         if member_complete:
             ckpt["members"][key] = {
-                "name": name, "articles": arows, "edges": erows, "categories": crows,
+                "name": name,
+                "articles": arows,
+                "edges": erows,
+                "categories": crows,
             }
             _save_checkpoint(work, ckpt)
         if max_articles is not None and emitted_total >= max_articles:
             # partial member on a sliced/test run: still surface its counts for manifest
-            ckpt["members"].setdefault(key, {
-                "name": name, "articles": arows, "edges": erows, "categories": crows,
-            })
+            ckpt["members"].setdefault(
+                key,
+                {
+                    "name": name,
+                    "articles": arows,
+                    "edges": erows,
+                    "categories": crows,
+                },
+            )
             break
 
     ckpt["source_truncated"] = "truncated" in warnings
@@ -519,12 +640,17 @@ def build_manifest(
 ) -> dict:
     """Assemble manifest.json: provenance + per-shard schema (from the checkpoint)."""
     members = sorted(ckpt["members"].items(), key=lambda kv: int(kv[0]))
-    art_files = [{"path": f"articles-{int(k):05d}.jsonl", "rows": v["articles"]}
-                 for k, v in members]
-    edge_files = [{"path": f"edges-{int(k):05d}.tsv", "rows": v["edges"]}
-                  for k, v in members]
-    cat_files = [{"path": f"categories-{int(k):05d}.tsv", "rows": v["categories"]}
-                 for k, v in members]
+    art_files = [
+        {"path": f"articles-{int(k):05d}.jsonl", "rows": v["articles"]}
+        for k, v in members
+    ]
+    edge_files = [
+        {"path": f"edges-{int(k):05d}.tsv", "rows": v["edges"]} for k, v in members
+    ]
+    cat_files = [
+        {"path": f"categories-{int(k):05d}.tsv", "rows": v["categories"]}
+        for k, v in members
+    ]
     n_art = sum(f["rows"] for f in art_files)
     n_edge = sum(f["rows"] for f in edge_files)
     n_cat = sum(f["rows"] for f in cat_files)
@@ -546,8 +672,9 @@ def build_manifest(
         "redirects_note": (
             "Enterprise HTML has no redirect pages/field; this map was reused from the "
             "wikitext-derived redirects.tsv to resolve link targets. Without it, links "
-            "to redirect titles drop." if redirects_src else
-            "NO redirect map supplied: links whose target is a redirect are dropped."
+            "to redirect titles drop."
+            if redirects_src
+            else "NO redirect map supplied: links whose target is a redirect are dropped."
         ),
         "max_articles": max_articles,
         "source_truncated": bool(ckpt.get("source_truncated")),
@@ -603,7 +730,9 @@ def extract(
     title_to_id = first_pass(source, work, max_articles)
     ckpt = second_pass(source, out, work, title_to_id, redirects, max_articles)
     redirect_shard = write_redirects(out, redirects)
-    manifest = build_manifest(source, max_articles, redirects_path, ckpt, redirect_shard)
+    manifest = build_manifest(
+        source, max_articles, redirects_path, ckpt, redirect_shard
+    )
     (out / "manifest.json").write_text(
         json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
     )
@@ -616,21 +745,29 @@ def main(argv: list[str] | None = None) -> int:
         "preserving, resumable corpus (structural HTML + plain-text fallback)."
     )
     ap.add_argument(
-        "--source", type=Path, required=True,
+        "--source",
+        type=Path,
+        required=True,
         help="enwiki-NS0-<DATE>-ENTERPRISE-HTML.json.tar.gz (streamed, never RAM-loaded)",
     )
     ap.add_argument("--out", type=Path, required=True, help="output corpus directory")
     ap.add_argument(
-        "--redirects", type=Path, default=None,
+        "--redirects",
+        type=Path,
+        default=None,
         help="reuse a source->target redirects.tsv for edge resolution "
         "(Enterprise HTML has none of its own)",
     )
     ap.add_argument(
-        "--max-articles", type=int, default=None,
+        "--max-articles",
+        type=int,
+        default=None,
         help="bound work: index+emit only the first N ns0 articles (slice/testing)",
     )
     ap.add_argument(
-        "--work", type=Path, default=None,
+        "--work",
+        type=Path,
+        default=None,
         help="scratch dir for pass-1 map + resume checkpoint (default <out>/_work)",
     )
     args = ap.parse_args(argv)

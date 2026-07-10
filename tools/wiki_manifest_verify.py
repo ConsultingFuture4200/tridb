@@ -67,16 +67,21 @@ def verify(corpus: Path, manifest: dict) -> tuple[bool, list[str]]:
         for name, n in files:
             c = claimed.get(name)
             if c is not None and c != n:
-                report.append(f"    {name}: real={n:,} manifest_claimed={c:,} (CLOBBERED)")
+                report.append(
+                    f"    {name}: real={n:,} manifest_claimed={c:,} (CLOBBERED)"
+                )
     return ok, report
 
 
 def rebuild(corpus: Path, manifest: dict, shard_size: int = 100000) -> dict:
     real = scan(corpus)
     out = dict(manifest)
-    out.setdefault("extractor_claimed", {
-        "counts": dict(manifest.get("counts", {})),
-    })
+    out.setdefault(
+        "extractor_claimed",
+        {
+            "counts": dict(manifest.get("counts", {})),
+        },
+    )
     shards = dict(manifest.get("shards", {}))
     counts = dict(manifest.get("counts", {}))
     for kind, files in real.items():
@@ -99,7 +104,9 @@ def rebuild(corpus: Path, manifest: dict, shard_size: int = 100000) -> dict:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--corpus", required=True, help="corpus dir containing manifest.json")
+    ap.add_argument(
+        "--corpus", required=True, help="corpus dir containing manifest.json"
+    )
     ap.add_argument("--rebuild", action="store_true", help="write a corrected manifest")
     args = ap.parse_args()
 

@@ -70,10 +70,20 @@ _INFOBOX_TABLE = re.compile(r"\binfobox")  # class token on a <table>: "infobox[
 # Cross-referencing is RESTRICTED to these — asymmetric properties (party, employer,
 # occupation, parent/child, ...) would emit a garbage reciprocal for every link, so we
 # never suggest them. Confidence 0.85 (mechanical, exact-link, pending review).
-_RECIPROCAL_PROPS = frozenset({
-    "spouse", "spouse(s)", "sibling", "siblings", "sibling(s)",
-    "partner", "partner(s)", "relative", "relatives", "domestic partner",
-})
+_RECIPROCAL_PROPS = frozenset(
+    {
+        "spouse",
+        "spouse(s)",
+        "sibling",
+        "siblings",
+        "sibling(s)",
+        "partner",
+        "partner(s)",
+        "relative",
+        "relatives",
+        "domestic partner",
+    }
+)
 _RECIPROCAL_CONF = 0.85
 
 _MAX_PROP_LEN = 60
@@ -81,6 +91,7 @@ _MAX_VALUE_LEN = 1000
 
 
 # --------------------------------- infobox parsing -------------------------------------
+
 
 class _InfoboxParser(HTMLParser):
     """Extract (label, value_text, value_link_titles) rows from every infobox table.
@@ -110,7 +121,12 @@ class _InfoboxParser(HTMLParser):
         if tag == "tr":
             self._row = []
         elif tag in ("th", "td") and self._row is not None:
-            self._cell = {"tag": tag, "class": d.get("class", ""), "text": [], "links": []}
+            self._cell = {
+                "tag": tag,
+                "class": d.get("class", ""),
+                "text": [],
+                "links": [],
+            }
         elif tag == "a" and self._cell is not None:
             t = d.get("data-wiki-title")
             if t:
@@ -166,8 +182,7 @@ def parse_infobox_facts(html: str) -> Iterator[tuple[str, str, list[str]]]:
         pass  # malformed tail: keep whatever rows were completed
     for row in p.rows:
         label_idx = next(
-            (i for i, c in enumerate(row)
-             if c["tag"] == "th" or "label" in c["class"]),
+            (i for i, c in enumerate(row) if c["tag"] == "th" or "label" in c["class"]),
             None,
         )
         if label_idx is None:
@@ -176,7 +191,8 @@ def parse_infobox_facts(html: str) -> Iterator[tuple[str, str, list[str]]]:
         if not prop:
             continue
         vcells = [
-            c for j, c in enumerate(row)
+            c
+            for j, c in enumerate(row)
             if j != label_idx and (c["tag"] == "td" or "data" in c["class"])
         ]
         if not vcells:
@@ -189,6 +205,7 @@ def parse_infobox_facts(html: str) -> Iterator[tuple[str, str, list[str]]]:
 
 
 # ------------------------------------- storage -----------------------------------------
+
 
 def _connect(overlay: Path) -> sqlite3.Connection:
     overlay.parent.mkdir(parents=True, exist_ok=True)
@@ -257,7 +274,9 @@ def _shard_index(name: str) -> int:
     return int(m.group(1)) if m else -1
 
 
-def process_shard(conn: sqlite3.Connection, shard_path: Path, shard: int) -> tuple[int, int, int]:
+def process_shard(
+    conn: sqlite3.Connection, shard_path: Path, shard: int
+) -> tuple[int, int, int]:
     """Parse one article shard into infobox_facts / article_titles / value_links.
 
     Idempotent: clears this shard's own rows first (a crashed prior attempt), then
@@ -277,17 +296,23 @@ def process_shard(conn: sqlite3.Connection, shard_path: Path, shard: int) -> tup
         if titles:
             conn.executemany(
                 "INSERT OR REPLACE INTO article_titles(id,title,norm_title,shard) "
-                "VALUES (?,?,?,?)", titles)
+                "VALUES (?,?,?,?)",
+                titles,
+            )
             titles.clear()
         if facts:
             conn.executemany(
                 "INSERT INTO infobox_facts(subject_id,property,value,shard) "
-                "VALUES (?,?,?,?)", facts)
+                "VALUES (?,?,?,?)",
+                facts,
+            )
             facts.clear()
         if vlinks:
             conn.executemany(
                 "INSERT INTO value_links(target_norm,property,source_id,shard) "
-                "VALUES (?,?,?,?)", vlinks)
+                "VALUES (?,?,?,?)",
+                vlinks,
+            )
             vlinks.clear()
 
     for obj in _iter_articles(shard_path):
@@ -314,7 +339,10 @@ def process_shard(conn: sqlite3.Connection, shard_path: Path, shard: int) -> tup
     flush()
     conn.execute(
         "INSERT OR REPLACE INTO enrich_meta(key,value) VALUES (?,?)",
-        (f"shard:{shard}", json.dumps({"articles": n_art, "facts": n_fact, "value_links": n_vl})),
+        (
+            f"shard:{shard}",
+            json.dumps({"articles": n_art, "facts": n_fact, "value_links": n_vl}),
+        ),
     )
     conn.commit()
     return n_art, n_fact, n_vl
@@ -331,7 +359,8 @@ def build_suggestions(conn: sqlite3.Connection) -> int:
     conn.execute("CREATE INDEX IF NOT EXISTS ix_at_norm ON article_titles(norm_title)")
     conn.execute("CREATE INDEX IF NOT EXISTS ix_vl_target ON value_links(target_norm)")
     conn.execute(
-        "CREATE INDEX IF NOT EXISTS ix_if_subj_prop ON infobox_facts(subject_id,property)")
+        "CREATE INDEX IF NOT EXISTS ix_if_subj_prop ON infobox_facts(subject_id,property)"
+    )
     conn.execute("DELETE FROM attr_suggestions")
     conn.execute(
         """
@@ -350,12 +379,14 @@ def build_suggestions(conn: sqlite3.Connection) -> int:
         (_RECIPROCAL_CONF, *sorted(_RECIPROCAL_PROPS)),
     )
     conn.execute(
-        "INSERT OR REPLACE INTO enrich_meta(key,value) VALUES ('phaseB','done')")
+        "INSERT OR REPLACE INTO enrich_meta(key,value) VALUES ('phaseB','done')"
+    )
     conn.commit()
     return conn.execute("SELECT COUNT(*) FROM attr_suggestions").fetchone()[0]
 
 
 # --------------------------------------- main ------------------------------------------
+
 
 def run(corpus: Path, overlay: Path, sentinel: Path | None, log) -> dict:
     shards = sorted(corpus.glob("articles-*.jsonl"), key=lambda p: _shard_index(p.name))
@@ -375,15 +406,18 @@ def run(corpus: Path, overlay: Path, sentinel: Path | None, log) -> dict:
         tot_vl += v
         done += 1
         log(f"  shard {shard:05d}: {a} articles, {f} infobox facts, {v} value-links")
-    log(f"phase A done: {done} shards processed, {skipped} already-done; "
-        f"{tot_fact} facts, {tot_vl} value-links over {tot_art} articles")
+    log(
+        f"phase A done: {done} shards processed, {skipped} already-done; "
+        f"{tot_fact} facts, {tot_vl} value-links over {tot_art} articles"
+    )
 
     log("phase B: computing infobox attribute-gap suggestions")
     n_sugg = build_suggestions(conn)
 
     n_facts = conn.execute("SELECT COUNT(*) FROM infobox_facts").fetchone()[0]
     n_subj = conn.execute(
-        "SELECT COUNT(DISTINCT subject_id) FROM infobox_facts").fetchone()[0]
+        "SELECT COUNT(DISTINCT subject_id) FROM infobox_facts"
+    ).fetchone()[0]
     n_art_tot = conn.execute("SELECT COUNT(*) FROM article_titles").fetchone()[0]
     conn.close()
     dur = round(time.time() - t0, 1)
@@ -401,11 +435,14 @@ def run(corpus: Path, overlay: Path, sentinel: Path | None, log) -> dict:
         "duration_s": dur,
         "time": time.strftime("%Y-%m-%d %H:%M:%S"),
     }
-    log(f"=== enrichment DONE: {n_facts} infobox facts over {n_subj} subjects, "
-        f"{n_sugg} attr-gap suggestions in {dur}s ===")
+    log(
+        f"=== enrichment DONE: {n_facts} infobox facts over {n_subj} subjects, "
+        f"{n_sugg} attr-gap suggestions in {dur}s ==="
+    )
     if sentinel is not None:
         sentinel.write_text(
-            "".join(f"{k}={v}\n" for k, v in summary.items()), encoding="utf-8")
+            "".join(f"{k}={v}\n" for k, v in summary.items()), encoding="utf-8"
+        )
         log(f"sentinel written: {sentinel}")
     return summary
 
@@ -413,13 +450,26 @@ def run(corpus: Path, overlay: Path, sentinel: Path | None, log) -> dict:
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(
         description="Batch infobox structured-facts KB + mechanical attribute-gap "
-        "suggestions over the enwiki_html re-extract corpus (no LLM).")
-    ap.add_argument("--corpus", type=Path, required=True,
-                    help="re-extract corpus dir (data/wiki/enwiki_html) with articles-*.jsonl")
-    ap.add_argument("--overlay", type=Path, required=True,
-                    help="shared overlay sqlite DB (data/wiki/enrich_overlay.db)")
-    ap.add_argument("--sentinel", type=Path, default=None,
-                    help="completion sentinel to write with counts (e.g. /tmp/wiki_enrich.done)")
+        "suggestions over the enwiki_html re-extract corpus (no LLM)."
+    )
+    ap.add_argument(
+        "--corpus",
+        type=Path,
+        required=True,
+        help="re-extract corpus dir (data/wiki/enwiki_html) with articles-*.jsonl",
+    )
+    ap.add_argument(
+        "--overlay",
+        type=Path,
+        required=True,
+        help="shared overlay sqlite DB (data/wiki/enrich_overlay.db)",
+    )
+    ap.add_argument(
+        "--sentinel",
+        type=Path,
+        default=None,
+        help="completion sentinel to write with counts (e.g. /tmp/wiki_enrich.done)",
+    )
     args = ap.parse_args(argv)
 
     def log(msg: str) -> None:

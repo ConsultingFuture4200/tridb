@@ -56,7 +56,7 @@ def measure_tridb(port, table, emb, qids, grid, *, k, runs, host="localhost"):
     cur = conn.cursor()
     cur.execute("SET enable_seqscan = off;")
     out: dict[str, dict] = {}
-    for (ms, hops, tc, cap) in grid:
+    for ms, hops, tc, cap in grid:
         tag = f"m{ms}h{hops}t{tc}c{cap}"
         cur.execute(f"SET vectordb.tjs_open_max_examined = {cap};")
         per: dict[int, dict] = {}
@@ -77,7 +77,9 @@ def measure_tridb(port, table, emb, qids, grid, *, k, runs, host="localhost"):
                 return [int(r[0]) for r in rows], dt
 
             top, _ = one()  # warm-up (also the graded id set)
-            cur.execute("SELECT tjs_open_candidates_examined(), tjs_open_bridges_injected();")
+            cur.execute(
+                "SELECT tjs_open_candidates_examined(), tjs_open_bridges_injected();"
+            )
             ex, br = cur.fetchone()
             times = []
             for _ in range(runs):
@@ -105,9 +107,12 @@ def measure_baseline(cfg, emb, qids, grid, *, k, runs, id_cap, efs, vector_only=
 
     def milvus_seed(qv, seeds, ef):
         res = col.search(
-            [qv.tolist()], "embedding",
+            [qv.tolist()],
+            "embedding",
             {"metric_type": cfg.milvus_metric, "params": {"ef": ef}},
-            limit=seeds, output_fields=["id"], expr=expr,
+            limit=seeds,
+            output_fields=["id"],
+            expr=expr,
         )
         return [int(h.id) for h in res[0]]
 
@@ -115,7 +120,11 @@ def measure_baseline(cfg, emb, qids, grid, *, k, runs, id_cap, efs, vector_only=
         # NB: the wiki loader stores Article.id as a STRING property, so seeds must be matched
         # as strings and the id-cap must toInteger() the property — an int `a.id IN $ids` or a
         # numeric `n.id < cap` silently matches NOTHING (empty graph leg => fabricated result).
-        capf = f" AND all(n IN nodes(p) WHERE toInteger(n.id) < {id_cap})" if id_cap else ""
+        capf = (
+            f" AND all(n IN nodes(p) WHERE toInteger(n.id) < {id_cap})"
+            if id_cap
+            else ""
+        )
         cy = (
             f"MATCH p=(a:{cfg.neo4j_node_label})-[:{cfg.neo4j_rel}*1..{hops}]->"
             f"(b:{cfg.neo4j_node_label}) WHERE a.id IN $ids{capf} RETURN DISTINCT b.id AS id"
@@ -133,7 +142,7 @@ def measure_baseline(cfg, emb, qids, grid, *, k, runs, id_cap, efs, vector_only=
         return [int(r[0]) for r in curpg.fetchall()]
 
     out: dict[str, dict] = {}
-    for (seeds, hops) in grid:
+    for seeds, hops in grid:
         for ef in efs:
             tag = f"m{seeds}h{hops}e{ef}"
             per: dict[int, dict] = {}
@@ -229,6 +238,7 @@ def main(argv=None):
     args = ap.parse_args(argv)
 
     import os
+
     os.environ["WH_N"] = str(args.n)
     cfg = Cfg()
     emb = load_emb(cfg)
@@ -236,54 +246,93 @@ def main(argv=None):
 
     if args.vector_only:
         adj = {}
-        oracle = compute_oracle(emb, adj, qids, k=args.k, m_seeds=max(200, args.k), hops=0)
-        tridb_grid = [(ms, 0, 64, cap) for ms in (10, 20, 40, 80)
-                      for cap in (256, 1024, 4000, 16000)]
+        oracle = compute_oracle(
+            emb, adj, qids, k=args.k, m_seeds=max(200, args.k), hops=0
+        )
+        tridb_grid = [
+            (ms, 0, 64, cap)
+            for ms in (10, 20, 40, 80)
+            for cap in (256, 1024, 4000, 16000)
+        ]
         base_grid = [(args.k, 0)]
         efs = [16, 32, 64, 128, 256]
         oracle_meta = {"m_seeds": max(200, args.k), "hops": 0}
     else:
         adj = load_induced_adj(cfg)
         oracle = compute_oracle(emb, adj, qids, k=args.k, m_seeds=16, hops=2)
-        tridb_grid = [(ms, h, 64, cap) for ms in (8, 16) for h in (1, 2)
-                      for cap in (128, 256, 512, 1024, 2048, 4000)]
+        tridb_grid = [
+            (ms, h, 64, cap)
+            for ms in (8, 16)
+            for h in (1, 2)
+            for cap in (128, 256, 512, 1024, 2048, 4000)
+        ]
         base_grid = [(4, 1), (8, 1), (8, 2), (16, 2)]
         efs = [32, 64, 128, 256]
         oracle_meta = {"m_seeds": 16, "hops": 2}
 
     induced_edges = sum(len(v) for v in adj.values())
-    print(f"[run {args.point}] N={args.n} q={len(qids)} induced_edges={induced_edges} "
-          f"tridb_combos={len(tridb_grid)}", flush=True)
+    print(
+        f"[run {args.point}] N={args.n} q={len(qids)} induced_edges={induced_edges} "
+        f"tridb_combos={len(tridb_grid)}",
+        flush=True,
+    )
 
     t0 = time.time()
-    tridb_raw = measure_tridb(args.engine_port, "articles", emb, qids, tridb_grid,
-                              k=args.k, runs=args.runs, host=args.engine_host)
-    print(f"[run] tridb measured {time.time()-t0:.1f}s", flush=True)
+    tridb_raw = measure_tridb(
+        args.engine_port,
+        "articles",
+        emb,
+        qids,
+        tridb_grid,
+        k=args.k,
+        runs=args.runs,
+        host=args.engine_host,
+    )
+    print(f"[run] tridb measured {time.time() - t0:.1f}s", flush=True)
     t0 = time.time()
-    base_raw = measure_baseline(cfg, emb, qids, base_grid, k=args.k, runs=args.runs,
-                                id_cap=args.id_cap, efs=efs, vector_only=args.vector_only)
-    print(f"[run] baseline measured {time.time()-t0:.1f}s", flush=True)
+    base_raw = measure_baseline(
+        cfg,
+        emb,
+        qids,
+        base_grid,
+        k=args.k,
+        runs=args.runs,
+        id_cap=args.id_cap,
+        efs=efs,
+        vector_only=args.vector_only,
+    )
+    print(f"[run] baseline measured {time.time() - t0:.1f}s", flush=True)
 
     tridb_curve = grade(tridb_raw, oracle, args.k, has_examined=True)
     base_curve = grade(base_raw, oracle, args.k, has_examined=False)
     mp = matched_point(tridb_curve, base_curve, eps=args.eps)
 
     result = {
-        "point": args.point, "n": args.n, "dim": cfg.dim, "k": args.k,
-        "queries": len(qids), "induced_edges": induced_edges,
-        "vector_only": args.vector_only, "eps": args.eps,
+        "point": args.point,
+        "n": args.n,
+        "dim": cfg.dim,
+        "k": args.k,
+        "queries": len(qids),
+        "induced_edges": induced_edges,
+        "vector_only": args.vector_only,
+        "eps": args.eps,
         "oracle_meta": oracle_meta,
-        "tridb_curve": tridb_curve, "baseline_curve": base_curve,
+        "tridb_curve": tridb_curve,
+        "baseline_curve": base_curve,
     }
     if mp:
         tt, tr, bt, br = mp
         result["matched"] = {
             "recall": round(min(tr["recall_at_k"], br["recall_at_k"]), 4),
-            "tridb_combo": tt, "tridb_recall": round(tr["recall_at_k"], 4),
-            "tridb_p50_ms": round(tr["p50_ms"], 3), "tridb_p95_ms": round(tr["p95_ms"], 3),
+            "tridb_combo": tt,
+            "tridb_recall": round(tr["recall_at_k"], 4),
+            "tridb_p50_ms": round(tr["p50_ms"], 3),
+            "tridb_p95_ms": round(tr["p95_ms"], 3),
             "tridb_examined": tr["median_examined"],
-            "baseline_combo": bt, "baseline_recall": round(br["recall_at_k"], 4),
-            "baseline_p50_ms": round(br["p50_ms"], 3), "baseline_p95_ms": round(br["p95_ms"], 3),
+            "baseline_combo": bt,
+            "baseline_recall": round(br["recall_at_k"], 4),
+            "baseline_p50_ms": round(br["p50_ms"], 3),
+            "baseline_p95_ms": round(br["p95_ms"], 3),
         }
     Path(args.out_prefix).parent.mkdir(parents=True, exist_ok=True)
     Path(args.out_prefix + ".json").write_text(json.dumps(result, indent=2))

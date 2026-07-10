@@ -51,7 +51,7 @@ import os
 import re
 import statistics
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -145,8 +145,7 @@ def load_induced_adj(cfg: Cfg) -> dict[int, list[int]]:
     edge — the rest would rescan the 224M-edge corpus for nothing."""
     manifest = json.loads((cfg.manifest_dir / "manifest.json").read_text())
     shard_size = (
-        manifest.get("shard_size")
-        or manifest["shards"]["articles"]["files"][0]["rows"]
+        manifest.get("shard_size") or manifest["shards"]["articles"]["files"][0]["rows"]
     )
     max_shard = (cfg.n - 1) // shard_size
     adj: dict[int, list[int]] = {}
@@ -290,7 +289,9 @@ def emit_tridb_sql(
     w = out.append
     w("\\set ON_ERROR_STOP on")
     w("\\pset pager off")
-    w("SET enable_seqscan = off;  -- NB: does NOT force HNSW here; gate on EXAMINED>0 (see docstring)")
+    w(
+        "SET enable_seqscan = off;  -- NB: does NOT force HNSW here; gate on EXAMINED>0 (see docstring)"
+    )
     # TRIDB DEV-1354 — TR-1 SAFETY bound, disclosed and NOT swept (reviewer finding: the cap is not a
     # validated recall/latency tunable). A point whose examined reaches this ceiling is a truncated
     # (censored) drain — the report gate flags median examined >= cap CENSORED and excludes it.
@@ -302,7 +303,7 @@ def emit_tridb_sql(
     for qid in qids:
         qv = _vec_lit(emb[qid])
         expr = f"'embedding <-> ''{qv}'''"
-        for (ms, hops, tc) in grid:
+        for ms, hops, tc in grid:
             tag = combo_tag(ms, hops, tc)
             call = (
                 f"SELECT t.id FROM tjs_open('{cfg.engine_table}', {k}, {tc}, {ms}, {hops}, "
@@ -335,7 +336,9 @@ def parse_tridb(raw: str) -> dict[tuple[int, str], dict]:
         mi = _IDS.search(line)
         if mi:
             cur = (int(mi[1]), mi[2])
-            res.setdefault(cur, {"ids": [], "times": [], "examined": None, "bridges": None})
+            res.setdefault(
+                cur, {"ids": [], "times": [], "examined": None, "bridges": None}
+            )
             in_ids = True
             continue
         if line.startswith("\\echo") or "#WH ENDIDS" in line:
@@ -343,7 +346,9 @@ def parse_tridb(raw: str) -> dict[tuple[int, str], dict]:
         me = _EX.search(line)
         if me:
             key = (int(me[1]), me[2])
-            d = res.setdefault(key, {"ids": [], "times": [], "examined": None, "bridges": None})
+            d = res.setdefault(
+                key, {"ids": [], "times": [], "examined": None, "bridges": None}
+            )
             d["examined"] = int(me[3])
             d["bridges"] = int(me[4])
             in_ids = False
@@ -398,7 +403,9 @@ def run_baseline(
     """Sweep (ef, seeds, hops) live across the three stores. grid is [(seeds, hops), ...];
     Milvus ef swept via WH_BASELINE_EFS. Returns {"m{seeds}h{hops}e{ef}": {qid: {...}}}."""
     col, driver, pg = _connect_baseline(cfg)
-    efs = [int(x) for x in os.environ.get("WH_BASELINE_EFS", "32,64,128,256").split(",")]
+    efs = [
+        int(x) for x in os.environ.get("WH_BASELINE_EFS", "32,64,128,256").split(",")
+    ]
     cur = pg.cursor()
 
     def milvus_seed(qv, seeds, ef):
@@ -434,7 +441,7 @@ def run_baseline(
         return [int(r[0]) for r in cur.fetchall()]
 
     out: dict[str, dict] = {}
-    for (seeds, hops) in grid:
+    for seeds, hops in grid:
         for ef in efs:
             tag = f"m{seeds}h{hops}e{ef}"
             per: dict[int, dict] = {}
@@ -451,10 +458,7 @@ def run_baseline(
                         top = pg_rerank(qv, reach, k)
                     else:
                         cand = np.fromiter(reach, dtype=np.int64, count=len(reach))
-                        top = [
-                            int(x)
-                            for x in cand[np.argsort(-(emb[cand] @ qv))][:k]
-                        ]
+                        top = [int(x) for x in cand[np.argsort(-(emb[cand] @ qv))][:k]]
                     t3 = time.perf_counter()
                     return top, (
                         (t1 - t0) * 1e3,
@@ -504,8 +508,12 @@ def grade_tridb(parsed: dict, oracle: dict, k: int) -> dict[str, dict]:
     return {
         tag: {
             "recall_at_k": float(np.mean(c["recall"])) if c["recall"] else float("nan"),
-            "median_latency_ms": float(np.median(c["latency"])) if c["latency"] else float("nan"),
-            "median_examined": float(np.median(c["examined"])) if c["examined"] else float("nan"),
+            "median_latency_ms": float(np.median(c["latency"]))
+            if c["latency"]
+            else float("nan"),
+            "median_examined": float(np.median(c["examined"]))
+            if c["examined"]
+            else float("nan"),
             "n_queries": len(c["recall"]),
         }
         for tag, c in by_combo.items()
@@ -726,7 +734,9 @@ def render_md(
     w("")
     w(f"## TriDB fused `tjs_open` — recall curve (warm, median of runs), N={cfg.n:,}")
     w("")
-    w("| combo (m_seeds/hops/term_cond) | recall@k | latency (ms) | candidates examined (SM-3) |")
+    w(
+        "| combo (m_seeds/hops/term_cond) | recall@k | latency (ms) | candidates examined (SM-3) |"
+    )
     w("|---|---:|---:|---:|")
     for tag, c in sorted(tridb.items(), key=lambda kv: kv[1]["recall_at_k"]):
         w(
@@ -814,7 +824,9 @@ def _grid_env(name: str, default):
 
 
 def main(argv: list[str] | None = None) -> int:
-    ap = argparse.ArgumentParser(description="Matched wiki tjs_open vs multi-store h2h.")
+    ap = argparse.ArgumentParser(
+        description="Matched wiki tjs_open vs multi-store h2h."
+    )
     sub = ap.add_subparsers(dest="cmd", required=True)
     for name in ("oracle", "tridb-emit", "baseline", "report"):
         p = sub.add_parser(name)
@@ -825,11 +837,19 @@ def main(argv: list[str] | None = None) -> int:
         p.add_argument("--oracle-hops", type=int, default=2)
         p.add_argument("--runs", type=int, default=3)
         p.add_argument("--target", type=float, default=0.90)
-        p.add_argument("--oracle", type=Path, default=Path("bench/results/wiki_h2h_oracle.json"))
+        p.add_argument(
+            "--oracle", type=Path, default=Path("bench/results/wiki_h2h_oracle.json")
+        )
         p.add_argument("--tridb-raw", type=Path)
-        p.add_argument("--baseline", type=Path, default=Path("bench/results/wiki_h2h_baseline.json"))
+        p.add_argument(
+            "--baseline",
+            type=Path,
+            default=Path("bench/results/wiki_h2h_baseline.json"),
+        )
         p.add_argument("--out", type=Path)
-        p.add_argument("--md-out", type=Path, default=Path("bench/results/wiki_h2h_report.md"))
+        p.add_argument(
+            "--md-out", type=Path, default=Path("bench/results/wiki_h2h_report.md")
+        )
         p.add_argument("--no-pg-rerank", action="store_true")
     args = ap.parse_args(argv)
     cfg = Cfg()
@@ -887,12 +907,22 @@ def main(argv: list[str] | None = None) -> int:
         qids = meta["queries"]
         grid = _grid_env("WH_BASELINE_GRID", DEFAULT_BASELINE_GRID)
         res = run_baseline(
-            cfg, emb, qids, grid, k=meta["k"], runs=args.runs,
+            cfg,
+            emb,
+            qids,
+            grid,
+            k=meta["k"],
+            runs=args.runs,
             use_pg_rerank=not args.no_pg_rerank,
         )
         out = args.out or args.baseline
         out.parent.mkdir(parents=True, exist_ok=True)
-        out.write_text(json.dumps({str(t): {str(q): d for q, d in per.items()} for t, per in res.items()}, indent=2))
+        out.write_text(
+            json.dumps(
+                {str(t): {str(q): d for q, d in per.items()} for t, per in res.items()},
+                indent=2,
+            )
+        )
         print(f"[wiki_h2h baseline] {len(qids)} queries x {len(res)} combos -> {out}")
         return 0
 
@@ -900,10 +930,16 @@ def main(argv: list[str] | None = None) -> int:
         meta = json.loads(args.oracle.read_text())
         oracle = {int(q): ids for q, ids in meta["oracle"].items()}
         k = meta["k"]
-        tridb = grade_tridb(parse_tridb(args.tridb_raw.read_text()), oracle, k) if args.tridb_raw else {}
+        tridb = (
+            grade_tridb(parse_tridb(args.tridb_raw.read_text()), oracle, k)
+            if args.tridb_raw
+            else {}
+        )
         braw = json.loads(args.baseline.read_text()) if args.baseline.exists() else {}
         baseline = grade_baseline(
-            {t: {int(q): d for q, d in per.items()} for t, per in braw.items()}, oracle, k
+            {t: {int(q): d for q, d in per.items()} for t, per in braw.items()},
+            oracle,
+            k,
         )
         oracle_meta = {
             "m_seeds": meta["oracle_mseeds"],
@@ -915,13 +951,22 @@ def main(argv: list[str] | None = None) -> int:
             "hnsw_total_builds": os.environ.get("WH_HNSW_TOTAL_BUILDS"),
         }
         md = render_md(
-            cfg, tridb, baseline, k=k, target=args.target,
-            q=len(meta["queries"]), oracle_meta=oracle_meta,
+            cfg,
+            tridb,
+            baseline,
+            k=k,
+            target=args.target,
+            q=len(meta["queries"]),
+            oracle_meta=oracle_meta,
         )
         args.md_out.parent.mkdir(parents=True, exist_ok=True)
         args.md_out.write_text(md)
         jout = args.out or Path("bench/results/wiki_h2h_metrics.json")
-        jout.write_text(json.dumps({"tridb": tridb, "baseline": baseline, "target": args.target}, indent=2))
+        jout.write_text(
+            json.dumps(
+                {"tridb": tridb, "baseline": baseline, "target": args.target}, indent=2
+            )
+        )
         print(f"[wiki_h2h report] -> {args.md_out} / {jout}")
         return 0
 
