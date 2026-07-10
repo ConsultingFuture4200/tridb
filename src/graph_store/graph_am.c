@@ -657,8 +657,11 @@ PG_FUNCTION_INFO_V1(gph_insert_edges);
  * parity contract): same append order, same slot layout, same page chaining. Only two things change
  * vs the scalar path — both O(1) instead of O(V):
  *   - src is located with gph_locate_vertex_dense (dense fast path; hard-verified, never corrupts);
- *   - dst existence is a metapage bounds check (0 <= dst < gm_next_vid), valid because under the
- *     dense-in-order load ext_id == vid so a dst is a real vertex iff it is in [0, next_vid).
+ *   - dst existence + visibility is a metapage bounds check (0 <= dst < gm_next_vid) followed by
+ *     gph_locate_vertex_dense (advisor plan 046): under the dense-in-order load ext_id == vid, so
+ *     a dst is a candidate vertex iff it is in [0, next_vid), and the dense locate's visibility
+ *     filter rejects a tombstoned dst the same way the scalar gph_locate_vertex does — this keeps
+ *     scalar/batch parity (a tombstoned dst is rejected either way) while staying O(1) per dst.
  *
  * WAL (the delicate part): GenericXLog caps at MAX_GENERIC_XLOG_PAGES (4) buffers per record, and a
  * multi-page adjacency run needs meta + vertex + old-tail + new-page = exactly 4 to chain ONE page.
@@ -722,13 +725,29 @@ gph_insert_edges(PG_FUNCTION_ARGS)
 	gph_ensure_meta(rel);
 	gph_read_meta(rel, &meta0);		/* snapshot: bounds (gm_next_vid) + gm_first_vertex_blk */
 
-	/* O(1) dst existence: under the dense load a dst is a vertex iff 0 <= dst < gm_next_vid. */
+	/*
+	 * O(1) dst existence + visibility (advisor plan 046): the scalar gph_insert_edge locates
+	 * BOTH endpoints via gph_locate_vertex, which is visibility-checked (rejects a tombstoned
+	 * dst). The batch path previously only bounds-checked dst against gm_next_vid, so a live
+	 * src could append edges to a tombstoned dst — phantom adjacency. gph_locate_vertex_dense
+	 * is the O(1) dense-layout equivalent of gph_locate_vertex (same visibility filter, same
+	 * hard-ERROR on a non-dense layout as the src locate below), so this restores scalar/batch
+	 * parity without giving up the O(1) dense fast path.
+	 */
 	for (k = 0; k < nelems; k++)
 	{
+		BlockNumber	dst_blk;
+		uint32		dst_slot;
+		GphVertexRecord dst_rec;
+
 		if (dsts[k] < 0 || (uint64) dsts[k] >= meta0.gm_next_vid)
 			ereport(ERROR,
 					(errmsg("graph_store: destination vertex %lld out of dense range [0," UINT64_FORMAT ")",
 							(long long) dsts[k], meta0.gm_next_vid)));
+		if (!gph_locate_vertex_dense(rel, (uint64) dsts[k], &meta0, &dst_blk, &dst_slot, &dst_rec))
+			ereport(ERROR,
+					(errmsg("graph_store: destination vertex %lld does not exist (or has been deleted)",
+							(long long) dsts[k])));
 	}
 	if (src >= meta0.gm_next_vid)
 		ereport(ERROR,

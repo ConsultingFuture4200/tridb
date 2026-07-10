@@ -141,4 +141,38 @@ BEGIN
     RAISE NOTICE 'PASS FR-7 substrate: own write visible in-txn (7), invisible after ROLLBACK (6)';
 END $$;
 
+-- Batch/scalar parity on a tombstoned dst (advisor plan 046): gph_insert_edge locates BOTH
+-- endpoints (visibility-checked), so a tombstoned dst is rejected. gph_insert_edges must reject
+-- the same way instead of silently appending a phantom edge to a dead vertex. Vertex 2 is live at
+-- this point (target of edge 0->2 and of vertex 3's batched run); tombstone it here, at the end of
+-- the file, so no earlier assertion depends on it staying live.
+SELECT gph_tombstone_vertex(2);
+
+DO $$
+DECLARE nbrs bigint[];
+BEGIN
+    BEGIN
+        PERFORM gph_insert_edges(1, ARRAY[4,2]::bigint[]);
+        RAISE EXCEPTION 'gph_insert_edges(1, {4,2}) should have ERRORed on tombstoned dst 2';
+    EXCEPTION WHEN others THEN
+        IF SQLERRM NOT LIKE '%destination vertex 2%' THEN
+            RAISE;   -- some other error: propagate, this is not the expected rejection
+        END IF;
+    END;
+
+    -- the rejected batch left no phantom edge: neighbors(1) is still just the pre-existing {4}.
+    SELECT array_agg(x ORDER BY x) INTO nbrs FROM gph_neighbors(1) x;
+    IF nbrs IS DISTINCT FROM ARRAY[4]::bigint[] THEN
+        RAISE EXCEPTION 'neighbors(1)=% after rejected batch (expected {4}: no phantom edge to tombstoned 2)', nbrs;
+    END IF;
+
+    -- same shape of call with the tombstoned dst swapped for a live one succeeds normally.
+    PERFORM gph_insert_edges(1, ARRAY[4,3]::bigint[]);
+    SELECT array_agg(x) INTO nbrs FROM gph_neighbors(1) x;
+    IF nbrs IS DISTINCT FROM ARRAY[4,4,3]::bigint[] THEN
+        RAISE EXCEPTION 'neighbors(1)=% after live-dst batch (expected {4,4,3})', nbrs;
+    END IF;
+    RAISE NOTICE 'PASS batch/scalar dst parity: tombstoned dst rejected (no phantom edge), live-dst batch still succeeds';
+END $$;
+
 \echo '============ graph_store_am v1 core: ALL TESTS PASSED (DEV-1164) ============'
