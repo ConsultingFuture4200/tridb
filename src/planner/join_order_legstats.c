@@ -151,10 +151,19 @@ tridb_build_legstats(Relation rel,
 	 * If the graph store is absent/uninitialized in this database, legstats_read_graph_meta returns
 	 * false and avg_out_degree stays 0.0 — the same value the old placeholder produced.
 	 *
+	 * RAW-UPPER-BOUND CAVEAT after deletes (advisor plan 055): gm_edge_count is a raw insert counter
+	 * that is NEVER decremented, including by gph_tombstone_edge/gph_tombstone_vertex (plan 037) — a
+	 * store with tombstoned edges has a LOWER live degree than this formula reports. This helper
+	 * intentionally still reads the cheap metapage counter rather than the MVCC-visible,
+	 * O(vertices+edges)-scanning graph_am.c:gph_visible_edge_count(): the two are separately linked
+	 * .so's sharing gph_page.h but not symbols (see the file banner above), and no caller here needs
+	 * an exact count.
+	 *
 	 * This remains SAFE for the FR-6 decision: avg_out_degree is NOT an input to
 	 * tridb_choose_join_order (FROZEN §10.1 — it is carried only for tridb_estimate_intermediate's
-	 * EXPLAIN graph fan-out). The ordering decision is fully determined by rel_filter_matches,
-	 * table_size, and the threshold; populating avg_out_degree cannot change which order is chosen.
+	 * EXPLAIN graph fan-out, where an over-estimate of fanout after deletes is the conservative
+	 * direction). The ordering decision is fully determined by rel_filter_matches, table_size, and
+	 * the threshold; populating avg_out_degree cannot change which order is chosen.
 	 */
 	{
 		GphMeta	gmeta;
