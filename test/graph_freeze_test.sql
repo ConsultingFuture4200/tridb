@@ -10,6 +10,15 @@
 --   plus horizon validation (a too-new horizon RAISES) and the plan-026 ACL (non-owner denied).
 -- (c) crash/WAL durability of the frozen pages is covered by scripts/crash_recovery_test.sh.
 --
+-- Advisor plan 040 (DEV-1354) extends this with the xmax half of freeze — plan 037's tombstone
+-- (es_xmax / vr_xmax) was previously left un-frozen, so a committed delete's xmax could outlive
+-- relfrozenxid and hit truncated clog on a later read. Added below (after the horizon-validation
+-- block, before the ACL section):
+--   (f) tombstone-then-freeze: a COMMITTED delete stays deleted, no clog error, xmin+xmax both frozen;
+--   (g) freeze mid-txn (past a still-open tombstone) is BLOCKED by the existing oldest-xmin guard;
+--   (h) tombstone + ROLLBACK + freeze: the aborted delete resurrects the record (flag cleared, xmax
+--       reset to Invalid) and it reads LIVE both before and after.
+--
 -- Run by scripts/graph_freeze_test.sh (AM harness: PGXS-builds src/graph_store in the image) with
 -- psql -v ON_ERROR_STOP=1, so any RAISE EXCEPTION produces a nonzero exit. GX10/Docker only.
 
@@ -138,6 +147,118 @@ BEGIN
     END;
 END $$;
 
+-- ============================================================================
+-- (f) Tombstone-then-freeze (advisor plan 040 / DEV-1354's clog-truncation hazard): freeze previously
+-- rewrote only es_xmin, so a COMMITTED delete's es_xmax survived past `relfrozenxid` unfrozen — a
+-- later TransactionIdDidCommit(xmax) call in gph_deleted_visible could hit clog truncated past that
+-- xid. This proves the fixed freeze rewrites xmax too: 0->4 is inserted, tombstoned (committed
+-- delete), then frozen past both xids; it must stay absent from traversal with no error, and the
+-- freeze count must show BOTH its xmin and its xmax were newly frozen (2 — nothing else in the store
+-- is unfrozen at this point).
+-- ============================================================================
+SELECT gph_insert_edge(0, 4);          -- vid 4 already exists (committed above); new edge 0->4
+
+DO $$
+DECLARE nbrs bigint[];
+BEGIN
+    SELECT array_agg(x ORDER BY x) INTO nbrs FROM gph_neighbors(0) x;
+    IF nbrs <> ARRAY[1,2,3,4]::bigint[] THEN
+        RAISE EXCEPTION 'f(setup): neighbors(0)=% (expected {1,2,3,4})', nbrs;
+    END IF;
+END $$;
+
+SELECT gph_tombstone_edge(0, 4);       -- committed delete of 0->4 (its es_xmax is now a normal, committed xid)
+
+-- Second horizon, captured after the tombstone commits; burn a few xids so it strictly precedes the
+-- oldest running xmin, same discipline as the first horizon capture above.
+CREATE TEMP TABLE hz2 AS SELECT (txid_current()::text)::xid AS h;
+SELECT txid_current();
+SELECT txid_current();
+SELECT txid_current();
+
+DO $$
+DECLARE n bigint; h xid; nbrs bigint[];
+BEGIN
+    SELECT hz2.h INTO h FROM hz2;
+    n := graph_store.gph_freeze(h);
+    IF n <> 2 THEN
+        RAISE EXCEPTION '(f) gph_freeze(%) froze % records (expected 2: 0->4''s es_xmin + es_xmax)', h, n;
+    END IF;
+    SELECT array_agg(x ORDER BY x) INTO nbrs FROM gph_neighbors(0) x;
+    IF nbrs <> ARRAY[1,2,3]::bigint[] THEN
+        RAISE EXCEPTION '(f) neighbors(0)=% after tombstone-then-freeze (expected {1,2,3}: 0->4 stays deleted)', nbrs;
+    END IF;
+    RAISE NOTICE 'PASS (f): tombstone-then-freeze — 0->4 stays absent, no clog error, froze % records', n;
+END $$;
+
+-- ============================================================================
+-- (g) Freeze mid-txn is BLOCKED: a horizon that would have to cover a still-OPEN transaction's own
+-- xid can never precede the oldest running xmin, because that open transaction's own xid IS (part
+-- of) the oldest running xmin — the pre-existing horizon-validation guard (design §1) already makes
+-- this unreachable, so no second mechanism is needed. Chosen rule, documented here rather than
+-- invented in the C: freezing past an in-flight tombstone is rejected by the SAME check that rejects
+-- freezing past an in-flight insert.
+-- ============================================================================
+BEGIN;
+    SELECT gph_tombstone_edge(0, 3);   -- self-visible in-txn delete; own xid still open
+    DO $$
+    DECLARE bad_h xid;
+    BEGIN
+        bad_h := ((txid_current() + 1)::text)::xid;    -- past our OWN still-open xid
+        BEGIN
+            PERFORM graph_store.gph_freeze(bad_h);
+            RAISE EXCEPTION '(g) gph_freeze(%) inside the open tombstone txn was accepted (expected block)', bad_h;
+        EXCEPTION WHEN others THEN
+            IF SQLERRM LIKE '%does not precede%' THEN
+                RAISE NOTICE 'PASS (g): freeze mid-txn blocked by the oldest-xmin guard: %', SQLERRM;
+            ELSE
+                RAISE;   -- some other error: propagate
+            END IF;
+        END;
+    END $$;
+ROLLBACK;
+
+-- ============================================================================
+-- (h) Tombstone, ROLLBACK, THEN freeze: GenericXLog has no in-process UNDO, so the aborted delete's
+-- GPH_FLAG_DELETED + es_xmax bytes are still physically on the page after ROLLBACK (same as an
+-- aborted INSERT) — 0->3 must read LIVE both before AND after a freeze that walks past this aborted
+-- xmax. This exercises the resurrection rule: GPH_FLAG_DELETED + xmax ABORTED + <= horizon clears the
+-- flag and resets xmax to Invalid (gph_freeze_xmax), matching the FR-7 rollback semantics
+-- gph_deleted_visible already gives this edge before the freeze ever runs.
+-- ============================================================================
+BEGIN;
+    SELECT gph_tombstone_edge(0, 3);
+ROLLBACK;
+
+DO $$
+DECLARE nbrs bigint[];
+BEGIN
+    SELECT array_agg(x ORDER BY x) INTO nbrs FROM gph_neighbors(0) x;
+    IF nbrs <> ARRAY[1,2,3]::bigint[] THEN
+        RAISE EXCEPTION '(h) neighbors(0)=% after ROLLBACK, pre-freeze (expected {1,2,3}: 0->3 still LIVE)', nbrs;
+    END IF;
+END $$;
+
+CREATE TEMP TABLE hz3 AS SELECT (txid_current()::text)::xid AS h;
+SELECT txid_current();
+SELECT txid_current();
+SELECT txid_current();
+
+DO $$
+DECLARE n bigint; h xid; nbrs bigint[];
+BEGIN
+    SELECT hz3.h INTO h FROM hz3;
+    n := graph_store.gph_freeze(h);
+    IF n <> 1 THEN
+        RAISE EXCEPTION '(h) gph_freeze(%) froze % records (expected 1: 0->3''s aborted es_xmax)', h, n;
+    END IF;
+    SELECT array_agg(x ORDER BY x) INTO nbrs FROM gph_neighbors(0) x;
+    IF nbrs <> ARRAY[1,2,3]::bigint[] THEN
+        RAISE EXCEPTION '(h) neighbors(0)=% after freezing past a rolled-back tombstone (expected {1,2,3}: still LIVE)', nbrs;
+    END IF;
+    RAISE NOTICE 'PASS (h): rolled-back tombstone stays LIVE after freeze (froze % records)', n;
+END $$;
+
 -- ACL (plan 026 discipline): gph_freeze is a maintenance mutator, REVOKEd from PUBLIC.
 CREATE ROLE tridb_freeze_probe LOGIN;
 GRANT USAGE ON SCHEMA graph_store TO tridb_freeze_probe;   -- schema visibility only (see ACL test)
@@ -154,4 +275,4 @@ RESET ROLE;
 REVOKE USAGE ON SCHEMA graph_store FROM tridb_freeze_probe;
 DROP ROLE tridb_freeze_probe;
 
-\echo '============ gph_freeze anti-wraparound pass (DEV-1347): ALL TESTS PASSED ============'
+\echo '============ gph_freeze anti-wraparound pass (DEV-1347/DEV-1354): ALL TESTS PASSED ============'
