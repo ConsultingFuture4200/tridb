@@ -1244,16 +1244,19 @@ gph_freeze(PG_FUNCTION_ARGS)
 /*
  * gph_tombstone_adjacency — walk vertex `adj_head`'s adjacency-page chain and set GPH_FLAG_DELETED +
  * es_xmax = `xid` on every LIVE (visibly inserted, not-already-tombstoned) edge slot whose
- * es_dst_vid == `match_dst`, OR on every live slot when `match_all` is true (the vertex out-edge
- * sweep). Adjacency pages are per-vertex (gph_owner_vid == the source), so every slot on the chain
- * already has es_src_vid == the source — no src check needed. Each page that actually has a slot to
- * flip is rewritten ONCE under GenericXLog in the caller's txn (crash-safe, atomic with the host txn,
- * one WAL); pages with nothing to flip are left untouched (no WAL record), so the pass is idempotent.
+ * es_dst_vid == `match_dst` AND es_edge_type_id == `type_filter` (GPH_EDGE_TYPE_ANY = no type
+ * filter, matches every type), OR on every live slot matching `type_filter` when `match_all` is
+ * true (the vertex out-edge sweep — gph_tombstone_vertex passes GPH_EDGE_TYPE_ANY here so a vertex
+ * delete still sweeps ALL of its out-edges regardless of type; advisor plan 045). Adjacency pages
+ * are per-vertex (gph_owner_vid == the source), so every slot on the chain already has
+ * es_src_vid == the source — no src check needed. Each page that actually has a slot to flip is
+ * rewritten ONCE under GenericXLog in the caller's txn (crash-safe, atomic with the host txn, one
+ * WAL); pages with nothing to flip are left untouched (no WAL record), so the pass is idempotent.
  * Caller holds RowExclusiveLock on `rel`.
  */
 static void
 gph_tombstone_adjacency(Relation rel, BlockNumber adj_head, uint64 match_dst, bool match_all,
-						TransactionId xid)
+						uint32 type_filter, TransactionId xid)
 {
 	BlockNumber	blk = adj_head;
 
@@ -1284,6 +1287,8 @@ gph_tombstone_adjacency(Relation rel, BlockNumber adj_head, uint64 match_dst, bo
 				continue;			/* already tombstoned — idempotent no-op */
 			if (!match_all && s->es_dst_vid != match_dst)
 				continue;
+			if (type_filter != GPH_EDGE_TYPE_ANY && s->es_edge_type_id != type_filter)
+				continue;			/* different edge type — not this tombstone's target (plan 045) */
 			any = true;
 			break;
 		}
@@ -1305,6 +1310,8 @@ gph_tombstone_adjacency(Relation rel, BlockNumber adj_head, uint64 match_dst, bo
 					continue;
 				if (!match_all && s->es_dst_vid != match_dst)
 					continue;
+				if (type_filter != GPH_EDGE_TYPE_ANY && s->es_edge_type_id != type_filter)
+					continue;
 				s->es_flags |= GPH_FLAG_DELETED;
 				s->es_xmax = xid;
 			}
@@ -1319,30 +1326,45 @@ gph_tombstone_adjacency(Relation rel, BlockNumber adj_head, uint64 match_dst, bo
 PG_FUNCTION_INFO_V1(gph_tombstone_edge);
 
 /*
- * gph_tombstone_edge(src bigint, dst bigint) RETURNS void — soft-delete every visible src->dst
- * :related_to edge by setting GPH_FLAG_DELETED + es_xmax under GenericXLog (crash-safe, atomic with
- * the host txn; FR-7). Idempotent: tombstoning an already-deleted or absent edge (or an absent src)
- * is a no-op, not an error. The read path already filters visible tombstones (gph_deleted_visible),
- * so traversal stops emitting the edge immediately; the store-wide gm_edge_count is a raw
- * monotone counter and is deliberately NOT decremented (freeze, plans 036/040, only immortalizes or
- * resurrects the xmax stamp in place — it never reclaims the slot; physical reclamation is plan 055).
- * Owner-guarded (REVOKEd from PUBLIC, plan 026).
+ * gph_tombstone_edge(src bigint, dst bigint [, type_id integer]) RETURNS void — soft-delete every
+ * visible src->dst edge of the given type by setting GPH_FLAG_DELETED + es_xmax under GenericXLog
+ * (crash-safe, atomic with the host txn; FR-7). Idempotent: tombstoning an already-deleted or
+ * absent edge (or an absent src) is a no-op, not an error. The read path already filters visible
+ * tombstones (gph_deleted_visible), so traversal stops emitting the edge immediately; the store-wide
+ * gm_edge_count is a raw monotone counter and is deliberately NOT decremented (freeze in plans
+ * 036/040 only re-stamps the xmax in place; physical reclamation is plan 055). Owner-guarded (REVOKEd from PUBLIC, plan 026).
+ *
+ * Backs BOTH SQL declarations (2-arg and the plan-045 3-arg overload) at the same C symbol,
+ * matching the gph_insert_edge PG_NARGS() pattern. The 2-arg form defaults type_id to
+ * GPH_EDGE_TYPE_RELATED_TO — before typed edges (plan 038) this was the ONLY edge type, so this is
+ * byte-identical to the pre-045 behavior for every untyped caller. Before this fix, gph_tombstone_edge
+ * matched on dst ALONE, so a related_to delete between two vertices also wiped any co-located typed
+ * edge between the same endpoints (silent multi-type data loss). The 3-arg overload lets a caller
+ * pass an explicit dictionary type id, or GPH_EDGE_TYPE_ANY (0) to explicitly request the old
+ * all-type wipe (documented migration path for any caller that depended on it).
  */
 Datum
 gph_tombstone_edge(PG_FUNCTION_ARGS)
 {
 	uint64		src = (uint64) PG_GETARG_INT64(0);
 	uint64		dst = (uint64) PG_GETARG_INT64(1);
+	uint32		type_id = GPH_EDGE_TYPE_RELATED_TO;
 	Relation	rel = gph_open_store(RowExclusiveLock);
 	GphVertexRecord	src_rec;
 	BlockNumber	vblk;
 	uint32		vslot;
 
+	/* Optional 3rd arg (plan 045): the dictionary edge type id to tombstone, or GPH_EDGE_TYPE_ANY
+	 * for an explicit all-type wipe. Absent => default RELATED_TO (2-arg overload). The 3-arg
+	 * overload is STRICT, so a passed arg is never NULL. */
+	if (PG_NARGS() >= 3)
+		type_id = (uint32) PG_GETARG_INT32(2);
+
 	/* vr_adj_head is stable once set (only vr_adj_tail moves on chaining) and the single-writer
 	 * contract excludes a concurrent mutator, so the head read here drives a correct chain walk;
 	 * each page is re-read under its own exclusive lock inside gph_tombstone_adjacency. */
 	if (gph_locate_vertex(rel, src, &vblk, &vslot, &src_rec))
-		gph_tombstone_adjacency(rel, src_rec.vr_adj_head, dst, false,
+		gph_tombstone_adjacency(rel, src_rec.vr_adj_head, dst, false, type_id,
 								GetCurrentTransactionId());
 
 	relation_close(rel, RowExclusiveLock);
@@ -1399,8 +1421,9 @@ gph_tombstone_vertex(PG_FUNCTION_ARGS)
 	GenericXLogFinish(state);
 	UnlockReleaseBuffer(buf);	/* release before the out-edge sweep: never two buffers at once */
 
-	/* 2. Tombstone all of the vertex's out-edges so traversal FROM it yields nothing. */
-	gph_tombstone_adjacency(rel, src_rec.vr_adj_head, 0, true, xid);
+	/* 2. Tombstone all of the vertex's out-edges (every type — GPH_EDGE_TYPE_ANY, plan 045) so
+	 * traversal FROM it yields nothing regardless of edge type. */
+	gph_tombstone_adjacency(rel, src_rec.vr_adj_head, 0, true, GPH_EDGE_TYPE_ANY, xid);
 
 	relation_close(rel, RowExclusiveLock);
 	PG_RETURN_VOID();

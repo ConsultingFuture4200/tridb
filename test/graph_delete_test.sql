@@ -6,6 +6,11 @@
 -- honored only when that xid is visible, exactly as an INSERT is honored only when its xmin is
 -- visible — so delete rolls back atomically with the host txn, not via any GenericXLog UNDO).
 --
+-- Test F (advisor plan 045): gph_tombstone_edge now filters by es_edge_type_id (default
+-- RELATED_TO), so a typed edge (plan 038) co-located with a related_to edge between the same
+-- src/dst survives an untyped tombstone; the 3-arg overload takes an explicit type id, or
+-- GPH_EDGE_TYPE_ANY (0) for the old all-type wipe.
+--
 -- UNBUILT-HERE (GX10-gated): the graph store access method compiles only inside the MSVBASE fork
 -- (PG 13.4, --with-blocksize=32). Run by scripts/graph_delete_test.sh on target.
 
@@ -170,4 +175,86 @@ BEGIN
     RAISE NOTICE 'PASS E (remove_edge compat): external-id 100->200 removed, 100->300 kept';
 END $$;
 
-\echo '============ graph_store native delete (plan 037): ALL TESTS PASSED ============'
+-- ============================================================================
+-- Test F — typed tombstone (advisor plan 045 / DEV-1354 follow-up). Before this fix,
+-- gph_tombstone_edge matched on dst ALONE (no es_edge_type_id check), so tombstoning a
+-- related_to edge between two vertices also silently wiped any co-located typed edge (plan 038)
+-- between the SAME endpoints. Fresh vertices 9,10 to avoid interaction with the earlier tests'
+-- tombstones — Test E's add_edge(100,*) already auto-created vids 6,7,8 (ext 100/200/300) with a
+-- live 6->8 related_to edge, so the two vertices created here are 9 and 10. Three edges 9->10:
+-- related_to (default), works_at, mentions.
+-- ============================================================================
+SELECT gph_insert_vertex() FROM generate_series(1, 2);   -- vids 9, 10
+
+DO $$
+DECLARE w int; m int;
+BEGIN
+    w := register_edge_type('works_at');   -- id 2
+    m := register_edge_type('mentions');   -- id 3
+    IF (w, m) IS DISTINCT FROM (2, 3) THEN
+        RAISE EXCEPTION 'F setup: works_at=%, mentions=% (expected 2,3)', w, m;
+    END IF;
+END $$;
+
+SELECT gph_insert_edge(9, 10);        -- related_to (default 2-arg)
+SELECT gph_insert_edge(9, 10, 2);     -- works_at
+SELECT gph_insert_edge(9, 10, 3);     -- mentions
+
+-- F1: default (2-arg) tombstone only removes the related_to edge; works_at/mentions survive.
+SELECT gph_tombstone_edge(9, 10);
+
+DO $$
+DECLARE all_types bigint[]; rel bigint[]; work bigint[]; ment bigint[];
+BEGIN
+    SELECT array_agg(dst) INTO rel  FROM gph_traverse_typed(9, 1, 0, -1);   -- related_to
+    SELECT array_agg(dst) INTO work FROM gph_traverse_typed(9, 2, 0, -1);   -- works_at
+    SELECT array_agg(dst) INTO ment FROM gph_traverse_typed(9, 3, 0, -1);   -- mentions
+    SELECT array_agg(dst) INTO all_types FROM gph_traverse_typed(9, 0, 0, -1);  -- any type
+
+    IF rel IS NOT NULL THEN
+        RAISE EXCEPTION 'F1: related_to(9->10)=% after default tombstone (expected gone)', rel;
+    END IF;
+    IF work <> ARRAY[10]::bigint[] THEN
+        RAISE EXCEPTION 'F1: works_at(9->10)=% (expected {10}: typed edge must survive an untyped tombstone)', work;
+    END IF;
+    IF ment <> ARRAY[10]::bigint[] THEN
+        RAISE EXCEPTION 'F1: mentions(9->10)=% (expected {10}: typed edge must survive an untyped tombstone)', ment;
+    END IF;
+    IF all_types <> ARRAY[10,10]::bigint[] THEN
+        RAISE EXCEPTION 'F1: any-type(9->10)=% (expected two surviving typed edges {10,10})', all_types;
+    END IF;
+    RAISE NOTICE 'PASS F1 (typed tombstone default): related_to gone, works_at + mentions survive';
+END $$;
+
+-- F2: explicit-type 3-arg tombstone removes only the named type (mentions); works_at still lives.
+SELECT gph_tombstone_edge(9, 10, 3);
+
+DO $$
+DECLARE work bigint[]; ment bigint[];
+BEGIN
+    SELECT array_agg(dst) INTO work FROM gph_traverse_typed(9, 2, 0, -1);
+    SELECT array_agg(dst) INTO ment FROM gph_traverse_typed(9, 3, 0, -1);
+    IF ment IS NOT NULL THEN
+        RAISE EXCEPTION 'F2: mentions(9->10)=% after explicit-type tombstone (expected gone)', ment;
+    END IF;
+    IF work <> ARRAY[10]::bigint[] THEN
+        RAISE EXCEPTION 'F2: works_at(9->10)=% (expected {10}: untouched by mentions tombstone)', work;
+    END IF;
+    RAISE NOTICE 'PASS F2 (explicit-type tombstone): mentions gone, works_at untouched';
+END $$;
+
+-- F3: GPH_EDGE_TYPE_ANY (0) sentinel explicitly requests the old all-type wipe (documented
+-- migration path for a caller that depended on it) — removes the remaining works_at edge too.
+SELECT gph_tombstone_edge(9, 10, 0);
+
+DO $$
+DECLARE n bigint;
+BEGIN
+    SELECT count(*) INTO n FROM gph_traverse_typed(9, 0, 0, -1);
+    IF n <> 0 THEN
+        RAISE EXCEPTION 'F3: any-type(9->10) count=% after ANY-sentinel tombstone (expected 0)', n;
+    END IF;
+    RAISE NOTICE 'PASS F3 (ANY-sentinel tombstone): all remaining types wiped';
+END $$;
+
+\echo '============ graph_store native delete (plan 037 + typed tombstone, plan 045): ALL TESTS PASSED ============'
