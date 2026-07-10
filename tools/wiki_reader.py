@@ -1771,6 +1771,233 @@ def _clean_body(text: str) -> str:
 # --------------------------------------------------------------------------- #
 # HTTP
 # --------------------------------------------------------------------------- #
+LANDING_HTML = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>TriDB Wiki — a tri-modal database, demonstrated on all of Wikipedia</title>
+<meta name="description" content="A private Wikipedia running on TriDB — a vector + graph + relational database in one Postgres process. Search by meaning, traverse the link graph, find the path between any two topics, ask questions. Wikipedia is the demonstration; Wikidata is next." />
+<style>
+  :root{
+    --ink:#202122; --soft:#54595d; --dim:#72777d; --line:#e4e6eb; --line2:#eef0f2;
+    --bg:#ffffff; --bg2:#f8f9fa; --link:#3366cc; --link2:#2a4b8d;
+    --v:#0f8b7c;   /* vector — teal   */
+    --g:#6f4fd0;   /* graph  — violet */
+    --r:#b8790f;   /* rel    — amber  */
+    --maxw:900px;
+  }
+  *{box-sizing:border-box}
+  html{-webkit-text-size-adjust:100%}
+  body{margin:0;background:var(--bg);color:var(--ink);
+    font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;}
+  a{color:var(--link);text-decoration:none}
+  a:hover{text-decoration:underline}
+  .serif{font-family:"Linux Libertine",Georgia,"Times New Roman",serif}
+  .wrap{max-width:var(--maxw);margin:0 auto;padding:0 22px}
+  .mono{font-family:ui-monospace,"SF Mono",Menlo,Consolas,monospace}
+
+  /* ---- hero / portal ---- */
+  .portal{padding:54px 0 26px;text-align:center}
+  .globe{width:96px;height:96px;margin:0 auto 14px;display:block}
+  .word{font-size:clamp(40px,8vw,64px);font-weight:400;letter-spacing:-.5px;line-height:1}
+  .word b{font-weight:700}
+  .tag{color:var(--soft);font-size:15px;margin-top:8px;font-style:italic}
+  .tag .sep{color:var(--line);margin:0 8px}
+  .intro{max-width:60ch;margin:22px auto 0;color:var(--soft);font-size:16px}
+  .intro b{color:var(--ink)}
+
+  /* ---- central search ---- */
+  form.search{max-width:620px;margin:30px auto 6px;display:flex;position:relative}
+  form.search input{flex:1;font-size:17px;padding:13px 16px;border:1px solid #a2a9b1;
+    border-right:0;border-radius:3px 0 0 3px;outline:none}
+  form.search input:focus{border-color:var(--link);box-shadow:inset 0 0 0 1px var(--link)}
+  form.search button{border:1px solid var(--link);background:var(--link);color:#fff;
+    font-size:16px;font-weight:600;padding:0 22px;border-radius:0 3px 3px 0;cursor:pointer}
+  form.search button:hover{background:var(--link2);border-color:var(--link2)}
+  .enter{margin-top:12px;font-size:14px;color:var(--dim)}
+  .enter a{font-weight:600}
+  .modes{display:flex;gap:18px;justify-content:center;flex-wrap:wrap;margin:22px auto 0;
+    color:var(--soft);font-size:13.5px}
+  .modes span{display:inline-flex;align-items:center;gap:7px}
+  .sw{width:9px;height:9px;border-radius:50%;display:inline-block}
+
+  /* ---- section chrome ---- */
+  section{border-top:1px solid var(--line);padding:40px 0}
+  h2{font-size:22px;font-weight:600;margin:0 0 6px}
+  h2 .k{font:600 11px/1 ui-monospace,monospace;letter-spacing:.14em;text-transform:uppercase;
+    color:var(--dim);display:block;margin-bottom:8px}
+  .lead{color:var(--soft);max-width:70ch;margin:0 0 18px}
+
+  .why3{display:grid;grid-template-columns:repeat(3,1fr);gap:16px;margin-top:22px}
+  .why3 .c{border:1px solid var(--line);border-radius:8px;padding:16px;background:var(--bg2)}
+  .why3 .c h3{font-size:15px;margin:0 0 6px;display:flex;align-items:center;gap:8px}
+  .why3 .c p{margin:0;color:var(--soft);font-size:14px}
+
+  /* ---- comparison table ---- */
+  .tablewrap{overflow-x:auto;margin-top:20px;border:1px solid var(--line);border-radius:8px}
+  table{border-collapse:collapse;width:100%;min-width:640px;font-size:14.5px}
+  thead th{text-align:left;padding:13px 16px;background:var(--bg2);border-bottom:2px solid var(--line);
+    font-weight:600;font-size:13px}
+  thead th.tri{color:var(--ink)}
+  thead th.tri .badge{display:inline-block;width:8px;height:8px;border-radius:50%;
+    background:linear-gradient(135deg,var(--v),var(--g),var(--r));margin-right:6px;vertical-align:middle}
+  tbody td{padding:11px 16px;border-bottom:1px solid var(--line2);vertical-align:top}
+  tbody tr:last-child td{border-bottom:0}
+  td.dim{color:var(--dim)}
+  td.win{color:var(--ink)}
+  td.win b{color:var(--v)}
+  .yes{color:var(--v);font-weight:600}
+  .no{color:var(--dim)}
+  .note{margin-top:14px;font-size:13.5px;color:var(--soft);border-left:3px solid var(--r);
+    background:var(--bg2);padding:12px 16px;border-radius:0 6px 6px 0}
+  .note b{color:var(--ink)}
+
+  /* ---- proof stats ---- */
+  .stats{display:grid;grid-template-columns:repeat(3,1fr);gap:14px;margin-top:22px}
+  .stat{border:1px solid var(--line);border-radius:8px;padding:16px;background:var(--bg2)}
+  .stat .n{font-size:26px;font-weight:700;letter-spacing:-.02em}
+  .stat .n small{font-size:13px;color:var(--soft);font-weight:600}
+  .stat .l{color:var(--soft);font-size:13px;margin-top:6px}
+
+  footer{border-top:1px solid var(--line);padding:26px 0 60px;text-align:center;color:var(--dim);font-size:13.5px}
+  footer .links{display:flex;gap:20px;justify-content:center;flex-wrap:wrap;margin-bottom:12px}
+  footer .links a{color:var(--link)}
+
+  @media(max-width:720px){.why3,.stats{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+
+<div class="wrap portal">
+  <!-- tri-modal globe: meridians/parallels + three colored arcs (vector/graph/relational) -->
+  <svg class="globe" viewBox="0 0 100 100" aria-hidden="true">
+    <circle cx="50" cy="50" r="46" fill="#fff" stroke="#c8ccd1" stroke-width="1.5"/>
+    <g fill="none" stroke="#dadde1" stroke-width="1">
+      <ellipse cx="50" cy="50" rx="46" ry="17"/>
+      <ellipse cx="50" cy="50" rx="46" ry="33"/>
+      <ellipse cx="50" cy="50" rx="17" ry="46"/>
+      <ellipse cx="50" cy="50" rx="33" ry="46"/>
+      <line x1="4" y1="50" x2="96" y2="50"/><line x1="50" y1="4" x2="50" y2="96"/>
+    </g>
+    <path d="M50 4 A46 46 0 0 1 89.8 27" fill="none" stroke="var(--v)" stroke-width="3.5" stroke-linecap="round"/>
+    <path d="M89.8 73 A46 46 0 0 1 50 96" fill="none" stroke="var(--g)" stroke-width="3.5" stroke-linecap="round"/>
+    <path d="M10.2 73 A46 46 0 0 1 10.2 27" fill="none" stroke="var(--r)" stroke-width="3.5" stroke-linecap="round"/>
+  </svg>
+
+  <div class="word serif">Tri<b>DB</b> <span style="font-weight:400">Wiki</span></div>
+  <div class="tag serif">A tri-modal database <span class="sep">·</span> demonstrated on all of Wikipedia</div>
+
+  <p class="intro">
+    A <b>private Wikipedia</b> running on TriDB — a database that fuses <b>vector similarity</b>,
+    <b>graph traversal</b>, and <b>relational filters</b> inside one Postgres process, under one
+    write-ahead log. Search by meaning, walk the link graph, find the path between any two topics,
+    ask questions — in a single early-terminating query.
+  </p>
+
+  <form class="search" action="/read" method="get" role="search">
+    <input name="q" placeholder="Search 6.9 million articles — by title or by meaning" aria-label="Search the wiki" autofocus>
+    <button type="submit">Search</button>
+  </form>
+  <div class="enter"><a href="/read">Enter the wiki &rarr;</a> &nbsp;·&nbsp; no keyword needed — it understands meaning</div>
+
+  <div class="modes">
+    <span><i class="sw" style="background:var(--v)"></i>Vector — similarity</span>
+    <span><i class="sw" style="background:var(--g)"></i>Graph — traversal</span>
+    <span><i class="sw" style="background:var(--r)"></i>Relational — filter</span>
+  </div>
+</div>
+
+<!-- WHY WIKI -->
+<section>
+  <div class="wrap">
+    <h2><span class="k">Why Wikipedia is the demonstration</span>The perfect tri-modal proving ground.</h2>
+    <p class="lead">
+      A database that unifies similarity, traversal, and filter needs data that is all three at once.
+      Wikipedia is exactly that — and at a scale that makes the fusion matter.
+    </p>
+    <div class="why3">
+      <div class="c"><h3><i class="sw" style="background:var(--v)"></i>Meaning</h3>
+        <p>Every article is text — an embedding. "Find articles like this one," not just string matches.</p></div>
+      <div class="c"><h3><i class="sw" style="background:var(--g)"></i>Links</h3>
+        <p>~6.9M articles woven by hundreds of millions of hyperlinks — a native graph to traverse and path-find.</p></div>
+      <div class="c"><h3><i class="sw" style="background:var(--r)"></i>Structure</h3>
+        <p>Infobox facts, categories, lengths, in-degree — relational predicates to filter and rank by.</p></div>
+    </div>
+    <div class="note">
+      Wikipedia proves the fusion at <b>6.9M articles</b>. The next proving ground is <b>Wikidata</b> —
+      ~110M entities joined by ~1.5B <em>typed</em> statements, ~16&times; larger, and edited millions of
+      times a day (a live consistency workload). <a href="https://github.com/ConsultingFuture4200/tridb">See the roadmap &#8599;</a>
+    </div>
+  </div>
+</section>
+
+<!-- COMPARISON -->
+<section>
+  <div class="wrap">
+    <h2><span class="k">Official Wikipedia vs the TriDB Wiki</span>Same articles. A different engine underneath.</h2>
+    <p class="lead">
+      This isn't a faster way to load a page — Wikimedia's global CDN is excellent at that. It's a
+      knowledge engine: things the official reader can't do in one step, done in one fused query.
+    </p>
+    <div class="tablewrap">
+      <table>
+        <thead><tr>
+          <th>Capability</th>
+          <th>Official Wikipedia</th>
+          <th class="tri"><span class="badge"></span>TriDB Wiki</th>
+        </tr></thead>
+        <tbody>
+          <tr><td>Article page delivery</td><td class="dim">Global CDN — needs a network round-trip</td><td class="win">Local / offline — <b>zero network RTT</b> on the host</td></tr>
+          <tr><td>Search</td><td class="dim">Keyword full-text (Elasticsearch)</td><td class="win">Full-text <b>+ semantic vector similarity</b></td></tr>
+          <tr><td>Related articles</td><td class="dim">"What links here" — raw link list</td><td class="win">Fused <b>vector + graph</b>, relevance-ranked, early-terminating</td></tr>
+          <tr><td>Path between two topics</td><td class="no">Not built in</td><td class="win"><span class="yes">Native shortest-path</span> ("Connect")</td></tr>
+          <tr><td>Ask a question (RAG)</td><td class="no">Not available</td><td class="win"><span class="yes">Graph-aware RAG</span> over the articles</td></tr>
+          <tr><td>Structured filters</td><td class="no">Not in the reader</td><td class="win">Relational predicates — in-degree, length, category</td></tr>
+          <tr><td>Cross-modal update consistency</td><td class="dim">n/a (single modality)</td><td class="win">One WAL, atomic — <b>0 torn vs 42</b> across a 3-store stack</td></tr>
+          <tr><td>Private &amp; offline</td><td class="no">Public, online only</td><td class="win"><span class="yes">Self-hosted</span>, private, fully offline</td></tr>
+          <tr><td>Scale demonstrated</td><td class="dim">~6.9M (English)</td><td class="win">6.9M today &rarr; <b>Wikidata 110M</b> next</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="note">
+      <b>On raw speed:</b> we don't claim to out-serve Wikipedia's cached HTML. Where TriDB wins is the
+      <em>knowledge</em> query — semantic related, multi-hop paths, fused RAG — which the fused operator
+      returns while examining as little as <b>~0.71%</b> of the corpus. A real page-load and search
+      head-to-head will be <em>measured</em> and posted here, not asserted.
+    </div>
+  </div>
+</section>
+
+<!-- EVIDENCE -->
+<section>
+  <div class="wrap">
+    <h2><span class="k">Measured, not asserted</span>The engine underneath, in numbers.</h2>
+    <div class="stats">
+      <div class="stat"><div class="n">0 <small>vs 42</small></div><div class="l">Torn cross-modal writes under injected failure — one transaction vs three independent stores.</div></div>
+      <div class="stat"><div class="n">+15.6 <small>pts</small></div><div class="l">Multi-hop joint recall@5 when the graph leg injects source-anchored context into retrieval (HotpotQA).</div></div>
+      <div class="stat"><div class="n">~0.71<small>%</small></div><div class="l">Share of the corpus examined while the streaming fused operator beat a full blocking oracle on recall.</div></div>
+    </div>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap">
+    <div class="links">
+      <a href="/read">Enter the wiki</a>
+      <a href="https://github.com/ConsultingFuture4200/tridb">GitHub &#8599;</a>
+      <a href="#">Architecture</a>
+      <a href="#">Why Wikidata</a>
+    </div>
+    <div>TriDB — vector, graph, and relational retrieval fused in one Postgres process, under one write-ahead log. Wikipedia is the demonstration.</div>
+  </div>
+</footer>
+
+</body>
+</html>
+"""
+
+
 INDEX_HTML = """<!doctype html>
 <html><head><meta charset="utf-8"><title>Offline Wikipedia</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -1911,6 +2138,7 @@ p { line-height:1.6; }
 </style></head>
 <body>
 <header>
+  <a href="/" title="TriDB — portal home" style="color:#fff;font-weight:700;text-decoration:none;white-space:nowrap;font-size:15px">TriDB</a>
   <button id="back" onclick="goBack()" title="Back (also works with the browser Back button)">&larr; Back</button>
   <button id="home" onclick="goHome()" title="Home — jump to a fresh random article">&#127968; Home</button>
   <h1 onclick="goHome()" title="Home — a fresh random article">Offline Wikipedia</h1>
@@ -2362,6 +2590,7 @@ updateBack();
 loadHome();   // landing view: a fresh random article
 
 $('#q').addEventListener('keydown', e => { if(e.key==='Enter') search(); });
+(function(){var _q=new URLSearchParams(location.search).get('q');if(_q){$('#q').value=_q;search();}})();
 $('#ask').addEventListener('keydown', e => { if(e.key==='Enter') ask(); });
 $('#from').addEventListener('keydown', e => { if(e.key==='Enter') connect(); });
 $('#to').addEventListener('keydown', e => { if(e.key==='Enter') connect(); });
@@ -2391,6 +2620,8 @@ def make_handler(reader: Reader):
             path = u.path
             try:
                 if path == "/":
+                    self._send(200, LANDING_HTML.encode("utf-8"), "text/html; charset=utf-8")
+                elif path in ("/read", "/read/"):
                     self._send(200, INDEX_HTML.encode("utf-8"), "text/html; charset=utf-8")
                 elif path == "/random":
                     r = reader.random_article()

@@ -1,0 +1,5 @@
+{
+  "rewrites": [
+    { "source": "/read", "destination": "/read.html" }
+  ]
+}
