@@ -787,7 +787,28 @@ class Reader:
         id2title = self._out_target_titles(aid)
         title2id = {t: i for i, t in id2title.items()}
         norm2id = {_norm_title(t): i for i, t in id2title.items()}
-        san = _HtmlSanitizer(title2id, norm2id)
+        # dense inline auto-linking over the HTML's text nodes: same Layer-A surface
+        # map + full-corpus matcher as link_body, so nearly every notable term links.
+        a_surf: dict[str, int] = {}
+        for tid, title in id2title.items():
+            key = _norm_ws(title).lower()
+            if len(key) >= 2:
+                a_surf.setdefault(key, tid)
+        for tid, alias in self._aliases_for(list(id2title)):
+            key = _norm_ws(alias).lower()
+            if len(key) >= 3:
+                a_surf.setdefault(key, tid)
+        a_rx = None
+        if a_surf:
+            alt = "|".join(re.escape(k) for k in sorted(a_surf, key=len, reverse=True))
+            a_rx = re.compile(
+                r"(?<![0-9A-Za-z])(?:" + alt + r")(?![0-9A-Za-z])", re.IGNORECASE
+            )
+
+        def link(frag: str) -> str:
+            return self._linkify(frag, a_surf, a_rx, aid)
+
+        san = _HtmlSanitizer(title2id, norm2id, link)
         san.feed(raw_html)
         san.close()
         return san.result()
@@ -1906,13 +1927,15 @@ class _HtmlSanitizer(HTMLParser):
     only integer ids, escaped class tokens, and whitelisted image URLs reach any
     attribute value."""
 
-    def __init__(self, title2id, norm2id):
+    def __init__(self, title2id, norm2id, link_fn=None):
         super().__init__(convert_charrefs=True)
         self.title2id = title2id
         self.norm2id = norm2id
+        self.link_fn = link_fn
         self.out = []
         self.skip = 0
         self.astack = []
+        self.anchor_depth = 0
 
     def _attrs(self, tag, attrs):
         d = dict(attrs)
@@ -1986,12 +2009,17 @@ class _HtmlSanitizer(HTMLParser):
         if tag == "a":
             if self.astack and self.astack.pop():
                 self.out.append("</a>")
+                self.anchor_depth -= 1
             return
         if tag in _HTML_OK and tag not in _HTML_VOID and tag != "img":
             self.out.append(f"</{tag}>")
 
     def handle_data(self, data):
-        if not self.skip:
+        if self.skip:
+            return
+        if self.anchor_depth == 0 and self.link_fn is not None:
+            self.out.append(self.link_fn(data))
+        else:
             self.out.append(html.escape(data))
 
     def _open_a(self, attrs):
@@ -2004,11 +2032,13 @@ class _HtmlSanitizer(HTMLParser):
                 self.out.append(
                     f'<a href="/article/{int(tid)}" class="wl" data-id="{int(tid)}">'
                 )
+                self.anchor_depth += 1
                 self.astack.append(True)
                 return
             self.out.append(
                 f'<a class="wl-title" data-title="{html.escape(wt, quote=True)}">'
             )
+            self.anchor_depth += 1
             self.astack.append(True)
             return
         self.astack.append(False)
