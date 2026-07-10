@@ -166,6 +166,17 @@ verify_patches() {
     || die "TriDB tridb_hnsw_scan_workbound.patch NOT applied — plain HNSW scan work-bound GUC missing in lib.cpp (DEV-1354); drift?"
   grep -q 'hnsw_max_examined_guc' "$root/src/hnswindex.cpp" 2>/dev/null \
     || die "TriDB tridb_hnsw_scan_workbound.patch NOT applied — plain HNSW scan examined ceiling missing in hnswindex.cpp (DEV-1354); drift?"
+  # ADR-0014 (advisor plan 052): HNSW vector_index_map relcache invalidation. Three sentinels on
+  # LOAD-BEARING code tokens (not comment phrases) across the three touched call sites — a partial
+  # apply (e.g. the callback wired but no scan-site keepalive, or vice versa) misses one and die()s.
+  grep -q 'RegisterInvalidationCallback' "$root/src/hnswindex_scan.hpp" 2>/dev/null \
+    || die "TriDB tridb_hnsw_index_cache_inval.patch NOT applied — relcache invalidation callback declaration missing in hnswindex_scan.hpp (ADR-0014 / advisor plan 052); drift?"
+  grep -q 'HNSWIndexScan::RegisterInvalidationCallback' "$root/src/lib.cpp" 2>/dev/null \
+    || die "TriDB tridb_hnsw_index_cache_inval.patch NOT applied — callback not registered in lib.cpp _PG_init (ADR-0014 / advisor plan 052); drift?"
+  grep -q 'relid_to_path_map' "$root/src/hnswindex_scan.cpp" 2>/dev/null \
+    || die "TriDB tridb_hnsw_index_cache_inval.patch NOT applied — relid->path side map missing in hnswindex_scan.cpp (ADR-0014 / advisor plan 052); drift?"
+  grep -q 'indexKeepalive' "$root/src/tridb_vector_iter.cpp" 2>/dev/null \
+    || die "TriDB tridb_hnsw_index_cache_inval.patch INCOMPLETE — shared_ptr keepalive missing in tridb_vector_iter.cpp (ADR-0014 ownership rule / advisor plan 052); drift?"
   log "all MSVBASE + TriDB fork patches verified present"
 }
 
@@ -638,6 +649,36 @@ apply_tridb_fork_patches() {
     log "applying TriDB fork patch: plain HNSW scan TR-1 hard work-bound (DEV-1354)"
     ( cd "$root" && git apply "$hnswwb_patch" ) \
       || die "tridb_hnsw_scan_workbound.patch did not apply — hnsw-chain drift? re-generate per DEV-1354"
+  fi
+
+  #   tridb_hnsw_index_cache_inval.patch (ADR-0014 Option A, advisor plan 052): the process-global
+  #     vector_index_map/distanceFunction_map (src/hnswindex_scan.cpp) are never erased, so a
+  #     pooled backend serves a STALE (or, on a dimension change, wrong-dimension/OOB, the plan-019
+  #     class defect) graph after DROP INDEX + CREATE (same name), REINDEX, or recreate-at-new-
+  #     dimension. Adds a CacheRegisterRelcacheCallback registered once from _PG_init (lib.cpp),
+  #     which erases the stale map entry on relcache invalidation (DROP/REINDEX/rewrite; InvalidOid
+  #     means flush everything) so the very next LoadIndex cache-misses and the existing DEV-1235
+  #     rebuild-on-recovery path repopulates from the live heap. Since the invalidation callback
+  #     receives only an Oid, a side map `relid_to_path_map` (Oid -> p_path) — populated in
+  #     LoadIndex — lets the callback find which name-keyed entry to erase without re-keying the
+  #     whole cache (the ADR-sanctioned Option A variant). Ownership rule (mandatory, ADR-0014):
+  #     the callback ONLY erases map entries, never frees/mutates the graph directly — BeginScan
+  #     now also copies the map's shared_ptr into a caller-held "keepalive" (WorkSpace::
+  #     indexKeepalive / TridbVectorIter::indexKeepalive) BEFORE constructing the iterator, so an
+  #     eviction racing a long-lived scan only drops the map's own reference; the graph itself is
+  #     freed only once every keepalive copy is also released. Diffed against the fully-patched
+  #     hnswindex.cpp/hnswindex_scan.{hpp,cpp}/tridb_vector_iter.cpp/lib.cpp, so it MUST apply LAST
+  #     in the HNSW chain (after tridb_hnsw_scan_workbound.patch). GX10/Docker-gated: authored and
+  #     apply/sentinel-verified on the x86 standin only — NOT compiled or run; the repro
+  #     (scripts/hnsw_stale_index_repro.sh) is the acceptance test once it is built on the engine.
+  local hnswinval_patch="${_MSVBASE_LIB_DIR}/../patches/tridb_hnsw_index_cache_inval.patch"
+  [[ -f "$hnswinval_patch" ]] || die "missing TriDB fork patch: $hnswinval_patch"
+  if grep -q 'RegisterInvalidationCallback' "$root/src/hnswindex_scan.hpp" 2>/dev/null; then
+    log "TriDB fork patch (HNSW vector_index_map relcache invalidation, ADR-0014 / advisor plan 052) already applied"
+  else
+    log "applying TriDB fork patch: HNSW vector_index_map relcache invalidation (ADR-0014 Option A / advisor plan 052)"
+    ( cd "$root" && git apply "$hnswinval_patch" ) \
+      || die "tridb_hnsw_index_cache_inval.patch did not apply — hnsw-chain drift? re-generate per ADR-0014 / advisor plan 052"
   fi
 
   # ----------------------------------------------------------------------------

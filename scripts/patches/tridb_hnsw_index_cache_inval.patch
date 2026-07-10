@@ -1,0 +1,214 @@
+diff --git a/src/hnswindex.cpp b/src/hnswindex.cpp
+--- a/src/hnswindex.cpp
++++ b/src/hnswindex.cpp
+@@ -339,8 +339,11 @@ bool hnsw_gettuple(IndexScanDesc scan, ScanDirection dir)
+             scanState->hasRangeFilter = true;
+             scanState->inRange = false;
+             scanState->range = scanState->workSpace->array[0];
++            // TRIDB ADR-0014 (advisor plan 052): capture the shared_ptr keepalive alongside the
++            // iterator so a concurrent DROP/REINDEX invalidation cannot free the graph mid-scan.
+             scanState->workSpace->resultIterator =
+-                       HNSWIndexScan::BeginScan((char *)(scanState->workSpace->array.data() + 1),path);
++                       HNSWIndexScan::BeginScan((char *)(scanState->workSpace->array.data() + 1),path,
++                                                 &scanState->workSpace->indexKeepalive);
+         }
+         else{
+             if (scan->orderByData->sk_flags & SK_ISNULL)
+@@ -367,8 +370,11 @@ bool hnsw_gettuple(IndexScanDesc scan, ScanDirection dir)
+ 	     * monotone, so the TJS operator's term_cond is the real recall knob, never
+ 	     * this window. See docs/decisions/0007-tjs-operator.md. */
+ 	    scanState->range = 86;
++            // TRIDB ADR-0014 (advisor plan 052): capture the shared_ptr keepalive alongside the
++            // iterator so a concurrent DROP/REINDEX invalidation cannot free the graph mid-scan.
+             scanState->workSpace->resultIterator =
+-                       HNSWIndexScan::BeginScan((char *)scanState->workSpace->array.data(),path);
++                       HNSWIndexScan::BeginScan((char *)scanState->workSpace->array.data(),path,
++                                                 &scanState->workSpace->indexKeepalive);
+         }
+         scan->xs_inorder = false;
+         scanState->first = false;
+diff --git a/src/hnswindex_scan.cpp b/src/hnswindex_scan.cpp
+--- a/src/hnswindex_scan.cpp
++++ b/src/hnswindex_scan.cpp
+@@ -11,6 +11,8 @@ extern "C"
+ #include <access/table.h>
+ #include <catalog/index.h>
+ #include <utils/rel.h>
++// TRIDB ADR-0014 (advisor plan 052): CacheRegisterRelcacheCallback.
++#include <utils/inval.h>
+ }
+ 
+ // TRIDB DEV-1286: defined in hnswindex.cpp (C++ linkage). Read per-index HNSW build-quality
+@@ -26,6 +28,54 @@ TRIDB_ASSERT_VECTOR_BACKEND(HNSWIndexScan);
+ 
+ std::map<std::string, std::shared_ptr<hnswlib::SpaceInterface<float>>> HNSWIndexScan::distanceFunction_map;
+ std::map<std::string, std::shared_ptr<hnswlib::HierarchicalNSW<float>>> HNSWIndexScan::vector_index_map;
++// TRIDB ADR-0014 (advisor plan 052): see hnswindex_scan.hpp for the rationale.
++std::map<Oid, std::string> HNSWIndexScan::relid_to_path_map;
++
++// TRIDB ADR-0014 (advisor plan 052): relcache-invalidation callback (CacheRegisterRelcacheCallback
++// signature: void(Datum, Oid)). Fires on DROP INDEX / REINDEX / any relation rewrite that
++// invalidates a relcache entry — including, with relid == InvalidOid, a "flush everything"
++// notification. A pooled backend that never re-derives its cache key otherwise keeps serving the
++// STALE (or, on a dimension change, wrong-dimension/OOB) graph forever (the bug this ADR fixes).
++//
++// Ownership rule (mandatory, ADR-0014): this callback ONLY erases map entries. It never frees,
++// mutates, or saves the underlying HierarchicalNSW directly — dropping vector_index_map's
++// shared_ptr reference merely lets the refcount fall; the object itself is freed only once every
++// last holder (including a WorkSpace/TridbVectorIter::indexKeepalive copy taken by an in-flight
++// BeginScan) releases it. The very next LoadIndex on this path then cache-misses and the existing
++// DEV-1235 rebuild-on-recovery path repopulates from the live heap — no rebuild logic changes.
++//
++// Concurrency: Postgres backends are single-threaded, and invalidation callbacks fire
++// synchronously on the same backend thread that would otherwise be inside a scan (e.g. at
++// AcceptInvalidationMessages during CommandCounterIncrement/lock acquisition, never re-entrant
++// with an in-progress hnsw_gettuple pull) — so no lock around these maps is required beyond that
++// single-threaded-per-backend assumption, which the ADR requires be stated explicitly here.
++static void
++HNSWCacheInvalCallback(Datum /*arg*/, Oid relid)
++{
++    if (relid == InvalidOid)
++    {
++        // "Flush everything" notification: erase every entry rather than try to figure out which
++        // ones are stale. Correct-but-conservative — the next access to any index simply rebuilds.
++        HNSWIndexScan::vector_index_map.clear();
++        HNSWIndexScan::distanceFunction_map.clear();
++        HNSWIndexScan::relid_to_path_map.clear();
++        return;
++    }
++
++    auto found = HNSWIndexScan::relid_to_path_map.find(relid);
++    if (found == HNSWIndexScan::relid_to_path_map.end())
++        return;   // not an index this backend has ever loaded — nothing cached to erase.
++
++    const std::string path = found->second;
++    HNSWIndexScan::vector_index_map.erase(path);
++    HNSWIndexScan::distanceFunction_map.erase(path);
++    HNSWIndexScan::relid_to_path_map.erase(found);
++}
++
++void HNSWIndexScan::RegisterInvalidationCallback()
++{
++    CacheRegisterRelcacheCallback(HNSWCacheInvalCallback, (Datum) 0);
++}
+ 
+ // DEV-1235 (ADR-0009 rebuild-on-recovery): state struct threaded through the
+ // heap-rebuild scan callback. Mirrors HNSWIndexBuilder but inline here to avoid
+@@ -202,12 +252,26 @@ void HNSWIndexScan::LoadIndex(Relation index,
+     // is tied to vector_index (hnswlib holds a raw pointer to the space object).
+     distanceFunction_map.insert(std::make_pair(p_path, distanceFunction));
+     vector_index_map.insert(std::make_pair(p_path, vector_index));
++    // TRIDB ADR-0014 (advisor plan 052): record relid -> p_path so a later relcache invalidation
++    // for THIS relid (DROP/REINDEX) can find and erase the entry above by name. Always overwritten
++    // with the current relid on every fresh build, so a subsequent DROP+CREATE (new relid, same
++    // p_path) is tracked correctly once its own LoadIndex runs.
++    relid_to_path_map[RelationGetRelid(index)] = p_path;
+ }
+ 
+ std::shared_ptr<hnswlib::ResultIterator<float>> HNSWIndexScan::BeginScan(
+-    const void* p_target, const std::string &p_path)
++    const void* p_target, const std::string &p_path,
++    std::shared_ptr<hnswlib::HierarchicalNSW<float>> *out_index_keepalive)
+ {
+-    return std::make_shared<hnswlib::ResultIterator<float>>(vector_index_map[p_path].get(), p_target);
++    // TRIDB ADR-0014 (advisor plan 052): copy the shared_ptr out of the map BEFORE constructing
++    // the iterator (which only holds hnswlib's raw pointer). If the caller stashes
++    // *out_index_keepalive for the scan's lifetime, a relcache-invalidation erase of this map
++    // entry mid-scan drops only the map's reference — the graph itself stays alive until the
++    // caller's copy is also released, so the iterator's raw pointer never dangles.
++    std::shared_ptr<hnswlib::HierarchicalNSW<float>> index_ref = vector_index_map[p_path];
++    if (out_index_keepalive)
++        *out_index_keepalive = index_ref;
++    return std::make_shared<hnswlib::ResultIterator<float>>(index_ref.get(), p_target);
+ }
+ 
+ hnswlib::QueryResult<float>* HNSWIndexScan::GetNet(
+diff --git a/src/hnswindex_scan.hpp b/src/hnswindex_scan.hpp
+--- a/src/hnswindex_scan.hpp
++++ b/src/hnswindex_scan.hpp
+@@ -33,6 +33,13 @@ public:
+         std::shared_ptr<hnswlib::ResultIterator<float>> resultIterator;
+ 	    std::vector<float> array;
+         std::priority_queue<float> distanceQueue;
++        // TRIDB ADR-0014 (advisor plan 052): scan-local copy of the graph shared_ptr, taken at
++        // BeginScan time. Keeps the HierarchicalNSW alive for the scan's lifetime even if a
++        // relcache-invalidation callback erases the map's own reference mid-scan (DROP/REINDEX
++        // racing a long-lived scan) — the underlying graph is only freed once BOTH the map's
++        // reference and every scan holding this copy are gone. Ownership rule: the callback must
++        // ONLY erase its map entry, never touch/free the object directly.
++        std::shared_ptr<hnswlib::HierarchicalNSW<float>> indexKeepalive;
+     };
+     // DEV-1235 (ADR-0009 rebuild-on-recovery): LoadIndex now takes the index Relation
+     // so it can open the heap and rebuild the in-RAM index from WAL-durable heap tuples
+@@ -43,8 +50,14 @@ public:
+     static void LoadIndex(Relation index,
+                           const std::string &p_path,
+                           DistanceMethod distance_method, int dim);
++    // TRIDB ADR-0014 (advisor plan 052): optional out-param, defaulted so the pre-existing 2-arg
++    // call form still compiles. When non-null, BeginScan copies the map's shared_ptr into
++    // *out_index_keepalive BEFORE constructing the iterator — the caller must store it
++    // (WorkSpace::indexKeepalive / TridbVectorIter::indexKeepalive) for the scan's lifetime so a
++    // concurrent invalidation-callback erase cannot free the graph out from under it.
+     static std::shared_ptr<hnswlib::ResultIterator<float>> BeginScan(
+-        const void *p_target, const std::string &p_path);
++        const void *p_target, const std::string &p_path,
++        std::shared_ptr<hnswlib::HierarchicalNSW<float>> *out_index_keepalive = nullptr);
+     static hnswlib::QueryResult<float>* GetNet(
+         std::shared_ptr<hnswlib::ResultIterator<float>> &resultIterator);
+     static void EndScan(
+@@ -60,8 +73,17 @@ public:
+             IndexBulkDeleteResult* stats,
+             IndexBulkDeleteCallback callback,
+             void* callback_state);
++    // TRIDB ADR-0014 (advisor plan 052): register the relcache-invalidation callback that keeps
++    // vector_index_map/distanceFunction_map fresh across DROP INDEX / REINDEX / rewrite. Call
++    // once per backend from _PG_init (lib.cpp).
++    static void RegisterInvalidationCallback();
+ 
+     static std::map<std::string, std::shared_ptr<hnswlib::SpaceInterface<float>>> distanceFunction_map;
+     static std::map<std::string, std::shared_ptr<hnswlib::HierarchicalNSW<float>>> vector_index_map;
++    // TRIDB ADR-0014 (advisor plan 052): side map from an index's relid to its cache key
++    // (p_path), populated in LoadIndex. The relcache invalidation callback receives only an Oid,
++    // so this is how it finds which vector_index_map/distanceFunction_map entry to erase without
++    // re-keying the whole cache (Option A per the ADR: "keep a side map Oid -> p_path").
++    static std::map<Oid, std::string> relid_to_path_map;
+ };
+ #endif
+diff --git a/src/lib.cpp b/src/lib.cpp
+--- a/src/lib.cpp
++++ b/src/lib.cpp
+@@ -114,4 +114,8 @@ void _PG_init(void)
+         0,
+         NULL, NULL, NULL);
+ 
++    // TRIDB ADR-0014 (advisor plan 052): register the HNSW vector_index_map relcache-invalidation
++    // callback once per backend, so a pooled connection stops serving a stale (or, on a dimension
++    // change, wrong-dimension/OOB) graph after DROP INDEX / REINDEX / recreate.
++    HNSWIndexScan::RegisterInvalidationCallback();
+ }
+\ No newline at end of file
+diff --git a/src/tridb_vector_iter.cpp b/src/tridb_vector_iter.cpp
+--- a/src/tridb_vector_iter.cpp
++++ b/src/tridb_vector_iter.cpp
+@@ -38,6 +38,9 @@ constexpr int kDefaultInversionTolerance = 3;  // lifted from hnsw_gettuple's di
+ struct TridbVectorIter
+ {
+     std::shared_ptr<hnswlib::ResultIterator<float>> resultIterator;
++    // TRIDB ADR-0014 (advisor plan 052): scan-local copy of the graph shared_ptr, taken at
++    // BeginScan time — see HNSWIndexScan::WorkSpace::indexKeepalive for the ownership rationale.
++    std::shared_ptr<hnswlib::HierarchicalNSW<float>> indexKeepalive;
+     std::vector<float> query;  // owns the query copy the iterator points into.
+ 
+     int k = 1;
+@@ -128,8 +131,10 @@ TridbVectorIter *tridb_vec_open(Relation index, const float *query_vec, int dim,
+         // BeginScan points the hnswlib iterator at our owned copy of the query vector. If it
+         // throws (workspace alloc / OOM), the unique_ptr destructs `it` — returning its hnswlib
+         // WorkSpace to the visited_list_pool_ — and we leak nothing.
++        // TRIDB ADR-0014 (advisor plan 052): capture the keepalive so a concurrent DROP/REINDEX
++        // invalidation cannot free the graph mid-scan.
+         it->resultIterator = HNSWIndexScan::BeginScan(
+-            static_cast<const void *>(it->query.data()), path);
++            static_cast<const void *>(it->query.data()), path, &it->indexKeepalive);
+         return it.release();
+     }
+     catch (std::exception &ex)

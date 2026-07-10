@@ -1,6 +1,10 @@
 # ADR-0014: Invalidate the process-global HNSW in-RAM index-map on DROP/REINDEX/recreate
 
-**Status:** Proposed (DESIGN + SPIKE — the production fix is deferred to DEV-1259 Phase C; hot-path C, GX10+Docker-gated)
+**Status:** Option A PATCH AUTHORED (advisor plan 052, 2026-07-09) — apply/sentinel-verified via
+`ci_check_patches.sh` (exit 0) on the x86 standin; **NOT yet Accepted**. The patch has not been
+compiled or run: the live engine acceptance (`scripts/hnsw_stale_index_repro.sh` showing B=42,
+C=99, D=7-with-no-crash) plus the recall/latency non-regression sweep are GX10+Docker-gated and
+remain open for DEV-1259 Phase C. See "Implementation status (advisor plan 052)" below.
 **Date:** 2026-07-02
 **Issue:** advisor plan 023 (design + repro). Implementation home: DEV-1259 (HNSW durability Phase C).
 **Relates to:** UPCORE-02 (index name as the cache key collides distinct-but-same-named indexes),
@@ -180,3 +184,38 @@ is still traversing.** Mandatory rule for the DEV-1259 implementation:
 3. Gate on `bash scripts/ci_check_patches.sh` (patch applies) + a live engine run of
    `scripts/hnsw_stale_index_repro.sh` showing B=42, C=99, D=7-with-no-crash, plus the
    existing recall/latency sweep to prove no hot-path regression.
+
+## Implementation status (advisor plan 052, 2026-07-09)
+
+Step 1 of the handoff above is done as a fork patch; steps 2 and half of 3 are done; the live
+engine run in step 3 is **not**.
+
+- **Patch:** `scripts/patches/tridb_hnsw_index_cache_inval.patch`. Implements Option A with the
+  side-map variant the ADR explicitly sanctions ("keep a side map Oid -> p_path") rather than a
+  full re-key of `vector_index_map`/`distanceFunction_map` to relid — smaller diff, same
+  correctness for scenarios B/C/D (DROP+CREATE, REINDEX, dimension-change recreate). This does
+  **not** additionally close UPCORE-02 (distinct-but-same-named indexes colliding); that would
+  need the full re-key and is left for a follow-up if UPCORE-02 is prioritized separately.
+  - `HNSWIndexScan::relid_to_path_map` (Oid -> p_path), populated in `LoadIndex`.
+  - `HNSWCacheInvalCallback` registered once per backend via `CacheRegisterRelcacheCallback`
+    (`HNSWIndexScan::RegisterInvalidationCallback()`, called from `lib.cpp`'s `_PG_init`). On a
+    specific `relid` it erases only that relid's map entries; on `InvalidOid` it flushes all three
+    maps. The callback only ever `.erase()`s — it never frees/mutates the graph directly.
+  - Ownership rule implemented: `HNSWIndexScan::BeginScan` gained an optional out-param that
+    copies the map's `shared_ptr` into caller-held storage (`WorkSpace::indexKeepalive` /
+    `TridbVectorIter::indexKeepalive`) *before* constructing the `ResultIterator`, so an eviction
+    racing a long-lived scan only drops the map's own reference — the graph is freed only once
+    every keepalive copy is also released. All three `BeginScan` call sites (both branches of
+    `hnsw_gettuple` in `hnswindex.cpp`, and `tridb_vec_open` in `tridb_vector_iter.cpp`) were
+    updated to pass the out-param; the 2-arg call form still compiles (default `nullptr`) so no
+    other `BeginScan` caller (SPANN/PASE, which have their own separate process-global-map bug,
+    noted above as unfixed) needed changes.
+- **Verified in this pass:** `bash scripts/ci_check_patches.sh` — clean-clones MSVBASE at the pin,
+  applies the full fork-patch chain including this one, and greps all sentinels — **exit 0**.
+  `git apply --check` of the patch also passes standalone against the post-chain tree. This proves
+  the patch applies and the sentinels are load-bearing; it does **not** prove the C compiles or the
+  fix behaves correctly at runtime.
+- **NOT done (GX10/Docker-gated, no engine image available on the authoring box):** the patch has
+  not been compiled; `scripts/hnsw_stale_index_repro.sh` has not been run against it. Status is
+  therefore **not** "Accepted" — do not treat this as a shipped fix until DEV-1259 runs the live
+  repro (B=42, C=99, D=7-with-no-crash) and the recall/latency non-regression sweep on the GX10.
