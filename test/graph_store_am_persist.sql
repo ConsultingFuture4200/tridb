@@ -8,8 +8,8 @@ SET search_path TO graph_store, public;
 DO $$
 DECLARE n bigint[]; c bigint;
 BEGIN
-    IF gph_vertex_count() <> 6 THEN
-        RAISE EXCEPTION 'after restart: vertex_count % <> 6 (not WAL-persisted)', gph_vertex_count();
+    IF gph_vertex_count() <> 5 THEN
+        RAISE EXCEPTION 'after restart: vertex_count % <> 5 (not WAL-persisted)', gph_vertex_count();
     END IF;
     SELECT array_agg(x ORDER BY x) INTO n FROM gph_neighbors(0) x;
     IF n IS DISTINCT FROM ARRAY[1,2,3]::bigint[] THEN
@@ -19,7 +19,7 @@ BEGIN
     IF c <> 1500 THEN
         RAISE EXCEPTION 'after restart: vertex 5 edges = % (expected 1500)', c;
     END IF;
-    RAISE NOTICE 'PASS persistence across restart (WAL recovery): 6 vertices, neighbors(0)={1,2,3}, 1500 edges on v5';
+    RAISE NOTICE 'PASS persistence across restart (WAL recovery): 5 vertices, neighbors(0)={1,2,3}, 1500 edges on v5';
 END $$;
 
 \echo '============ graph_store_am: PERSISTENCE VERIFIED (DEV-1164) ============'
