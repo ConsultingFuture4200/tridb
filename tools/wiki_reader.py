@@ -34,6 +34,7 @@ import json
 import os
 import random
 import re
+import secrets
 import sqlite3
 import threading
 import time
@@ -1708,7 +1709,7 @@ class Reader:
         property + value). Returns the refreshed accepted-fact list for the subject."""
         sid = int(d["subject_id"])
         prop = str(d.get("property", ""))[:300]
-        val = str(d.get("value", ""))
+        val = str(d.get("value", ""))[:300]
         try:
             source_id = int(d.get("source_id"))
         except (TypeError, ValueError):
@@ -1727,8 +1728,8 @@ class Reader:
                         prop,
                         val,
                         source_id,
-                        str(d.get("source_title", "")),
-                        str(d.get("source_snippet", "")),
+                        str(d.get("source_title", ""))[:300],
+                        str(d.get("source_snippet", ""))[:300],
                         time.time(),
                     ),
                 )
@@ -2001,6 +2002,7 @@ LANDING_HTML = """<!doctype html>
 INDEX_HTML = """<!doctype html>
 <html><head><meta charset="utf-8"><title>Offline Wikipedia</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="wr-token" content="">
 <style>
 * { box-sizing: border-box; }
 body { margin:0; font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;
@@ -2172,6 +2174,7 @@ p { line-height:1.6; }
 <div id="hovercard"></div>
 <script>
 const $ = s => document.querySelector(s);
+function wrToken(){ const m = document.querySelector('meta[name="wr-token"]'); return m ? m.content : ''; }
 async function j(u){ const r = await fetch(u); return r.json(); }
 function esc(s){ const d=document.createElement('div'); d.textContent=s; return d.innerHTML; }
 // score is cosine similarity (0..1, higher = more related).
@@ -2312,7 +2315,8 @@ async function acceptEnrich(id, i){
     source_id:f.source_id, source_title:f.source_title, source_snippet:f.source_snippet };
   let r;
   try { r = await (await fetch('/enrich/accept', { method:'POST',
-    headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload) })).json(); }
+    headers:{'Content-Type':'application/json', 'X-TriDB-Token':wrToken()},
+    body:JSON.stringify(payload) })).json(); }
   catch(e){ return; }
   const row = $('#sug'+i); if(row) row.style.display = 'none';
   if(r.facts) $('#enrichaccepted').innerHTML = renderEnrichments(r.facts);
@@ -2320,7 +2324,7 @@ async function acceptEnrich(id, i){
 async function dismissEnrich(id, i){
   const f = _enrichData[i]; if(!f) return;
   try { await fetch('/enrich/dismiss', { method:'POST',
-    headers:{'Content-Type':'application/json'},
+    headers:{'Content-Type':'application/json', 'X-TriDB-Token':wrToken()},
     body:JSON.stringify({ subject_id:id, property:f.property, value:f.value }) }); }
   catch(e){ return; }
   const row = $('#sug'+i); if(row) row.style.display = 'none';
@@ -2600,7 +2604,37 @@ $('#to').addEventListener('keydown', e => { if(e.key==='Enter') connect(); });
 </body></html>"""
 
 
-def make_handler(reader: Reader):
+MAX_BODY_BYTES = 64 * 1024  # cap mutating POST bodies (accept/dismiss payloads are small)
+
+
+def check_token(headers, expected: str) -> bool:
+    """True iff `headers` (dict-like, `.get(name, default)`) carries `expected` via
+    the `X-TriDB-Token` header or an `Authorization: Bearer <token>` header."""
+    if not expected:
+        return False
+    supplied = headers.get("X-TriDB-Token", "") or ""
+    if not supplied:
+        auth = headers.get("Authorization", "") or ""
+        if auth.startswith("Bearer "):
+            supplied = auth[len("Bearer ") :]
+    return supplied == expected
+
+
+def parse_body(raw: bytes, max_len: int = MAX_BODY_BYTES) -> dict:
+    """Parse a JSON POST body, rejecting oversized payloads.
+
+    Raises ValueError if `raw` exceeds `max_len` bytes."""
+    if len(raw) > max_len:
+        raise ValueError(f"body exceeds {max_len} bytes")
+    return json.loads(raw or b"{}")
+
+
+def make_handler(reader: Reader, token: str):
+    index_html = INDEX_HTML.replace(
+        '<meta name="wr-token" content="">',
+        f'<meta name="wr-token" content="{html.escape(token)}">',
+    )
+
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *a):  # quiet
             pass
@@ -2622,7 +2656,7 @@ def make_handler(reader: Reader):
                 if path == "/":
                     self._send(200, LANDING_HTML.encode("utf-8"), "text/html; charset=utf-8")
                 elif path in ("/read", "/read/"):
-                    self._send(200, INDEX_HTML.encode("utf-8"), "text/html; charset=utf-8")
+                    self._send(200, index_html.encode("utf-8"), "text/html; charset=utf-8")
                 elif path == "/random":
                     r = reader.random_article()
                     self._json(r if r is not None else {"error": "no articles"})
@@ -2707,7 +2741,20 @@ def make_handler(reader: Reader):
             u = urlparse(self.path)
             try:
                 length = int(self.headers.get("Content-Length", "0") or "0")
-                body = json.loads(self.rfile.read(length) or b"{}") if length else {}
+                if length > MAX_BODY_BYTES:
+                    self._send(413, b"payload too large", "text/plain")
+                    return
+                raw = self.rfile.read(length) if length else b""
+                try:
+                    body = parse_body(raw)
+                except ValueError:
+                    self._send(413, b"payload too large", "text/plain")
+                    return
+                if u.path in ("/enrich/accept", "/enrich/dismiss") and not check_token(
+                    self.headers, token
+                ):
+                    self._send(401, b"unauthorized", "text/plain")
+                    return
                 if u.path == "/enrich/accept":
                     self._json(reader.accept_fact(body))
                 elif u.path == "/enrich/dismiss":
@@ -2722,7 +2769,10 @@ def make_handler(reader: Reader):
 
 def cmd_serve(corpus: Path, host: str, port: int) -> None:
     reader = Reader(corpus)
-    httpd = ThreadingHTTPServer((host, port), make_handler(reader))
+    token = os.environ.get("WIKI_READER_TOKEN") or secrets.token_urlsafe(24)
+    if not os.environ.get("WIKI_READER_TOKEN"):
+        print(f"[serve] auth token (mutating POSTs): {token}")
+    httpd = ThreadingHTTPServer((host, port), make_handler(reader, token))
     print(f"[serve] listening on http://{host}:{port}  (Ctrl-C to stop)")
     try:
         httpd.serve_forever()
@@ -2751,10 +2801,25 @@ def main(argv: list[str] | None = None) -> int:
     sp = sub.add_parser("serve", help="serve the reader")
     sp.add_argument("--host", default="127.0.0.1")
     sp.add_argument("--port", type=int, default=8080)
+    sp.add_argument(
+        "--allow-remote",
+        action="store_true",
+        help="permit a non-loopback --host (fail-closed by default)",
+    )
     args = ap.parse_args(argv)
 
     if not (args.corpus / "manifest.json").exists():
         ap.error(f"no manifest.json under {args.corpus}")
+
+    if (
+        args.cmd == "serve"
+        and args.host not in ("127.0.0.1", "::1", "localhost")
+        and not args.allow_remote
+    ):
+        ap.error(
+            f"--host {args.host!r} is non-loopback; pass --allow-remote to confirm "
+            "intentional remote exposure"
+        )
 
     if args.cmd == "build":
         cmd_build(args.corpus)

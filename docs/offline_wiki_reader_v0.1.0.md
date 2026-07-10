@@ -744,3 +744,29 @@ lookup), each still showing its source — **the original body is never touched.
   category-type match; a recurring heading is a hint, not a guarantee the target needs it.
 - **Sources are lead-only** (`ENRICH_SOURCE_CHARS`), so a fact buried deep in a long
   source article can be missed (and its snippet would fail the gate, correctly).
+
+# Addendum v9 — auth + body limits on mutating POSTs (advisor 051)
+
+`serve` is a local, single-user tool, but `--host` was previously unrestricted and
+the two mutating endpoints (`POST /enrich/accept`, `POST /enrich/dismiss`) had no
+auth and no request-size cap. Fail-closed defaults, still zero-config for the
+common case (loopback, no token to type):
+
+- **Non-loopback bind requires `--allow-remote`.** `--host` outside
+  `{127.0.0.1, ::1, localhost}` now errors at argparse time unless `--allow-remote`
+  is also passed.
+- **Mutating POSTs require a token.** `POST /enrich/accept` and `POST /enrich/dismiss`
+  require `X-TriDB-Token: <token>` (or `Authorization: Bearer <token>`), else `401`.
+  The token comes from env `WIKI_READER_TOKEN`, or is auto-generated and printed once
+  at `serve` startup (`[serve] auth token (mutating POSTs): ...`) if the env var is
+  unset. The served `/` page carries the token in a same-origin
+  `<meta name="wr-token">` tag; the client JS reads it and attaches the header on
+  both mutating fetches. `GET` endpoints (browse/search/ask/etc.) are unchanged —
+  still open, as before.
+- **Body cap.** `Content-Length` over 64 KiB on a POST now gets `413`
+  (`MAX_BODY_BYTES` in `tools/wiki_reader.py`). Overlay `value` / `source_title` /
+  `source_snippet` strings are truncated to 300 chars, symmetric with the existing
+  `property` cap.
+- Set `WIKI_READER_TOKEN` yourself if you want a stable token across restarts
+  (e.g. to avoid re-copying it after every `nohup` relaunch); do not commit a token
+  value into the repo.
