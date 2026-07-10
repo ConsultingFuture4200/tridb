@@ -1,4 +1,4 @@
-.PHONY: test lint graph-test smoke-test test-all baseline-up baseline-down seed bench bench-live sweep sm2 fetch-dataset bench-public bench-repro fetch-hotpot graphrag graphrag-live bench-filtered ablation recall-decay tjs-open-ref tjs-open-live graphrag-h2h rabitq-sim gpu-build-index wiki-fetch wiki-extract wiki-scale wiki-neo4j wiki-subgraph wiki-linkpred lock clean
+.PHONY: test lint graph-test smoke-test test-all baseline-up baseline-down seed bench bench-live sweep sm2 fetch-dataset bench-public bench-repro fetch-hotpot graphrag graphrag-live bench-filtered ablation recall-decay tjs-open-ref tjs-open-live graphrag-h2h rabitq-sim gpu-build-index wiki-fetch wiki-extract wiki-scale wiki-neo4j wiki-subgraph wiki-linkpred lock clean clean-data
 
 PUBLIC_DATASET ?= gist-960-euclidean
 
@@ -383,4 +383,10 @@ baseline-down:
 	docker compose -f baseline/docker-compose.yml down -v
 
 clean:
-	rm -rf data/ bench/out/ .pytest_cache/
+	rm -rf bench/out/ .pytest_cache/
+
+clean-data:
+ifneq ($(CONFIRM),1)
+	$(error This deletes data/ (seed corpora, ANN sets, HotpotQA, wiki artifacts). Re-run as: make clean-data CONFIRM=1)
+endif
+	rm -rf data/
