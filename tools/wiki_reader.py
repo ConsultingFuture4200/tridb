@@ -3043,11 +3043,11 @@ function renderState(st){   // restore a view for a popstate (no new push)
   updateBack();
 }
 window.addEventListener('popstate', e => renderState(e.state));
-history.replaceState({view:'home'}, '', location.pathname);   // base state
+const _bootQ = new URLSearchParams(location.search).get('q');   // capture BEFORE replaceState strips ?q=
+history.replaceState({view:'home'}, '', location.pathname);   // base state (drops ?q= from the URL)
 updateBack();
 (function(){   // boot: a ?q= handoff from the portal landing runs the search and opens the top hit; else random landing
-  const _bq = new URLSearchParams(location.search).get('q');
-  if(_bq){ $('#q').value = _bq; loadSearch(_bq).then(() => { const top = document.querySelector('#results .item'); if(top) top.click(); }); }
+  if(_bootQ){ $('#q').value = _bootQ; loadSearch(_bootQ).then(() => { const top = document.querySelector('#results .item'); if(top) top.click(); }); }
   else { loadHome(); }
 })();
 
