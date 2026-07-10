@@ -294,6 +294,12 @@ $$;
 -- correct under the v1 single-writer bulk-load-then-query contract (plan 034 / DEV-1345,
 -- PERF-03; see the header comment in graph_am.c). This is the probe the TJS operator's
 -- reachable-set resolution (graphReachableT) SPI-calls instead of gph_neighbors_ext.
+-- Also honors gph_am_meta.identity_mode (plan 047 / DEV-1354 follow-up): reads the flag
+-- ONCE per Open (graph_am.c gph_read_identity_mode) and, when ON, skips BOTH the forward
+-- map probe and the reverse hash lookup exactly like gph_neighbors_ext's CASE guards above
+-- — before plan 047 this C twin ALWAYS hit gph_vid_map regardless of identity_mode, so
+-- under identity ON with an empty/incomplete map it silently returned empty where the SQL
+-- shim returned full adjacency (the bug this plan fixes).
 CREATE FUNCTION gph_neighbors_ext_cached(bigint) RETURNS SETOF bigint
   AS 'MODULE_PATHNAME' LANGUAGE C VOLATILE STRICT;
 

@@ -1883,6 +1883,46 @@ gph_vid_cache_ensure(void)
 	gph_vid_cache = h;			/* publish the fully-built table */
 }
 
+/*
+ * gph_read_identity_mode() -- read graph_store.gph_am_meta.identity_mode via SPI (single-row
+ * config table, gph_set_identity_mode's counterpart reader). Mirrors gph_vid_cache_ensure's SPI
+ * usage pattern. FAILS LOUD if the meta table is missing or not exactly one row: an install that
+ * lacks gph_am_meta is a schema mismatch (plan 047 STOP condition) — silently defaulting to
+ * false/OFF here would make gph_neighbors_ext_cached take the map path while gph_neighbors_ext
+ * (which reads the same table via plain SQL and would itself ERROR on a missing table) takes
+ * whatever a broken install does; better to ERROR clearly than diverge.
+ */
+static bool
+gph_read_identity_mode(void)
+{
+	bool	identity_mode = false;
+	bool	isnull;
+
+	if (SPI_connect() != SPI_OK_CONNECT)
+		elog(ERROR, "graph_store identity_mode read: SPI_connect failed");
+	if (SPI_execute("SELECT identity_mode FROM graph_store.gph_am_meta", true, 0) != SPI_OK_SELECT)
+		elog(ERROR, "graph_store identity_mode read: gph_am_meta query failed (meta table missing?)");
+	if (SPI_processed != 1)
+		elog(ERROR, "graph_store identity_mode read: gph_am_meta has " UINT64_FORMAT " rows, expected exactly 1",
+			 (uint64) SPI_processed);
+	identity_mode = DatumGetBool(SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isnull));
+	if (isnull)
+		elog(ERROR, "graph_store identity_mode read: identity_mode is NULL (violates NOT NULL)");
+	SPI_finish();
+
+	return identity_mode;
+}
+
+/*
+ * Per-Open context for gph_neighbors_ext_cached (plan 047): wraps the scan cursor with the
+ * identity_mode flag read ONCE on FIRSTCALL, so Next() never re-queries gph_am_meta.
+ */
+typedef struct GphNeighborsExtCachedCtx
+{
+	GraphScanDesc  *scan;
+	bool			identity_mode;
+} GphNeighborsExtCachedCtx;
+
 PG_FUNCTION_INFO_V1(gph_neighbors_ext_cached);
 
 /*
@@ -1892,12 +1932,18 @@ PG_FUNCTION_INFO_V1(gph_neighbors_ext_cached);
  * (absent src => empty set; an unmapped neighbor vid => a NULL row, matching the shim's scalar
  * subquery) — but the per-neighbor reverse translation hits the backend-local hash instead of a
  * correlated btree + SPI subquery. Byte-identical to gph_neighbors_ext (parity oracle).
+ *
+ * IDENTITY FAST-PATH (plan 047, matching gph_neighbors_ext's plan-033 CASE guards): identity_mode
+ * is read ONCE per Open and cached on the funcctx. When ON, src is already the vid (skip the
+ * forward map probe) and every emitted neighbor vid is already the external id (skip the reverse
+ * hash lookup too) — the cache warm (gph_vid_cache_ensure) is skipped entirely since its reverse
+ * map is unused under identity. When OFF, behavior is byte-identical to the pre-047 body.
  */
 Datum
 gph_neighbors_ext_cached(PG_FUNCTION_ARGS)
 {
 	FuncCallContext *funcctx;
-	GraphScanDesc  *scan;
+	GphNeighborsExtCachedCtx *ctx;
 	Relation		rel;
 	GraphElement	elem;
 
@@ -1911,43 +1957,54 @@ gph_neighbors_ext_cached(PG_FUNCTION_ARGS)
 		funcctx = SRF_FIRSTCALL_INIT();
 		oldctx = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
 
-		scan = (GraphScanDesc *) palloc0(sizeof(GraphScanDesc));
+		ctx = (GphNeighborsExtCachedCtx *) palloc0(sizeof(GphNeighborsExtCachedCtx));
+		ctx->scan = (GraphScanDesc *) palloc0(sizeof(GraphScanDesc));
+		ctx->identity_mode = gph_read_identity_mode();
 
-		/* Warm the reverse cache (also registers the invalidation hook). */
-		gph_vid_cache_ensure();
-
-		/*
-		 * Forward ext_id -> vid: ONE scalar probe per call (the reverse per-neighbor direction is
-		 * what the cache accelerates, not this). ext_src is a bigint from PG_GETARG, so the %lld
-		 * interpolation carries no injection risk (same pattern the TJS operator's SPI probe uses).
-		 */
-		if (SPI_connect() != SPI_OK_CONNECT)
-			elog(ERROR, "graph_store vid cache: SPI_connect failed");
+		if (ctx->identity_mode)
 		{
-			char	cmd[128];
+			/* ON: src is already the native vid — no map probe, no reverse-cache warm. */
+			vid = ext_src;
+			have_vid = true;
+		}
+		else
+		{
+			/* Warm the reverse cache (also registers the invalidation hook). */
+			gph_vid_cache_ensure();
 
-			snprintf(cmd, sizeof(cmd),
-					 "SELECT vid FROM graph_store.gph_vid_map WHERE ext_id = %lld",
-					 (long long) ext_src);
-			if (SPI_execute(cmd, true, 1) == SPI_OK_SELECT && SPI_processed == 1)
+			/*
+			 * Forward ext_id -> vid: ONE scalar probe per call (the reverse per-neighbor direction is
+			 * what the cache accelerates, not this). ext_src is a bigint from PG_GETARG, so the %lld
+			 * interpolation carries no injection risk (same pattern the TJS operator's SPI probe uses).
+			 */
+			if (SPI_connect() != SPI_OK_CONNECT)
+				elog(ERROR, "graph_store vid cache: SPI_connect failed");
 			{
-				bool	isnull;
-				int64	v = DatumGetInt64(SPI_getbinval(SPI_tuptable->vals[0],
-													   SPI_tuptable->tupdesc, 1, &isnull));
+				char	cmd[128];
 
-				if (!isnull)
+				snprintf(cmd, sizeof(cmd),
+						 "SELECT vid FROM graph_store.gph_vid_map WHERE ext_id = %lld",
+						 (long long) ext_src);
+				if (SPI_execute(cmd, true, 1) == SPI_OK_SELECT && SPI_processed == 1)
 				{
-					vid = v;
-					have_vid = true;
+					bool	isnull;
+					int64	v = DatumGetInt64(SPI_getbinval(SPI_tuptable->vals[0],
+														   SPI_tuptable->tupdesc, 1, &isnull));
+
+					if (!isnull)
+					{
+						vid = v;
+						have_vid = true;
+					}
 				}
 			}
+			SPI_finish();
 		}
-		SPI_finish();
 
 		if (have_vid)
 		{
 			rel = gph_open_store(AccessShareLock);
-			(void) gs_open(scan, rel, (GraphVertexId) vid, GRAPH_SCAN_OUTGOING,
+			(void) gs_open(ctx->scan, rel, (GraphVertexId) vid, GRAPH_SCAN_OUTGOING,
 						   GPH_EDGE_TYPE_RELATED_TO, (GraphVertexId) GRAPHSTORE_INVALID_ID);
 			relation_close(rel, AccessShareLock);
 		}
@@ -1958,37 +2015,44 @@ gph_neighbors_ext_cached(PG_FUNCTION_ARGS)
 			 * absent vertex (page_buf allocated, cur_blk Invalid) so gs_getnext returns false — do
 			 * NOT rely on palloc0's zeroed cur_blk (block 0 is the metapage, not "no pages").
 			 */
-			scan->page_buf = (GphEdgeSlot *) palloc(sizeof(GphEdgeSlot) * GphEdgeSlotsPerPage());
-			scan->cur_blk = InvalidBlockNumber;
-			scan->type_filter = GPH_EDGE_TYPE_RELATED_TO;
-			scan->source_scope = (GraphVertexId) GRAPHSTORE_INVALID_ID;
-			scan->page_n = 0;
-			scan->page_i = 0;
+			ctx->scan->page_buf = (GphEdgeSlot *) palloc(sizeof(GphEdgeSlot) * GphEdgeSlotsPerPage());
+			ctx->scan->cur_blk = InvalidBlockNumber;
+			ctx->scan->type_filter = GPH_EDGE_TYPE_RELATED_TO;
+			ctx->scan->source_scope = (GraphVertexId) GRAPHSTORE_INVALID_ID;
+			ctx->scan->page_n = 0;
+			ctx->scan->page_i = 0;
 		}
 
-		funcctx->user_fctx = scan;
+		funcctx->user_fctx = ctx;
 		MemoryContextSwitchTo(oldctx);
 	}
 
 	funcctx = SRF_PERCALL_SETUP();	/* === Next === */
-	scan = (GraphScanDesc *) funcctx->user_fctx;
+	ctx = (GphNeighborsExtCachedCtx *) funcctx->user_fctx;
 
 	rel = gph_open_store(AccessShareLock);
-	if (gs_getnext(rel, scan, &elem))
+	if (gs_getnext(rel, ctx->scan, &elem))
 	{
 		int64		nvid = (int64) elem.edge_dst;
-		GphVidCacheEntry *e;
-		bool		found;
 
 		relation_close(rel, AccessShareLock);
-		gph_vid_cache_ensure();		/* re-warm if an invalidation flushed it between Next() calls */
-		e = (GphVidCacheEntry *) hash_search(gph_vid_cache, &nvid, HASH_FIND, &found);
-		if (found)
-			SRF_RETURN_NEXT(funcctx, Int64GetDatum(e->ext_id));
-		SRF_RETURN_NEXT_NULL(funcctx);	/* unmapped vid => NULL (shim parity) */
+
+		if (ctx->identity_mode)
+			SRF_RETURN_NEXT(funcctx, Int64GetDatum(nvid));	/* vid IS the ext id under identity */
+
+		{
+			GphVidCacheEntry *e;
+			bool		found;
+
+			gph_vid_cache_ensure();		/* re-warm if an invalidation flushed it between Next() calls */
+			e = (GphVidCacheEntry *) hash_search(gph_vid_cache, &nvid, HASH_FIND, &found);
+			if (found)
+				SRF_RETURN_NEXT(funcctx, Int64GetDatum(e->ext_id));
+			SRF_RETURN_NEXT_NULL(funcctx);	/* unmapped vid => NULL (shim parity) */
+		}
 	}
 	relation_close(rel, AccessShareLock);	/* === Close === */
-	gs_close(scan);
+	gs_close(ctx->scan);
 	SRF_RETURN_DONE(funcctx);
 }
 
