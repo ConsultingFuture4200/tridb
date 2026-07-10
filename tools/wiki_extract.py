@@ -280,6 +280,15 @@ class _ShardWriter:
 
     Article i and the edges/categories emitted for it always land in shard
     i // shard_size, so the three streams stay index-aligned.
+
+    Each shard_idx is opened AT MOST ONCE for the life of a writer: `_rotate`
+    exclusive-creates the shard files ("x" mode) and records which indices have
+    been opened. A non-monotonic shard progression (write() computing a
+    shard_idx that was already opened+closed) previously reopened that shard's
+    files in truncate ("w") mode, silently wiping prior content while the
+    manifest kept the earlier (now-stale) descriptor around too. That is now a
+    hard error: this can only happen from a bug upstream (e.g. duplicate/
+    out-of-order article ids), and silent data loss is worse than a loud crash.
     """
 
     def __init__(self, out: Path, shard_size: int):
@@ -291,16 +300,26 @@ class _ShardWriter:
         self._idx = -1
         self._af = self._ef = self._cf = None
         self._arows = self._erows = self._crows = 0
+        self._opened_shards: set[int] = set()
 
     def _rotate(self, shard_idx: int) -> None:
+        if shard_idx in self._opened_shards:
+            raise ValueError(
+                f"non-monotonic shard progression: shard {shard_idx} was already "
+                f"opened and closed (currently on shard {self._idx}); reopening it "
+                "would truncate its existing content. This indicates article ids "
+                "were not emitted in non-decreasing shard order upstream — fix the "
+                "id assignment rather than reopening the shard."
+            )
         self._close_current()
         self._idx = shard_idx
+        self._opened_shards.add(shard_idx)
         ap = self.out / f"articles-{shard_idx:05d}.jsonl"
         ep = self.out / f"edges-{shard_idx:05d}.tsv"
         cp = self.out / f"categories-{shard_idx:05d}.tsv"
-        self._af = ap.open("w", encoding="utf-8")
-        self._ef = ep.open("w", encoding="utf-8")
-        self._cf = cp.open("w", encoding="utf-8")
+        self._af = ap.open("x", encoding="utf-8")
+        self._ef = ep.open("x", encoding="utf-8")
+        self._cf = cp.open("x", encoding="utf-8")
         self._arows = self._erows = self._crows = 0
         self.articles_shards.append({"path": ap.name, "rows": 0})
         self.edges_shards.append({"path": ep.name, "rows": 0})

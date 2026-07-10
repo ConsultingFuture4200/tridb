@@ -13,10 +13,13 @@ import json
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from tools.wiki_extract import (  # noqa: E402
     _copy_text_escape,
+    _ShardWriter,
     extract,
     normalize_title,
     resolve_edge,
@@ -232,6 +235,44 @@ def test_sharding_splits_files(tmp_path):
     assert len(files) == 2
     assert sorted(s["rows"] for s in files) == [1, 2]
     assert len(articles) == 3
+
+
+def test_shard_writer_monotonic_progression_two_shards(tmp_path):
+    # Ids landing in shard 0 then shard 1 (forward-only): both shard files end up
+    # non-empty, manifest has exactly two article descriptors (no duplicate paths),
+    # and each descriptor's row count matches what was actually written.
+    out = tmp_path / "corpus"
+    out.mkdir()
+    writer = _ShardWriter(out, shard_size=1)
+    writer.write({"id": 0, "title": "A", "text": "a", "ts": ""}, [], [])
+    writer.write({"id": 1, "title": "B", "text": "b", "ts": ""}, [], [])
+    writer.close()
+    assert len(writer.articles_shards) == 2
+    paths = [s["path"] for s in writer.articles_shards]
+    assert len(set(paths)) == 2  # no duplicate path descriptors for one shard
+    assert [s["rows"] for s in writer.articles_shards] == [1, 1]
+    for s in writer.articles_shards:
+        assert (out / s["path"]).read_text().strip() != ""
+
+
+def test_shard_writer_backward_jump_errors_without_truncating(tmp_path):
+    # A write() that resolves to a shard_idx already opened+closed (a backward/
+    # non-monotonic jump) must fail loud instead of silently truncating that
+    # shard's already-written content.
+    out = tmp_path / "corpus"
+    out.mkdir()
+    writer = _ShardWriter(out, shard_size=1)
+    writer.write({"id": 0, "title": "A", "text": "a", "ts": ""}, [], [])
+    writer.write({"id": 1, "title": "B", "text": "b", "ts": ""}, [], [])
+    shard0_path = out / "articles-00000.jsonl"
+    before = shard0_path.read_text()
+    assert before  # shard 0 content was flushed when we rotated to shard 1
+
+    with pytest.raises(ValueError):
+        writer.write({"id": 0, "title": "C", "text": "c", "ts": ""}, [], [])
+
+    after = shard0_path.read_text()
+    assert after == before  # untouched, not truncated
 
 
 # --------------------------------------------------------------------------- #
