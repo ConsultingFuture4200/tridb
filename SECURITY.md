@@ -58,6 +58,13 @@ beyond that use.
   application role, and set a rotated, non-default `PGPASSWORD`. This is a publish-time checklist item,
   not a code change in this repo; TriDB does not use upstream's `dockerrun.sh` (which supplies a weak
   default password), but the superuser-on-all-interfaces posture is inherited by the image.
+- **`scripts/wiki_engine_serve.sh` publishes a password-gated engine port (advisor 044).** It binds
+  the published port to `127.0.0.1` by default (set `TRIDB_SERVE_BIND=0.0.0.0` to opt into all
+  interfaces, e.g. a shared-lab timer-parity run) and requires a per-run random password over TCP
+  (`scram-sha-256`, written to `$OUT/pg_password`, host mode `0600`); it no longer appends
+  `host all all 0.0.0.0/0 trust`. The container's unix socket stays trust-auth (used by the
+  in-container load steps and `docker exec` transcripts), matching the rest of this engine's
+  single-tenant, local-hardware posture.
 
 ## Graph store container (`gstore`) hazards
 
