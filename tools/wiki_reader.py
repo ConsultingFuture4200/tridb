@@ -1659,6 +1659,7 @@ class Reader:
         q = (q or "").strip()
         if not q:
             return {"answer": "Ask a question.", "sources": [], "expanded": False}
+        t0 = time.perf_counter()
         qvec = self._embed_query(q)
         cap_total = 12
         k_seed = 6 if expand else k
@@ -1690,7 +1691,10 @@ class Reader:
                         "via": via_titles.get(via),
                     }
                 )
+        retrieval_ms = (time.perf_counter() - t0) * 1000.0
+        _ta = time.perf_counter()
         answer = self._llm_answer(q, passages)
+        answer_ms = (time.perf_counter() - _ta) * 1000.0
         sources = [
             {
                 "n": i + 1,
@@ -1708,6 +1712,11 @@ class Reader:
             "expanded": bool(expand),
             "n_semantic": sum(1 for p in passages if p["origin"] == "semantic"),
             "n_graph": sum(1 for p in passages if p["origin"] == "graph"),
+            "timing": {
+                "retrieval_ms": round(retrieval_ms, 1),
+                "answer_ms": round(answer_ms, 1),
+                "total_ms": round((time.perf_counter() - t0) * 1000.0, 1),
+            },
         }
 
     # -- Enrich (on-demand, reviewed, CITED fact suggestions) -------------- #
@@ -2628,6 +2637,9 @@ p { line-height:1.6; }
   font-size:11.5px; background:#f4faf6; border:1px solid #dceee3; border-radius:10px;
   padding:1px 9px; }
 .pipe .tridb .ex { background:transparent; color:#0e6a3f; width:auto; height:auto; }
+.pipe .grounded { display:inline-flex; align-items:center; gap:4px; color:#8a5a00; font-weight:600;
+  font-size:11.5px; background:#fbf5e9; border:1px solid #ecdcc0; border-radius:10px; padding:1px 9px; }
+.pipe .llm { color:#aaa; font-size:11px; margin-left:auto; font-variant-numeric:tabular-nums; }
 .filtline { font-size:11px; color:#aaa; margin:0 8px 9px; }
 .og { font-size:9.5px; text-transform:uppercase; letter-spacing:.03em; padding:1px 5px;
   border-radius:8px; font-weight:600; white-space:nowrap; }
@@ -3014,7 +3026,7 @@ async function loadAsk(q){   // render only, no history push
   let r;
   try { r = await j('/ask?q='+encodeURIComponent(q)+'&expand='+expand); }
   catch(e){ art.innerHTML = '<div class="hint">Ask failed: '+esc(String(e))+'</div>'; return; }
-  let h = '<h2>Ask</h2><div class="answer">'+esc(r.answer)+'</div>';
+  let h = '<h2>Ask</h2><div class="answer">'+esc(r.answer)+'</div>'+askPipeline(r);
   if(r.sources && r.sources.length){
     const sub = r.expanded
       ? '<div class="legend">'+r.n_semantic+' from semantic retrieval &middot; '+
@@ -3072,6 +3084,39 @@ function semRow(a){
     relInd(a.score)+'<div class="meta">'+meta.join(' · ')+'</div>'+cats+'</div>';
 }
 function fmtms(x){ if(x==null) return ''; return (x<10 ? x.toFixed(1) : Math.round(x))+''; }
+// The TriDB "one fused query" tag + ⓘ explainer — shared by search results and Ask.
+const TRIDB_TAG = '<span class="tridb">TriDB &middot; one fused query<span class="ex">&#9432;'+
+  '<span class="win"><b>One fused query.</b> All three legs — vector similarity, graph traversal, '+
+  'relational filter — run inside <em>one</em> Postgres process in a single early-terminating query, '+
+  'under one write-ahead log: <b>one round-trip, not three</b> (a Milvus+Neo4j+Postgres stack needs '+
+  'three separate systems). <span style="color:#0e6a3f">Measured at 200k: 11.5&times; faster on '+
+  'shallow queries, 0 torn reads under concurrent edits.</span>'+
+  '<span class="legs"><i class="leg-v">vector</i><i class="leg-g">graph</i><i class="leg-r">relational</i></span>'+
+  '</span></span></span>';
+// Ask/RAG fusion strip: fused-retrieval latency + provenance + grounded-sources cue (honest:
+// the local LLM's answer time is shown separately, not credited to TriDB).
+function askPipeline(r){
+  const t = r.timing || {};
+  let flow = '<span class="leg"><span class="dot" style="background:#0f8b7c"></span>vector <b>'+
+    (r.n_semantic||0)+'</b></span>';
+  if(r.expanded){
+    flow += '<span class="arw">&rarr;</span><span class="leg"><span class="dot" style="background:#6f4fd0">'+
+      '</span>graph <b>+'+(r.n_graph||0)+'</b></span>';
+  }
+  const lat = (t.retrieval_ms!=null)
+    ? '<span class="lat" title="server-side time to fuse vector + graph retrieval (excludes the local LLM)">'+
+      '<span class="bolt">&#9889;</span>'+fmtms(t.retrieval_ms)+' ms retrieval</span>'
+    : '';
+  const grounded = (r.sources && r.sources.length)
+    ? '<span class="grounded" title="the answer is written only from these cited passages — no free-floating claims">'+
+      '&#9878; grounded in '+r.sources.length+' cited sources</span>'
+    : '';
+  const llm = (t.answer_ms!=null)
+    ? '<span class="llm" title="the local LLM that writes the answer — a separate model, not TriDB">'+
+      'answer by local LLM '+fmtms(t.answer_ms)+' ms</span>'
+    : '';
+  return '<div class="pipe">'+lat+'<span class="flow">'+flow+'</span>'+TRIDB_TAG+grounded+llm+'</div>';
+}
 // The fusion-pipeline bar: real server-side latency + the three legs + a TriDB explainer.
 function pipelineBar(r){
   const t = r.timing || {};
@@ -3090,15 +3135,7 @@ function pipelineBar(r){
     ? '<span class="lat" title="server-side wall-clock time of the fused query">'+
       '<span class="bolt">&#9889;</span>'+fmtms(t.total_ms)+' ms</span>'
     : '';
-  const tag = '<span class="tridb">TriDB &middot; one fused query<span class="ex">&#9432;'+
-    '<span class="win"><b>One fused query.</b> All three legs — vector similarity, graph traversal, '+
-    'relational filter — run inside <em>one</em> Postgres process in a single early-terminating query, '+
-    'under one write-ahead log: <b>one round-trip, not three</b> (a Milvus+Neo4j+Postgres stack needs '+
-    'three separate systems). <span style="color:#0e6a3f">Measured at 200k: 11.5&times; faster on '+
-    'shallow queries, 0 torn reads under concurrent edits.</span>'+
-    '<span class="legs"><i class="leg-v">vector</i><i class="leg-g">graph</i><i class="leg-r">relational</i></span>'+
-    '</span></span></span>';
-  return '<div class="pipe">'+lat+'<span class="flow">'+flow+'</span>'+tag+'</div>'+
+  return '<div class="pipe">'+lat+'<span class="flow">'+flow+'</span>'+TRIDB_TAG+'</div>'+
     '<div class="filtline">filters: '+esc(fdesc(r.filters, r.cats_available))+'</div>';
 }
 function renderSem(r){
