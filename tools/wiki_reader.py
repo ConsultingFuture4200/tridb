@@ -1123,6 +1123,7 @@ class Reader:
         only), 'linked (1-hop)' / 'linked (2-hop)' (graph only)."""
         from collections import Counter
 
+        t0 = time.perf_counter()
         # -- semantic (cosine) ranking --
         sem = self.semantic(aid, k=pool)
         cos_rank = {d["id"]: i for i, d in enumerate(sem)}
@@ -1203,6 +1204,7 @@ class Reader:
             "fused": fused,
             "semantic": sem[:12],  # component breakdown (existing panel)
             "hyperlinks": self.hyperlinks(aid),  # component breakdown (existing panel)
+            "timing": {"total_ms": round((time.perf_counter() - t0) * 1000.0, 1)},
         }
 
     # -- Ask (RAG) --------------------------------------------------------- #
@@ -2942,7 +2944,8 @@ async function loadRelated(id){
   rel.innerHTML = '<div class="hd">Loading…</div>';
   const r = await j('/related_fused/'+id);
   let h = '<div class="hd">Related (fused)</div>' +
-    '<div class="legend">meaning &times; links combined — both signals = strongest</div>';
+    '<div class="legend">meaning &times; links combined — both signals = strongest</div>' +
+    fusedHeaderBar(r);
   h += r.fused.length
     ? r.fused.map(fusedRow).join('')
     : '<div class="hint">none</div>';
@@ -3116,6 +3119,16 @@ function askPipeline(r){
       'answer by local LLM '+fmtms(t.answer_ms)+' ms</span>'
     : '';
   return '<div class="pipe">'+lat+'<span class="flow">'+flow+'</span>'+TRIDB_TAG+grounded+llm+'</div>';
+}
+// Compact fusion tag for the article-page "Related (fused)" panel (vector x graph RRF).
+function fusedHeaderBar(r){
+  const t = r.timing || {};
+  const lat = (t.total_ms!=null)
+    ? '<span class="lat"><span class="bolt">&#9889;</span>'+fmtms(t.total_ms)+' ms</span>' : '';
+  return '<div class="pipe" style="margin:2px 8px 6px">'+lat+
+    '<span class="leg"><span class="dot" style="background:#0f8b7c"></span>vector '+
+    '<span class="arw">&times;</span> <span class="dot" style="background:#6f4fd0"></span>graph</span>'+
+    TRIDB_TAG+'</div>';
 }
 // The fusion-pipeline bar: real server-side latency + the three legs + a TriDB explainer.
 function pipelineBar(r){
