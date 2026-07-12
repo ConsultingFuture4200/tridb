@@ -2598,6 +2598,22 @@ p { line-height:1.6; }
 #tribar button { padding:6px 16px; border:0; border-radius:4px; background:#127a4a; color:#fff;
   cursor:pointer; font-size:13px; }
 #tribar button:hover { background:#0e6a3f; }
+#tribar #cmpbtn { background:#fff; color:#127a4a; border:1px solid #127a4a; }
+#tribar #cmpbtn:hover { background:#eafaf1; color:#0e6a3f; }
+/* keyword-vs-tri-modal comparison view */
+.cmp { display:grid; grid-template-columns:1fr 1fr; gap:16px; margin:0 8px; }
+@media (max-width:760px){ .cmp { grid-template-columns:1fr; } }
+.cmpcol { min-width:0; }
+.cmphd { font-size:12.5px; font-weight:700; margin:2px 0 6px; padding-bottom:5px;
+  border-bottom:2px solid #eee; display:flex; align-items:center; gap:7px; flex-wrap:wrap; }
+.cmphd.kw { color:#777; }
+.cmphd.tri { color:#0e6a3f; border-color:#cdeede; }
+.cmphd .n { font-weight:600; color:#aaa; font-size:11px; }
+.cmpnote { margin:4px 8px 12px; padding:9px 12px; background:#f4faf6; border:1px solid #dceee3;
+  border-radius:8px; font-size:12.5px; color:#28624a; line-height:1.5; }
+.cmpnote b { color:#0b5030; }
+.kwtag { font-size:10px; color:#bbb; margin-left:6px; font-weight:600; }
+.onlytag { font-size:10px; color:#b8790f; margin-left:6px; font-weight:700; white-space:nowrap; }
 .prov { font-size:10.5px; color:#127a4a; margin-left:6px; font-weight:600; }
 .ex { display:inline-block; width:15px; height:15px; line-height:15px; text-align:center;
   border-radius:50%; background:rgba(255,255,255,.30); color:#fff; font-size:11px; font-weight:700;
@@ -2759,6 +2775,7 @@ p { line-height:1.6; }
   <input id="tmaxlen" class="numf" type="number" min="0" placeholder="max chars">
   <input id="tcat" placeholder="category contains…">
   <button id="tbtn" onclick="triSearch()">Search</button>
+  <button id="cmpbtn" onclick="compareSearch()" title="Run this query as plain keyword search AND tri-modal, side by side — see what keyword search can't find">&#9878; Compare vs keyword</button>
 </div>
 <main>
   <div id="results"><div class="hint">Type a query and press Enter.</div></div>
@@ -3201,6 +3218,62 @@ function renderTri(r){
   if(!r.results.length){ el.innerHTML = h+'<div class="hint">No results after filtering.</div>'; return; }
   el.innerHTML = h + r.results.map(triRow).join('');
 }
+// -- Compare: same query, keyword search vs tri-modal, side by side (same corpus) --
+async function compareSearch(){
+  const q = $('#tq').value.trim();
+  if(!q) return;
+  await loadCmp(q);
+  pushView({view:'cmp', q:q});
+}
+async function loadCmp(q){
+  $('#tq').value = q;
+  const el = $('#results');
+  el.innerHTML = '<div class="hint">Running keyword search and tri-modal fusion side by side…</div>';
+  let kw, tri;
+  try {
+    [kw, tri] = await Promise.all([
+      j('/search?q='+encodeURIComponent(q)),
+      j('/search_trimodal?q='+encodeURIComponent(q)+'&expand=1')
+    ]);
+  } catch(e){ el.innerHTML = '<div class="hint">Compare failed: '+esc(String(e))+'</div>'; return; }
+  renderCmp(q, kw||[], tri||{results:[]});
+}
+function renderCmp(q, kw, tri){
+  const el = $('#results');
+  const kwIds = new Set(kw.map(a => a.id));
+  const triIds = new Set((tri.results||[]).map(a => a.id));
+  const triRes = tri.results || [];
+  const onlyTri = triRes.filter(a => !kwIds.has(a.id)).length;
+  const t = tri.timing || {};
+  let h = '<div class="cmpnote">Same 6.9M-article corpus, same machine — only the <b>retrieval method</b> '+
+    'differs. Regular Wikipedia search is keyword / full-text (great when you know the words); it has no '+
+    'embeddings, no ranked graph traversal, no fused filter. Here <b>'+onlyTri+' of '+triRes.length+'</b> '+
+    'tri-modal results are ones a keyword index <b>cannot</b> surface. (Capability comparison, not a speed '+
+    'claim — Wikipedia’s search infrastructure is excellent.)</div>';
+  h += '<div class="cmp">';
+  h += '<div class="cmpcol"><div class="cmphd kw">&#128269; Keyword search'+
+    '<span class="n">'+kw.length+' title match'+(kw.length===1?'':'es')+'</span></div>';
+  h += kw.length
+    ? kw.map(a => '<div class="item" onclick="open_('+a.id+')">'+esc(a.title)+
+        (triIds.has(a.id)?'':'<span class="kwtag">keyword-only</span>')+'</div>').join('')
+    : '<div class="hint">No title matches — a keyword index needs the query words to appear in a title.</div>';
+  h += '</div>';
+  h += '<div class="cmpcol"><div class="cmphd tri">&#10022; TriDB tri-modal'+
+    (t.total_ms!=null?' <span class="lat" style="font-size:11px;padding:1px 8px">&#9889; '+fmtms(t.total_ms)+' ms</span>':'')+
+    '<span class="n">'+triRes.length+' fused</span></div>';
+  h += triRes.length
+    ? triRes.map(a => {
+        const tag = kwIds.has(a.id)
+          ? '<span class="kwtag">also keyword</span>'
+          : '<span class="onlytag" title="only meaning + graph retrieval can surface this">&#9733; '+
+            esc(a.prov||'meaning/linked')+'</span>';
+        return '<div class="item" onclick="open_('+a.id+')"><div class="rtitle">'+esc(a.title)+tag+
+          '</div>'+relInd(a.cos)+'</div>';
+      }).join('')
+    : '<div class="hint">none</div>';
+  h += '</div></div>';
+  el.innerHTML = h;
+}
 // -- inline-link clicks + hovercards (page previews) --------------------------
 const _sumCache = {};        // id -> {title, lead}, cached per session
 let _hcTimer = null, _hcId = null;
@@ -3311,6 +3384,7 @@ function renderState(st){   // restore a view for a popstate (no new push)
   else if(st.view==='ask'){ loadAsk(st.q); }
   else if(st.view==='sem'){ loadSem(st.p); }
   else if(st.view==='tri'){ loadTri(st.p); }
+  else if(st.view==='cmp'){ loadCmp(st.q); }
   else if(st.view==='search'){ loadSearch(st.q); }
   updateBack();
 }
