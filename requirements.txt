@@ -15,3 +15,6 @@ hnswlib>=0.8
 # Public-ANN dataset reader (ann-benchmarks .hdf5) for the one-command repro
 # (make bench-repro). Soft dep elsewhere; required only to build the SIFT oracle.
 h5py>=3.10
+# Wikidata full-dump fast path (tools/wikidata_compact.py + ingest --compact) — fast
+# per-line json parse; optional at runtime (stdlib json fallback, tests never require it)
+orjson>=3.9

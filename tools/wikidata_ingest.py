@@ -38,6 +38,16 @@ wiki_extract's red-link drop), so the emitted graph is closed over the slice.
 CLI:
     python -m tools.wikidata_ingest --dump <latest-all.json.gz> --out <dir> --limit 100000
     python -m tools.wikidata_ingest --dump <dump> --out <dir> --seeds Q11173 --target 1000000
+
+FAST PATH (full-dump scale). The pure path json-parses the whole dump once per BFS hop
+plus twice more — days at 110M lines. `tools/wikidata_compact.py` amortizes all parsing
+into ONE parallel scan producing a small sidecar; passing it back via `--compact`
+consumes the sidecar for the slice/present scans and guards the emit scan, with
+byte-identical output (see the compact section below):
+
+    python -m tools.wikidata_compact --dump <dump> --out <dir>
+    python -m tools.wikidata_ingest --dump <dump> --out <dir> --seeds Q11173 \\
+        --target 1000000 --compact <dir>/compact.tsv.gz
 """
 
 from __future__ import annotations
@@ -52,6 +62,13 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import BinaryIO, Iterable, Iterator
+
+try:  # optional fast parser for the --compact fast path (tools/wikidata_compact.py);
+    # stdlib json fallback keeps the pure path dependency-free. Both raise ValueError
+    # subclasses on bad input, and both accept the same JSON documents the dump emits.
+    from orjson import loads as _fast_loads
+except ImportError:  # pragma: no cover - exercised implicitly where orjson is absent
+    _fast_loads = json.loads
 
 INGEST_VERSION = "0.1.0"
 EDGE_SOURCE = "wikidata-statement"
@@ -440,6 +457,119 @@ def present_ids(dump: Path, kept: set[int], lang: str) -> set[int]:
     return present
 
 
+# --------------------------------------------------------------------------- #
+# --compact fast path: consume the tools/wikidata_compact.py sidecar
+#
+# The sidecar (one `qid<TAB>usable<TAB>p:dst,...` line per Q-id entity, dump order,
+# built by importing parse_entity/entity_edges from THIS module) replaces every
+# full-dump parsed scan except the final emit: closure hops and the present/prefix
+# scans walk the ~100x-smaller sidecar parse-free, and the emit scan skips json for
+# lines whose head positively identifies a non-kept id. Semantics are identical to
+# the pure functions above by construction — same loops over the same per-entity
+# (qid, usable, edges) values.
+# --------------------------------------------------------------------------- #
+
+# Anchored structural head of a real dump line: {"type":"item","id":"Q42",... .
+# Used ONLY to positively identify the entity id at the START of a raw line; any
+# miss (unusual key order, property ids, decoy '"id":"Q..."' text later in the
+# line) falls back to a full parse, so the guard can never wrongly skip.
+_HEAD_QID = re.compile(rb'^\s*\{"type":\s*"[a-z]+",\s*"id":\s*"Q([1-9][0-9]*)"')
+
+
+def _compact_lines(compact: Path) -> Iterator[bytes]:
+    """Stream raw sidecar lines (bytes). Multi-member gzip reads transparently."""
+    opener = gzip.open if compact.suffix == ".gz" else open
+    with opener(compact, "rb") as fh:
+        yield from fh
+
+
+def prefix_ids_compact(compact: Path, limit: int) -> set[int]:
+    """prefix_ids from the sidecar: first `limit` usable qids in dump order."""
+    kept: set[int] = set()
+    for raw in _compact_lines(compact):
+        parts = raw.rstrip(b"\n").split(b"\t")
+        if parts[1] != b"1":
+            continue
+        kept.add(int(parts[0]))
+        if len(kept) >= limit:
+            break
+    return kept
+
+
+def closure_ids_compact(
+    compact: Path, seeds: Iterable[int], target: int
+) -> tuple[set[int], int]:
+    """closure_ids from the sidecar: identical hop/determinism semantics, parse-free.
+
+    Same loop as closure_ids (one sidecar scan per hop, sorted mid-frontier target
+    cut) over the same per-entity edge lists. Memory ceiling: the kept set (<= target)
+    + frontier + next_frontier as int sets — the out-neighbourhood of one frontier,
+    e.g. a 1M-id frontier with ~20 out-edges each is <~20M ints, a few GB worst case,
+    far under the 128 GB box; the 1.5B-edge adjacency is never held in RAM.
+    """
+    kept: set[int] = {s for s in seeds}
+    frontier: set[int] = set(kept)
+    hops = 0
+    while frontier and len(kept) < target:
+        next_frontier: set[int] = set()
+        for raw in _compact_lines(compact):
+            tab = raw.find(b"\t")
+            if int(raw[:tab]) not in frontier:
+                continue
+            edges = raw.rstrip(b"\n").split(b"\t")[2]
+            for tok in edges.split(b","):
+                if not tok:
+                    continue
+                dst = int(tok[tok.index(b":") + 1 :])
+                if dst not in kept:
+                    next_frontier.add(dst)
+        hops += 1
+        # honour target even mid-frontier: keep in a stable (sorted) order for determinism
+        for dst in sorted(next_frontier):
+            if len(kept) >= target:
+                break
+            kept.add(dst)
+        frontier = {d for d in next_frontier if d in kept}
+    return kept, hops
+
+
+def present_ids_compact(compact: Path, kept: set[int]) -> set[int]:
+    """present_ids from the sidecar: `kept` ids whose usable flag is 1."""
+    present: set[int] = set()
+    for raw in _compact_lines(compact):
+        parts = raw.rstrip(b"\n").split(b"\t")
+        qid = int(parts[0])
+        if qid in kept and parts[1] == b"1":
+            present.add(qid)
+    return present
+
+
+def _iter_kept_entities(fh: BinaryIO, present: set[int]) -> Iterator[dict]:
+    """iter_entities plus a cheap pre-parse guard for the --compact emit scan.
+
+    A raw line whose anchored structural head POSITIVELY identifies a Q-id not in
+    `present` is skipped without json parsing; every other line (guard miss, kept id)
+    takes the exact iter_entities path, with orjson when available. A decoy
+    '"id":"Q999"' inside a label/claim value can never cause a wrong skip: the
+    pattern only matches at the start of the line.
+    """
+    for raw in fh:
+        m = _HEAD_QID.match(raw)
+        if m is not None and int(m.group(1)) not in present:
+            continue
+        line = raw.decode("utf-8").strip()
+        if not line or line in ("[", "]"):
+            continue
+        if line.endswith(","):
+            line = line[:-1]
+        try:
+            obj = _fast_loads(line)
+        except ValueError:  # json.JSONDecodeError / orjson.JSONDecodeError
+            continue
+        if isinstance(obj, dict):
+            yield obj
+
+
 def emit_slice(
     dump: Path,
     out: Path,
@@ -447,6 +577,7 @@ def emit_slice(
     lang: str,
     literal_props: list[str],
     shard_size: int,
+    compact: Path | None = None,
 ) -> dict:
     """Emit pass: stream the dump, write shards for every present entity in `kept`.
 
@@ -455,12 +586,20 @@ def emit_slice(
     no-vector-row item). Emission ordinal is a dense counter over emitted entities in dump
     order (id-aligned shards).
     """
-    present = present_ids(dump, kept, lang)
+    if compact is not None:
+        present = present_ids_compact(compact, kept)
+    else:
+        present = present_ids(dump, kept, lang)
     writer = _ShardWriter(out, shard_size)
     ordinal = 0
     dropped_edges = 0
     with _open_dump(dump) as fh:
-        for obj in iter_entities(fh):
+        entities = (
+            _iter_kept_entities(fh, present)
+            if compact is not None
+            else iter_entities(fh)
+        )
+        for obj in entities:
             eid = qid_to_int(obj.get("id", ""))
             if eid is None or eid not in present:
                 continue
@@ -563,13 +702,22 @@ def ingest(
     lang: str = DEFAULT_LANG,
     literal_props: Iterable[str] = (),
     shard_size: int = DEFAULT_SHARD_SIZE,
+    compact: Path | None = None,
 ) -> dict:
-    """Run the full slice + emit and write the manifest. Returns the manifest."""
+    """Run the full slice + emit and write the manifest. Returns the manifest.
+
+    `compact` (optional) is a tools/wikidata_compact.py sidecar for `dump`; when given,
+    the slice/present scans consume it instead of re-parsing the dump (fast path,
+    byte-identical output — see the compact section above).
+    """
     out.mkdir(parents=True, exist_ok=True)
     literal_props = [p for p in literal_props if p != TYPE_PROP]
     if spec.seeds:
         target = spec.target or (spec.limit or 0) or len(spec.seeds)
-        kept, hops = closure_ids(dump, spec.seeds, target, lang)
+        if compact is not None:
+            kept, hops = closure_ids_compact(compact, spec.seeds, target)
+        else:
+            kept, hops = closure_ids(dump, spec.seeds, target, lang)
         slice_meta = {
             "mode": "bfs_closure",
             "seeds": [f"Q{s}" for s in spec.seeds],
@@ -581,7 +729,10 @@ def ingest(
     else:
         if not spec.limit:
             raise ValueError("prefix slice requires a positive --limit")
-        kept = prefix_ids(dump, spec.limit, lang)
+        if compact is not None:
+            kept = prefix_ids_compact(compact, spec.limit)
+        else:
+            kept = prefix_ids(dump, spec.limit, lang)
         slice_meta = {
             "mode": "prefix",
             "limit": spec.limit,
@@ -589,7 +740,7 @@ def ingest(
             "note": "first-N in dump order; induced graph is largely DISCONNECTED "
             "(tooling dry-run, not a traversal measurement)",
         }
-    emit = emit_slice(dump, out, kept, lang, literal_props, shard_size)
+    emit = emit_slice(dump, out, kept, lang, literal_props, shard_size, compact)
     manifest = build_manifest(dump, slice_meta, lang, literal_props, shard_size, emit)
     (out / "manifest.json").write_text(
         json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
@@ -653,6 +804,13 @@ def main(argv: list[str] | None = None) -> int:
         default=DEFAULT_SHARD_SIZE,
         help=f"entities per shard file (default {DEFAULT_SHARD_SIZE})",
     )
+    ap.add_argument(
+        "--compact",
+        type=Path,
+        default=None,
+        help="fast path: compact.tsv.gz sidecar built by tools/wikidata_compact.py "
+        "for this same dump/lang (output is byte-identical to the pure path)",
+    )
     args = ap.parse_args(argv)
     if args.shard_size <= 0:
         ap.error("--shard-size must be positive")
@@ -662,6 +820,31 @@ def main(argv: list[str] | None = None) -> int:
     if not seeds and not args.limit:
         ap.error("provide --limit (prefix slice) or --seeds (bfs slice)")
     literal_props = [p.strip() for p in args.claim_props.split(",") if p.strip()]
+    if args.compact is not None:
+        # refuse a sidecar that provably does not match this run (wrong language flips
+        # the usable column; a --limit sidecar is a prefix, not the dump; a different
+        # dump size means a different dump). Missing meta: trust the caller.
+        meta_path = args.compact.with_name("compact.meta.json")
+        if meta_path.exists():
+            cmeta = json.loads(meta_path.read_text(encoding="utf-8"))
+            if cmeta.get("lang") != args.lang:
+                ap.error(
+                    f"--compact was built with --lang {cmeta.get('lang')!r}, "
+                    f"this run uses {args.lang!r}"
+                )
+            if cmeta.get("limit") is not None:
+                ap.error(
+                    "--compact was built with --limit (a smoke prefix, not the "
+                    "full dump); rebuild it without --limit"
+                )
+            if args.dump.exists() and cmeta.get("dump_size") not in (
+                None,
+                args.dump.stat().st_size,
+            ):
+                ap.error(
+                    f"--compact was built from a dump of {cmeta.get('dump_size')} "
+                    f"bytes; {args.dump} is {args.dump.stat().st_size} bytes"
+                )
 
     manifest = ingest(
         args.dump,
@@ -670,6 +853,7 @@ def main(argv: list[str] | None = None) -> int:
         lang=args.lang,
         literal_props=literal_props,
         shard_size=args.shard_size,
+        compact=args.compact,
     )
     c = manifest["counts"]
     print(
