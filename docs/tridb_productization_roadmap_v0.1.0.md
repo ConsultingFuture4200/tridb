@@ -136,6 +136,14 @@ fix) never has to be dug.
    in D2 — don't fix the fork's iterator unless D2 keeps `vectordb`.
 2. **Vector leg: pgvector vs keep `vectordb`.** Recommend pgvector for installability + determinism;
    keep `vectordb` only if Gate B shows it's load-bearing for the win.
+   - **Licensing (verified clean):** pgvector is **PostgreSQL-licensed** (permissive, OSI-approved,
+     no copyleft) — fully compatible with TriDB's **MIT** license (and MSVBASE's MIT lineage). Net
+     effect is neutral-to-positive: it *replaces* the SPTAG-derived forked `vectordb` with a
+     cleanly-licensed, universally-packaged extension, shrinking the bespoke-derived-code surface and
+     improving the "OSI-approved, still just Postgres" hygiene the landscape review calls
+     non-negotiable. Only obligation: retain pgvector's notice on distribution (same as MSVBASE's).
+     To-do: confirm the `LICENSE` at the pinned `$PGV_TAG` (`scripts/add_pgvector.sh`); a full IP
+     review belongs at D3, not before.
 3. **Resourcing.** D1 = solo, GX10-gated, weeks. D2 = 1–2 engineers, real C work, months. D3 = a
    funded team, quarters. Don't pretend D2/D3 are solo.
 
