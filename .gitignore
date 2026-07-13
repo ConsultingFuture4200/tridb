@@ -36,3 +36,4 @@ __pycache__/
 
 # VectorDBBench writes an empty log dir on import
 /logs/
+/vendor/
