@@ -123,7 +123,7 @@ fix) never has to be dug.
 
 ---
 
-## Risks, kill criteria, open decisions
+## Risks & kill criteria
 
 **Risks**
 - Fusion win doesn't reproduce at 1M under matched recall → consistency-only pivot (kills D2's premise).
@@ -131,22 +131,53 @@ fix) never has to be dug.
 - CSR redesign (B3) is a real access-method rewrite — the hardest pure-engineering item in D2.
 - Graph-leg SI (B4/DEV-1166) is a known-hard concurrency change deferred once already.
 
-**Open decisions (resolve before the phase that needs them)**
-1. **043: fix vs scope-out.** Recommend *scope-out* for D1 (filter-first), and *retire via pgvector*
-   in D2 — don't fix the fork's iterator unless D2 keeps `vectordb`.
-2. **Vector leg: pgvector vs keep `vectordb`.** Recommend pgvector for installability + determinism;
-   keep `vectordb` only if Gate B shows it's load-bearing for the win.
-   - **Licensing (verified clean):** pgvector is **PostgreSQL-licensed** (permissive, OSI-approved,
-     no copyleft) — fully compatible with TriDB's **MIT** license (and MSVBASE's MIT lineage). Net
-     effect is neutral-to-positive: it *replaces* the SPTAG-derived forked `vectordb` with a
-     cleanly-licensed, universally-packaged extension, shrinking the bespoke-derived-code surface and
-     improving the "OSI-approved, still just Postgres" hygiene the landscape review calls
-     non-negotiable. Only obligation: retain pgvector's notice on distribution (same as MSVBASE's).
-     To-do: confirm the `LICENSE` at the pinned `$PGV_TAG` (`scripts/add_pgvector.sh`); a full IP
-     review belongs at D3, not before.
-3. **Resourcing.** D1 = solo, GX10-gated, weeks. D2 = 1–2 engineers, real C work, months. D3 = a
-   funded team, quarters. Don't pretend D2/D3 are solo.
+## Resolved decisions (v0.1.0 recommendations, folded in 2026-07-13)
 
-**Recommended immediate next step:** execute **D1** (it's mostly built), let the benchmark answer
-Gate A, and pre-decide 043 as filter-first-scope + pgvector-retire so D2 has a clear line. Everything
-past D1 is contingent on the number D1 produces.
+These are the standing recommendations — treat as the plan's direction unless a gate overturns them.
+
+**D1. Plan 043 → SCOPE OUT, don't fix; retire via pgvector.**
+Fixing the fork's relaxed-monotonicity HNSW iterator is deep, uncertain engine-C work on a component
+D2 will delete — wasted effort. Instead: scope the D1 claim to **filter-first** (green at 1M,
+DEV-1290; `publication_gate` enforces the honesty), and let pgvector's deterministic HNSW make 043
+**moot** in D2 (the seedless path returns for free). Do NOT touch the fork iterator.
+- **Hedge (Gate B):** validate that pgvector's scan can feed `tjs_open`'s early termination (the VBASE
+  relaxed-monotonicity mechanism the fusion win rides on). pgvector 0.8 shipped iterative index scans
+  and PR #524 adds a relaxed-monotonicity mode — it's converging on exactly this. If insufficient, a
+  thin relaxed-order shim over pgvector's index is the fallback (never resurrect the fork).
+
+**D2. Vector leg → pgvector, decisively.** Keeping the forked `vectordb` (SPTAG) *is* keeping the
+fork — the single biggest launch liability per the landscape review (unavailable on managed PG; PG-13
+near-EOL). pgvector is the distribution gold standard, deterministic, and the only way to hold the
+"still just Postgres" trust position 2025-26 sentiment rewards.
+- **Scale is not a constraint:** pgvector's comfort zone (≤~1M–10M vectors) *is* TriDB's differentiator
+  regime (selective, interactive fusion), and the graph footprint (B3) caps you near there anyway.
+  TriDB's edge is fusion + native graph, never raw vector scale.
+- **Fallback order** if Gate B shows the fusion win doesn't survive over pgvector: (a) pgvector
+  iterative-scan / relaxed-order mode → (b) minimal relaxed-order shim over pgvector's index → (c)
+  last resort, package `vectordb` as its own extension. Keep `vectordb` as default only if (a) and (b)
+  both fail.
+- **Licensing (verified clean):** pgvector is **PostgreSQL-licensed** (permissive, OSI-approved, no
+  copyleft) — fully compatible with TriDB's **MIT** license (and MSVBASE's MIT lineage). Net
+  neutral-to-positive: it *replaces* the SPTAG-derived forked `vectordb` with a cleanly-licensed,
+  universally-packaged extension, shrinking the bespoke-derived-code surface and improving the
+  "OSI-approved, still just Postgres" hygiene the landscape review calls non-negotiable. Only
+  obligation: retain pgvector's notice on distribution (same as MSVBASE's). To-do: confirm the
+  `LICENSE` at the pinned `$PGV_TAG` (`scripts/add_pgvector.sh`); a full IP review belongs at D3.
+
+**D3. Resourcing → D1 solo now; D2 is not a solo sprint; D3 is a team.**
+- **D1:** solo, ~80% built — the GX10 pass + writeup.
+- **D2:** porting the graph AM to PG 16/17, re-homing `tjs_open` onto pgvector, the CSR footprint
+  rewrite (a real AM redesign), and x86+ARM packaging = months of specialized PG-internals C. Two
+  honest paths: **(preferred)** after Gate A, bring in **one experienced Postgres-extension/internals
+  engineer** (contract or hire — a specialist 5×'s a generalist here); **(if solo-only)** de-scope to
+  a **v0.2**: ship the graph AM extension + pgvector, **defer the CSR redesign, cap scale at ~1M**
+  (which fits the regime), grow later. Do not attempt the full un-fork + CSR + packaging solo.
+- **D3:** unambiguously a funded team; don't start without design partners (Gate C).
+
+**Meta — the pivotal de-risk:** the one number that governs the whole path is **whether `tjs_open`
+keeps its fusion advantage running over pgvector's HNSW (Gate B)**. Spike that EARLY in D2, before the
+CSR/packaging investment.
+
+**Recommended immediate next step:** execute **D1** (mostly built), let its benchmark answer Gate A.
+043 and the vector leg are pre-decided (filter-first scope now, pgvector retire in D2), so D2 has a
+clear line the moment Gate A greenlights. Everything past D1 is contingent on the number D1 produces.
