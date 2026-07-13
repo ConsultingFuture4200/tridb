@@ -2339,6 +2339,11 @@ LANDING_HTML = """<!doctype html>
 
   /* ---- comparison table ---- */
   .tablewrap{overflow-x:auto;margin-top:20px;border:1px solid var(--line);border-radius:8px}
+  .trylive{text-align:center;margin-top:22px}
+  .trybtn{display:inline-block;background:#127a4a;color:#fff;font-weight:600;font-size:14.5px;
+    padding:11px 22px;border-radius:8px;border:1px solid #0e6a3f}
+  .trybtn:hover{background:#0e6a3f;color:#fff}
+  .trysub{margin-top:8px;font-size:12.5px;color:var(--dim)}
   table{border-collapse:collapse;width:100%;min-width:640px;font-size:14.5px}
   thead th{text-align:left;padding:13px 16px;background:var(--bg2);border-bottom:2px solid var(--line);
     font-weight:600;font-size:13px}
@@ -2468,6 +2473,10 @@ LANDING_HTML = """<!doctype html>
       <em>knowledge</em> query — semantic related, multi-hop paths, fused RAG — which the fused operator
       returns while examining as little as <b>~0.71%</b> of the corpus. A real page-load and search
       head-to-head will be <em>measured</em> and posted here, not asserted.
+    </div>
+    <div class="trylive">
+      <a class="trybtn" href="/read?cmp=early+mechanical+computers">&#9878;&nbsp; Try it live — Compare keyword vs tri-modal search &rarr;</a>
+      <div class="trysub">runs the same query both ways over the same 6.9M-article corpus &mdash; see what a keyword index can&rsquo;t surface</div>
     </div>
   </div>
 </section>
@@ -3389,11 +3398,14 @@ function renderState(st){   // restore a view for a popstate (no new push)
   updateBack();
 }
 window.addEventListener('popstate', e => renderState(e.state));
-const _bootQ = new URLSearchParams(location.search).get('q');   // capture BEFORE replaceState strips ?q=
-history.replaceState({view:'home'}, '', location.pathname);   // base state (drops ?q= from the URL)
+const _bootParams = new URLSearchParams(location.search);   // capture BEFORE replaceState strips them
+const _bootQ = _bootParams.get('q');
+const _bootCmp = _bootParams.get('cmp');   // ?cmp=<query> handoff → the keyword-vs-tri-modal compare view
+history.replaceState({view:'home'}, '', location.pathname);   // base state (drops query string from the URL)
 updateBack();
-(function(){   // boot: a ?q= handoff from the portal landing runs the search and opens the top hit; else random landing
-  if(_bootQ){ $('#q').value = _bootQ; loadSearch(_bootQ).then(() => { const top = document.querySelector('#results .item'); if(top) top.click(); }); }
+(function(){   // boot: a ?cmp= or ?q= handoff from the portal landing; else random landing
+  if(_bootCmp){ $('#tq').value = _bootCmp; loadCmp(_bootCmp).then(() => pushView({view:'cmp', q:_bootCmp})); }
+  else if(_bootQ){ $('#q').value = _bootQ; loadSearch(_bootQ).then(() => { const top = document.querySelector('#results .item'); if(top) top.click(); }); }
   else { loadHome(); }
 })();
 
