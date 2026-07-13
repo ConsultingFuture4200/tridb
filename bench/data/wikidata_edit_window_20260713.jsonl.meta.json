@@ -1,0 +1,18 @@
+{
+  "recorder": "tools/wikidata_record_edits.py",
+  "recorder_version": "0.1.0",
+  "stream_url": "https://stream.wikimedia.org/v2/stream/recentchange",
+  "recorded_at": "2026-07-13T10:40:21.511143+00:00",
+  "filter": "wiki=\"wikidatawiki\" namespace=0 type=\"edit\" title=\"Q<int>\"",
+  "requested": {
+    "edits": 2000,
+    "seconds": 3600.0
+  },
+  "events_seen": 18106,
+  "edits_recorded": 2000,
+  "first_event_ts": 1783938731,
+  "last_event_ts": 1783939221,
+  "last_event_id": "[{\"topic\":\"eqiad.mediawiki.recentchange\",\"partition\":0,\"timestamp\":1783939221375},{\"topic\":\"codfw.mediawiki.recentchange\",\"partition\":0,\"offset\":-1}]",
+  "interrupted": false,
+  "schema": "{\"entity\": int (Q-number), \"rev\": int (revision.new), \"ts\"/\"user\"/\"comment\" informational} \u2014 bench/wikidata_consistency.parse_edit"
+}
