@@ -22,10 +22,12 @@ the edges/claims shards are remapped through that same map — the "measure the 
 discipline (ADR-0013). The gate's engine-edges == oracle/Neo4j-edges blocker enforces that the
 oracle's remapped graph equals the engine's actually-loaded adjacency before any headline.
 
-THREE COMMANDS (mirror wiki_h2h): `oracle` (exact fused ground truth, runs anywhere on a slice's
-assets), `tridb-emit` (the filter-first tjs_open sweep SQL — GX10), `baseline` (Milvus+Neo4j+pg —
-GX10), `report` (grade both vs the oracle, gate the headline). Only `oracle` + the pure helpers run
-on the x86 standin; the live legs are GX10/Spark-gated, same boundary as wiki_h2h.
+FIVE COMMANDS (mirror wiki_h2h): `oracle` (exact fused ground truth, runs anywhere on a slice's
+assets), `tridb-emit` (the filter-first tjs_open sweep SQL — GX10), `baseline` (the live
+multi-store leg, Neo4j traversal + pg type-filter + pg rerank — GX10), `grade` (raw psql
+transcript + baseline JSON -> the graded curves JSON `report` consumes; curves only, no headline
+math), `report` (render + gate the headline). Only `oracle`/`grade`/`report` + the pure helpers
+run on the x86 standin; the live legs are GX10/Spark-gated, same boundary as wiki_h2h.
 
 HONESTY (inherited): COMPUTE-BOUND at 1M (RAM-resident dim-D floats); the I/O-locality thesis is
 dead (wiki-scale memory). Value = fusion speed + one-WAL consistency (Harness A). Latency /
@@ -37,6 +39,9 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
+import statistics
+import time
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
@@ -44,9 +49,17 @@ from pathlib import Path
 import numpy as np
 
 # Reuse the generic scoring + the honesty gate VERBATIM (plan 060: "Reuse publication_gate()
-# unchanged"). operating_point / _vec_lit / publication_gate are query-shape-agnostic.
+# unchanged"). operating_point / _vec_lit / publication_gate are query-shape-agnostic, and so
+# are the grading reducers (grade_tridb / grade_baseline: they consume the parsed per-(qid,tag)
+# dict / the per-combo baseline JSON, both of which this file produces in the same shape) and
+# the transcript micro-parsers (_TIME / _INT) + the grid env parser (_grid_env).
 from bench.wiki_h2h import (
+    _INT,
+    _TIME,
+    _grid_env,
     _vec_lit,
+    grade_baseline,
+    grade_tridb,
     operating_point,
     publication_gate,
 )
@@ -69,9 +82,14 @@ class WCfg:
     milvus_port: str = os.environ.get("WD_MILVUS_PORT", "19531")
     milvus_collection: str = os.environ.get("WD_MILVUS_COLLECTION", "wikidata_entities")
     neo4j_uri: str = os.environ.get("WD_NEO4J_URI", "bolt://localhost:7688")
+    neo4j_user: str = os.environ.get("WD_NEO4J_USER", "neo4j")
+    neo4j_password: str = os.environ.get("WD_NEO4J_PASSWORD", "wikipassword")
+    neo4j_node_label: str = os.environ.get("WD_NEO4J_LABEL", "Entity")
     pg_host: str = os.environ.get("WD_PGHOST", "localhost")
     pg_port: str = os.environ.get("WD_PGPORT", "5434")
     pg_db: str = os.environ.get("WD_PGDB", "tridb_wikidata")
+    pg_user: str = os.environ.get("WD_PGUSER", "postgres")
+    pg_password: str = os.environ.get("WD_PGPASSWORD", "postgres")
     pg_table: str = os.environ.get("WD_PGTABLE", "wd_entity")
     # TR-1 work cap — MUST match the C default (mirror wiki_h2h WH_TJS_MAX_EXAMINED).
     tjs_max_examined: int = int(os.environ.get("WD_TJS_MAX_EXAMINED", "4000"))
@@ -341,6 +359,215 @@ def emit_tridb_sql(
 
 
 # ======================================================================================
+# BASELINE SIDE — live Neo4j typed traversal -> pg type-filter -> pg rerank, app-side, warm.
+# ======================================================================================
+def _connect_baseline(cfg: WCfg):
+    """Neo4j + Postgres only — Milvus is NOT in the KBQA loop, and that is a fairness
+    choice, not an omission: the anchor X is GIVEN (no ANN seeding step exists in this
+    query shape), and the rank leg mirrors wiki_h2h's default use_pg_rerank convention
+    (exact pgvector rerank over the small surviving candidate set — no ANN index needed).
+    Charging the baseline a gratuitous Milvus round-trip would fabricate latency; omitting
+    it FAVORS the baseline. Live-store imports are lazy so the module stays host-importable."""
+    from neo4j import GraphDatabase
+    import psycopg
+
+    driver = GraphDatabase.driver(
+        cfg.neo4j_uri, auth=(cfg.neo4j_user, cfg.neo4j_password)
+    )
+    pg = psycopg.connect(
+        host=cfg.pg_host,
+        port=cfg.pg_port,
+        dbname=cfg.pg_db,
+        user=cfg.pg_user,
+        password=cfg.pg_password,
+    )
+    return driver, pg
+
+
+def run_baseline(
+    cfg: WCfg,
+    emb: np.ndarray,
+    queries: list[dict],
+    grid: list[tuple[int, int]],
+    *,
+    k: int,
+    runs: int,
+    use_pg_rerank: bool = True,
+) -> dict[str, dict]:
+    """Sweep (hops, frontier) live across the stores the KBQA shape needs. grid is
+    [(hops, frontier), ...] (WD_BASELINE_GRID overrides); returns {"h{hops}f{frontier}":
+    {qi: {"ids", "median_ms", ...legs}}} — the same per-(combo,query) shape wiki_h2h's
+    baseline emits, so grade_baseline consumes it unchanged.
+
+    KNOBS. There is no Milvus ef/seeds here; the recall/latency curve comes from (a) hops
+    swept UNDER/AT the oracle's hops (cheap low-recall points) and (b) a frontier cap
+    (Cypher LIMIT on the DISTINCT typed reach — the traversal-work analogue of ef).
+
+    TIMING. The full app-side assembly is timed per query — the per-store round-trips ARE
+    the point: (i) Neo4j P-typed out-traversal from X, (ii) pg filter of the candidates to
+    P31 ∋ T, (iii) rank of the survivors by cosine to X's embedding (pg `<=>` rerank by
+    default; --no-pg-rerank = host numpy rerank, wiki_h2h's exact convention). Warm-up run
+    excluded; `runs` timed repeats, median-of-runs (the graded ids come from the sweep's
+    deterministic result, mirroring wiki_h2h). The query vector emb[x] is host-side on BOTH
+    sides (wiki_h2h's fairness choice — the anchor vector is free for TriDB too, inlined in
+    the emitted SQL)."""
+    driver, pg = _connect_baseline(cfg)
+    cur = pg.cursor()
+
+    def neo4j_traverse(x: int, p: int, hops: int, frontier: int) -> list[int]:
+        # Loader contract (mirror wiki_h2h): Entity.id is a STRING property (an int
+        # `a.id IN $ids` silently matches NOTHING), edges are property-typed relationships
+        # [:P<n>] in the natural subject->object direction (ADR-0016/ADR-0018 out-only).
+        cy = (
+            f"MATCH (a:{cfg.neo4j_node_label})-[:P{p}*1..{hops}]->"
+            f"(b:{cfg.neo4j_node_label}) WHERE a.id IN $ids "
+            f"RETURN DISTINCT b.id AS id LIMIT {frontier}"
+        )
+        with driver.session() as s:
+            rows = s.run(cy, ids=[str(x)])
+            return [int(r["id"]) for r in rows]
+
+    def pg_type_filter(cand: list[int], t: int) -> list[int]:
+        cur.execute(
+            f"SELECT id FROM {cfg.pg_table} WHERE id = ANY(%s) "
+            f"AND p31 @> ARRAY[%s]::bigint[]",
+            (cand, t),
+        )
+        return [int(r[0]) for r in cur.fetchall()]
+
+    def pg_rerank(qv, cand: list[int], k: int) -> list[int]:
+        # exact rerank over the small surviving set ('<=>' cosine distance), as wiki_h2h.
+        lit = "[" + ",".join(repr(float(x)) for x in qv) + "]"
+        cur.execute(
+            f"SELECT id FROM {cfg.pg_table} WHERE id = ANY(%s) "
+            f"ORDER BY embedding <=> %s::vector LIMIT %s",
+            (cand, lit, k),
+        )
+        return [int(r[0]) for r in cur.fetchall()]
+
+    out: dict[str, dict] = {}
+    for hops, frontier in grid:
+        tag = f"h{hops}f{frontier}"
+        per: dict[int, dict] = {}
+        for qi, qy in enumerate(queries):
+            qv = emb[qy["x"]]
+
+            def one():
+                t0 = time.perf_counter()
+                cand = neo4j_traverse(qy["x"], qy["p"], hops, frontier)
+                t1 = time.perf_counter()
+                surv = pg_type_filter(cand, qy["t"]) if cand else []
+                t2 = time.perf_counter()
+                if not surv:
+                    top: list[int] = []
+                elif use_pg_rerank:
+                    top = pg_rerank(qv, surv, k)
+                else:
+                    arr = np.fromiter(surv, dtype=np.int64, count=len(surv))
+                    top = [int(x) for x in arr[np.argsort(-(emb[arr] @ qv))][:k]]
+                t3 = time.perf_counter()
+                return top, (
+                    (t1 - t0) * 1e3,
+                    (t2 - t1) * 1e3,
+                    (t3 - t2) * 1e3,
+                )
+
+            top, _ = one()  # warm-up (excluded)
+            times, legs_last = [], None
+            for _ in range(runs):
+                top, legs = one()
+                times.append(sum(legs))
+                legs_last = legs
+            per[qi] = {
+                "ids": top,
+                "median_ms": float(statistics.median(times)),
+                "neo4j_ms": legs_last[0],
+                "pg_filter_ms": legs_last[1],
+                "rank_ms": legs_last[2],
+            }
+        out[tag] = per
+    cur.close()
+    pg.close()
+    driver.close()
+    return out
+
+
+# ======================================================================================
+# GRADE — raw transcript + baseline JSON -> the graded curves JSON `report` consumes.
+# Curves ONLY: recall vs the oracle, median-of-runs latency, median examined. No headline
+# math here — `report` (via the reused publication_gate) is the only place a ratio exists.
+# ======================================================================================
+_WD_IDS = re.compile(r"#WD IDS qid=(\d+) combo=(\S+)")
+_WD_EX = re.compile(r"#WD EXAMINED qid=(\d+) combo=(\S+) examined=(\d+) bridges=(\d+)")
+
+
+def parse_tridb(raw: str) -> dict[tuple[int, str], dict]:
+    """Mirror of wiki_h2h.parse_tridb for the #WD marker format emit_tridb_sql emits:
+    #WD IDS / #WD ENDIDS bracket the graded id rows of the warm-up call, #WD EXAMINED
+    carries the SM-3 counters, and the psql `Time:` lines after it are the timed repeats
+    (median-of-runs downstream). Refuses an incomplete transcript (no '#WD DONE')."""
+    if "#WD DONE" not in raw:
+        raise SystemExit("TriDB transcript did not reach '#WD DONE' — incomplete")
+    res: dict[tuple[int, str], dict] = {}
+    cur: tuple[int, str] | None = None
+    in_ids = False
+    for line in raw.splitlines():
+        mi = _WD_IDS.search(line)
+        if mi:
+            cur = (int(mi[1]), mi[2])
+            res.setdefault(
+                cur, {"ids": [], "times": [], "examined": None, "bridges": None}
+            )
+            in_ids = True
+            continue
+        if line.startswith("\\echo") or "#WD ENDIDS" in line:
+            in_ids = False
+        me = _WD_EX.search(line)
+        if me:
+            key = (int(me[1]), me[2])
+            d = res.setdefault(
+                key, {"ids": [], "times": [], "examined": None, "bridges": None}
+            )
+            d["examined"] = int(me[3])
+            d["bridges"] = int(me[4])
+            in_ids = False
+            continue
+        if cur is not None and in_ids:
+            m = _INT.match(line)
+            if m:
+                res[cur]["ids"].append(int(m[1]))
+            continue
+        mt = _TIME.search(line)
+        if mt and cur is not None:
+            res[cur]["times"].append(float(mt[1]))
+    return res
+
+
+def oracle_meta_from_env(meta: dict, cfg: WCfg) -> dict:
+    """The oracle_meta block publication_gate requires (same WH_* env names as wiki_h2h
+    and the spike report's reproducibility pins, so one declaration serves both harnesses).
+
+    Honesty defaults: engine_edges / HNSW build health have NO default — undeclared keeps
+    the graph-set / build-health blockers up until someone measures and declares them.
+    neo4j_edges defaults to the oracle's induced edge count (the count Neo4j MUST hold if
+    the loader staged the same slice). tjs_max_examined is the disclosed TR-1 cap: a combo
+    whose median examined reaches it is a CENSORED point the gate excludes (mechanism
+    reused verbatim from wiki_h2h — grade only carries the numbers through)."""
+    induced = meta.get("induced_edges")
+    return {
+        "k": meta.get("k"),
+        "hops": meta.get("hops"),
+        "engine_edges": os.environ.get("WH_ENGINE_EDGES"),
+        "neo4j_edges": os.environ.get(
+            "WH_NEO4J_EDGES", str(induced) if induced is not None else None
+        ),
+        "tjs_max_examined": cfg.tjs_max_examined,
+        "hnsw_healthy_builds": os.environ.get("WH_HNSW_HEALTHY_BUILDS"),
+        "hnsw_total_builds": os.environ.get("WH_HNSW_TOTAL_BUILDS"),
+    }
+
+
+# ======================================================================================
 # REPORT — operating points + the reused honesty gate (host-runnable; latency pre-graded on GX10)
 # ======================================================================================
 def render_report(
@@ -389,6 +616,10 @@ def render_report(
 # CLI
 # ======================================================================================
 DEFAULT_GRID = [(8, 1, 64), (16, 2, 128), (32, 2, 256)]
+# baseline knobs (hops, frontier): hops swept under/at the oracle's default hops=2 (the cheap
+# low-recall end of the curve), frontier = Cypher LIMIT on the DISTINCT typed reach (the
+# traversal-work analogue of Milvus ef). Same 4-point curve size as wiki_h2h's baseline grid.
+DEFAULT_BASELINE_GRID = [(1, 64), (1, 256), (2, 1024), (2, 4096)]
 
 
 def _load_all(cfg: WCfg):
@@ -405,7 +636,7 @@ def main(argv: list[str] | None = None) -> int:
         description="Matched Wikidata tjs_open vs multi-store h2h."
     )
     sub = ap.add_subparsers(dest="cmd", required=True)
-    for name in ("oracle", "tridb-emit", "report"):
+    for name in ("oracle", "tridb-emit", "baseline", "grade", "report"):
         p = sub.add_parser(name)
         p.add_argument("--k", type=int, default=10)
         p.add_argument("--queries", type=int, default=int(os.environ.get("WD_Q", "50")))
@@ -420,6 +651,12 @@ def main(argv: list[str] | None = None) -> int:
             default=Path("bench/results/wikidata_h2h_oracle.json"),
         )
         p.add_argument("--tridb-raw", type=Path)
+        p.add_argument(
+            "--baseline",
+            type=Path,
+            default=Path("bench/results/wikidata_h2h_baseline.json"),
+        )
+        p.add_argument("--no-pg-rerank", action="store_true")
         p.add_argument("--out", type=Path)
     args = ap.parse_args(argv)
     cfg = WCfg()
@@ -479,6 +716,66 @@ def main(argv: list[str] | None = None) -> int:
         print(
             f"[wikidata_h2h tridb-emit] {len(queries)} queries x {len(DEFAULT_GRID)} combos "
             f"-> {out} (GX10: docker exec -i {cfg.engine_container} psql -f - < {out})"
+        )
+        return 0
+
+    if args.cmd == "baseline":
+        meta = json.loads(args.oracle.read_text())
+        queries = meta["queries"]
+        emb = load_emb(cfg, meta["n"])
+        grid = _grid_env("WD_BASELINE_GRID", DEFAULT_BASELINE_GRID)
+        res = run_baseline(
+            cfg,
+            emb,
+            queries,
+            grid,
+            k=meta["k"],
+            runs=args.runs,
+            use_pg_rerank=not args.no_pg_rerank,
+        )
+        out = args.out or args.baseline
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(
+            json.dumps(
+                {str(t): {str(q): d for q, d in per.items()} for t, per in res.items()},
+                indent=2,
+            )
+        )
+        print(
+            f"[wikidata_h2h baseline] {len(queries)} queries x {len(res)} combos -> {out}"
+        )
+        return 0
+
+    if args.cmd == "grade":
+        # raw -> curves ONLY (recall vs the oracle, median-of-runs latency, median examined);
+        # the honesty gate and any ratio live in `report`, unchanged.
+        meta = json.loads(args.oracle.read_text())
+        oracle = meta["oracle"]
+        k = meta["k"]
+        tridb = (
+            grade_tridb(parse_tridb(args.tridb_raw.read_text()), oracle, k)
+            if args.tridb_raw
+            else {}
+        )
+        baseline: dict[str, dict] = {}
+        if args.baseline and args.baseline.exists():
+            braw = json.loads(args.baseline.read_text())
+            baseline = grade_baseline(
+                {t: {int(q): d for q, d in per.items()} for t, per in braw.items()},
+                oracle,
+                k,
+            )
+        graded = {
+            "tridb": tridb,
+            "baseline": baseline,
+            "oracle_meta": oracle_meta_from_env(meta, cfg),
+        }
+        out = args.out or Path("bench/results/wikidata_h2h_graded.json")
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps(graded, indent=2))
+        print(
+            f"[wikidata_h2h grade] tridb {len(tridb)} combos, baseline {len(baseline)} "
+            f"combos -> {out} (feed to: report --oracle {out})"
         )
         return 0
 
