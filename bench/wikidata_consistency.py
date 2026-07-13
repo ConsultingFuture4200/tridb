@@ -209,11 +209,22 @@ def run_live(edits: list[Edit], reads: int, gap_ms: float) -> dict:
 
     GX10/Spark-ONLY: needs the loaded engine + the isolated tridb-wiki Milvus/Neo4j/pg baseline
     (bench/wiki_consistency's live layout). Reuses engine_setup/engine_write/engine_read and the
-    live MultiStore verbatim. A concurrent reader hammers the hot entities while a writer replays
+    live MultiStore verbatim. A concurrent reader hammers the hot entity while a writer replays
     the edits — TriDB one txn/edit, multi-store three independent commits/edit. Imported lazily so
     the host layer never requires a running engine.
+
+    READER/WRITER CONTRACT (differs from wiki_consistency's synthetic-stream design, deliberately):
+    a REAL edit window is sparse — thousands of distinct entities, each written a handful of times —
+    so a fixed-count reader that finishes in the replay's first second and then STOPS the writer
+    (the wiki shape) observes almost no exposure and would under-report the multi-store tear.
+    Here (a) the writer always replays the FULL window, (b) the reader samples continuously for the
+    WHOLE replay (`reads` is a floor, kept for tiny windows), and (c) the watched entity is the
+    window's MOST-EDITED one — the same hot-bot behavior the real firehose exhibits, maximal but
+    real exposure, pinned by the recorded window itself. Both architectures get the identical
+    contract, so the comparison stays symmetric.
     """
     import threading
+    from collections import Counter
 
     from bench.wiki_consistency import (
         MultiStore,
@@ -228,17 +239,17 @@ def run_live(edits: list[Edit], reads: int, gap_ms: float) -> dict:
     idx = {q: i for i, q in enumerate(ents)}
     m = len(ents)
     gap = gap_ms / 1000.0
+    hot_ent, hot_edits = Counter(e.entity for e in edits).most_common(1)[0]
 
-    # ---- TriDB: writer replays edits, each a one-txn multi-modal write; reader tallies torn ----
+    hot = idx[hot_ent]
+
+    # ---- TriDB: writer replays the FULL window, one txn/edit; reader samples for the duration ----
     engine_setup(m)
     rev_state = {i: 0 for i in range(m)}
-    stop = threading.Event()
 
     def tri_writer():
         c = engine_connect(autocommit=False)
         for e in edits:
-            if stop.is_set():
-                break
             i = idx[e.entity]
             nv = (
                 1 - rev_state[i]
@@ -252,28 +263,25 @@ def run_live(edits: list[Edit], reads: int, gap_ms: float) -> dict:
     tw = threading.Thread(target=tri_writer)
     tw.start()
     tri_torn = 0
+    tri_reads = 0
     rc = engine_connect(autocommit=True)
-    hot = idx[edits[0].entity]
-    for _ in range(reads):
+    while tw.is_alive() or tri_reads < reads:
         with rc.cursor() as cur:
             legs = engine_read(cur, m, hot)
+        tri_reads += 1
         if torn(legs):
             tri_torn += 1
     rc.close()
-    stop.set()
     tw.join()
 
-    # ---- Multi-store: independent-commit writer, sequential 3-store reader ----
+    # ---- Multi-store: independent-commit writer replays the FULL window; same reader contract ----
     ms = MultiStore()
     ms.setup(m)
-    stop2 = threading.Event()
 
     def ms_writer():
         w = MultiStore()
         rv = {i: 0 for i in range(m)}
         for e in edits:
-            if stop2.is_set():
-                break
             i = idx[e.entity]
             nv = 1 - rv[i]
             w.write(i, nv, gap=gap)
@@ -283,10 +291,11 @@ def run_live(edits: list[Edit], reads: int, gap_ms: float) -> dict:
     mw = threading.Thread(target=ms_writer)
     mw.start()
     ms_torn = 0
-    for _ in range(reads):
+    ms_reads = 0
+    while mw.is_alive() or ms_reads < reads:
         if torn(ms.read(hot)):
             ms_torn += 1
-    stop2.set()
+        ms_reads += 1
     mw.join()
     ms.close()
 
@@ -294,12 +303,16 @@ def run_live(edits: list[Edit], reads: int, gap_ms: float) -> dict:
         "layer": "live_replay",
         "edits": len(edits),
         "entities": m,
-        "reads": reads,
+        "hot_entity": hot_ent,
+        "hot_entity_edits": hot_edits,
+        "reads_floor": reads,
+        "tridb_reads": tri_reads,
         "writer_gap_ms": gap_ms,
         "tridb_torn_reads": tri_torn,
-        "tridb_torn_rate": tri_torn / reads,
+        "tridb_torn_rate": tri_torn / tri_reads if tri_reads else 0.0,
+        "multistore_reads": ms_reads,
         "multistore_torn_reads": ms_torn,
-        "multistore_torn_rate": ms_torn / reads,
+        "multistore_torn_rate": ms_torn / ms_reads if ms_reads else 0.0,
     }
 
 
@@ -357,10 +370,11 @@ def main(argv=None) -> int:
         result["live_replay"] = run_live(edits, args.reads, args.gap_ms)
         lr = result["live_replay"]
         print(
-            f"[live]     TriDB torn {lr['tridb_torn_reads']}/{lr['reads']} "
+            f"[live]     TriDB torn {lr['tridb_torn_reads']}/{lr['tridb_reads']} "
             f"({100 * lr['tridb_torn_rate']:.1f}%)  vs  multi-store "
-            f"{lr['multistore_torn_reads']}/{lr['reads']} "
-            f"({100 * lr['multistore_torn_rate']:.1f}%)"
+            f"{lr['multistore_torn_reads']}/{lr['multistore_reads']} "
+            f"({100 * lr['multistore_torn_rate']:.1f}%)  "
+            f"[hot entity Q{lr['hot_entity']}: {lr['hot_entity_edits']} edits in window]"
         )
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
