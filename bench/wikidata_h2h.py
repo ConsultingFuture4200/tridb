@@ -618,12 +618,15 @@ def render_report(
     bp = operating_point(baseline_curve, target)
     blockers = publication_gate(tp, bp, oracle_meta)
     L: list[str] = [
-        "# TriDB Wikidata h2h — filter-first `tjs_open` vs multi-store (matched)",
+        "# TriDB Wikidata h2h — fused filter-first vs multi-store (matched)",
         "",
     ]
     L.append(
         "> COMPUTE-BOUND regime (RAM-resident); value = fusion speed + one-WAL consistency. "
-        "Latency/pages reported ONLY at matched recall. Seedless/vector-first mode blocked on 043."
+        "Latency/pages reported ONLY at matched recall. Seedless/vector-first mode blocked on 043. "
+        "TriDB side = ONE fused statement (native typed BFS -> relational filter -> exact vector "
+        "rank; `graph_store.assume_dense_open=on`, disclosed) — tjs_open's typed-traversal "
+        "integration is the plan 038 residual, not part of this claim."
     )
     L.append("")
     if blockers:
@@ -636,9 +639,13 @@ def render_report(
         return "\n".join(L) + "\n", blockers
     t_lat = tp[1]["median_latency_ms"]
     b_lat = bp[1]["median_latency_ms"]
-    L.append(f"**Matched at recall≈{target:.2f}** (TriDB {tp[0]}, baseline {bp[0]}):")
+    L.append(
+        f"**Matched recall** (target {target:.2f}): TriDB {tp[0]} at "
+        f"recall {tp[1]['recall_at_k']:.3f}, baseline {bp[0]} at "
+        f"recall {bp[1]['recall_at_k']:.3f}:"
+    )
     L.append("")
-    L.append(f"- TriDB filter-first `tjs_open`: {t_lat:.2f} ms")
+    L.append(f"- TriDB fused filter-first statement: {t_lat:.2f} ms")
     L.append(f"- multi-store (Milvus+Neo4j+pg): {b_lat:.2f} ms")
     L.append(f"- **speedup: {b_lat / t_lat:.2f}×**")
     return "\n".join(L) + "\n", blockers
