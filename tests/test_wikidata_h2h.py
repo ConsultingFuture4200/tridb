@@ -242,3 +242,11 @@ def test_render_report_blocks_then_headlines(monkeypatch):
     good_meta = {**bad_meta, "neo4j_edges": 1000}
     md2, blockers2 = render_report(tridb, baseline, good_meta, target=0.90)
     assert blockers2 == [] and "speedup: 4.68×" in md2
+
+
+def test_typed_reach_excludes_src_on_cycle():
+    """A 2-hop cycle over a symmetric property (x -P-> a -P-> x) must not put the
+    anchor in its own reach — the documented contract, matched by the engine BFS
+    (gph_traverse_bfs excludes the seed). Caught live on the 1M slice (P47)."""
+    adj = {0: [(1, 1)], 1: [(1, 0), (1, 2)]}
+    assert typed_reach(adj, 0, 1, 2) == {1, 2}

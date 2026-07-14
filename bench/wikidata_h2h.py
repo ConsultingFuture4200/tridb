@@ -206,7 +206,11 @@ def typed_reach(
         for pe, dst in adj.get(cur, ()):
             if p_id is not None and pe != p_id:
                 continue
-            if dst not in seen:
+            # A cycle back to src (x --P47--> a --P47--> x on symmetric properties) must NOT
+            # put the anchor in its own reach — the documented contract ("excludes src"), the
+            # engine BFS's structural behavior (gph_traverse_bfs excludes the seed), and sane
+            # KBQA semantics all agree. Caught live at 1M: 33/50 queries missed only [x].
+            if dst != src and dst not in seen:
                 seen.add(dst)
             if dst not in visited:
                 visited.add(dst)
@@ -439,9 +443,11 @@ def run_baseline(
         # Loader contract (mirror wiki_h2h): Entity.id is a STRING property (an int
         # `a.id IN $ids` silently matches NOTHING), edges are property-typed relationships
         # [:P<n>] in the natural subject->object direction (ADR-0016/ADR-0018 out-only).
+        # `b <> a` mirrors typed_reach's exclude-src contract (and the engine BFS): a cycle
+        # back to the anchor on a symmetric property must not return the anchor itself.
         cy = (
             f"MATCH (a:{cfg.neo4j_node_label})-[:P{p}*1..{hops}]->"
-            f"(b:{cfg.neo4j_node_label}) WHERE a.id IN $ids "
+            f"(b:{cfg.neo4j_node_label}) WHERE a.id IN $ids AND b <> a "
             f"RETURN DISTINCT b.id AS id LIMIT {frontier}"
         )
         with driver.session() as s:
