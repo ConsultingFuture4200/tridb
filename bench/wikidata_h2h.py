@@ -355,8 +355,9 @@ def emit_tridb_sql(
         # Fused filter-first statement: native typed BFS (C) seeds the small candidate set,
         # the relational P31 filter prunes it, the exact vector distance ranks the survivors.
         # `e.id <> x` mirrors the oracle's typed_reach, which never emits the anchor itself.
+        # NB signature is gph_traverse_bfs(seed, max_depth, type_id) — graph_am.c:1705.
         call = (
-            f"SELECT e.id FROM graph_store.gph_traverse_bfs({qy['x']}, {type_id}, {hops}) "
+            f"SELECT e.id FROM graph_store.gph_traverse_bfs({qy['x']}, {hops}, {type_id}) "
             f"AS t(dst) JOIN {cfg.engine_table} e ON e.id = t.dst "
             f"WHERE e.P31 @> ARRAY[{qy['t']}] AND e.id <> {qy['x']} "
             f"ORDER BY e.embedding <-> '{qv}' LIMIT {k}"
