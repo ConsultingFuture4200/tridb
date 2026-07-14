@@ -345,6 +345,11 @@ def emit_tridb_sql(
     w("\\set ON_ERROR_STOP on")
     w("\\pset pager off")
     w("SET enable_seqscan = off;  -- wiki_h2h convention: force index paths")
+    w(
+        "SET graph_store.assume_dense_open = on;  -- advisor 048 O(1) vertex locate; the"
+        " loader's dense-in-order load satisfies its precondition and every lookup is"
+        " hard-verified (ERROR on violation, never silent). Disclosed in the report."
+    )
     w("\\timing off")
     tag = f"fusedh{hops}"
     for qi, qy in enumerate(queries):
