@@ -302,7 +302,18 @@ def sample_queries(
 
 
 # ======================================================================================
-# TriDB SIDE — emit the filter-first tjs_open sweep SQL (GX10-gated; mirrors wiki_h2h).
+# TriDB SIDE — emit the fused filter-first statement (GX10-gated; mirrors wiki_h2h).
+#
+# SURFACE HONESTY (2026-07-14, first live engine run): tjs_open has NO typed-traversal slot —
+# plan 038 landed typed traversal as native AM SRFs (gph_traverse_typed / gph_traverse_bfs),
+# not as an operator argument (the switch ADR-0018's consequences anticipate). The KBQA
+# filter-first query is therefore realized as ONE fused SQL statement over the native
+# surfaces: C multi-hop typed BFS -> relational P31 filter -> exact vector rank, one
+# round-trip, one system, one snapshot — semantically identical to the oracle (both sides
+# exact => recall matched at 1.0 by construction; the h2h measures single-system fusion vs
+# 3-system app-side assembly at identical semantics). The gate's examined>0 seqscan guard is
+# fed by the backend-local graph visit counter delta (gph_visits) — >0 proves the native AM
+# actually traversed; the operator's SM-3 counter does not exist on this shape.
 # ======================================================================================
 def emit_tridb_sql(
     cfg: WCfg,
@@ -312,48 +323,57 @@ def emit_tridb_sql(
     *,
     k: int,
     runs: int,
+    hops: int = 2,
+    edge_type_map: dict[str, int] | None = None,
 ) -> str:
-    """Per (query, knob-combo): warm-up (graded ids + SM-3 counters) then `runs` timed repeats.
+    """Per query: warm-up (graded ids + gph_visits delta) then `runs` timed repeats.
 
-    FILTER-FIRST call: the entity-type + typed-edge constraint is the selective seed (the filter
-    slot carries the P31 == T predicate and the P-typed traversal is rooted at X), the vector
-    ranks the survivors. GX10-gated — emitted here, executed against the loaded engine on the
-    Spark; any harvested timing is trustworthy ONLY if EXAMINED > 0 (the report gate enforces it).
-    """
+    `edge_type_map` maps 'P<m>' -> the engine's dictionary edge-type id (from the engine
+    load manifest's #WDL ETYPE lines); a query property missing from it is a slice/engine
+    mismatch and fails loudly. `grid` is accepted for CLI-shape compatibility but the fused
+    statement's only knob is `hops` (one combo: 'fusedh<hops>')."""
+    if edge_type_map is None:
+        raise SystemExit(
+            "emit_tridb_sql: edge_type_map required (engine_load_manifest.json edge_type_map)"
+        )
     out: list[str] = []
     w = out.append
     w("\\set ON_ERROR_STOP on")
     w("\\pset pager off")
-    w("SET enable_seqscan = off;  -- gate on EXAMINED>0 (see wiki_h2h docstring)")
-    w(
-        f"SET vectordb.tjs_open_max_examined = {cfg.tjs_max_examined};"
-        "  -- TR-1 work cap; examined>=cap => CENSORED point, gated out"
-    )
+    w("SET enable_seqscan = off;  -- wiki_h2h convention: force index paths")
     w("\\timing off")
+    tag = f"fusedh{hops}"
     for qi, qy in enumerate(queries):
+        pkey = f"P{qy['p']}"
+        if pkey not in edge_type_map:
+            raise SystemExit(
+                f"emit_tridb_sql: property {pkey} not in engine edge_type_map — "
+                "slice/engine mismatch (reload or re-sample)"
+            )
+        type_id = int(edge_type_map[pkey])
         qv = _vec_lit(emb[qy["x"]])
-        expr = f"'embedding <-> ''{qv}'''"
-        # filter-first predicate: entity-type constraint + the P-typed edge rooted at the anchor.
-        filt = f"'P31 @> ARRAY[{qy['t']}] AND src={qy['x']} AND ptype={qy['p']}'"
-        for ms, hops, tc in grid:
-            tag = f"m{ms}h{hops}t{tc}"
-            call = (
-                f"SELECT t.id FROM tjs_open('{cfg.engine_table}', {k}, {tc}, {ms}, {hops}, "
-                f"'id', {filt}, {expr}) AS t(id bigint)"
-            )
-            w(f"\\echo #WD TRIDB qid={qi} combo={tag}")
-            w(f"\\echo #WD IDS qid={qi} combo={tag}")
+        # Fused filter-first statement: native typed BFS (C) seeds the small candidate set,
+        # the relational P31 filter prunes it, the exact vector distance ranks the survivors.
+        # `e.id <> x` mirrors the oracle's typed_reach, which never emits the anchor itself.
+        call = (
+            f"SELECT e.id FROM graph_store.gph_traverse_bfs({qy['x']}, {type_id}, {hops}) "
+            f"AS t(dst) JOIN {cfg.engine_table} e ON e.id = t.dst "
+            f"WHERE e.P31 @> ARRAY[{qy['t']}] AND e.id <> {qy['x']} "
+            f"ORDER BY e.embedding <-> '{qv}' LIMIT {k}"
+        )
+        w(f"\\echo #WD TRIDB qid={qi} combo={tag}")
+        w("SELECT graph_store.gph_visits() AS wdv0 \\gset")
+        w(f"\\echo #WD IDS qid={qi} combo={tag}")
+        w(call + ";")
+        w(f"\\echo #WD ENDIDS qid={qi} combo={tag}")
+        w(
+            f"SELECT '#WD EXAMINED qid={qi} combo={tag} examined=' || "
+            f"(graph_store.gph_visits() - :wdv0) || ' bridges=0' AS line;"
+        )
+        w("\\timing on")
+        for _ in range(runs):
             w(call + ";")
-            w(f"\\echo #WD ENDIDS qid={qi} combo={tag}")
-            w(
-                f"SELECT '#WD EXAMINED qid={qi} combo={tag} examined=' || "
-                f"tjs_open_candidates_examined() || ' bridges=' || "
-                f"tjs_open_bridges_injected() AS line;"
-            )
-            w("\\timing on")
-            for _ in range(runs):
-                w(call + ";")
-            w("\\timing off")
+        w("\\timing off")
     w("\\echo #WD DONE")
     return "\n".join(out) + "\n"
 
@@ -708,8 +728,21 @@ def main(argv: list[str] | None = None) -> int:
         emb = load_emb(cfg, n)
         meta = json.loads(args.oracle.read_text())
         queries = meta["queries"]
+        eng_manifest_path = Path(
+            os.environ.get(
+                "WD_ENGINE_MANIFEST", cfg.slice_dir / "engine_load_manifest.json"
+            )
+        )
+        etype_map = json.loads(eng_manifest_path.read_text())["engine"]["edge_type_map"]
         sql = emit_tridb_sql(
-            cfg, emb, queries, DEFAULT_GRID, k=meta["k"], runs=args.runs
+            cfg,
+            emb,
+            queries,
+            DEFAULT_GRID,
+            k=meta["k"],
+            runs=args.runs,
+            hops=int(meta.get("hops", args.hops)),
+            edge_type_map=etype_map,
         )
         out = args.out or Path("/tmp/wikidata_h2h_tridb.sql")
         out.write_text(sql)
