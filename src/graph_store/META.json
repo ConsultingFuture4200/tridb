@@ -1,0 +1,42 @@
+{
+   "name": "graph_store_am",
+   "abstract": "Native adjacency-list graph store for PostgreSQL (TriDB tri-modal substrate)",
+   "description": "A WAL-logged, MVCC-visible adjacency-list graph access method: typed + directional edges, dense vertex ids with an external-id map, streaming TR-1 traversals (gph_traverse, gph_traverse_typed, gph_traverse_bfs), tombstone deletes and freeze. One transaction manager, one WAL — the graph leg of TriDB's tri-modal (vector + graph + relational) architecture; pairs with pgvector for the vector leg.",
+   "version": "0.1.0",
+   "maintainer": "ConsultingFuture4200",
+   "license": "mit",
+   "provides": {
+      "graph_store_am": {
+         "abstract": "Native adjacency-list graph access method",
+         "file": "graph_store_am--0.1.0.sql",
+         "docfile": "README.md",
+         "version": "0.1.0"
+      }
+   },
+   "prereqs": {
+      "runtime": {
+         "requires": {
+            "PostgreSQL": "16.0.0"
+         }
+      }
+   },
+   "resources": {
+      "repository": {
+         "url": "https://github.com/ConsultingFuture4200/tridb.git",
+         "web": "https://github.com/ConsultingFuture4200/tridb",
+         "type": "git"
+      }
+   },
+   "generated_by": "TriDB roadmap D2 phase 2.4",
+   "meta-spec": {
+      "version": "1.0.0",
+      "url": "https://pgxn.org/meta/spec.txt"
+   },
+   "tags": [
+      "graph",
+      "access method",
+      "adjacency list",
+      "tri-modal",
+      "traversal"
+   ]
+}

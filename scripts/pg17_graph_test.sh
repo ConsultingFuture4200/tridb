@@ -27,7 +27,7 @@ docker run --rm --user postgres --entrypoint bash \
   -v "${EXT_V0}:/tmp/ext_v0:ro" -v "${EXT_V1}:/tmp/ext_v1:ro" \
   -v "${TEST}:/tmp/graph_test.sql:ro" "$IMAGE" -c '
   set -e
-  B=/usr/lib/postgresql/17/bin
+  B=$(ls -d /usr/lib/postgresql/*/bin | sort -V | tail -1)  # works for the pg16/pg17 CI matrix
   PGC=$B/pg_config
   for e in v1 v0; do
     cp -r /tmp/ext_$e /tmp/build_$e && cd /tmp/build_$e

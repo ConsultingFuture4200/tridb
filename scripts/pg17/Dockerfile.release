@@ -1,0 +1,26 @@
+# Shippable tri-modal Postgres image (roadmap D2 phase 2.4): stock Postgres + pgvector
+# + the un-forked TriDB graph AM, prebaked. A stranger runs:
+#
+#   docker build -f scripts/pg17/Dockerfile.release -t tridb/postgres-trimodal:pg17 .
+#   docker run -d -e POSTGRES_PASSWORD=... tridb/postgres-trimodal:pg17
+#   psql: CREATE EXTENSION vector; CREATE EXTENSION graph_store_am;
+#
+# Build context = the repo root (src/graph_store is COPYed in). PG_MAJOR selects 16/17.
+ARG PG_MAJOR=17
+
+FROM pgvector/pgvector:pg${PG_MAJOR} AS builder
+ARG PG_MAJOR
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        build-essential postgresql-server-dev-${PG_MAJOR} \
+    && rm -rf /var/lib/apt/lists/*
+COPY src/graph_store /tmp/graph_store
+RUN cd /tmp/graph_store && make PG_CONFIG=/usr/lib/postgresql/${PG_MAJOR}/bin/pg_config \
+    && make PG_CONFIG=/usr/lib/postgresql/${PG_MAJOR}/bin/pg_config install
+
+FROM pgvector/pgvector:pg${PG_MAJOR}
+ARG PG_MAJOR
+COPY --from=builder /usr/lib/postgresql/${PG_MAJOR}/lib/graph_store_am.so \
+    /usr/lib/postgresql/${PG_MAJOR}/lib/
+COPY --from=builder /usr/share/postgresql/${PG_MAJOR}/extension/graph_store_am* \
+    /usr/share/postgresql/${PG_MAJOR}/extension/
