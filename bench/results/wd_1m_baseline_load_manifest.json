@@ -1,0 +1,40 @@
+{
+  "tool": "tools/wikidata_baseline_load.py",
+  "created": "2026-07-14T18:43:07.057901+00:00",
+  "slice_dir": "/home/bob/data/wikidata_slice_1m",
+  "emb_path": "/home/bob/data/wikidata_slice_1m/emb/dense_id_aligned.npy",
+  "dim": 384,
+  "force": true,
+  "counts": {
+    "entities": 1002331,
+    "edges_kept": 7422959,
+    "edges_dropped_dangling": 0,
+    "distinct_properties": 1370
+  },
+  "stores": {
+    "postgres": {
+      "table": "wd_entity",
+      "rows": 1002331
+    },
+    "neo4j": {
+      "label": "Entity",
+      "nodes": 1002331,
+      "relationships": 7422959,
+      "distinct_properties": 1370
+    },
+    "milvus": {
+      "collection": "wikidata_entities",
+      "vectors": 1002331,
+      "metric": "COSINE",
+      "index": "HNSW"
+    }
+  },
+  "durations": {
+    "postgres_secs": 174.64,
+    "neo4j_secs": 174.58,
+    "milvus_secs": 156.77
+  },
+  "gate_env": {
+    "WD_NEO4J_EDGES": 7422959
+  }
+}

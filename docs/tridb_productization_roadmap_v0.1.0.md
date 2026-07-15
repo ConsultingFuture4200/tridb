@@ -181,3 +181,22 @@ CSR/packaging investment.
 **Recommended immediate next step:** execute **D1** (mostly built), let its benchmark answer Gate A.
 043 and the vector leg are pre-decided (filter-first scope now, pgvector retire in D2), so D2 has a
 clear line the moment Gate A greenlights. Everything past D1 is contingent on the number D1 produces.
+
+---
+
+## Addendum A1 (2026-07-14) — Gate A verdict: PASS
+
+D1's measurement pass ran on the GX10/Spark against a pinned 1,002,331-entity Wikidata slice
+(full evidence + pins: `docs/wikidata_spike_v0.2.0.md`, artifacts `bench/results/wd_1m_*`):
+
+- **Fusion win, gated:** 0.27 ms vs 3.16 ms at matched recall (0.992 / 0.986) — **11.90×** —
+  through `publication_gate` (graph parity, HNSW 3/3, examined>0, boundary parity equalized).
+- **Consistency win, live:** 0.029% vs 1.33% torn reads on a real pinned edit window (46×);
+  TriDB residual = graph-leg only (DEV-1166, D3 hardening as planned).
+
+**The kill-criterion did NOT trigger** — TriDB is not a consistency-only play; D2's
+fusion-centric un-fork is justified. One surface caveat feeds D2 planning: the typed
+filter-first headline runs as a fused native-surface statement, because `tjs_open` has no
+typed-traversal argument (plan 038 landed typed traversal as AM SRFs only). D2 phase 2.2's
+re-home of the operator over pgvector should absorb the typed slot into the operator surface
+(and Gate B measures it there).

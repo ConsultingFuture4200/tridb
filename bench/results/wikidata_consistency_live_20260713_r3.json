@@ -1,0 +1,71 @@
+{
+  "meta": {
+    "generated": "2026-07-13T11:25:22Z",
+    "source": "bench/data/wikidata_edit_window_20260713.jsonl",
+    "edits": 2000
+  },
+  "host_simulation": {
+    "layer": "host_simulation",
+    "note": "deterministic model of the two architectures; the reader samples the in-flight entity after every store commit (maximal exposure). TriDB torn=0 is structural (atomic edit); the multi-store rate is the STRUCTURAL UPPER BOUND, not a timing measurement \u2014 the live replay (--live, GX10) measures the real, lower rate.",
+    "tridb": {
+      "architecture": "one_wal_atomic",
+      "edits": 2000,
+      "observations": 2000,
+      "torn": 0,
+      "torn_rate": 0.0,
+      "examples": []
+    },
+    "multistore": {
+      "architecture": "multistore_independent_commits",
+      "edits": 2000,
+      "observations": 6000,
+      "torn": 4000,
+      "torn_rate": 0.6666666666666666,
+      "examples": [
+        {
+          "entity": 28872567,
+          "rev": 2517012644,
+          "vector": 2517012644,
+          "graph": 0,
+          "relational": 0
+        },
+        {
+          "entity": 28872567,
+          "rev": 2517012644,
+          "vector": 2517012644,
+          "graph": 2517012644,
+          "relational": 0
+        },
+        {
+          "entity": 140529729,
+          "rev": 2517012646,
+          "vector": 2517012646,
+          "graph": 0,
+          "relational": 0
+        },
+        {
+          "entity": 140529729,
+          "rev": 2517012646,
+          "vector": 2517012646,
+          "graph": 2517012646,
+          "relational": 0
+        }
+      ]
+    }
+  },
+  "live_replay": {
+    "layer": "live_replay",
+    "edits": 2000,
+    "entities": 1487,
+    "hot_entity": 116065247,
+    "hot_entity_edits": 23,
+    "reads_floor": 300,
+    "tridb_reads": 16969,
+    "writer_gap_ms": 5.0,
+    "tridb_torn_reads": 5,
+    "tridb_torn_rate": 0.0002946549590429607,
+    "multistore_reads": 300,
+    "multistore_torn_reads": 4,
+    "multistore_torn_rate": 0.013333333333333334
+  }
+}
