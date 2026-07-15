@@ -328,7 +328,10 @@ def sql_hnsw_and_health(
     if dialect == "stock":
         index_sql = (
             # disclosed build resources: pgvector's HNSW build spills without enough
-            # maintenance memory at 1M x 384; parallelism is pgvector-native
+            # maintenance memory at 1M x 384; parallelism is pgvector-native. NB the
+            # parallel build allocates ~maintenance_work_mem of DYNAMIC SHARED MEMORY —
+            # a docker container needs --shm-size >= that (default 64MB fails with
+            # "could not resize shared memory segment"; observed live at 1M, 2026-07-15).
             "SET maintenance_work_mem = '8GB';\n"
             "SET max_parallel_maintenance_workers = 8;\n"
             f"CREATE INDEX {table}_hnsw ON {table} USING hnsw "
