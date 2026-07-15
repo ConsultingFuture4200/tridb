@@ -77,6 +77,9 @@ class WCfg:
     engine_container: str = os.environ.get("WD_ENGINE", "tridb-wikidata")
     engine_db: str = os.environ.get("WD_ENGINE_DB", "postgres")
     engine_table: str = os.environ.get("WD_ENGINE_TABLE", "entities")
+    # fork = MSVBASE vectordb (float8[] embedding, {..} literals); stock = pgvector on
+    # stock PG 17 (vector(dim) embedding, [..] literals) — D2 un-fork / Gate B spike.
+    engine_dialect: str = os.environ.get("WD_ENGINE_DIALECT", "fork")
     # baseline multi-store (isolated ports; mirror wiki_h2h layout)
     milvus_host: str = os.environ.get("WD_MILVUS_HOST", "localhost")
     milvus_port: str = os.environ.get("WD_MILVUS_PORT", "19531")
@@ -360,7 +363,12 @@ def emit_tridb_sql(
                 "slice/engine mismatch (reload or re-sample)"
             )
         type_id = int(edge_type_map[pkey])
-        qv = _vec_lit(emb[qy["x"]])
+        if cfg.engine_dialect == "stock":
+            # pgvector literal (square brackets); the unknown-typed quoted literal
+            # coerces to vector against the vector <-> operator.
+            qv = "[" + ",".join(repr(float(x)) for x in emb[qy["x"]]) + "]"
+        else:
+            qv = _vec_lit(emb[qy["x"]])
         # Fused filter-first statement: native typed BFS (C) seeds the small candidate set,
         # the relational P31 filter prunes it, the exact vector distance ranks the survivors.
         # `e.id <> x` mirrors the oracle's typed_reach, which never emits the anchor itself.
