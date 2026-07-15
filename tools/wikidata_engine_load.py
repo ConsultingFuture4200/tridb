@@ -327,6 +327,10 @@ def sql_hnsw_and_health(
     m=16 / ef_construction=64 (the ADR-0015 E3 probe's parameters, disclosed)."""
     if dialect == "stock":
         index_sql = (
+            # disclosed build resources: pgvector's HNSW build spills without enough
+            # maintenance memory at 1M x 384; parallelism is pgvector-native
+            "SET maintenance_work_mem = '8GB';\n"
+            "SET max_parallel_maintenance_workers = 8;\n"
             f"CREATE INDEX {table}_hnsw ON {table} USING hnsw "
             f"(embedding vector_l2_ops) WITH (m = 16, ef_construction = 64);"
         )
