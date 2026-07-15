@@ -1,0 +1,41 @@
+{
+  "tridb": {
+    "fusedh2": {
+      "recall_at_k": 0.992,
+      "median_latency_ms": 0.141,
+      "median_examined": 42.0,
+      "n_queries": 50
+    }
+  },
+  "baseline": {
+    "h1f64": {
+      "recall_at_k": 0.45000000000000007,
+      "median_latency_ms": 3.0312290182337165,
+      "n_queries": 50
+    },
+    "h1f256": {
+      "recall_at_k": 0.45000000000000007,
+      "median_latency_ms": 3.0503650195896626,
+      "n_queries": 50
+    },
+    "h2f1024": {
+      "recall_at_k": 0.986,
+      "median_latency_ms": 3.338861046358943,
+      "n_queries": 50
+    },
+    "h2f4096": {
+      "recall_at_k": 0.986,
+      "median_latency_ms": 3.6164060002192855,
+      "n_queries": 50
+    }
+  },
+  "oracle_meta": {
+    "k": 10,
+    "hops": 2,
+    "engine_edges": "7422959",
+    "neo4j_edges": "7422959",
+    "tjs_max_examined": 4000,
+    "hnsw_healthy_builds": "3",
+    "hnsw_total_builds": "3"
+  }
+}

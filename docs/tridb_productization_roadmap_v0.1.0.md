@@ -200,3 +200,15 @@ filter-first headline runs as a fused native-surface statement, because `tjs_ope
 typed-traversal argument (plan 038 landed typed traversal as AM SRFs only). D2 phase 2.2's
 re-home of the operator over pgvector should absorb the typed slot into the operator surface
 (and Gate B measures it there).
+
+## Addendum A2 (2026-07-15) — Gate B verdict: PASS (the fusion win doubles off the fork)
+
+The pivotal de-risk ran one day after Gate A, on the same pinned 1M slice through the same gate
+(`docs/gate_b_spike_v0.1.0.md`): stock PG 17.10 + pgvector + the un-forked graph AM (8KB pages)
+runs the fused filter-first query at **0.14 ms vs 3.34 ms multi-store = 23.68×** at matched
+recall (0.992/0.986) — vs 11.90× on the PG 13.4 fork. Same recall, same BFS work, newer
+executor: **stock PG is ~2× faster than the fork.** Phase 2.1 is landed (BLCKSZ capability +
+2 version guards; 11/11 graph suites green on stock PG17, x86 + ARM); 2.2's premise is proven.
+Remaining: 2.3 CSR (scale-motivated), 2.4 packaging/CI (pg17 image is the seed), 2.5 operator
+re-home for the vector-first legs (the ADR-0015 E3 gaps — the second half of Gate B, scoped to
+the seedless mode D1 already excludes). Plan 043 is moot on the target platform, as predicted.
