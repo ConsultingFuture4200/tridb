@@ -71,7 +71,7 @@ jobs:
                    test/graph_delete_test.sql test/graph_edge_count_test.sql \
                    test/graph_freeze_test.sql test/graph_dense_open_test.sql \
                    test/graph_v0v1_parity_test.sql test/graph_vid_cache_test.sql \
-                   test/graph_am_acl_test.sql; do
+                   test/graph_am_acl_test.sql test/tjs_pg_test.sql; do
             echo "=== $t (pg${{ matrix.pg }}) ==="
             bash scripts/pg17_graph_test.sh tridb/pg17-unfork:dev "$t"
           done

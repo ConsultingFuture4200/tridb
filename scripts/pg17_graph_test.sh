@@ -16,6 +16,7 @@ IMAGE="${1:-tridb/pg17-unfork:dev}"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 EXT_V0="$ROOT/src/graph_store_ext"
 EXT_V1="$ROOT/src/graph_store"
+EXT_TJS="$ROOT/src/tjs_pg"
 TEST="$(cd "$ROOT" && realpath "${2:-test/graph_store_am_test.sql}")"
 
 docker image inspect "$IMAGE" >/dev/null 2>&1 || {
@@ -25,11 +26,12 @@ docker image inspect "$IMAGE" >/dev/null 2>&1 || {
 
 docker run --rm --user postgres --entrypoint bash \
   -v "${EXT_V0}:/tmp/ext_v0:ro" -v "${EXT_V1}:/tmp/ext_v1:ro" \
+  -v "${EXT_TJS}:/tmp/ext_tjs:ro" \
   -v "${TEST}:/tmp/graph_test.sql:ro" "$IMAGE" -c '
   set -e
   B=$(ls -d /usr/lib/postgresql/*/bin | sort -V | tail -1)  # works for the pg16/pg17 CI matrix
   PGC=$B/pg_config
-  for e in v1 v0; do
+  for e in v1 v0 tjs; do
     cp -r /tmp/ext_$e /tmp/build_$e && cd /tmp/build_$e
     echo "=== make ($e, stock PG17) ==="; make PG_CONFIG=$PGC 2>&1 | tail -2
     # the image chowns the extension/lib dirs to postgres (scripts/pg17/Dockerfile)

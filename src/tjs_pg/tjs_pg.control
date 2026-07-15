@@ -1,0 +1,7 @@
+# tridb_tjs — the fused tri-modal operator on stock PostgreSQL (ADR-0019, D2 phase 2.5)
+comment = 'TriDB fused tri-modal operator (tjs_open) over pgvector + graph_store_am'
+default_version = '0.1.0'
+module_pathname = '$libdir/tjs_pg'
+relocatable = false
+schema = public
+requires = 'vector, graph_store_am'

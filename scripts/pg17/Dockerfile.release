@@ -15,12 +15,17 @@ RUN apt-get update \
         build-essential postgresql-server-dev-${PG_MAJOR} \
     && rm -rf /var/lib/apt/lists/*
 COPY src/graph_store /tmp/graph_store
+COPY src/tjs_pg /tmp/tjs_pg
 RUN cd /tmp/graph_store && make PG_CONFIG=/usr/lib/postgresql/${PG_MAJOR}/bin/pg_config \
+    && make PG_CONFIG=/usr/lib/postgresql/${PG_MAJOR}/bin/pg_config install \
+    && cd /tmp/tjs_pg && make PG_CONFIG=/usr/lib/postgresql/${PG_MAJOR}/bin/pg_config \
     && make PG_CONFIG=/usr/lib/postgresql/${PG_MAJOR}/bin/pg_config install
 
 FROM pgvector/pgvector:pg${PG_MAJOR}
 ARG PG_MAJOR
 COPY --from=builder /usr/lib/postgresql/${PG_MAJOR}/lib/graph_store_am.so \
+    /usr/lib/postgresql/${PG_MAJOR}/lib/tjs_pg.so \
     /usr/lib/postgresql/${PG_MAJOR}/lib/
 COPY --from=builder /usr/share/postgresql/${PG_MAJOR}/extension/graph_store_am* \
+    /usr/share/postgresql/${PG_MAJOR}/extension/tjs_pg* \
     /usr/share/postgresql/${PG_MAJOR}/extension/

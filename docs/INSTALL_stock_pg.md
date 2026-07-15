@@ -49,9 +49,13 @@ available on this repository's plan, so ARM is not (yet) in the per-push matrix.
 
 - **Included:** the native graph access method (typed/directional adjacency, `gph_*` SQL
   surface, WAL-logged via GenericXLog, MVCC-visible), on stock PG.
-- **Not included (fork-only, being re-homed per roadmap D2 phase 2.5):** the `tjs`/`tjs_open`
-  fused operators for the *seedless / vector-first* physical path. The **filter-first** fused
-  query — the Gate A/B headline — needs no operator: it is a single SQL statement over
-  `graph_store.gph_traverse_bfs(...)` + a relational filter + a vector rank (see
+- **Included (D2 phase 2.5, ADR-0019):** `src/tjs_pg` — the fused operator `tjs_open(...)`
+  re-homed on stock PG: filter-first behind the operator surface, and vector-first/seedless
+  driving pgvector's iterative HNSW scan directly (requires
+  `SET hnsw.iterative_scan = relaxed_order`, pgvector ≥ 0.8) with TR-1 early termination and
+  honest budget-cap reporting (`tjs_open_budget_capped()`). Exact fork phase/bridge parity
+  (ADR-0012/0017 seed-bridge injection) is follow-up; the harness counters expose enough to
+  grade recall honestly either way. The **filter-first** Gate A/B headline also works with no
+  operator at all: a single SQL statement over `graph_store.gph_traverse_bfs(...)` (see
   `bench/wikidata_h2h.py:emit_tridb_sql`).
 - **PGXN:** `src/graph_store/META.json` is prepared; publication happens at release time.
