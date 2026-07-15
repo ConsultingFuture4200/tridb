@@ -57,14 +57,14 @@ extern "C" {
 /* -------------------------------------------------------------------------
  * On-disk geometry constants (mirror docs/graph_store_layout_v0.1.0.md).
  *
- * The fork builds Postgres with --with-blocksize=32, so every on-disk
- * adjacency page is 32KB. These constants exist so callers and the layout
- * spec share one source of truth; the implementation MUST static-assert them
- * against the live BLCKSZ at build time on GX10.
+ * The layout is derived from the live BLCKSZ (ADR-0015 / D2 un-fork): 32KB on
+ * the fork (--with-blocksize=32, the performance target), 8KB on stock PG
+ * 16/17 (~4x adjacency page reads at high degree — ADR-0015 E2). gph_page.h
+ * static-asserts BLCKSZ >= 8192 at build time.
  * ------------------------------------------------------------------------- */
 
-/* 32KB pages: the only block size this access method targets. */
-#define GRAPHSTORE_BLOCKSZ          (32 * 1024)
+/* The block size this build targets (whatever the host PG was compiled with). */
+#define GRAPHSTORE_BLOCKSZ          BLCKSZ
 
 /* v1 supports exactly one edge label. */
 #define GRAPHSTORE_EDGE_LABEL       "related_to"

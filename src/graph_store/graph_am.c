@@ -1130,7 +1130,12 @@ gph_freeze(PG_FUNCTION_ARGS)
 	 * permanently, falsely visible — validation makes that unreachable rather than a caller
 	 * contract (design §1 "Horizon validation").
 	 */
+#if PG_VERSION_NUM >= 140000
+	/* PG 14 renamed the vacuum-horizon read (same semantics for a plain relation). */
+	oldest = GetOldestNonRemovableTransactionId(rel);
+#else
 	oldest = GetOldestXmin(rel, PROCARRAY_FLAGS_VACUUM);
+#endif
 	if (!TransactionIdPrecedes(horizon, oldest))
 		ereport(ERROR,
 				(errmsg("graph_store: freeze horizon %u does not precede the oldest running xmin %u",
@@ -1225,6 +1230,19 @@ gph_freeze(PG_FUNCTION_ARGS)
 	 * the autocommit note above). num_pages/num_tuples pass the current values through unchanged
 	 * (the container is never planned/ANALYZEd — access is gph_* only); hasindex=false.
 	 */
+#if PG_VERSION_NUM >= 150000
+	/* PG 15 added the frozenxid/minmulti out-params (we don't need the feedback). */
+	vac_update_relstats(rel,
+						RelationGetNumberOfBlocks(rel),
+						rel->rd_rel->reltuples,
+						0,
+						false,
+						horizon,
+						InvalidMultiXactId,
+						NULL,
+						NULL,
+						false);
+#else
 	vac_update_relstats(rel,
 						RelationGetNumberOfBlocks(rel),
 						rel->rd_rel->reltuples,
@@ -1233,6 +1251,7 @@ gph_freeze(PG_FUNCTION_ARGS)
 						horizon,
 						InvalidMultiXactId,
 						false);
+#endif
 
 	relation_close(rel, ShareUpdateExclusiveLock);
 	PG_RETURN_INT64(frozen);
