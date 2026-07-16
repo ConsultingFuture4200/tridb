@@ -17,10 +17,13 @@ BEGIN
 END $$;
 
 -- tjs_open: fused tri-modal top-k.
---   src IS NOT NULL -> FILTER-FIRST (typed BFS reach -> relational filter -> exact rank);
+--   src IS NOT NULL -> FILTER-FIRST (bounded pull graph traversal -> relational filter ->
+--                      exact rank -> bounded top-k; plan 077 / ADR-0020);
 --   src IS NULL     -> VECTOR-FIRST/SEEDLESS (owned relaxed-order pgvector HNSW stream ->
 --                      per-candidate filter/graph predicates -> term_cond early termination).
 -- Vector-first requires: SET hnsw.iterative_scan = relaxed_order (pgvector >= 0.8).
+-- Graph leg (both paths): bounded by the tjs.graph_work_budget GUC (edge-steps, default
+-- 65536) -- see tjs_open_graph_censored()/tjs_open_graph_examined() below.
 CREATE FUNCTION tjs_open(tbl regclass,
                          k integer,
                          term_cond integer,
@@ -72,4 +75,22 @@ REVOKE EXECUTE ON FUNCTION tjs_open(regclass,integer,integer,integer,integer,tex
 -- NOT a count of bridges that land in the FINAL k (that share is capped at k/2).
 CREATE FUNCTION tjs_open_bridges_injected() RETURNS bigint
 AS 'MODULE_PATHNAME', 'tjs_open_bridges_injected_pg'
+LANGUAGE C VOLATILE;
+
+-- Graph-leg honesty counters (plan 077 / ADR-0020), orthogonal to the stream-termination
+-- metrics above: the graph work bound is a property of reach acquisition (a bounded pull
+-- traversal over graph_store.gph_traverse_bounded), not of how the candidate stream ended.
+--
+-- tjs_open_graph_examined(): edge-steps the last call's graph leg consumed (0 for a pure
+-- vector-first call with m_seeds = 0, which never touches the graph).
+CREATE FUNCTION tjs_open_graph_examined() RETURNS bigint
+AS 'MODULE_PATHNAME', 'tjs_open_graph_examined_pg'
+LANGUAGE C VOLATILE;
+
+-- tjs_open_graph_censored(): TRUE iff the last call's graph leg hit tjs.graph_work_budget
+-- before its bounded reach exhausted naturally (a deterministic-prefix result, disclosed, never
+-- silently exact). A REAL boolean, never NULL — unlike tjs_open_budget_capped(), this operator
+-- owns the traversal and can always observe whether its own budget was hit.
+CREATE FUNCTION tjs_open_graph_censored() RETURNS boolean
+AS 'MODULE_PATHNAME', 'tjs_open_graph_censored_pg'
 LANGUAGE C VOLATILE;
