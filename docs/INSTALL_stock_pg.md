@@ -45,6 +45,43 @@ CI runs the full 11-suite matrix on stock PG 16 and 17 (x86_64) on every push
 (GB10): the same suites pass on aarch64 stock PG17 — GitHub-hosted ARM runners are not
 available on this repository's plan, so ARM is not (yet) in the per-push matrix.
 
+## Harness environment variables
+
+The Wikidata head-to-head harness (`bench/wikidata_h2h.py`, and its sibling `bench/wiki_h2h.py`)
+is configured entirely through environment variables. The one that matters most is
+**`WD_ENGINE_DIALECT`**: it selects which engine the harness drives. It defaults to `fork` (the
+MSVBASE fork) — set `WD_ENGINE_DIALECT=stock` to benchmark the un-forked pgvector engine this
+document installs. Forgetting it silently measures the fork.
+
+| Variable | Meaning | Default |
+|---|---|---|
+| `WD_ENGINE_DIALECT` | Engine to drive: `fork` (MSVBASE) or `stock` (pgvector) | `fork` |
+| `WD_SLICE` | Corpus slice directory | `data/wikidata_slice` |
+| `WD_EMB` | Dense id-aligned embedding `.npy` | `data/wikidata_slice/emb/dense_id_aligned.npy` |
+| `WD_DIM` | Embedding dimensionality | `384` |
+| `WD_ENGINE` | TriDB engine container name | `tridb-wikidata` |
+| `WD_ENGINE_DB` | TriDB engine database | `postgres` |
+| `WD_ENGINE_TABLE` | TriDB engine entity table | `entities` |
+| `WD_Q` | Number of queries | `50` |
+| `WD_TJS_MAX_EXAMINED` | TR-1 work cap (must match the C default) | `4000` |
+| `WD_MILVUS_HOST` / `WD_MILVUS_PORT` / `WD_MILVUS_COLLECTION` | Baseline Milvus target | `localhost` / `19531` / `wikidata_entities` |
+| `WD_NEO4J_URI` / `WD_NEO4J_USER` / `WD_NEO4J_PASSWORD` / `WD_NEO4J_LABEL` | Baseline Neo4j target | `bolt://localhost:7688` / `neo4j` / `wikipassword` / `Entity` |
+| `WD_PGHOST` / `WD_PGPORT` / `WD_PGDB` / `WD_PGUSER` / `WD_PGPASSWORD` / `WD_PGTABLE` | Baseline Postgres target | `localhost` / `5434` / `tridb_wikidata` / `postgres` / `postgres` / `wd_entity` |
+
+### Publication-gate keys
+
+The honesty gate refuses a headline ratio until the ground-truth graph size and HNSW build
+health are declared. These keys accept **either** the `WH_` or the `WD_` prefix (plan 065) — the
+harness reads `WH_` first, then falls back to `WD_`:
+
+| Variable | Meaning | Default |
+|---|---|---|
+| `WH_ENGINE_EDGES` / `WD_ENGINE_EDGES` | Edges the engine graph actually holds | *(undeclared → gate blocks)* |
+| `WH_NEO4J_EDGES` / `WD_NEO4J_EDGES` | Edges Neo4j holds | oracle's induced edge count |
+| `WH_HNSW_HEALTHY_BUILDS` / `WD_HNSW_HEALTHY_BUILDS` | HNSW builds that came out healthy | *(undeclared → gate blocks)* |
+| `WH_HNSW_TOTAL_BUILDS` / `WD_HNSW_TOTAL_BUILDS` | HNSW builds attempted | *(undeclared → gate blocks)* |
+| `WH_BOUNDARY_PARITY` | Set `1` to acknowledge timer-boundary parity was equalized | *(unset → gate blocks)* |
+
 ## What this does and does not include
 
 - **Included:** the native graph access method (typed/directional adjacency, `gph_*` SQL

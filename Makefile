@@ -1,4 +1,4 @@
-.PHONY: test lint graph-test smoke-test test-all baseline-up baseline-down seed bench bench-live sweep sm2 fetch-dataset bench-public bench-repro fetch-hotpot graphrag graphrag-live bench-filtered ablation recall-decay tjs-open-ref tjs-open-live graphrag-h2h rabitq-sim gpu-build-index wiki-fetch wiki-extract wiki-scale wiki-neo4j wiki-subgraph wiki-linkpred lock clean clean-data
+.PHONY: test lint graph-test stock-graph-test smoke-test test-all baseline-up baseline-down seed bench bench-live sweep sm2 fetch-dataset bench-public bench-repro fetch-hotpot graphrag graphrag-live bench-filtered ablation recall-decay tjs-open-ref tjs-open-live graphrag-h2h rabitq-sim gpu-build-index wiki-fetch wiki-extract wiki-scale wiki-neo4j wiki-subgraph wiki-linkpred lock clean clean-data
 
 PUBLIC_DATASET ?= gist-960-euclidean
 
@@ -6,6 +6,19 @@ PUBLIC_DATASET ?= gist-960-euclidean
 PY := $(shell [ -x .venv/bin/python ] && echo .venv/bin/python || echo python3)
 
 IMAGE ?= tridb/msvbase:dev
+
+# Stock-PG (un-forked) engine image + suites — the D2 pgvector path, built per PG major.
+PG_MAJOR ?= 17
+STOCK_IMAGE ?= tridb/pg$(PG_MAJOR)-unfork:dev
+# Pure-SQL graph + tjs suites run on stock PG — kept verbatim in lockstep with the
+# CI job `stock-pg` in .github/workflows/ci.yml.
+STOCK_TESTS := test/graph_store_am_test.sql test/graph_store_test.sql \
+               test/graph_traversal_test.sql test/graph_typed_traversal_test.sql \
+               test/graph_delete_test.sql test/graph_edge_count_test.sql \
+               test/graph_freeze_test.sql test/graph_dense_open_test.sql \
+               test/graph_v0v1_parity_test.sql test/graph_vid_cache_test.sql \
+               test/graph_am_acl_test.sql test/tjs_pg_test.sql
+
 ENGINE_TESTS := test/graph_store_test.sql test/trimodal_compose.sql \
                 test/trimodal_early_term.sql test/fork_distance_probe.sql \
                 test/vector_relaxed_mono_test.sql test/canonical_e2e_test.sql \
@@ -83,6 +96,17 @@ graph-test:
 	    { [ -n "$$KEEP_GOING" ] && FAILED="$$FAILED $$h" || exit 1; }; \
 	done; \
 	if [ -n "$$FAILED" ]; then echo "=== FAILED SUITES:$$FAILED ==="; exit 1; fi
+
+# The un-forked graph AM on STOCK PostgreSQL 16/17 (roadmap D2 phase 2.4): build the
+# pgvector-based dev image and run every pure-SQL graph + tjs suite on 8KB pages — the
+# local mirror of CI job `stock-pg` (.github/workflows/ci.yml). No fork, no GX10, no
+# 32KB pages. PG_MAJOR selects the major (default 17); STOCK_IMAGE overrides the tag.
+stock-graph-test:
+	docker build --build-arg PG_MAJOR=$(PG_MAJOR) -t $(STOCK_IMAGE) scripts/pg17/
+	@for t in $(STOCK_TESTS); do \
+	  echo "=== $$t (stock PG$(PG_MAJOR)) ==="; \
+	  bash scripts/pg17_graph_test.sh $(STOCK_IMAGE) $$t || exit 1; \
+	done
 
 smoke-test:
 	@docker image inspect $(IMAGE) >/dev/null 2>&1 || \
