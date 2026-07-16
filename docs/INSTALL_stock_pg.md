@@ -82,6 +82,15 @@ harness reads `WH_` first, then falls back to `WD_`:
 | `WH_HNSW_TOTAL_BUILDS` / `WD_HNSW_TOTAL_BUILDS` | HNSW builds attempted | *(undeclared → gate blocks)* |
 | `WH_BOUNDARY_PARITY` | Set `1` to acknowledge timer-boundary parity was equalized | *(unset → gate blocks)* |
 
+`tools/wikidata_engine_load.py` publishes `gate_env.WD_ENGINE_EDGES` in its load manifest
+**only from engine-observed transcript markers** (plan 079). The manifest's `load_status`
+(`emitted` | `complete` | `failed`) and `engine.graph_verified` / `engine.hnsw_healthy`
+fields keep the phases distinct: a load that fails after the graph-count assertion still
+records the observed edge/vertex counts (the graph really holds them), but its
+`load_status` stays `failed` and HNSW health stays unhealthy; an `--emit-sql` run or a
+failure before the assertion publishes no engine count at all — the expected host slice
+counts stay under `counts` and never stand in for engine observations.
+
 ## What this does and does not include
 
 - **Included:** the native graph access method (typed/directional adjacency, `gph_*` SQL
