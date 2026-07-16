@@ -243,9 +243,9 @@ def test_sql_graph_surface(tmp_path):
     assert "graph_store.gph_upsert_vertex(r.qid)" in sql
     assert "DENSE-VID CONTRACT BROKEN" in sql
     assert "ORDER BY id" in sql
-    # (c) edge-type dictionary + typed insert by verified dense vid
+    # (c) edge-type dictionary + typed BATCHED insert by verified dense vid (plan 091)
     assert "graph_store.register_edge_type('P' || pid)" in sql
-    assert "graph_store.gph_insert_edge(e.src, e.dst, m.type_id)" in sql
+    assert "graph_store.gph_insert_edges(g.src, g.dsts, g.type_id)" in sql
     assert "ORDER BY e.src" in sql
     # distinct properties staged: only KEPT edges register a type (31, 50, 279)
     assert "\n31\n" in sql and "\n50\n" in sql and "\n279\n" in sql
@@ -258,6 +258,33 @@ def test_sql_graph_surface(tmp_path):
     assert "\t555\n" not in sql and "555\t" not in sql
     # native-count asserts
     assert "gph_edge_count" in sql and "gph_vertex_count" in sql
+
+
+def test_sql_edge_insert_batched_shape(tmp_path):
+    """Plan 091: edges go through the typed BATCH gph_insert_edges, one call per
+    (src, type_id) group, with the count assertion and #WDL markers intact."""
+    sql, _ = _script(tmp_path)
+    # batched call shape: grouped stage rows, dst array per group, typed
+    assert (
+        "coalesce(sum(graph_store.gph_insert_edges(g.src, g.dsts, g.type_id)), 0)"
+        in sql
+    )
+    assert "array_agg(e.dst ORDER BY e.dst) AS dsts" in sql
+    assert "GROUP BY e.src, m.type_id" in sql
+    # the scalar per-edge call is gone from the emitted script
+    assert "gph_insert_edge(e.src" not in sql
+    # count assertion intact: summed batch returns must equal the staged count (5)
+    assert "IF n <> 5 THEN" in sql
+    assert "RAISE EXCEPTION 'edge insert count % != staged 5', n;" in sql
+    # plan-079 markers unchanged (the transcript parser depends on them)
+    for marker in (
+        "\\echo #WDL COPY_EDGES_START",
+        "\\echo #WDL COPY_EDGES_DONE",
+        "\\echo #WDL EDGE_INSERT_START",
+        "\\echo #WDL EDGE_INSERT_DONE",
+        "\\echo #WDL LOAD_COMPLETE",
+    ):
+        assert marker in sql
 
 
 @pytest.mark.parametrize("dialect", ["fork", "stock"])

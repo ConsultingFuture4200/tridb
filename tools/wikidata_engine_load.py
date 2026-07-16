@@ -17,8 +17,9 @@ container (docker exec -i <container> psql -f -, the bench/wiki_h2h.py conventio
       (ADR-0013 / ADR-0018 (c)) fails LOUDLY, never silently drifts;
   (c) registers one typed-edge dictionary id per distinct property via
       graph_store.register_edge_type('P<m>') (ADR-0016) and inserts every in-slice edge
-      with graph_store.gph_insert_edge(src_vid, dst_vid, type_id) — src/dst ARE the dense
-      vids verified in (b), ORDER BY src for adjacency-chain locality;
+      with the typed BATCH graph_store.gph_insert_edges(src_vid, dst_array, type_id),
+      one call per (src, type_id) group (advisor plan 091) — src/dst ARE the dense
+      vids verified in (b), groups ORDER BY src for adjacency-chain locality;
   (d) builds the HNSW index — fork dialect exactly as tools/wiki_engine_load
       (USING hnsw(embedding) WITH (dimension=D, distmethod=l2_distance)); stock dialect
       via pgvector (USING hnsw (embedding vector_l2_ops) WITH (m=16, ef_construction=64),
@@ -286,18 +287,30 @@ def edge_copy_row(src: int, pid: int, dst: int) -> str:
 
 
 def sql_edge_insert(n_edges: int, n_vertices: int) -> str:
-    """Typed edge insert by verified dense vid, ORDER BY src for chain locality."""
+    """Typed BATCHED edge insert by verified dense vid (advisor plan 091).
+
+    Staged edges are grouped by (src, type_id) and each group goes through ONE
+    graph_store.gph_insert_edges(src, dsts, type_id) call — a single src locate +
+    amortized page/WAL handling per group instead of a per-edge locate + pin/WAL
+    cycle (the scalar path this replaces). ORDER BY src keeps the adjacency-chain
+    locality of the old ORDER BY e.src; dsts are sorted within a group for a
+    deterministic array (array_agg duplicates preserved — parity definition).
+    The count assertion is unchanged: the summed per-call returns must equal the
+    staged count (coalesce: sum() over zero groups is NULL, never a silent pass).
+    """
     return f"""\\.
 \\echo #WDL COPY_EDGES_DONE
 \\echo #WDL EDGE_INSERT_START
 DO $$
 DECLARE n bigint;
 BEGIN
-  SELECT count(*) INTO n FROM (
-    SELECT graph_store.gph_insert_edge(e.src, e.dst, m.type_id)
+  SELECT coalesce(sum(graph_store.gph_insert_edges(g.src, g.dsts, g.type_id)), 0) INTO n
+  FROM (
+    SELECT e.src, m.type_id, array_agg(e.dst ORDER BY e.dst) AS dsts
     FROM edge_stage e JOIN etype_map m USING (pid)
+    GROUP BY e.src, m.type_id
     ORDER BY e.src
-  ) _;
+  ) g;
   IF n <> {n_edges} THEN
     RAISE EXCEPTION 'edge insert count % != staged {n_edges}', n;
   END IF;
