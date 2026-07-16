@@ -483,7 +483,7 @@ def run_baseline(
         lit = "[" + ",".join(repr(float(x)) for x in qv) + "]"
         cur.execute(
             f"SELECT id FROM {cfg.pg_table} WHERE id = ANY(%s) "
-            f"ORDER BY embedding <=> %s::vector LIMIT %s",
+            f"ORDER BY embedding <=> %s::vector, id LIMIT %s",
             (cand, lit, k),
         )
         return [int(r[0]) for r in cur.fetchall()]
@@ -507,7 +507,9 @@ def run_baseline(
                     top = pg_rerank(qv, surv, k)
                 else:
                     arr = np.fromiter(surv, dtype=np.int64, count=len(surv))
-                    top = [int(x) for x in arr[np.argsort(-(emb[arr] @ qv))][:k]]
+                    sims = emb[arr] @ qv
+                    order = np.lexsort((arr, -sims))
+                    top = [int(x) for x in arr[order][:k]]
                 t3 = time.perf_counter()
                 return top, (
                     (t1 - t0) * 1e3,

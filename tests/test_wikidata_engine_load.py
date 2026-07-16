@@ -179,7 +179,7 @@ def test_kept_edges_drop_dangling_and_match_typed_adj(tmp_path):
 # --------------------------------------------------------------------------- #
 # generated SQL surface
 # --------------------------------------------------------------------------- #
-def _script(tmp_path, *, force=False) -> tuple[str, dict]:
+def _script(tmp_path, *, force=False, dialect="fork") -> tuple[str, dict]:
     manifest = _write_slice(tmp_path)
     stats: dict = {}
     sql = "".join(
@@ -191,6 +191,7 @@ def _script(tmp_path, *, force=False) -> tuple[str, dict]:
             dim=DIM,
             force=force,
             stats=stats,
+            dialect=dialect,
         )
     )
     return sql, stats
@@ -202,8 +203,9 @@ def _norm(v):
     return [x / n for x in vals]
 
 
-def test_sql_table_and_copy_rows(tmp_path):
-    sql, stats = _script(tmp_path)
+@pytest.mark.parametrize("dialect", ["fork", "stock"])
+def test_sql_table_and_copy_rows(tmp_path, dialect):
+    sql, stats = _script(tmp_path, dialect=dialect)
     assert stats == {
         "entities": 5,
         "edges_kept": 5,
@@ -215,13 +217,23 @@ def test_sql_table_and_copy_rows(tmp_path):
     assert "id        bigint PRIMARY KEY" in sql
     assert "qid       bigint NOT NULL" in sql
     assert "P31       int[] NOT NULL DEFAULT '{}'" in sql
-    assert f"embedding float8[{DIM}]" in sql
     assert "COPY entities (id, qid, P31, embedding) FROM stdin;" in sql
+    if dialect == "stock":
+        # pgvector leg: vector(dim) column + `vector` extension (not vectordb)
+        assert f"embedding vector({DIM})" in sql
+        assert "CREATE EXTENSION IF NOT EXISTS vector;" in sql
+        assert "vectordb" not in sql
+        vec_open = "["  # pgvector bracket literal
+    else:
+        # fork leg: MSVBASE float8[] column + vectordb extension
+        assert f"embedding float8[{DIM}]" in sql
+        assert "CREATE EXTENSION IF NOT EXISTS vectordb;" in sql
+        vec_open = "{"  # Postgres float8[] brace literal
     # row 0: dense 0 / Q10 / P31 {3} / normalized vector
     emb = _emb()
-    row0 = entity_copy_row(0, 10, [3], _norm(emb[0]))
+    row0 = entity_copy_row(0, 10, [3], _norm(emb[0]), dialect)
     assert row0 in sql
-    assert row0.startswith("0\t10\t{3}\t{")
+    assert row0.startswith(f"0\t10\t{{3}}\t{vec_open}")
     assert math.isclose(sum(x * x for x in _norm(emb[0])), 1.0, rel_tol=1e-6)
 
 
@@ -248,12 +260,19 @@ def test_sql_graph_surface(tmp_path):
     assert "gph_edge_count" in sql and "gph_vertex_count" in sql
 
 
-def test_sql_hnsw_build_and_health_probe(tmp_path):
-    sql, _ = _script(tmp_path)
-    assert "CREATE INDEX entities_hnsw ON entities USING hnsw(embedding)" in sql
-    assert f"WITH (dimension = {DIM}, distmethod = l2_distance);" in sql
+@pytest.mark.parametrize("dialect", ["fork", "stock"])
+def test_sql_hnsw_build_and_health_probe(tmp_path, dialect):
+    sql, _ = _script(tmp_path, dialect=dialect)
+    if dialect == "stock":
+        # pgvector hnsw AM: vector_l2_ops opclass + pinned m / ef_construction
+        assert "CREATE INDEX entities_hnsw ON entities USING hnsw " in sql
+        assert "(embedding vector_l2_ops) WITH (m = 16, ef_construction = 64);" in sql
+    else:
+        # fork MSVBASE hnsw AM: dimension / distmethod reloptions
+        assert "CREATE INDEX entities_hnsw ON entities USING hnsw(embedding)" in sql
+        assert f"WITH (dimension = {DIM}, distmethod = l2_distance);" in sql
     # health probe: top-k on a loaded row's own vector (row 0, normalized)
-    probe = vec_literal(_norm(_emb()[0]))
+    probe = vec_literal(_norm(_emb()[0]), dialect)
     assert f"ORDER BY embedding <-> '{probe}' LIMIT {N}" in sql  # k = min(10, N) = 5
     assert "HNSW health probe returned" in sql
 

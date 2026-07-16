@@ -73,6 +73,13 @@ def exact_oracle(cur, q: dict) -> list[int]:
     return [r[0] for r in cur.fetchall()]
 
 
+def recall_at_k(ids: list[int], oracle_ids: list[int]) -> float:
+    o = set(oracle_ids)
+    if not o:
+        return 1.0
+    return len(o & set(ids)) / len(o)
+
+
 def run_point(cur, queries, oracle, tc: int, budget: int) -> dict:
     cur.execute("SET hnsw.iterative_scan = relaxed_order")
     cur.execute(f"SET hnsw.max_scan_tuples = {int(budget)}")
@@ -92,8 +99,7 @@ def run_point(cur, queries, oracle, tc: int, budget: int) -> dict:
         exams.append(ex)
         if cap:
             capped += 1
-        o = set(oracle[q["x"]])
-        recalls.append(len(o & set(ids)) / max(1, len(o)))
+        recalls.append(recall_at_k(ids, oracle[q["x"]]))
         # timed repeats (median of 3, client-clocked over TCP)
         reps = []
         for _ in range(3):
