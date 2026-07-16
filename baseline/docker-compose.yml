@@ -20,9 +20,11 @@ services:
   neo4j:
     image: neo4j:5.20
     container_name: tridb-baseline-neo4j
+    # Host ports bind loopback by default; set BASELINE_BIND=0.0.0.0 for a
+    # deliberate all-interface exposure (replace dev credentials + firewall first).
     ports:
-      - "7474:7474"   # HTTP browser
-      - "7687:7687"   # Bolt (neo4j python driver)
+      - "${BASELINE_BIND:-127.0.0.1}:7474:7474"   # HTTP browser
+      - "${BASELINE_BIND:-127.0.0.1}:7687:7687"   # Bolt (neo4j python driver)
     environment:
       # Dev-only credentials. Override NEO4J_AUTH for anything non-local.
       NEO4J_AUTH: "neo4j/testpassword"
@@ -70,8 +72,8 @@ services:
       MINIO_SECRET_KEY: minioadmin
     command: minio server /minio_data --console-address ":9001"
     ports:
-      - "9000:9000"   # S3 API
-      - "9001:9001"   # console
+      - "${BASELINE_BIND:-127.0.0.1}:9000:9000"   # S3 API
+      - "${BASELINE_BIND:-127.0.0.1}:9001:9001"   # console
     volumes:
       - ./volumes/milvus/minio:/minio_data
     healthcheck:
@@ -89,8 +91,8 @@ services:
       ETCD_ENDPOINTS: etcd:2379
       MINIO_ADDRESS: minio:9000
     ports:
-      - "19530:19530"   # gRPC (pymilvus)
-      - "9091:9091"     # metrics / health
+      - "${BASELINE_BIND:-127.0.0.1}:19530:19530"   # gRPC (pymilvus)
+      - "${BASELINE_BIND:-127.0.0.1}:9091:9091"     # metrics / health
     volumes:
       - ./volumes/milvus/data:/var/lib/milvus
     healthcheck:
@@ -113,7 +115,7 @@ services:
     # taken by another local Postgres/PGlite. Point the harness at the same port
     # with PGPORT. Container-internal port stays 5432.
     ports:
-      - "${BASELINE_PG_PORT:-5432}:5432"
+      - "${BASELINE_BIND:-127.0.0.1}:${BASELINE_PG_PORT:-5432}:5432"
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
