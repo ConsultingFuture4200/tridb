@@ -238,8 +238,10 @@ graphrag:
 	$(PY) -m tools.hotpot_corpus --slice data/hotpot/dev_slice.json --k 10
 	$(PY) -m bench.graphrag_report --reader $(GRAPHRAG_READER)
 
-# LIVE engine head-to-head (GX10/engine-gated): canonical tjs() + live latency vs the
-# multi-store baseline. Guards on the image like bench-public; UNBUILT-HERE off-target.
+# LIVE ENGINE-ONLY run (GX10/engine-gated): canonical tjs() on the live engine, then
+# STRICT grading of the captured output vs the HotpotQA gold — bench/graphrag_live_report.py
+# gates the DONE marker. Grades TriDB only; the measured multi-system latency head-to-head
+# is `make graphrag-h2h`. Guards on the image like bench-public; UNBUILT-HERE off-target.
 graphrag-live:
 	@docker image inspect $(IMAGE) >/dev/null 2>&1 || \
 	  { echo "image $(IMAGE) not built — graphrag-live is ENGINE-GATED (UNBUILT-HERE)"; exit 1; }
