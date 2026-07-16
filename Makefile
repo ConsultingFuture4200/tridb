@@ -1,4 +1,4 @@
-.PHONY: test lint graph-test stock-graph-test stock-release-smoke tjs-parity-test smoke-test test-all baseline-up baseline-down seed bench bench-live sweep sm2 fetch-dataset bench-public bench-repro fetch-hotpot graphrag graphrag-live bench-filtered ablation recall-decay tjs-open-ref tjs-open-live graphrag-h2h rabitq-sim gpu-build-index gpu-setup gpu-verify gpu-lock wiki-fetch wiki-extract wiki-scale wiki-neo4j wiki-subgraph wiki-linkpred lock clean clean-data
+.PHONY: test lint graph-test stock-graph-test stock-crash-test stock-release-smoke tjs-parity-test smoke-test test-all baseline-up baseline-down seed bench bench-live sweep sm2 fetch-dataset bench-public bench-repro fetch-hotpot graphrag graphrag-live bench-filtered ablation recall-decay tjs-open-ref tjs-open-live graphrag-h2h rabitq-sim gpu-build-index gpu-setup gpu-verify gpu-lock wiki-fetch wiki-extract wiki-scale wiki-neo4j wiki-subgraph wiki-linkpred lock clean clean-data
 
 PUBLIC_DATASET ?= gist-960-euclidean
 
@@ -10,8 +10,9 @@ IMAGE ?= tridb/msvbase:dev
 # Stock-PG (un-forked) engine image + suites — the D2 pgvector path, built per PG major.
 PG_MAJOR ?= 17
 STOCK_IMAGE ?= tridb/pg$(PG_MAJOR)-unfork:dev
-# Pure-SQL graph + tjs suites run on stock PG — kept verbatim in lockstep with the
-# CI job `stock-pg` in .github/workflows/ci.yml.
+# Pure-SQL graph + tjs suites run on stock PG. SINGLE SOURCE OF TRUTH (advisor plan 090):
+# the CI job `stock-pg` (.github/workflows/ci.yml) consumes this list via
+# `make stock-graph-test PG_MAJOR=...` — never duplicate it there.
 STOCK_TESTS := test/graph_store_am_test.sql test/graph_store_test.sql \
                test/graph_traversal_test.sql test/graph_typed_traversal_test.sql \
                test/graph_delete_test.sql test/graph_edge_count_test.sql \
@@ -108,6 +109,14 @@ stock-graph-test:
 	  echo "=== $$t (stock PG$(PG_MAJOR)) ==="; \
 	  bash scripts/pg17_graph_test.sh $(STOCK_IMAGE) $$t || exit 1; \
 	done
+
+# Stock-PG WAL crash-recovery (REDO) gate (advisor plan 090): the stock mirror of the
+# fork's scripts/crash_recovery_test.sh — 5 scenarios (committed / uncommitted /
+# committed tombstone / uncommitted tombstone / freeze) against `pg_ctl stop -m
+# immediate`, sharing test/crash_recovery_assert.sql. CI runs it after the SQL suites.
+stock-crash-test:
+	docker build --build-arg PG_MAJOR=$(PG_MAJOR) -t $(STOCK_IMAGE) scripts/pg17/
+	bash scripts/pg17_crash_recovery_test.sh $(STOCK_IMAGE)
 
 # Runtime smoke of the SHIPPED release image (advisor plan 076): build the prebaked
 # tridb/postgres-trimodal image for PG_MAJOR, start it as a user would, install all

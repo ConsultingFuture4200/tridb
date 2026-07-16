@@ -8,7 +8,9 @@
 --   (d) pg_class.relfrozenxid for gstore is advanced to the horizon (disarms forced autovacuum);
 --   (e) a re-run at the same horizon is a no-op (idempotent, returns 0);
 --   plus horizon validation (a too-new horizon RAISES) and the plan-026 ACL (non-owner denied).
--- (c) crash/WAL durability of the frozen pages is covered by scripts/crash_recovery_test.sh.
+-- (c) crash/WAL durability of the frozen pages is covered by the freeze REDO scenario (scenario 5)
+--     of scripts/crash_recovery_test.sh (fork) and scripts/pg17_crash_recovery_test.sh (stock
+--     PG 16/17), asserting via the 'freeze' phase of test/crash_recovery_assert.sql (plan 090).
 --
 -- Advisor plan 040 (DEV-1354) extends this with the xmax half of freeze — plan 037's tombstone
 -- (es_xmax / vr_xmax) was previously left un-frozen, so a committed delete's xmax could outlive

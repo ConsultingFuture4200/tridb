@@ -62,20 +62,13 @@ jobs:
         pg: [16, 17]
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      - run: docker build --build-arg PG_MAJOR=${{ matrix.pg }} -t tridb/pg17-unfork:dev scripts/pg17/
+      # The suite list lives ONCE, in Makefile STOCK_TESTS (plan 090 lockstep): this step
+      # builds the image and loops the suites via the same target devs run locally.
       - name: graph suites on stock PG${{ matrix.pg }}
-        run: |
-          set -e
-          for t in test/graph_store_am_test.sql test/graph_store_test.sql \
-                   test/graph_traversal_test.sql test/graph_typed_traversal_test.sql \
-                   test/graph_delete_test.sql test/graph_edge_count_test.sql \
-                   test/graph_freeze_test.sql test/graph_dense_open_test.sql \
-                   test/graph_v0v1_parity_test.sql test/graph_vid_cache_test.sql \
-                   test/graph_am_acl_test.sql test/tjs_pg_test.sql \
-                   test/canonical_stock_e2e_test.sql; do
-            echo "=== $t (pg${{ matrix.pg }}) ==="
-            bash scripts/pg17_graph_test.sh tridb/pg17-unfork:dev "$t"
-          done
+        run: make stock-graph-test PG_MAJOR=${{ matrix.pg }}
+      # FR-7 on the ship surface: WAL crash-recovery (REDO) driver, 5 scenarios incl. freeze.
+      - name: crash-recovery (WAL redo) on stock PG${{ matrix.pg }}
+        run: make stock-crash-test PG_MAJOR=${{ matrix.pg }}
       - name: release image builds (prebaked extension)
         run: docker build --build-arg PG_MAJOR=${{ matrix.pg }} -f scripts/pg17/Dockerfile.release -t tridb/postgres-trimodal:pg${{ matrix.pg }} .
       - name: release runtime smoke (start image, install extensions, run canonical query)
