@@ -1,4 +1,4 @@
-.PHONY: test lint graph-test stock-graph-test smoke-test test-all baseline-up baseline-down seed bench bench-live sweep sm2 fetch-dataset bench-public bench-repro fetch-hotpot graphrag graphrag-live bench-filtered ablation recall-decay tjs-open-ref tjs-open-live graphrag-h2h rabitq-sim gpu-build-index wiki-fetch wiki-extract wiki-scale wiki-neo4j wiki-subgraph wiki-linkpred lock clean clean-data
+.PHONY: test lint graph-test stock-graph-test tjs-parity-test smoke-test test-all baseline-up baseline-down seed bench bench-live sweep sm2 fetch-dataset bench-public bench-repro fetch-hotpot graphrag graphrag-live bench-filtered ablation recall-decay tjs-open-ref tjs-open-live graphrag-h2h rabitq-sim gpu-build-index wiki-fetch wiki-extract wiki-scale wiki-neo4j wiki-subgraph wiki-linkpred lock clean clean-data
 
 PUBLIC_DATASET ?= gist-960-euclidean
 
@@ -107,6 +107,13 @@ stock-graph-test:
 	  echo "=== $$t (stock PG$(PG_MAJOR)) ==="; \
 	  bash scripts/pg17_graph_test.sh $(STOCK_IMAGE) $$t || exit 1; \
 	done
+
+# Fork<->stock filter-first PARITY gate (advisor plan 071): the SAME corpus + queries
+# through the fork's fused filter-first statement (tridb/msvbase:dev) and the stock
+# tjs_open operator's filter-first mode (tridb/pg17-unfork:dev); any top-k drift fails.
+# Heavy (needs BOTH engine images) — a manual / CI-dispatch gate, NOT per-PR.
+tjs-parity-test:
+	bash scripts/tjs_parity_test.sh
 
 smoke-test:
 	@docker image inspect $(IMAGE) >/dev/null 2>&1 || \
