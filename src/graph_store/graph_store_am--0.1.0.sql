@@ -35,6 +35,16 @@ CREATE FUNCTION gph_insert_edge(bigint, bigint, integer) RETURNS void
 CREATE FUNCTION gph_insert_edges(bigint, bigint[]) RETURNS bigint
   AS 'MODULE_PATHNAME' LANGUAGE C VOLATILE STRICT;
 
+-- Typed batched edge-append (advisor plan 091): the 3-arg overload stamps the caller's edge_type
+-- dictionary id on EVERY slot in the run (one type per call — the Wikidata loader groups its
+-- staged edges by (src, type_id) and issues one call per group). Same C symbol as the 2-arg form
+-- (PG_NARGS branches, the gph_insert_edge pattern); the 2-arg form is unchanged and defaults the
+-- type to GPH_EDGE_TYPE_RELATED_TO (id 1), so every existing caller/bench is byte-identical.
+-- Result parity: identical on-disk chains to N x gph_insert_edge(src, dst[i], type_id) fed in
+-- array order. Owner-guarded (REVOKEd from PUBLIC below) like its siblings.
+CREATE FUNCTION gph_insert_edges(bigint, bigint[], integer) RETURNS bigint
+  AS 'MODULE_PATHNAME', 'gph_insert_edges' LANGUAGE C VOLATILE STRICT;
+
 -- ----------------------------------------------------------------------------
 -- Edge type dictionary (advisor plan 038): gBrain's typed link model (founded/
 -- founded_by, works_at/employs, mentions, attended, ...) maps link-type NAMES to
@@ -187,6 +197,7 @@ REVOKE EXECUTE ON FUNCTION gph_tombstone_edge(bigint,bigint), gph_tombstone_vert
 REVOKE EXECUTE ON FUNCTION gph_tombstone_edge(bigint,bigint,integer) FROM PUBLIC;
 REVOKE EXECUTE ON FUNCTION gph_insert_edge(bigint,bigint,integer) FROM PUBLIC;
 REVOKE EXECUTE ON FUNCTION gph_insert_edges(bigint,bigint[]) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION gph_insert_edges(bigint,bigint[],integer) FROM PUBLIC;
 
 -- ============================================================================
 -- ADR-0013 Stage A (advisor plan 025): the external-id mapping layer + the v0

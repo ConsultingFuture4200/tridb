@@ -662,15 +662,22 @@ gph_insert_edge(PG_FUNCTION_ARGS)
 PG_FUNCTION_INFO_V1(gph_insert_edges);
 
 /*
- * gph_insert_edges(src bigint, dst bigint[]) RETURNS bigint — the BATCHED edge-append entry point
- * (DEV-1354 / spec §2 "bulk edge loader"). Appends a whole adjacency run for ONE source in a single
- * call, so the wiki-scale graph (1M vertices / 39M induced edges) loads in minutes instead of the
- * O(E*V) hours that N x gph_insert_edge cost (each scalar call did TWO O(V) linear vertex locates).
- * Returns the number of edges appended (== array length).
+ * gph_insert_edges(src bigint, dst bigint[] [, type_id integer]) RETURNS bigint — the BATCHED
+ * edge-append entry point (DEV-1354 / spec §2 "bulk edge loader"). Appends a whole adjacency run
+ * for ONE source in a single call, so the wiki-scale graph (1M vertices / 39M induced edges) loads
+ * in minutes instead of the O(E*V) hours that N x gph_insert_edge cost (each scalar call did TWO
+ * O(V) linear vertex locates). Returns the number of edges appended (== array length).
  *
- * The result is BYTE-IDENTICAL to N x gph_insert_edge(src, dst[i]) fed in array order (design §2
- * parity contract): same append order, same slot layout, same page chaining. Only two things change
- * vs the scalar path — both O(1) instead of O(V):
+ * Backs BOTH SQL declarations (the original 2-arg and the plan-091 3-arg typed overload) at the
+ * same C symbol; PG_NARGS() selects the path, exactly like gph_insert_edge above. The 2-arg form
+ * is byte-identical to the pre-091 body (type defaults to GPH_EDGE_TYPE_RELATED_TO); the 3-arg
+ * form stamps the caller's dictionary type id into es_edge_type_id for EVERY slot in the run —
+ * the same field the scalar typed insert writes (one type per call: the Wikidata loader groups
+ * its staged edges by (src, type_id) and issues one call per group).
+ *
+ * The result is BYTE-IDENTICAL to N x gph_insert_edge(src, dst[i] [, type_id]) fed in array order
+ * (design §2 parity contract): same append order, same slot layout, same page chaining. Only two
+ * things change vs the scalar path — both O(1) instead of O(V):
  *   - src is located with gph_locate_vertex_dense (dense fast path; hard-verified, never corrupts);
  *   - dst existence + visibility is a metapage bounds check (0 <= dst < gm_next_vid) followed by
  *     gph_locate_vertex_dense (advisor plan 046): under the dense-in-order load ext_id == vid, so
@@ -696,6 +703,7 @@ gph_insert_edges(PG_FUNCTION_ARGS)
 {
 	uint64		src = (uint64) PG_GETARG_INT64(0);
 	ArrayType  *dst_arr = PG_GETARG_ARRAYTYPE_P(1);
+	uint32		type_id = GPH_EDGE_TYPE_RELATED_TO;
 	Relation	rel = gph_open_store(RowExclusiveLock);
 	GphMeta		meta0;
 	GphVertexRecord src_rec;
@@ -718,6 +726,12 @@ gph_insert_edges(PG_FUNCTION_ARGS)
 				newpage;
 	GphMeta    *meta;
 	GphVertexRecord *vr;
+
+	/* Optional 3rd arg (plan 091): the dictionary edge type id, stamped on every slot in the run.
+	 * Absent => default RELATED_TO (2-arg overload => byte-identical to the pre-091 body). The
+	 * 3-arg overload is STRICT, so a passed arg is never NULL. */
+	if (PG_NARGS() >= 3)
+		type_id = (uint32) PG_GETARG_INT32(2);
 
 	/* Array shape guards: 1-D, no NULL elements (the loader never produces either). int8 elements
 	 * are 8-byte, pass-by-value, stored inline and unaligned-safe to index as int64. */
@@ -813,7 +827,7 @@ gph_insert_edges(PG_FUNCTION_ARGS)
 			memset(&es, 0, sizeof(es));
 			es.es_src_vid = src;
 			es.es_dst_vid = (uint64) dsts[k + i];
-			es.es_edge_type_id = GPH_EDGE_TYPE_RELATED_TO;
+			es.es_edge_type_id = type_id;	/* default RELATED_TO (2-arg) or the caller's dictionary id (3-arg) */
 			es.es_flags = 0;
 			es.es_xmin = xid;
 			GphPageAppendRecord(newpage, &es, sizeof(GphEdgeSlot));
@@ -855,7 +869,7 @@ gph_insert_edges(PG_FUNCTION_ARGS)
 				memset(&es, 0, sizeof(es));
 				es.es_src_vid = src;
 				es.es_dst_vid = (uint64) dsts[k + i];
-				es.es_edge_type_id = GPH_EDGE_TYPE_RELATED_TO;
+				es.es_edge_type_id = type_id;	/* default RELATED_TO (2-arg) or the caller's dictionary id (3-arg) */
 				es.es_flags = 0;
 				es.es_xmin = xid;
 				GphPageAppendRecord(tailpage, &es, sizeof(GphEdgeSlot));
@@ -907,7 +921,7 @@ gph_insert_edges(PG_FUNCTION_ARGS)
 			memset(&es, 0, sizeof(es));
 			es.es_src_vid = src;
 			es.es_dst_vid = (uint64) dsts[k + i];
-			es.es_edge_type_id = GPH_EDGE_TYPE_RELATED_TO;
+			es.es_edge_type_id = type_id;	/* default RELATED_TO (2-arg) or the caller's dictionary id (3-arg) */
 			es.es_flags = 0;
 			es.es_xmin = xid;
 			GphPageAppendRecord(newpage, &es, sizeof(GphEdgeSlot));
