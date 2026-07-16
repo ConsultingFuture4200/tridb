@@ -3,8 +3,8 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>TriDB Wiki — a tri-modal database, demonstrated on all of Wikipedia</title>
-<meta name="description" content="A private Wikipedia running on TriDB — a vector + graph + relational database in one Postgres process. Search by meaning, traverse the link graph, find the path between any two topics, ask questions. Wikipedia is the demonstration; Wikidata is next." />
+<title>TriDB Wiki — tri-modal search over all of Wikipedia (offline reader demo)</title>
+<meta name="description" content="A private Wikipedia demonstrating TriDB's tri-modal (vector + graph + relational) retrieval model. The full 6.9M-article experience is served by an offline reader (SQLite metadata, NumPy CSR link graph, cuVS CAGRA vectors); the Postgres-native TriDB engine is measured at 200K articles graph-inclusive and 1M vector-only. Wikidata is next." />
 <style>
   :root{
     --ink:#202122; --soft:#54595d; --dim:#72777d; --line:#e4e6eb; --line2:#eef0f2;
@@ -113,13 +113,15 @@
   </svg>
 
   <div class="word serif">Tri<b>DB</b> <span style="font-weight:400">Wiki</span></div>
-  <div class="tag serif">A tri-modal database <span class="sep">·</span> demonstrated on all of Wikipedia</div>
+  <div class="tag serif">A tri-modal retrieval demo <span class="sep">·</span> all of Wikipedia, served by an offline reader</div>
 
   <p class="intro">
-    A <b>private Wikipedia</b> running on TriDB — a database that fuses <b>vector similarity</b>,
-    <b>graph traversal</b>, and <b>relational filters</b> inside one Postgres process, under one
-    write-ahead log. Search by meaning, walk the link graph, find the path between any two topics,
-    ask questions — in a single early-terminating query.
+    A <b>private Wikipedia</b> demonstrating TriDB's tri-modal model — <b>vector similarity</b>,
+    <b>graph traversal</b>, and <b>relational filters</b> in one query. This full-corpus demo is
+    served by an offline reader (SQLite metadata, NumPy CSR link graph, cuVS CAGRA vectors); the
+    Postgres-native TriDB engine — one process, one write-ahead log — is measured at 200K articles
+    graph-inclusive and 1M vector-only. Search by meaning, walk the link graph, find the path
+    between any two topics, ask questions.
   </p>
 
   <form class="search" action="/read" method="get" role="search">
@@ -138,7 +140,7 @@
 <!-- WHY WIKI -->
 <section>
   <div class="wrap">
-    <h2><span class="k">Why Wikipedia is the demonstration</span>The perfect tri-modal proving ground.</h2>
+    <h2><span class="k">Why Wikipedia is the demo corpus</span>The perfect tri-modal proving ground.</h2>
     <p class="lead">
       A database that unifies similarity, traversal, and filter needs data that is all three at once.
       Wikipedia is exactly that — and at a scale that makes the fusion matter.
@@ -147,12 +149,14 @@
       <div class="c"><h3><i class="sw" style="background:var(--v)"></i>Meaning</h3>
         <p>Every article is text — an embedding. "Find articles like this one," not just string matches.</p></div>
       <div class="c"><h3><i class="sw" style="background:var(--g)"></i>Links</h3>
-        <p>~6.9M articles woven by hundreds of millions of hyperlinks — a native graph to traverse and path-find.</p></div>
+        <p>~6.9M articles woven by hundreds of millions of hyperlinks — a link graph to traverse and path-find (a NumPy CSR adjacency in this reader).</p></div>
       <div class="c"><h3><i class="sw" style="background:var(--r)"></i>Structure</h3>
         <p>Infobox facts, categories, lengths, in-degree — relational predicates to filter and rank by.</p></div>
     </div>
     <div class="note">
-      Wikipedia proves the fusion at <b>6.9M articles</b>. The next proving ground is <b>Wikidata</b> —
+      Wikipedia exercises the fusion at <b>6.9M articles</b> in this offline reader; the native
+      engine's largest graph-inclusive measurement is 200K articles (vector leg: 1M). The next
+      proving ground is <b>Wikidata</b> —
       ~110M entities joined by ~1.5B <em>typed</em> statements, ~16&times; larger, and edited millions of
       times a day (a live consistency workload). <a href="https://github.com/ConsultingFuture4200/tridb">See the roadmap &#8599;</a>
     </div>
@@ -172,26 +176,27 @@
         <thead><tr>
           <th>Capability</th>
           <th>Official Wikipedia</th>
-          <th class="tri"><span class="badge"></span>TriDB Wiki</th>
+          <th class="tri"><span class="badge"></span>TriDB Wiki (offline reader)</th>
         </tr></thead>
         <tbody>
           <tr><td>Article page delivery</td><td class="dim">Global CDN — needs a network round-trip</td><td class="win">Local / offline — <b>zero network RTT</b> on the host</td></tr>
           <tr><td>Search</td><td class="dim">Keyword full-text (Elasticsearch)</td><td class="win">Full-text <b>+ semantic vector similarity</b></td></tr>
           <tr><td>Related articles</td><td class="dim">"What links here" — raw link list</td><td class="win">Fused <b>vector + graph</b>, relevance-ranked, early-terminating</td></tr>
-          <tr><td>Path between two topics</td><td class="no">Not built in</td><td class="win"><span class="yes">Native shortest-path</span> ("Connect")</td></tr>
+          <tr><td>Path between two topics</td><td class="no">Not built in</td><td class="win"><span class="yes">Shortest-path</span> ("Connect") — BFS over the reader's NumPy CSR adjacency</td></tr>
           <tr><td>Ask a question (RAG)</td><td class="no">Not available</td><td class="win"><span class="yes">Graph-aware RAG</span> over the articles</td></tr>
           <tr><td>Structured filters</td><td class="no">Not in the reader</td><td class="win">Relational predicates — in-degree, length, category</td></tr>
-          <tr><td>Cross-modal update consistency</td><td class="dim">n/a (single modality)</td><td class="win">One WAL, atomic — <b>0 torn vs 42</b> across a 3-store stack</td></tr>
+          <tr><td>Cross-modal update consistency</td><td class="dim">n/a (single modality)</td><td class="win">One WAL, atomic — <b>0 torn vs 42</b> across a 3-store stack (native engine measurement)</td></tr>
           <tr><td>Private &amp; offline</td><td class="no">Public, online only</td><td class="win"><span class="yes">Self-hosted</span>, private, fully offline</td></tr>
-          <tr><td>Scale demonstrated</td><td class="dim">~6.9M (English)</td><td class="win">6.9M today &rarr; <b>Wikidata 110M</b> next</td></tr>
+          <tr><td>Scale demonstrated</td><td class="dim">~6.9M (English)</td><td class="win">Reader: 6.9M today &rarr; <b>Wikidata 110M</b> next &middot; native engine: 200K graph-inclusive, 1M vector</td></tr>
         </tbody>
       </table>
     </div>
     <div class="note">
       <b>On raw speed:</b> we don't claim to out-serve Wikipedia's cached HTML. Where TriDB wins is the
-      <em>knowledge</em> query — semantic related, multi-hop paths, fused RAG — which the fused operator
-      returns while examining as little as <b>~0.71%</b> of the corpus. A real page-load and search
-      head-to-head will be <em>measured</em> and posted here, not asserted.
+      <em>knowledge</em> query — semantic related, multi-hop paths, fused RAG. On the
+      1,490-paragraph HotpotQA host reference corpus (not this wiki), the streaming fused operator
+      matched a blocking oracle's recall while examining <b>~0.71%</b> of that corpus. A real
+      page-load and search head-to-head will be <em>measured</em> and posted here, not asserted.
     </div>
   </div>
 </section>
@@ -199,11 +204,11 @@
 <!-- EVIDENCE -->
 <section>
   <div class="wrap">
-    <h2><span class="k">Measured, not asserted</span>The engine underneath, in numbers.</h2>
+    <h2><span class="k">Measured, not asserted</span>The native engine, in numbers — each at its measured scale.</h2>
     <div class="stats">
-      <div class="stat"><div class="n">0 <small>vs 42</small></div><div class="l">Torn cross-modal writes under injected failure — one transaction vs three independent stores.</div></div>
+      <div class="stat"><div class="n">0 <small>vs 42</small></div><div class="l">Torn cross-modal writes under injected failure — one transaction vs three independent stores (native engine).</div></div>
       <div class="stat"><div class="n">+15.6 <small>pts</small></div><div class="l">Multi-hop joint recall@5 when the graph leg injects source-anchored context into retrieval (HotpotQA).</div></div>
-      <div class="stat"><div class="n">~0.71<small>%</small></div><div class="l">Share of the corpus examined while the streaming fused operator beat a full blocking oracle on recall.</div></div>
+      <div class="stat"><div class="n">~0.71<small>%</small></div><div class="l">Share of the 1,490-paragraph HotpotQA host reference corpus examined while the streaming fused operator beat a full blocking oracle on recall.</div></div>
     </div>
   </div>
 </section>
@@ -216,7 +221,7 @@
       <a href="#">Architecture</a>
       <a href="#">Why Wikidata</a>
     </div>
-    <div>TriDB — vector, graph, and relational retrieval fused in one Postgres process, under one write-ahead log. Wikipedia is the demonstration.</div>
+    <div>TriDB — vector, graph, and relational retrieval fused in one Postgres process, under one write-ahead log. This wiki is the offline-reader demonstration; engine results are reported at their measured scales.</div>
   </div>
 </footer>
 

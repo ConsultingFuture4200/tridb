@@ -770,3 +770,26 @@ common case (loopback, no token to type):
 - Set `WIKI_READER_TOKEN` yourself if you want a stable token across restarts
   (e.g. to avoid re-copying it after every `nohup` relaunch); do not commit a token
   value into the repo.
+
+# Addendum v10 — public claim provenance (advisor 080)
+
+The landing page (`site/index.html` + the identical `LANDING_HTML` embedded in
+`tools/wiki_reader.py`) mixes two execution layers: the **offline reader** (this
+tool: SQLite metadata + NumPy CSR adjacency + cuVS CAGRA vectors, host-side)
+and the **Postgres-native TriDB engine** (measured elsewhere, at smaller
+scales). Every public metric must carry corpus + engine + evidence labels:
+
+| Public claim | Corpus | Execution engine | Evidence |
+|---|---|---|---|
+| 6.9M-article search / related / shortest-path ("Connect") | enwiki 6.9M | Offline reader (SQLite / NumPy CSR / cuVS CAGRA) | this doc |
+| Graph-inclusive fused query (`tjs_open`, reconciled) | 200,000 articles | Native TriDB engine (Postgres) | `docs/benchmark_wiki_scale_h2h_v0.2.0.md` |
+| Vector leg (HNSW durable) | 1,000,000 articles | Native TriDB engine (Postgres) | `docs/benchmark_wiki_scale_h2h_v0.2.0.md` |
+| ~0.71% of corpus examined vs blocking oracle | 1,490-paragraph HotpotQA host reference | Host reference implementation (`bench/tjs_open_ref.py`) | `docs/benchmark_tjs_open_ref_v0.1.0.md` |
+| 0 vs 42 torn cross-modal writes | consistency workload | Native TriDB engine (one WAL) vs 3-store stack | consistency bench (DEV-1354 track) |
+| +15.6 pt multi-hop joint recall@5 | HotpotQA | GraphRAG bench (graph-leg context injection) | plan 015 report |
+
+A full 6.9M **native** graph-inclusive run has **not** been performed; do not
+attribute reader-side full-corpus behavior to the native engine. Guardrails are
+enforced by `tests/test_wiki_reader_claims.py` (prohibited pairings, required
+provenance phrases, and standalone/embedded copy parity). Future public metrics
+get all three labels at authoring time.
