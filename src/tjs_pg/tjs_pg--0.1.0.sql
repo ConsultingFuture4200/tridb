@@ -36,13 +36,29 @@ AS 'MODULE_PATHNAME', 'tjs_open_pg'
 LANGUAGE C VOLATILE;
 
 -- Per-backend honesty counters (mirror the fork's SM-3 probes).
+-- Vector-first: heap candidates the last call actually consumed. Filter-first:
+-- qualifying rows examined by the fused statement BEFORE the top-k LIMIT (plan 074 —
+-- a count capped at k carries no information about the work done).
 CREATE FUNCTION tjs_open_candidates_examined() RETURNS bigint
 AS 'MODULE_PATHNAME', 'tjs_open_candidates_examined_pg'
 LANGUAGE C VOLATILE;
 
--- TRUE iff the last vector-first call's candidate stream ended (pgvector budget
--- hnsw.max_scan_tuples, or index exhaustion) before term_cond fired — the harness must
--- refuse budget-shaped headlines (ADR-0015 E3.3).
+-- How the last call ended (plan 074):
+--   'filter_first'       — fused single-statement path; no candidate stream at all.
+--   'term_cond'          — TR-1 consecutive-drops early termination fired mid-stream.
+--   'stream_end_unknown' — the pgvector stream ended before term_cond fired; pgvector
+--                          does NOT disclose whether hnsw.max_scan_tuples or natural
+--                          index exhaustion ended it. Right-censored: treat as possibly
+--                          budget-shaped (ADR-0015 E3.3, ADR-0019 addendum 2026-07-16).
+CREATE FUNCTION tjs_open_termination_reason() RETURNS text
+AS 'MODULE_PATHNAME', 'tjs_open_termination_reason_pg'
+LANGUAGE C VOLATILE;
+
+-- Compatibility shim over tjs_open_termination_reason(): FALSE for known non-budget
+-- endings ('filter_first', 'term_cond'); SQL NULL for 'stream_end_unknown' (the ending
+-- is unobservable — budget or exhaustion). NEVER TRUE today: pgvector exposes no budget
+-- signal, and this function refuses to manufacture one. Harnesses must treat NULL as
+-- possibly-capped and refuse budget-shaped headlines (ADR-0015 E3.3).
 CREATE FUNCTION tjs_open_budget_capped() RETURNS boolean
 AS 'MODULE_PATHNAME', 'tjs_open_budget_capped_pg'
 LANGUAGE C VOLATILE;

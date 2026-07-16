@@ -99,7 +99,15 @@ counts stay under `counts` and never stand in for engine observations.
   re-homed on stock PG: filter-first behind the operator surface, and vector-first/seedless
   driving pgvector's iterative HNSW scan directly (requires
   `SET hnsw.iterative_scan = relaxed_order`, pgvector ≥ 0.8) with TR-1 early termination and
-  honest budget-cap reporting (`tjs_open_budget_capped()`). Fork phase/bridge parity **landed**
+  honest, *censored* termination reporting (ADR-0019 addendum 2026-07-16):
+  `tjs_open_termination_reason()` returns `filter_first` | `term_cond` |
+  `stream_end_unknown` — pgvector does not disclose whether `hnsw.max_scan_tuples` or
+  natural index exhaustion ended its stream, so an ended stream is reported as *unknown*,
+  never as a definite budget cap. The compat boolean `tjs_open_budget_capped()` is `false`
+  for known non-budget endings and SQL `NULL` for unknown ones (never `true` today);
+  measurement scripts must treat `NULL` as possibly-capped, not count it as either side.
+  `tjs_open_candidates_examined()` on the filter-first path reports the full qualifying-row
+  count before the top-k `LIMIT` (not `min(work, k)`). Fork phase/bridge parity **landed**
   (commit `81b8023`, ADR-0012 recipe B): `tjs_open` now performs the guaranteed reachability-bridge
   injection past the vector frontier, with the `tjs_open_bridges_injected()` counter exposing how
   many bridges were forced. The remaining follow-up is the **seedless SM-4 recall-curve parity** vs

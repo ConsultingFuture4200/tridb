@@ -24,9 +24,13 @@
  *   ADR-0015 E3 gap 1, closed), test the relational filter and (optionally, m_seeds > 0) the
  *   graph reachability predicate via cached SPI plans, and feed a bounded top-k. TR-1 early
  *   termination = ADR-0007 consecutive-drops term_cond over the recomputed distances; when it
- *   fires the scan is closed mid-stream. If pgvector's own scan budget (hnsw.max_scan_tuples)
- *   ends the stream first, the result is BUDGET-CAPPED and reported via
- *   tjs_open_budget_capped() — the honest E3.3 consequence, disclosed not hidden.
+ *   fires the scan is closed mid-stream. If the stream ends first, pgvector does NOT
+ *   disclose whether its scan budget (hnsw.max_scan_tuples) or natural index exhaustion
+ *   ended it — the ending is RIGHT-CENSORED and reported as such (plan 074):
+ *   tjs_open_termination_reason() = 'stream_end_unknown', tjs_open_budget_capped() = SQL
+ *   NULL. The boolean is never true without an observable upstream budget signal, which
+ *   pgvector's iterator API does not expose today (the honest E3.3 consequence, disclosed
+ *   not manufactured).
  *
  * SEEDLESS GRAPH PREDICATE (m_seeds > 0): the first m_seeds FILTER-PASSING candidates from
  * the vector stream become seeds; the reachable set is the union of their `hops`-bounded
@@ -36,9 +40,12 @@
  * bridge-injection parity (ADR-0012/0017) is follow-up work — counters expose enough for the
  * harness to grade recall honestly either way.
  *
- * Counters (per-backend, read via SQL): tjs_open_candidates_examined() — heap tuples examined
- * by the last call; tjs_open_budget_capped() — did the last vector-first call end on the
- * pgvector budget rather than term_cond/k-fill (the gate's honesty signal).
+ * Counters (per-backend, read via SQL): tjs_open_candidates_examined() — vector-first: heap
+ * tuples examined by the last call; filter-first: qualifying rows examined (post-filter,
+ * BEFORE the top-k LIMIT — a count capped at k carries no information, plan 074).
+ * tjs_open_termination_reason() — 'filter_first' | 'term_cond' | 'stream_end_unknown'.
+ * tjs_open_budget_capped() — compat shim over the reason: false for known non-budget
+ * endings, SQL NULL for 'stream_end_unknown'; never true (no observable budget signal).
  */
 #include "postgres.h"
 
@@ -70,10 +77,23 @@
 
 PG_MODULE_MAGIC;
 
+/*
+ * How the last call ended (plan 074). TJS_TERM_STREAM_END_UNKNOWN is right-censored:
+ * pgvector's iterator API does not say whether hnsw.max_scan_tuples or natural index
+ * exhaustion ended the stream, so the operator refuses to guess.
+ */
+typedef enum TjsTermReason
+{
+	TJS_TERM_FILTER_FIRST,		/* single fused statement; no candidate stream */
+	TJS_TERM_TERM_COND,			/* TR-1 consecutive-drops fired mid-stream */
+	TJS_TERM_STREAM_END_UNKNOWN	/* stream ended: budget OR exhaustion, unobservable */
+} TjsTermReason;
+
 /* per-backend counters (mirror the fork's SM-3 probes) */
 static int64 tjs_examined = 0;
 static int64 tjs_bridges_injected = 0;
-static bool tjs_budget_capped = false;
+/* pre-first-call state is also unknown — the censored default, not a claim */
+static TjsTermReason tjs_term_reason = TJS_TERM_STREAM_END_UNKNOWN;
 
 /* ---------------------------------------------------------------------------------- */
 
@@ -332,9 +352,10 @@ tjs_open_pg(PG_FUNCTION_ARGS)
 	rsinfo->setDesc = tupdesc;
 	MemoryContextSwitchTo(oldctx);
 
+	/* per-call metric reset: one lifecycle point, no leak into the next call */
 	tjs_examined = 0;
 	tjs_bridges_injected = 0;
-	tjs_budget_capped = false;
+	tjs_term_reason = TJS_TERM_STREAM_END_UNKNOWN;
 
 	if (SPI_connect() != SPI_OK_CONNECT)
 		ereport(ERROR, (errmsg("tjs_open: SPI_connect failed")));
@@ -370,9 +391,15 @@ tjs_open_pg(PG_FUNCTION_ARGS)
 			table_close(heap, AccessShareLock);
 		}
 
+		/*
+		 * count(*) OVER () evaluates after WHERE but before ORDER BY/LIMIT: every
+		 * emitted row carries the FULL qualifying count, so tjs_examined reports the
+		 * work the filter legs actually did, not min(work, k) — no second C-side
+		 * materialization, ordering untouched (plan 074).
+		 */
 		initStringInfo(&q);
 		appendStringInfo(&q,
-						 "SELECT e.%s FROM graph_store.gph_traverse_bfs(" INT64_FORMAT ", %d, %d) AS t(dst) "
+						 "SELECT e.%s, count(*) OVER () FROM graph_store.gph_traverse_bfs(" INT64_FORMAT ", %d, %d) AS t(dst) "
 						 "JOIN %s.%s e ON e.%s = t.dst WHERE e.%s <> " INT64_FORMAT,
 						 qident(id_col), src, hops, edge_type,
 						 qident(nspname), qident(relname), qident(id_col),
@@ -406,7 +433,18 @@ tjs_open_pg(PG_FUNCTION_ARGS)
 		rc = SPI_execute_with_args(q.data, 1, argtypes, values, NULL, true, 0);
 		if (rc != SPI_OK_SELECT)
 			ereport(ERROR, (errmsg("tjs_open: filter-first statement failed (%d)", rc)));
-		tjs_examined = (int64) SPI_processed;	/* survivors ranked (small by design) */
+		tjs_term_reason = TJS_TERM_FILTER_FIRST;
+		if (SPI_processed > 0)
+		{
+			/* qualifying count rides column 2 of any returned row */
+			bool		qnull;
+			Datum		qd = SPI_getbinval(SPI_tuptable->vals[0],
+										   SPI_tuptable->tupdesc, 2, &qnull);
+
+			tjs_examined = qnull ? (int64) SPI_processed : DatumGetInt64(qd);
+		}
+		else
+			tjs_examined = 0;	/* zero rows -> no window row carries the count */
 		for (i = 0; i < SPI_processed; i++)
 		{
 			bool		isnull;
@@ -456,7 +494,8 @@ tjs_open_pg(PG_FUNCTION_ARGS)
 			ereport(ERROR,
 					(errmsg("tjs_open: vector-first path requires hnsw.iterative_scan = relaxed_order"),
 					 errhint("SET hnsw.iterative_scan = relaxed_order; (pgvector >= 0.8). "
-							 "The scan budget hnsw.max_scan_tuples bounds the stream — disclosed via tjs_open_budget_capped().")));
+							 "The scan budget hnsw.max_scan_tuples bounds the stream — a possibly-capped ending is disclosed "
+							 "via tjs_open_termination_reason() = 'stream_end_unknown' (tjs_open_budget_capped() = NULL).")));
 
 		heap = table_open(reloid, AccessShareLock);
 		indexoid = find_hnsw_index(heap, &vec_attno, &distproc, &ignore_op);
@@ -576,16 +615,16 @@ tjs_open_pg(PG_FUNCTION_ARGS)
 			}
 		}
 
-		if (!terminated && tid == NULL)
-		{
-			/*
-			 * Stream ended before term_cond fired. If the top-k is full this may still be a
-			 * natural finish; either way, on the iterative-scan path an ended stream means
-			 * pgvector's budget (hnsw.max_scan_tuples) or index exhaustion — report it so the
-			 * harness can refuse budget-shaped headlines (ADR-0015 E3.3).
-			 */
-			tjs_budget_capped = true;
-		}
+		/*
+		 * Termination bookkeeping (plan 074). When term_cond fired, the ending is KNOWN
+		 * and not budget-shaped. When the stream ended first, pgvector's iterator API
+		 * does not say whether hnsw.max_scan_tuples or natural index exhaustion did it:
+		 * the ending stays TJS_TERM_STREAM_END_UNKNOWN (the reset default) — a
+		 * right-censored measurement the harness must treat as possibly budget-shaped
+		 * (ADR-0015 E3.3), never a manufactured boolean.
+		 */
+		if (terminated)
+			tjs_term_reason = TJS_TERM_TERM_COND;
 
 		ExecDropSingleTupleTableSlot(slot);
 		index_endscan(scan);
@@ -714,9 +753,38 @@ tjs_open_bridges_injected_pg(PG_FUNCTION_ARGS)
 	PG_RETURN_INT64(tjs_bridges_injected);
 }
 
+PG_FUNCTION_INFO_V1(tjs_open_termination_reason_pg);
+Datum
+tjs_open_termination_reason_pg(PG_FUNCTION_ARGS)
+{
+	const char *reason;
+
+	switch (tjs_term_reason)
+	{
+		case TJS_TERM_FILTER_FIRST:
+			reason = "filter_first";
+			break;
+		case TJS_TERM_TERM_COND:
+			reason = "term_cond";
+			break;
+		case TJS_TERM_STREAM_END_UNKNOWN:
+		default:
+			reason = "stream_end_unknown";
+			break;
+	}
+	PG_RETURN_TEXT_P(cstring_to_text(reason));
+}
+
+/*
+ * Compat shim over the termination reason: false for known non-budget endings, SQL NULL
+ * when the stream ended for an unobservable reason (budget OR exhaustion — pgvector does
+ * not disclose which). Never true today: there is no upstream budget signal to observe.
+ */
 PG_FUNCTION_INFO_V1(tjs_open_budget_capped_pg);
 Datum
 tjs_open_budget_capped_pg(PG_FUNCTION_ARGS)
 {
-	PG_RETURN_BOOL(tjs_budget_capped);
+	if (tjs_term_reason == TJS_TERM_STREAM_END_UNKNOWN)
+		PG_RETURN_NULL();
+	PG_RETURN_BOOL(false);
 }

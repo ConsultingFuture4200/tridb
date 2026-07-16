@@ -33,26 +33,53 @@ SELECT count(*) FROM (
 ) s;
 
 -- (1) FILTER-FIRST behind the operator surface: hub 2's typed reach, no ts filter, ranked
--- by distance to [0.5,...] (== id 1000's embedding) => 1000..1004.
+-- by distance to [0.5,...] (== id 1000's embedding) => 1000..1004. The reach has 101
+-- qualifying rows (1000..1100): examined must report the FULL qualifying count, not k
+-- (plan 074 — a counter capped at k carries no information). Reason is 'filter_first',
+-- capped is false (single fused statement; no candidate stream, no budget in play).
 DO $$
-DECLARE got bigint[];
+DECLARE got bigint[]; ex bigint; reason text; capped boolean;
 BEGIN
   SELECT array_agg(t) INTO got FROM tjs_open('entities', 5, 0, 0, 2, 'id', '',
     '[0.5,0,0,0,0,0,0,0]'::vector, 2, current_setting('tjs.ptype')::int) AS t;
+  ex := tjs_open_candidates_examined();
   IF got <> ARRAY[1000,1001,1002,1003,1004]::bigint[] THEN
     RAISE EXCEPTION 'filter-first: got %', got;
   END IF;
-  RAISE NOTICE 'PASS 1: filter-first via operator -> {1000..1004}';
+  IF ex <> 101 THEN
+    RAISE EXCEPTION 'filter-first examined=% (expected 101 qualifying rows, not LIMIT k)', ex;
+  END IF;
+  reason := tjs_open_termination_reason();
+  capped := tjs_open_budget_capped();
+  IF reason <> 'filter_first' THEN
+    RAISE EXCEPTION 'filter-first reason=% (expected filter_first)', reason;
+  END IF;
+  IF capped IS DISTINCT FROM false THEN
+    RAISE EXCEPTION 'filter-first capped=% (expected false)', capped;
+  END IF;
+  RAISE NOTICE 'PASS 1: filter-first -> {1000..1004}, examined=101 (> k), reason=filter_first';
 END $$;
 
--- (2) filter-first honors the relational filter (ts=900 up there, so ts<500 empties it)
+-- (2) filter-first honors the relational filter (ts=900 up there, so ts<500 empties it).
+-- Zero qualifying rows: examined = 0 (no window row exists to carry the count — the
+-- zero case must be handled explicitly), reason 'filter_first', capped false.
 DO $$
-DECLARE got bigint[];
+DECLARE got bigint[]; ex bigint; reason text; capped boolean;
 BEGIN
   SELECT array_agg(t) INTO got FROM tjs_open('entities', 5, 0, 0, 2, 'id', 'ts < 500',
     '[0.5,0,0,0,0,0,0,0]'::vector, 2, current_setting('tjs.ptype')::int) AS t;
+  ex := tjs_open_candidates_examined();
+  reason := tjs_open_termination_reason();
+  capped := tjs_open_budget_capped();
   IF got IS NOT NULL THEN RAISE EXCEPTION 'filter-first+filter: got %', got; END IF;
-  RAISE NOTICE 'PASS 2: filter-first honors the relational filter (empty set)';
+  IF ex <> 0 THEN RAISE EXCEPTION 'empty filter-first examined=% (expected 0)', ex; END IF;
+  IF reason <> 'filter_first' THEN
+    RAISE EXCEPTION 'empty filter-first reason=% (expected filter_first)', reason;
+  END IF;
+  IF capped IS DISTINCT FROM false THEN
+    RAISE EXCEPTION 'empty filter-first capped=% (expected false)', capped;
+  END IF;
+  RAISE NOTICE 'PASS 2: filter-first honors the relational filter (empty set, examined=0)';
 END $$;
 
 -- (1c) filter-first ranks by the index's ACTUAL metric, not a hardcoded L2. ent_cos
@@ -158,13 +185,17 @@ SET hnsw.iterative_scan = relaxed_order;
 SET hnsw.max_scan_tuples = 20000;
 
 -- (4) vector-first, filtered: matches the exact oracle at recall >= 4/5, examines > 0 and
--- FEWER than the table (TR-1 early termination with term_cond).
+-- FEWER than the table (TR-1 early termination with term_cond). term_cond fired the stop,
+-- so reason is 'term_cond' and capped is false — a known non-budget ending.
 DO $$
 DECLARE got bigint[]; oracle bigint[]; ex bigint; hits int := 0; i int;
+        reason text; capped boolean;
 BEGIN
   SELECT array_agg(t) INTO got FROM tjs_open('entities', 5, 64, 0, 0, 'id', 'ts < 500',
     '[0.1,0,0,0,0,0,0,0]'::vector) AS t;
   ex := tjs_open_candidates_examined();
+  reason := tjs_open_termination_reason();
+  capped := tjs_open_budget_capped();
   SELECT array_agg(id) INTO oracle FROM (
     SELECT id FROM entities WHERE ts < 500
     ORDER BY embedding <-> '[0.1,0,0,0,0,0,0,0]'::vector LIMIT 5) q;
@@ -174,7 +205,13 @@ BEGIN
   IF hits < 4 THEN RAISE EXCEPTION 'vector-first recall %/5 (got %, oracle %)', hits, got, oracle; END IF;
   IF ex <= 0 THEN RAISE EXCEPTION 'examined=% (no work reported)', ex; END IF;
   IF ex >= 2000 THEN RAISE EXCEPTION 'examined=% — no early termination', ex; END IF;
-  RAISE NOTICE 'PASS 4: vector-first filtered recall %/5, examined % (0 < ex < 2000)', hits, ex;
+  IF reason <> 'term_cond' THEN
+    RAISE EXCEPTION 'term_cond stop reason=% (expected term_cond)', reason;
+  END IF;
+  IF capped IS DISTINCT FROM false THEN
+    RAISE EXCEPTION 'term_cond stop capped=% (expected false)', capped;
+  END IF;
+  RAISE NOTICE 'PASS 4: vector-first filtered recall %/5, examined % (0 < ex < 2000), reason=term_cond', hits, ex;
 END $$;
 
 -- (5) seedless BRIDGE INJECTION (fork parity, ADR-0012 recipe B): query [0.001..] makes
@@ -195,18 +232,64 @@ BEGIN
   RAISE NOTICE 'PASS 5: bridges guaranteed into the budget past the frontier: % (injected %)', got, nb;
 END $$;
 
--- (6) budget-cap honesty: a tiny scan budget ends the stream before term_cond -> flag set
+-- (6) censored-ending honesty (plan 074): a tiny scan budget ends the stream before
+-- term_cond fires. pgvector does NOT disclose whether hnsw.max_scan_tuples or natural
+-- index exhaustion ended its stream, so the operator must NOT claim 'budget-capped':
+-- reason is 'stream_end_unknown' and the compat boolean is SQL NULL (right-censored).
 SET hnsw.max_scan_tuples = 50;
 DO $$
-DECLARE got bigint[];
+DECLARE got bigint[]; reason text; capped boolean;
 BEGIN
   SELECT array_agg(t) INTO got FROM tjs_open('entities', 5, 100000, 0, 0, 'id', 'ts >= 500',
     '[0.01,0,0,0,0,0,0,0]'::vector) AS t;
-  IF NOT tjs_open_budget_capped() THEN
-    RAISE EXCEPTION 'budget cap not reported (got %)', got;
+  reason := tjs_open_termination_reason();
+  capped := tjs_open_budget_capped();
+  IF reason <> 'stream_end_unknown' THEN
+    RAISE EXCEPTION 'budgeted stream end reason=% (expected stream_end_unknown, got %)', reason, got;
   END IF;
-  RAISE NOTICE 'PASS 6: budget-capped stream reported via tjs_open_budget_capped()';
+  IF capped IS NOT NULL THEN
+    RAISE EXCEPTION 'budgeted stream end capped=% (expected SQL NULL — no observable budget signal)', capped;
+  END IF;
+  RAISE NOTICE 'PASS 6: possibly-capped stream end reported as stream_end_unknown / NULL';
 END $$;
 SET hnsw.max_scan_tuples = 20000;
+
+-- (6b) natural-exhaustion negative case: budget (20000) far exceeds the table (2000) and
+-- term_cond never fires (huge), so the stream ends by plain index exhaustion. The old
+-- contract labeled this 'budget-capped' — a lie. Same censored reporting as (6): pgvector
+-- cannot distinguish the two endings, so reason 'stream_end_unknown', boolean SQL NULL —
+-- never true without a real upstream signal.
+DO $$
+DECLARE got bigint[]; reason text; capped boolean;
+BEGIN
+  SELECT array_agg(t) INTO got FROM tjs_open('entities', 5, 1000000, 0, 0, 'id', 'ts >= 500',
+    '[0.01,0,0,0,0,0,0,0]'::vector) AS t;
+  reason := tjs_open_termination_reason();
+  capped := tjs_open_budget_capped();
+  IF reason <> 'stream_end_unknown' THEN
+    RAISE EXCEPTION 'natural exhaustion reason=% (expected stream_end_unknown, got %)', reason, got;
+  END IF;
+  IF capped IS NOT NULL THEN
+    RAISE EXCEPTION 'natural exhaustion capped=% (expected SQL NULL, never true)', capped;
+  END IF;
+  RAISE NOTICE 'PASS 6b: natural index exhaustion no longer misreported as budget-capped';
+END $$;
+
+-- (7) per-call metric reset: after (6b) left reason=stream_end_unknown/examined>0, a
+-- fresh filter-first call in the SAME backend must fully overwrite all three metrics —
+-- no state leaks between consecutive calls.
+DO $$
+DECLARE got bigint[]; ex bigint; reason text; capped boolean;
+BEGIN
+  SELECT array_agg(t) INTO got FROM tjs_open('entities', 5, 0, 0, 2, 'id', 'ts < 500',
+    '[0.5,0,0,0,0,0,0,0]'::vector, 2, current_setting('tjs.ptype')::int) AS t;
+  ex := tjs_open_candidates_examined();
+  reason := tjs_open_termination_reason();
+  capped := tjs_open_budget_capped();
+  IF ex <> 0 OR reason <> 'filter_first' OR capped IS DISTINCT FROM false THEN
+    RAISE EXCEPTION 'metric leak across calls: examined=%, reason=%, capped=%', ex, reason, capped;
+  END IF;
+  RAISE NOTICE 'PASS 7: per-call metrics reset — no leak from the previous call';
+END $$;
 
 \echo === tjs_pg (stock-PG fused operator, ADR-0019): ALL PASS ===
