@@ -1,4 +1,4 @@
-.PHONY: test lint graph-test stock-graph-test tjs-parity-test smoke-test test-all baseline-up baseline-down seed bench bench-live sweep sm2 fetch-dataset bench-public bench-repro fetch-hotpot graphrag graphrag-live bench-filtered ablation recall-decay tjs-open-ref tjs-open-live graphrag-h2h rabitq-sim gpu-build-index gpu-setup gpu-verify gpu-lock wiki-fetch wiki-extract wiki-scale wiki-neo4j wiki-subgraph wiki-linkpred lock clean clean-data
+.PHONY: test lint graph-test stock-graph-test stock-release-smoke tjs-parity-test smoke-test test-all baseline-up baseline-down seed bench bench-live sweep sm2 fetch-dataset bench-public bench-repro fetch-hotpot graphrag graphrag-live bench-filtered ablation recall-decay tjs-open-ref tjs-open-live graphrag-h2h rabitq-sim gpu-build-index gpu-setup gpu-verify gpu-lock wiki-fetch wiki-extract wiki-scale wiki-neo4j wiki-subgraph wiki-linkpred lock clean clean-data
 
 PUBLIC_DATASET ?= gist-960-euclidean
 
@@ -108,6 +108,15 @@ stock-graph-test:
 	  echo "=== $$t (stock PG$(PG_MAJOR)) ==="; \
 	  bash scripts/pg17_graph_test.sh $(STOCK_IMAGE) $$t || exit 1; \
 	done
+
+# Runtime smoke of the SHIPPED release image (advisor plan 076): build the prebaked
+# tridb/postgres-trimodal image for PG_MAJOR, start it as a user would, install all
+# three extensions in dependency order, and run one direct tjs_open + one canonical
+# graph_query — the local mirror of the CI `release runtime smoke` step.
+stock-release-smoke:
+	docker build --build-arg PG_MAJOR=$(PG_MAJOR) -f scripts/pg17/Dockerfile.release \
+	  -t tridb/postgres-trimodal:pg$(PG_MAJOR) .
+	bash scripts/pg17_release_smoke.sh tridb/postgres-trimodal:pg$(PG_MAJOR)
 
 # Fork<->stock filter-first PARITY gate (advisor plan 071): the SAME corpus + queries
 # through the fork's fused filter-first statement (tridb/msvbase:dev) and the stock

@@ -78,6 +78,8 @@ jobs:
           done
       - name: release image builds (prebaked extension)
         run: docker build --build-arg PG_MAJOR=${{ matrix.pg }} -f scripts/pg17/Dockerfile.release -t tridb/postgres-trimodal:pg${{ matrix.pg }} .
+      - name: release runtime smoke (start image, install extensions, run canonical query)
+        run: bash scripts/pg17_release_smoke.sh tridb/postgres-trimodal:pg${{ matrix.pg }}
 
   engine:
     runs-on: ubuntu-latest
