@@ -32,13 +32,18 @@
  *   pgvector's iterator API does not expose today (the honest E3.3 consequence, disclosed
  *   not manufactured).
  *
- * SEEDLESS GRAPH PREDICATE (m_seeds > 0): the first m_seeds FILTER-PASSING candidates from
- * the vector stream become seeds; the reachable set is the union of their `hops`-bounded
- * typed out-reach (graph_store.gph_traverse_bfs via SPI, one probe per seed, cached in a
- * per-call hash). Candidates after the seed phase must be in-reach to be emitted. This is the
- * VBASE-style filtered/graph-constrained ANN core of the fork operator; exact fork phase/
- * bridge-injection parity (ADR-0012/0017) is follow-up work — counters expose enough for the
- * harness to grade recall honestly either way.
+ * SEEDLESS GRAPH BRIDGES (m_seeds > 0) — fork-parity semantics (plan 087): the operator
+ * buffers the first seed_window = max(m_seeds*8, m_seeds+32) FILTER-PASSING stream
+ * candidates and seeds from the m_seeds NEAREST within that window (the relaxed-order
+ * stream is only approximately nearest-first — first-emitted is not nearest); the
+ * reachable set is the union of the seeds' `hops`-bounded typed out-reach
+ * (graph_store.gph_traverse_bfs via SPI, one probe per seed, cached in a per-call hash).
+ * Every streamed candidate competes for the vector top-k and the TR-1 drop counter sees
+ * the uniform improve-or-drop outcome (the window itself is exempt, fork phase 1/3a); a
+ * reach member is ADDITIONALLY offered to a guaranteed bridge budget, and reach members
+ * the stream never emitted are fetched directly by id (filter respected). At finalize the
+ * reserved bridge share is capped at k/2 (min 1 when any bridge exists) — the fork's
+ * rule; bridges-take-all would silently delete the vector modality on dense graphs.
  *
  * Counters (per-backend, read via SQL): tjs_open_candidates_examined() — vector-first: heap
  * tuples examined by the last call; filter-first: qualifying rows examined (post-filter,
@@ -289,6 +294,46 @@ reach_add_from_seed(HTAB *reach, int64 seed, int hops, int edge_type)
 	}
 }
 
+/*
+ * Seedless phases 2/3a (fork parity, plan 087): runs ONCE, when the seed window fills
+ * or the stream ends first. Selects the m_seeds NEAREST buffered candidates as seeds
+ * (the fork buffers a seed_window = m_seeds*8, floor m_seeds+32, prefix and seeds from
+ * the nearest within it), expands the reach from them, then admits every buffered
+ * candidate to the vector top-k exactly once (fork phase 3a: a win resets the drop run;
+ * a loss does NOT count toward term_cond — the window is exempt). A buffered candidate
+ * in reach is ADDITIONALLY offered to the guaranteed bridge budget and counted (the
+ * fork's exhaustive by-id bridge fetch covers the same rows; here the phase-3b direct
+ * fetch skips in-stream ids, so the offer happens stream-side).
+ */
+static void
+seedless_seed_and_admit(TopkItem *seed_buf, int n_buf, int m_seeds, int hops,
+						int edge_type, HTAB *reach, Topk *topk, Topk *bridge_topk,
+						int *drops)
+{
+	int			i;
+	int			n_seeds;
+
+	/* nearest-first: seed selection and admission both use distance order */
+	qsort(seed_buf, n_buf, sizeof(TopkItem), topk_cmp_dist);
+	n_seeds = Min(m_seeds, n_buf);
+	for (i = 0; i < n_seeds; i++)
+		reach_add_from_seed(reach, seed_buf[i].id, hops, edge_type);
+
+	for (i = 0; i < n_buf; i++)
+	{
+		bool		found;
+
+		(void) hash_search(reach, &seed_buf[i].id, HASH_FIND, &found);
+		if (found)
+		{
+			(void) topk_offer(bridge_topk, seed_buf[i].id, seed_buf[i].dist);
+			tjs_bridges_injected++;
+		}
+		if (topk_offer(topk, seed_buf[i].id, seed_buf[i].dist))
+			*drops = 0;
+	}
+}
+
 /* ---------------------------------------------------------------------------------- */
 
 PG_FUNCTION_INFO_V1(tjs_open_pg);
@@ -487,7 +532,10 @@ tjs_open_pg(PG_FUNCTION_ARGS)
 		HTAB	   *reach = NULL;
 		HTAB	   *seen = NULL;
 		Topk		bridge_topk;
-		int			seeds_taken = 0;
+		int			seed_window = 0;
+		TopkItem   *seed_buf = NULL;
+		int			n_buf = 0;
+		bool		seeded = false;
 		ItemPointer tid;
 
 		if (iter == NULL || strcmp(iter, "relaxed_order") != 0)
@@ -525,6 +573,12 @@ tjs_open_pg(PG_FUNCTION_ARGS)
 			reach = reach_create();
 			seen = reach_create();	/* same shape: an int64 membership hash */
 			topk_init(&bridge_topk, k);
+			/* fork seed window: m_seeds * 8, floor m_seeds + 32 (bounded by the
+			 * m_seeds <= 10000 argument guard — no second knob) */
+			seed_window = m_seeds * 8;
+			if (seed_window < m_seeds + 32)
+				seed_window = m_seeds + 32;
+			seed_buf = palloc(sizeof(TopkItem) * seed_window);
 		}
 
 		topk_init(&topk, k);
@@ -538,7 +592,6 @@ tjs_open_pg(PG_FUNCTION_ARGS)
 
 		while ((tid = index_getnext_tid(scan, ForwardScanDirection)) != NULL)
 		{
-			bool		found;
 			Datum		idd,
 					vecd;
 			bool		idnull,
@@ -576,29 +629,42 @@ tjs_open_pg(PG_FUNCTION_ARGS)
 			dist = DatumGetFloat8(FunctionCall2Coll(&distfn, InvalidOid, vecd, query_vec));
 
 			/*
-			 * Seedless bridge semantics (fork parity, ADR-0012 recipe B): the first m_seeds
-			 * filter-passing candidates seed the bridge set (seeds + their hops-reach, seeds
-			 * included). A BRIDGE candidate is admitted to its own guaranteed-budget heap and
-			 * NEVER touches the consecutive-drops counter (admission past the vector frontier
-			 * must not defeat VBASE early termination). Non-bridges take the ordinary
-			 * improve-or-drop path.
+			 * Seedless bridge semantics (fork parity, ADR-0012 recipe B / plan 087).
+			 * PHASE 1: buffer the first seed_window filter-passing candidates; seeds are
+			 * the m_seeds NEAREST within the window, not the first m_seeds emitted
+			 * (relaxed-order streams are only approximately nearest-first). The buffered
+			 * prefix is exempt from drop accounting (fork phase 1/3a) and is admitted to
+			 * the vector top-k exactly once when the window closes.
+			 * PHASE 3b: a reach member is ADDITIONALLY offered to the guaranteed bridge
+			 * budget, but it still competes for the vector top-k below and the drop
+			 * counter sees the uniform improve-or-drop outcome — the fork admits every
+			 * streamed candidate to the vector queue and never exempts bridges from
+			 * termination progress.
 			 */
 			if (reach != NULL)
 			{
 				bool		dummy;
+				bool		found;
 
 				(void) hash_search(seen, &cand, HASH_ENTER, &dummy);
-				if (seeds_taken < m_seeds)
+				if (!seeded)
 				{
-					reach_add_from_seed(reach, cand, hops, edge_type);
-					seeds_taken++;
+					seed_buf[n_buf].id = cand;
+					seed_buf[n_buf].dist = dist;
+					n_buf++;
+					if (n_buf < seed_window)
+						continue;
+					seedless_seed_and_admit(seed_buf, n_buf, m_seeds, hops, edge_type,
+											reach, &topk, &bridge_topk, &drops);
+					seeded = true;
+					continue;
 				}
+
 				(void) hash_search(reach, &cand, HASH_FIND, &found);
 				if (found)
 				{
-					if (topk_offer(&bridge_topk, cand, dist))
-						tjs_bridges_injected++;
-					continue;	/* bridges never touch the drop counter */
+					(void) topk_offer(&bridge_topk, cand, dist);
+					tjs_bridges_injected++;
 				}
 			}
 
@@ -613,6 +679,15 @@ tjs_open_pg(PG_FUNCTION_ARGS)
 					break;		/* TR-1 early termination: we own the loop, just stop */
 				}
 			}
+		}
+
+		/* stream ended inside the seed window: seed from the partial buffer (fork
+		 * parity — phase 1 breaks out and proceeds with what it has) */
+		if (reach != NULL && !seeded)
+		{
+			seedless_seed_and_admit(seed_buf, n_buf, m_seeds, hops, edge_type,
+									reach, &topk, &bridge_topk, &drops);
+			seeded = true;
 		}
 
 		/*
@@ -684,29 +759,48 @@ tjs_open_pg(PG_FUNCTION_ARGS)
 						float8		bdist = DatumGetFloat8(
 									FunctionCall2Coll(&distfn, InvalidOid, vd, query_vec));
 
-						if (topk_offer(&bridge_topk, *bid, bdist))
-							tjs_bridges_injected++;
+						/* counted per offer, landed or not — the fork counts every
+						 * materialized bridge row the same way (plan 087) */
+						(void) topk_offer(&bridge_topk, *bid, bdist);
+						tjs_bridges_injected++;
 					}
 				}
 			}
 		}
 
 		/*
-		 * FINALIZE (fork parity): bridges are GUARANTEED into the final budget — best-k
-		 * bridges by distance first, remaining slots filled from the vector winners
-		 * (dedup'd), the merged set emitted ascending by distance.
+		 * FINALIZE (fork parity, plan 087): bridges are GUARANTEED into the final budget
+		 * but their reserved share is CAPPED at k/2 (min 1 when any bridge exists) —
+		 * bridges-take-all would silently delete the vector modality on dense graphs.
+		 * Nearest bridges first up to the cap, vector winners fill the rest (dedup'd by
+		 * id), and only if the vector winners run out do remaining bridges backfill.
+		 * The merged set is emitted ascending by distance.
 		 */
 		{
 			TopkItem   *final_items = palloc(sizeof(TopkItem) * k);
 			int			n_final = 0;
 			int			i,
 					j;
+			int			bridge_cap = k / 2;
 
 			if (reach != NULL)
 			{
+				if (bridge_cap == 0 && bridge_topk.n > 0)
+					bridge_cap = 1; /* min 1 when any bridge exists (fork rule) */
 				qsort(bridge_topk.items, bridge_topk.n, sizeof(TopkItem), topk_cmp_dist);
-				for (i = 0; i < bridge_topk.n && n_final < k; i++)
-					final_items[n_final++] = bridge_topk.items[i];
+				for (i = 0; i < bridge_topk.n && n_final < bridge_cap; i++)
+				{
+					bool		dup = false;
+
+					for (j = 0; j < n_final; j++)
+						if (final_items[j].id == bridge_topk.items[i].id)
+						{
+							dup = true;
+							break;
+						}
+					if (!dup)
+						final_items[n_final++] = bridge_topk.items[i];
+				}
 			}
 			qsort(topk.items, topk.n, sizeof(TopkItem), topk_cmp_dist);
 			for (i = 0; i < topk.n && n_final < k; i++)
@@ -722,6 +816,21 @@ tjs_open_pg(PG_FUNCTION_ARGS)
 				if (!dup)
 					final_items[n_final++] = topk.items[i];
 			}
+			/* backfill: only if the vector winners ran out (fork finalize step 3) */
+			if (reach != NULL)
+				for (i = 0; i < bridge_topk.n && n_final < k; i++)
+				{
+					bool		dup = false;
+
+					for (j = 0; j < n_final; j++)
+						if (final_items[j].id == bridge_topk.items[i].id)
+						{
+							dup = true;
+							break;
+						}
+					if (!dup)
+						final_items[n_final++] = bridge_topk.items[i];
+				}
 			qsort(final_items, n_final, sizeof(TopkItem), topk_cmp_dist);
 			for (i = 0; i < n_final; i++)
 			{
