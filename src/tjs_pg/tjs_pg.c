@@ -52,6 +52,7 @@
 #include "catalog/namespace.h"
 #include "catalog/pg_am.h"
 #include "catalog/pg_opclass.h"
+#include "catalog/pg_operator.h"
 #include "commands/defrem.h"
 #include "catalog/pg_type.h"
 #include "executor/spi.h"
@@ -64,6 +65,7 @@
 #include "utils/rel.h"
 #include "utils/regproc.h"
 #include "utils/snapmgr.h"
+#include "utils/syscache.h"
 #include "utils/hsearch.h"
 
 PG_MODULE_MAGIC;
@@ -178,7 +180,7 @@ topk_cmp_dist(const void *a, const void *b)
  * no hnsw index exists.
  */
 static Oid
-find_hnsw_index(Relation heap, AttrNumber *vec_attno, Oid *distproc)
+find_hnsw_index(Relation heap, AttrNumber *vec_attno, Oid *distproc, Oid *distop_out)
 {
 	List	   *indexes = RelationGetIndexList(heap);
 	ListCell   *lc;
@@ -204,6 +206,7 @@ find_hnsw_index(Relation heap, AttrNumber *vec_attno, Oid *distproc)
 			if (!OidIsValid(distop))
 				ereport(ERROR, (errmsg("tjs_open: no strategy-1 distance operator in the index opfamily")));
 			*distproc = get_opcode(distop);
+			*distop_out = distop;	/* the operator OID, for rendering into SQL */
 			index_close(ind, AccessShareLock);
 			list_free(indexes);
 			return indexoid;
@@ -346,14 +349,19 @@ tjs_open_pg(PG_FUNCTION_ARGS)
 		char	   *relname = get_rel_name(reloid);
 		char	   *nspname = get_namespace_name(get_rel_namespace(reloid));
 		char	   *vec_col;
+		Oid			distop = InvalidOid;
 
-		/* the vector column comes from the table's hnsw index, same as vector-first */
+		/*
+		 * The vector column AND its distance operator come from the table's
+		 * hnsw index, same as vector-first — rank by whatever metric the index
+		 * was built for (l2 <->, cosine <=>, ip <#>), never a hardcoded L2.
+		 */
 		{
 			Relation	heap = table_open(reloid, AccessShareLock);
 			AttrNumber	vattno = InvalidAttrNumber;
 			Oid			dp = InvalidOid;
 
-			(void) find_hnsw_index(heap, &vattno, &dp);
+			(void) find_hnsw_index(heap, &vattno, &dp, &distop);
 			vec_col = get_attname(reloid, vattno, false);
 			table_close(heap, AccessShareLock);
 		}
@@ -367,7 +375,27 @@ tjs_open_pg(PG_FUNCTION_ARGS)
 						 qident(id_col), src);
 		if (filter[0] != '\0')
 			appendStringInfo(&q, " AND (%s)", filter);
-		appendStringInfo(&q, " ORDER BY e.%s <-> $1 LIMIT %d", qident(vec_col), k);
+		/*
+		 * Rank by the index's own distance operator (l2 <->, cosine <=>, ip
+		 * <#>), schema-qualified via OPERATOR(nsp.op) so it resolves regardless
+		 * of search_path. (format_operator() is unusable here — it emits the
+		 * regoperator form `<->(vector,vector)`, which is invalid infix.)
+		 */
+		{
+			HeapTuple	optup = SearchSysCache1(OPEROID, ObjectIdGetDatum(distop));
+			Form_pg_operator opform;
+			char	   *opnsp;
+			char	   *opname;
+
+			if (!HeapTupleIsValid(optup))
+				ereport(ERROR, (errmsg("tjs_open: cache lookup failed for operator %u", distop)));
+			opform = (Form_pg_operator) GETSTRUCT(optup);
+			opnsp = get_namespace_name(opform->oprnamespace);
+			opname = pstrdup(NameStr(opform->oprname));
+			ReleaseSysCache(optup);
+			appendStringInfo(&q, " ORDER BY e.%s OPERATOR(%s.%s) $1 LIMIT %d",
+							 qident(vec_col), quote_identifier(opnsp), opname, k);
+		}
 
 		argtypes[0] = get_fn_expr_argtype(fcinfo->flinfo, 7);
 		values[0] = query_vec;
@@ -403,6 +431,7 @@ tjs_open_pg(PG_FUNCTION_ARGS)
 		Oid			indexoid;
 		AttrNumber	vec_attno = InvalidAttrNumber;
 		Oid			distproc = InvalidOid;
+		Oid			ignore_op = InvalidOid;		/* vector-first ranks via distfn, not a rendered operator */
 		Relation	index;
 		IndexScanDesc scan;
 		ScanKeyData orderby;
@@ -426,7 +455,7 @@ tjs_open_pg(PG_FUNCTION_ARGS)
 							 "The scan budget hnsw.max_scan_tuples bounds the stream — disclosed via tjs_open_budget_capped().")));
 
 		heap = table_open(reloid, AccessShareLock);
-		indexoid = find_hnsw_index(heap, &vec_attno, &distproc);
+		indexoid = find_hnsw_index(heap, &vec_attno, &distproc, &ignore_op);
 		index = index_open(indexoid, AccessShareLock);
 		fmgr_info(distproc, &distfn);
 

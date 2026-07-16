@@ -55,6 +55,42 @@ BEGIN
   RAISE NOTICE 'PASS 2: filter-first honors the relational filter (empty set)';
 END $$;
 
+-- (1c) filter-first ranks by the index's ACTUAL metric, not a hardcoded L2. ent_cos
+-- reuses the shared graph (hub 2 -> vids 1000..1100) but builds a vector_cosine_ops
+-- index. Embeddings are constructed so the cosine-nearest and L2-nearest top-5 DIFFER
+-- (magnitude-vs-angle split): cosine picks {1000..1004}, L2 would pick {1000,1005..1008}.
+-- Pre-fix (hardcoded <->) this returns the L2 set and fails; post-fix it ranks by <=>.
+CREATE TABLE ent_cos (id bigint PRIMARY KEY, ts int, embedding vector(8));
+INSERT INTO ent_cos
+SELECT g, 100,
+  (CASE
+     WHEN g = 1000 THEN '[1,0,0,0,0,0,0,0]'
+     -- cosine-near (small angle), L2-far (magnitude 4 vs query magnitude 1)
+     WHEN g BETWEEN 1001 AND 1004 THEN
+       format('[%s,%s,0,0,0,0,0,0]', 4*cos(0.01*(g-1000)), 4*sin(0.01*(g-1000)))
+     -- cosine-far (angle ~0.4), L2-near (magnitude 1 matches the query)
+     WHEN g BETWEEN 1005 AND 1008 THEN
+       format('[%s,%s,0,0,0,0,0,0]', cos(0.4+0.001*(g-1005)), sin(0.4+0.001*(g-1005)))
+     -- far in both metrics; never enters top-5
+     ELSE format('[%s,%s,0,0,0,0,0,0]', 10*cos(1.0), 10*sin(1.0))
+   END)::vector(8)
+FROM generate_series(0,1999) g;
+CREATE INDEX ent_cos_hnsw ON ent_cos USING hnsw (embedding vector_cosine_ops)
+  WITH (m=16, ef_construction=64);
+DO $$
+DECLARE got bigint[]; oracle bigint[];
+BEGIN
+  SELECT array_agg(t) INTO got FROM tjs_open('ent_cos', 5, 0, 0, 2, 'id', '',
+    (SELECT embedding FROM ent_cos WHERE id=1000), 2, current_setting('tjs.ptype')::int) AS t;
+  SELECT array_agg(id) INTO oracle FROM (
+    SELECT id FROM ent_cos WHERE id IN (
+      SELECT dst FROM graph_store.gph_traverse_bfs(2, 2, current_setting('tjs.ptype')::int) AS dst)
+      AND id <> 2
+    ORDER BY embedding <=> (SELECT embedding FROM ent_cos WHERE id=1000) LIMIT 5) q;
+  IF got <> oracle THEN RAISE EXCEPTION 'cosine filter-first: got % expected %', got, oracle; END IF;
+  RAISE NOTICE 'PASS 1c: filter-first ranks by the index cosine metric';
+END $$;
+
 -- (3) vector-first refuses to run without the iterative scan (fail-loud contract)
 DO $$
 BEGIN
