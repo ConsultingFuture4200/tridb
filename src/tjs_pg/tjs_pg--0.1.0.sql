@@ -1,6 +1,21 @@
 -- tridb_tjs 0.1.0 — the fused tri-modal operator on stock PostgreSQL (ADR-0019).
 \echo Use "CREATE EXTENSION tjs_pg" to load this file. \quit
 
+-- pgvector version floor. The control file's `requires = 'vector'` guarantees the
+-- extension is present, but not that it is >= 0.8 — the vector-first path REQUIRES
+-- SET hnsw.iterative_scan = relaxed_order, which pgvector only exposes from 0.8.
+DO $$
+DECLARE v text;
+BEGIN
+  SELECT extversion INTO v FROM pg_extension WHERE extname = 'vector';
+  IF v IS NULL THEN
+    RAISE EXCEPTION 'tjs_pg requires the pgvector "vector" extension (CREATE EXTENSION vector first)';
+  END IF;
+  IF string_to_array(v, '.')::int[] < ARRAY[0,8]::int[] THEN
+    RAISE EXCEPTION 'tjs_pg requires pgvector >= 0.8 (found %); the vector-first path needs hnsw.iterative_scan = relaxed_order', v;
+  END IF;
+END $$;
+
 -- tjs_open: fused tri-modal top-k.
 --   src IS NOT NULL -> FILTER-FIRST (typed BFS reach -> relational filter -> exact rank);
 --   src IS NULL     -> VECTOR-FIRST/SEEDLESS (owned relaxed-order pgvector HNSW stream ->

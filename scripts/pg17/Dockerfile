@@ -3,7 +3,8 @@
 # we add PGXS build deps so src/graph_store compiles INSIDE the container against stock headers.
 # PG_MAJOR selects the Postgres major (16 and 17 are the roadmap 2.4 CI matrix).
 ARG PG_MAJOR=17
-FROM pgvector/pgvector:pg${PG_MAJOR}
+ARG PGVECTOR_VERSION=0.8.0
+FROM pgvector/pgvector:${PGVECTOR_VERSION}-pg${PG_MAJOR}
 ARG PG_MAJOR
 
 RUN apt-get update \
