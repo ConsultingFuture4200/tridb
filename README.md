@@ -150,7 +150,18 @@ ORDER BY src_embedding <-> :question_embedding
 LIMIT 5;
 ```
 
-The `GRAPH_TABLE(...)` surface parses on stock PostgreSQL 16/17 and lowers to a single `tjs()` operator that drives all three legs with one global top-k.
+The template is carried verbatim (as text) through the front door `graph_store.graph_query($$...$$)`, which lowers it to a single fused-operator call that drives all three legs with one global top-k: the fork's `tjs()` where installed, or `tjs_open()` (extension `tjs_pg`) on stock PostgreSQL 16/17. Off-template text is rejected — one canonical query for v1.
+
+```sql
+SELECT * FROM graph_store.graph_query($$
+    SELECT chunk
+    FROM GRAPH_TABLE ( MATCH (src:entity)-[:related_to]->(dst:entity)
+      COLUMNS ( src.embedding AS src_embedding, dst.chunk AS chunk, dst.timestamp AS timestamp ) )
+    WHERE src.id = 1 AND timestamp IN (100)
+    ORDER BY src_embedding <-> '[19,0,0,0,0,0,0,0]'
+    LIMIT 5
+$$);
+```
 
 ## Quick Start
 
@@ -163,7 +174,8 @@ docker build -f scripts/pg17/Dockerfile.release -t tridb/postgres-trimodal:pg17 
 docker run -d --name trimodal -e POSTGRES_PASSWORD=secret tridb/postgres-trimodal:pg17
 docker exec -it trimodal psql -U postgres \
   -c 'CREATE EXTENSION vector;' \
-  -c 'CREATE EXTENSION graph_store_am;'
+  -c 'CREATE EXTENSION graph_store_am;' \
+  -c 'CREATE EXTENSION tjs_pg;'
 ```
 
 ### Build the dev/engine layers (advanced)

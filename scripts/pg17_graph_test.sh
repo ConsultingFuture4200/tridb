@@ -31,11 +31,16 @@ docker run --rm --user postgres --entrypoint bash \
   set -e
   B=$(ls -d /usr/lib/postgresql/*/bin | sort -V | tail -1)  # works for the pg16/pg17 CI matrix
   PGC=$B/pg_config
+  # Fail LOUD on a build error: piping make to `tail` previously masked the nonzero
+  # exit (no pipefail in this inner shell), so a broken build looked green.
   for e in v1 v0 tjs; do
     cp -r /tmp/ext_$e /tmp/build_$e && cd /tmp/build_$e
-    echo "=== make ($e, stock PG17) ==="; make PG_CONFIG=$PGC 2>&1 | tail -2
+    echo "=== make ($e, stock PG17) ==="
+    make PG_CONFIG=$PGC >/tmp/make_$e.log 2>&1 || { tail -30 /tmp/make_$e.log; echo "BUILD FAILED ($e)"; exit 1; }
+    tail -2 /tmp/make_$e.log
     # the image chowns the extension/lib dirs to postgres (scripts/pg17/Dockerfile)
-    make PG_CONFIG=$PGC install 2>&1 | tail -1
+    make PG_CONFIG=$PGC install >/tmp/install_$e.log 2>&1 || { tail -20 /tmp/install_$e.log; echo "INSTALL FAILED ($e)"; exit 1; }
+    tail -1 /tmp/install_$e.log
   done
   D=/tmp/pg; rm -rf $D; mkdir -p $D
   $B/initdb -A trust -D $D >/dev/null

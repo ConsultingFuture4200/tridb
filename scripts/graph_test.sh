@@ -26,11 +26,17 @@ docker run --rm --entrypoint bash \
   set -e
   B=/u01/app/postgres/product/13.4/bin
   PGC=$B/pg_config
-  # PGXS build both extensions (mounts are read-only, so build in writable copies)
+  # PGXS build both extensions (mounts are read-only, so build in writable copies).
+  # Fail LOUD on a build error: piping make to `tail` previously masked the nonzero
+  # exit (no pipefail in this inner shell), so a broken build looked green.
   for e in v1 v0; do
     cp -r /tmp/ext_$e /tmp/build_$e && cd /tmp/build_$e
-    echo "=== make ($e) ==="; make PG_CONFIG=$PGC 2>&1 | tail -6
-    echo "=== make install ($e) ==="; make PG_CONFIG=$PGC install 2>&1 | tail -4
+    echo "=== make ($e) ==="
+    make PG_CONFIG=$PGC >/tmp/make_$e.log 2>&1 || { tail -30 /tmp/make_$e.log; echo "BUILD FAILED ($e)"; exit 1; }
+    tail -6 /tmp/make_$e.log
+    echo "=== make install ($e) ==="
+    make PG_CONFIG=$PGC install >/tmp/install_$e.log 2>&1 || { tail -20 /tmp/install_$e.log; echo "INSTALL FAILED ($e)"; exit 1; }
+    tail -4 /tmp/install_$e.log
   done
   D=/tmp/pg; rm -rf $D; mkdir -p $D
   $B/initdb -A trust -D $D >/dev/null 2>&1

@@ -26,6 +26,10 @@ import statistics
 import time
 from pathlib import Path
 
+# Single-source recall@k semantics (empty truth: 1.0 iff nothing returned) —
+# any local copy is a bug (plan 089; scored empty-oracle+junk as a free 1.0).
+from tools.real_corpus import recall_at_k
+
 TERM_CONDS = [16, 64, 256]
 BUDGETS = [1000, 5000, 20000, 80000]
 K = 10
@@ -71,13 +75,6 @@ def exact_oracle(cur, q: dict) -> list[int]:
         (q["t"], q["x"], q["x"]),
     )
     return [r[0] for r in cur.fetchall()]
-
-
-def recall_at_k(ids: list[int], oracle_ids: list[int]) -> float:
-    o = set(oracle_ids)
-    if not o:
-        return 1.0
-    return len(o & set(ids)) / len(o)
 
 
 def run_point(cur, queries, oracle, tc: int, budget: int) -> dict:

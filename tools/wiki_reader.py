@@ -29,7 +29,9 @@ The corpus files, emb/ files, and baseline docker stack are READ-ONLY here.
 from __future__ import annotations
 
 import argparse
+import hmac
 import html
+import ipaddress
 import math
 from html.parser import HTMLParser
 import json
@@ -87,6 +89,14 @@ ENRICH_SOURCE_CHARS = 900  # per-source text budget (lead + a little body)
 ENRICH_TARGET_CHARS = 2000  # target-article text shown to the model (dedupe context)
 ENRICH_SECTION_MIN = 2  # a section must appear in >= N same-type neighbours to report
 ENRICH_SNIPPET_MIN = 12  # min verbatim-snippet length the grounding gate accepts
+# advisor 081: bounds on the server-side pending-suggestion store. Suggestions
+# emitted by /enrich are held server-side (canonical fields, opaque random id)
+# until the operator accepts or dismisses them BY ID; entries are one-use.
+ENRICH_PENDING_MAX = 200  # max pending suggestions held at once
+ENRICH_PENDING_TTL_S = 1800  # a suggestion must be acted on within 30 min
+# Conservative shape gate applied to canonical fact fields at the mutation
+# boundary (defense in depth — the fields are server-derived, never client-sent).
+_FACT_PROPERTY_RE = re.compile(r"^[\w][\w \-/.,'()&:%]{0,99}$")
 
 # --- Inline auto-linking config --------------------------------------------- #
 # Comprehensive linking is the DEFAULT: every word/phrase that resolves to an
@@ -467,6 +477,94 @@ def cmd_build(corpus: Path) -> None:
 # --------------------------------------------------------------------------- #
 # Serve — shared state loaded once at startup
 # --------------------------------------------------------------------------- #
+class PendingSuggestions:
+    """Server-side canonical store for enrichment suggestions awaiting operator
+    review (advisor 081). Browsers receive only an opaque random id plus
+    display-safe copies of the suggestion; accept/dismiss requests return the id,
+    and every persisted field comes from THIS store — client-supplied fact fields
+    are never trusted. Entries are TTL- and count-bounded and one-use: `claim`
+    atomically takes an entry in-flight (a concurrent claim of the same id gets
+    "replay"), `consume` retires it after a successful write, `release` returns
+    it to claimable if the write failed."""
+
+    def __init__(
+        self,
+        max_entries: int = ENRICH_PENDING_MAX,
+        ttl_s: float = ENRICH_PENDING_TTL_S,
+        clock=time.monotonic,
+    ):
+        self._lock = threading.Lock()
+        # insertion-ordered dict -> deterministic oldest-first eviction
+        self._entries: dict[str, dict] = {}
+        self._inflight: set[str] = set()
+        self.max_entries = max_entries
+        self.ttl_s = ttl_s
+        self._clock = clock
+
+    def _evict_locked(self, now: float) -> None:
+        for k in [
+            k
+            for k, e in self._entries.items()
+            if e["expires"] <= now and k not in self._inflight
+        ]:
+            del self._entries[k]
+        while len(self._entries) >= self.max_entries:
+            victim = next((k for k in self._entries if k not in self._inflight), None)
+            if victim is None:
+                break
+            del self._entries[victim]
+
+    def register(
+        self,
+        subject_id: int,
+        source_id: int,
+        prop: str,
+        value: str,
+        source_title: str,
+        source_snippet: str,
+    ) -> str:
+        """Store a canonical suggestion; returns the opaque one-use id."""
+        sug_id = secrets.token_urlsafe(16)
+        now = self._clock()
+        with self._lock:
+            self._evict_locked(now)
+            self._entries[sug_id] = {
+                "subject_id": int(subject_id),
+                "source_id": int(source_id),
+                "property": str(prop),
+                "value": str(value),
+                "source_title": str(source_title),
+                "source_snippet": str(source_snippet),
+                "expires": now + self.ttl_s,
+            }
+        return sug_id
+
+    def claim(self, sug_id: str, subject_id: int) -> tuple[str, dict | None]:
+        """Atomically take a pending entry in-flight. Returns ("ok", entry copy),
+        ("replay", None) if it is already in-flight, or ("unknown", None) for an
+        unknown/expired/consumed id or a subject mismatch."""
+        now = self._clock()
+        with self._lock:
+            e = self._entries.get(sug_id)
+            if e is not None and sug_id in self._inflight:
+                return "replay", None
+            if e is None or e["expires"] <= now or e["subject_id"] != int(subject_id):
+                return "unknown", None
+            self._inflight.add(sug_id)
+            return "ok", dict(e)
+
+    def consume(self, sug_id: str) -> None:
+        """Retire a claimed entry (one-use: it can never be claimed again)."""
+        with self._lock:
+            self._inflight.discard(sug_id)
+            self._entries.pop(sug_id, None)
+
+    def release(self, sug_id: str) -> None:
+        """Return a claimed entry to claimable (write failed; not consumed)."""
+        with self._lock:
+            self._inflight.discard(sug_id)
+
+
 class Reader:
     def __init__(self, corpus: Path):
         self.corpus = corpus
@@ -554,6 +652,9 @@ class Reader:
         self.overlay = sqlite3.connect(self.overlay_path, check_same_thread=False)
         self.overlay_lock = threading.Lock()
         self._init_overlay()
+        # advisor 081: pending (server-canonical) enrichment suggestions awaiting
+        # operator review — accept/dismiss consult THIS store by opaque id.
+        self.pending = PendingSuggestions()
         print(f"[serve] enrichment overlay: {self.overlay_path}")
         print("[serve] ready.")
 
@@ -1110,8 +1211,17 @@ class Reader:
             with urllib.request.urlopen(req, timeout=LLM_TIMEOUT) as r:
                 resp = json.loads(r.read())
             return resp["message"]["content"].strip()
-        except Exception as e:
-            return f"[LLM unavailable: {e!r}. The hyperlink chain above still holds.]"
+        except Exception:
+            # Same scrub as _llm_answer: detail to the server log, generic body.
+            logging.exception(
+                "wiki_reader llm narration failed (model=%s url=%s)",
+                ASK_MODEL,
+                OLLAMA_URL,
+            )
+            return (
+                "[Narration is temporarily unavailable. "
+                "The hyperlink chain above still holds.]"
+            )
 
     # -- Fused related (meaning x topology) -------------------------------- #
     def related_fused(
@@ -1596,10 +1706,17 @@ class Reader:
             with urllib.request.urlopen(req, timeout=LLM_TIMEOUT) as r:
                 resp = json.loads(r.read())
             return resp["message"]["content"].strip()
-        except Exception as e:  # surface the failure honestly rather than fabricate
+        except Exception:  # surface the failure honestly rather than fabricate
+            # Operator detail (exception, backend URL, model) goes to the server
+            # log only — the public 200-path body must never carry it (plan 092).
+            logging.exception(
+                "wiki_reader llm answer failed (model=%s url=%s)",
+                ASK_MODEL,
+                OLLAMA_URL,
+            )
             return (
-                f"[LLM unavailable: {e!r}. Is ollama serving '{ASK_MODEL}' at "
-                f"{OLLAMA_URL}? The retrieved sources below are still valid.]"
+                "[Answer generation is temporarily unavailable. "
+                "The retrieved sources below are still valid.]"
             )
 
     def _score_by_query(self, qvec: np.ndarray, ids: list[int]) -> dict[int, float]:
@@ -1972,8 +2089,19 @@ class Reader:
             key = (prop.lower(), val.lower())
             if key in dismissed or key in accepted:
                 continue
+            # advisor 081: the canonical suggestion lives server-side under an
+            # opaque one-use id; the browser only ever echoes the id back.
+            sug_id = self.pending.register(
+                subject_id=aid,
+                source_id=sid,
+                prop=prop,
+                value=val,
+                source_title=src["title"],
+                source_snippet=snip,
+            )
             suggestions.append(
                 {
+                    "suggestion_id": sug_id,
                     "property": prop,
                     "value": val,
                     "source_id": sid,
@@ -1990,48 +2118,105 @@ class Reader:
             "n_dropped": dropped,
         }
 
-    def accept_fact(self, d: dict) -> dict:
-        """Persist an accepted suggestion to the overlay (idempotent per subject +
-        property + value). Returns the refreshed accepted-fact list for the subject."""
-        sid = int(d["subject_id"])
-        prop = str(d.get("property", ""))[:300]
-        val = str(d.get("value", ""))[:300]
+    def _claim_pending(self, d: dict) -> tuple[int, dict | None, str, dict | None]:
+        """Shared accept/dismiss request gate (advisor 081): parse subject_id +
+        suggestion_id (the ONLY fields honored), claim the canonical entry.
+        Returns (http_code, error_obj, sug_id, entry); error_obj is None on ok."""
         try:
-            source_id = int(d.get("source_id"))
-        except (TypeError, ValueError):
-            source_id = -1
-        with self.overlay_lock:
-            exists = self.overlay.execute(
-                "SELECT 1 FROM facts WHERE subject_id=? AND lower(property)=? "
-                "AND lower(value)=?",
-                (sid, prop.lower(), val.lower()),
-            ).fetchone()
-            if not exists:
+            sid = int(d["subject_id"])
+            sug_id = str(d["suggestion_id"])
+        except (KeyError, TypeError, ValueError):
+            return 400, {"error": "subject_id and suggestion_id are required"}, "", None
+        status, entry = self.pending.claim(sug_id, sid)
+        if status == "replay":
+            return 409, {"error": "suggestion is already being processed"}, "", None
+        if entry is None:
+            return (
+                400,
+                {"error": "unknown, expired, or mismatched suggestion"},
+                "",
+                None,
+            )
+        return 200, None, sug_id, entry
+
+    def accept_fact(self, d: dict) -> tuple[int, dict]:
+        """Accept a pending suggestion BY ID (advisor 081). The request carries
+        only subject_id + suggestion_id; every persisted field comes from the
+        server-held canonical entry, revalidated against the CURRENT source
+        article (reload + `_snippet_grounded` again) before the write. The id is
+        consumed atomically only after a successful write (one-use). Returns
+        (http_code, response_obj); the write stays idempotent per subject +
+        property + value."""
+        code, err, sug_id, entry = self._claim_pending(d)
+        if err is not None:
+            return code, err
+        sid = entry["subject_id"]
+        prop, val = entry["property"], entry["value"]
+        try:
+            if (
+                not _FACT_PROPERTY_RE.match(prop)
+                or not val
+                or len(val) > 300
+                or any(ord(c) < 32 for c in val)
+            ):
+                self.pending.consume(sug_id)
+                return 400, {"error": "suggestion fields failed validation"}
+            src = self.article(int(entry["source_id"]))
+            if src is None:
+                self.pending.consume(sug_id)
+                return 409, {"error": "source article is no longer available"}
+            # Repeat the anti-hallucination gate against the source text AS IT IS
+            # NOW (same window the extraction saw); a changed source rejects.
+            if not self._snippet_grounded(
+                entry["source_snippet"], src["body"][:ENRICH_SOURCE_CHARS]
+            ):
+                self.pending.consume(sug_id)
+                return 409, {"error": "snippet no longer grounded in current source"}
+            with self.overlay_lock:
+                exists = self.overlay.execute(
+                    "SELECT 1 FROM facts WHERE subject_id=? AND lower(property)=? "
+                    "AND lower(value)=?",
+                    (sid, prop.lower(), val.lower()),
+                ).fetchone()
+                if not exists:
+                    self.overlay.execute(
+                        "INSERT INTO facts VALUES (?,?,?,?,?,?,?)",
+                        (
+                            sid,
+                            prop[:300],
+                            val[:300],
+                            int(entry["source_id"]),
+                            str(src["title"])[:300],  # title derived server-side
+                            entry["source_snippet"][:300],
+                            time.time(),
+                        ),
+                    )
+                    self.overlay.commit()
+        except Exception:
+            self.pending.release(sug_id)  # unexpected failure: id stays usable
+            raise
+        self.pending.consume(sug_id)  # one-use, only after the successful write
+        return 200, {"ok": True, "facts": self.overlay_facts(sid)}
+
+    def dismiss_fact(self, d: dict) -> tuple[int, dict]:
+        """Dismiss a pending suggestion BY ID (advisor 081) so it does not
+        resurface on the next /enrich. The suppressed property/value come from
+        the server-held canonical entry, never from the client."""
+        code, err, sug_id, entry = self._claim_pending(d)
+        if err is not None:
+            return code, err
+        try:
+            with self.overlay_lock:
                 self.overlay.execute(
-                    "INSERT INTO facts VALUES (?,?,?,?,?,?,?)",
-                    (
-                        sid,
-                        prop,
-                        val,
-                        source_id,
-                        str(d.get("source_title", ""))[:300],
-                        str(d.get("source_snippet", ""))[:300],
-                        time.time(),
-                    ),
+                    "INSERT INTO dismissed VALUES (?,?,?)",
+                    (entry["subject_id"], entry["property"], entry["value"]),
                 )
                 self.overlay.commit()
-        return {"ok": True, "facts": self.overlay_facts(sid)}
-
-    def dismiss_fact(self, d: dict) -> dict:
-        """Suppress a suggestion so it does not resurface on the next /enrich."""
-        sid = int(d["subject_id"])
-        with self.overlay_lock:
-            self.overlay.execute(
-                "INSERT INTO dismissed VALUES (?,?,?)",
-                (sid, str(d.get("property", "")), str(d.get("value", ""))),
-            )
-            self.overlay.commit()
-        return {"ok": True}
+        except Exception:
+            self.pending.release(sug_id)
+            raise
+        self.pending.consume(sug_id)
+        return 200, {"ok": True}
 
 
 _HTML_OK = {
@@ -2287,8 +2472,8 @@ LANDING_HTML = """<!doctype html>
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>TriDB Wiki — a tri-modal database, demonstrated on all of Wikipedia</title>
-<meta name="description" content="A private Wikipedia running on TriDB — a vector + graph + relational database in one Postgres process. Search by meaning, traverse the link graph, find the path between any two topics, ask questions. Wikipedia is the demonstration; Wikidata is next." />
+<title>TriDB Wiki — tri-modal search over all of Wikipedia (offline reader demo)</title>
+<meta name="description" content="A private Wikipedia demonstrating TriDB's tri-modal (vector + graph + relational) retrieval model. The full 6.9M-article experience is served by an offline reader (SQLite metadata, NumPy CSR link graph, cuVS CAGRA vectors); the Postgres-native TriDB engine is measured at 200K articles graph-inclusive and 1M vector-only. Wikidata is next." />
 <style>
   :root{
     --ink:#202122; --soft:#54595d; --dim:#72777d; --line:#e4e6eb; --line2:#eef0f2;
@@ -2402,13 +2587,15 @@ LANDING_HTML = """<!doctype html>
   </svg>
 
   <div class="word serif">Tri<b>DB</b> <span style="font-weight:400">Wiki</span></div>
-  <div class="tag serif">A tri-modal database <span class="sep">·</span> demonstrated on all of Wikipedia</div>
+  <div class="tag serif">A tri-modal retrieval demo <span class="sep">·</span> all of Wikipedia, served by an offline reader</div>
 
   <p class="intro">
-    A <b>private Wikipedia</b> running on TriDB — a database that fuses <b>vector similarity</b>,
-    <b>graph traversal</b>, and <b>relational filters</b> inside one Postgres process, under one
-    write-ahead log. Search by meaning, walk the link graph, find the path between any two topics,
-    ask questions — in a single early-terminating query.
+    A <b>private Wikipedia</b> demonstrating TriDB's tri-modal model — <b>vector similarity</b>,
+    <b>graph traversal</b>, and <b>relational filters</b> in one query. This full-corpus demo is
+    served by an offline reader (SQLite metadata, NumPy CSR link graph, cuVS CAGRA vectors); the
+    Postgres-native TriDB engine — one process, one write-ahead log — is measured at 200K articles
+    graph-inclusive and 1M vector-only. Search by meaning, walk the link graph, find the path
+    between any two topics, ask questions.
   </p>
 
   <form class="search" action="/read" method="get" role="search">
@@ -2427,7 +2614,7 @@ LANDING_HTML = """<!doctype html>
 <!-- WHY WIKI -->
 <section>
   <div class="wrap">
-    <h2><span class="k">Why Wikipedia is the demonstration</span>The perfect tri-modal proving ground.</h2>
+    <h2><span class="k">Why Wikipedia is the demo corpus</span>The perfect tri-modal proving ground.</h2>
     <p class="lead">
       A database that unifies similarity, traversal, and filter needs data that is all three at once.
       Wikipedia is exactly that — and at a scale that makes the fusion matter.
@@ -2436,12 +2623,14 @@ LANDING_HTML = """<!doctype html>
       <div class="c"><h3><i class="sw" style="background:var(--v)"></i>Meaning</h3>
         <p>Every article is text — an embedding. "Find articles like this one," not just string matches.</p></div>
       <div class="c"><h3><i class="sw" style="background:var(--g)"></i>Links</h3>
-        <p>~6.9M articles woven by hundreds of millions of hyperlinks — a native graph to traverse and path-find.</p></div>
+        <p>~6.9M articles woven by hundreds of millions of hyperlinks — a link graph to traverse and path-find (a NumPy CSR adjacency in this reader).</p></div>
       <div class="c"><h3><i class="sw" style="background:var(--r)"></i>Structure</h3>
         <p>Infobox facts, categories, lengths, in-degree — relational predicates to filter and rank by.</p></div>
     </div>
     <div class="note">
-      Wikipedia proves the fusion at <b>6.9M articles</b>. The next proving ground is <b>Wikidata</b> —
+      Wikipedia exercises the fusion at <b>6.9M articles</b> in this offline reader; the native
+      engine's largest graph-inclusive measurement is 200K articles (vector leg: 1M). The next
+      proving ground is <b>Wikidata</b> —
       ~110M entities joined by ~1.5B <em>typed</em> statements, ~16&times; larger, and edited millions of
       times a day (a live consistency workload). <a href="https://github.com/ConsultingFuture4200/tridb">See the roadmap &#8599;</a>
     </div>
@@ -2461,26 +2650,27 @@ LANDING_HTML = """<!doctype html>
         <thead><tr>
           <th>Capability</th>
           <th>Official Wikipedia</th>
-          <th class="tri"><span class="badge"></span>TriDB Wiki</th>
+          <th class="tri"><span class="badge"></span>TriDB Wiki (offline reader)</th>
         </tr></thead>
         <tbody>
           <tr><td>Article page delivery</td><td class="dim">Global CDN — needs a network round-trip</td><td class="win">Local / offline — <b>zero network RTT</b> on the host</td></tr>
           <tr><td>Search</td><td class="dim">Keyword full-text (Elasticsearch)</td><td class="win">Full-text <b>+ semantic vector similarity</b></td></tr>
           <tr><td>Related articles</td><td class="dim">"What links here" — raw link list</td><td class="win">Fused <b>vector + graph</b>, relevance-ranked, early-terminating</td></tr>
-          <tr><td>Path between two topics</td><td class="no">Not built in</td><td class="win"><span class="yes">Native shortest-path</span> ("Connect")</td></tr>
+          <tr><td>Path between two topics</td><td class="no">Not built in</td><td class="win"><span class="yes">Shortest-path</span> ("Connect") — BFS over the reader's NumPy CSR adjacency</td></tr>
           <tr><td>Ask a question (RAG)</td><td class="no">Not available</td><td class="win"><span class="yes">Graph-aware RAG</span> over the articles</td></tr>
           <tr><td>Structured filters</td><td class="no">Not in the reader</td><td class="win">Relational predicates — in-degree, length, category</td></tr>
-          <tr><td>Cross-modal update consistency</td><td class="dim">n/a (single modality)</td><td class="win">One WAL, atomic — <b>0 torn vs 42</b> across a 3-store stack</td></tr>
+          <tr><td>Cross-modal update consistency</td><td class="dim">n/a (single modality)</td><td class="win">One WAL, atomic — <b>0 torn vs 42</b> across a 3-store stack (native engine measurement)</td></tr>
           <tr><td>Private &amp; offline</td><td class="no">Public, online only</td><td class="win"><span class="yes">Self-hosted</span>, private, fully offline</td></tr>
-          <tr><td>Scale demonstrated</td><td class="dim">~6.9M (English)</td><td class="win">6.9M today &rarr; <b>Wikidata 110M</b> next</td></tr>
+          <tr><td>Scale demonstrated</td><td class="dim">~6.9M (English)</td><td class="win">Reader: 6.9M today &rarr; <b>Wikidata 110M</b> next &middot; native engine: 200K graph-inclusive, 1M vector</td></tr>
         </tbody>
       </table>
     </div>
     <div class="note">
       <b>On raw speed:</b> we don't claim to out-serve Wikipedia's cached HTML. Where TriDB wins is the
-      <em>knowledge</em> query — semantic related, multi-hop paths, fused RAG — which the fused operator
-      returns while examining as little as <b>~0.71%</b> of the corpus. A real page-load and search
-      head-to-head will be <em>measured</em> and posted here, not asserted.
+      <em>knowledge</em> query — semantic related, multi-hop paths, fused RAG. On the
+      1,490-paragraph HotpotQA host reference corpus (not this wiki), the streaming fused operator
+      matched a blocking oracle's recall while examining <b>~0.71%</b> of that corpus. A real
+      page-load and search head-to-head will be <em>measured</em> and posted here, not asserted.
     </div>
     <div class="trylive">
       <a class="trybtn" href="/read?cmp=early+mechanical+computers">&#9878;&nbsp; Try it live — Compare keyword vs tri-modal search &rarr;</a>
@@ -2492,11 +2682,11 @@ LANDING_HTML = """<!doctype html>
 <!-- EVIDENCE -->
 <section>
   <div class="wrap">
-    <h2><span class="k">Measured, not asserted</span>The engine underneath, in numbers.</h2>
+    <h2><span class="k">Measured, not asserted</span>The native engine, in numbers — each at its measured scale.</h2>
     <div class="stats">
-      <div class="stat"><div class="n">0 <small>vs 42</small></div><div class="l">Torn cross-modal writes under injected failure — one transaction vs three independent stores.</div></div>
+      <div class="stat"><div class="n">0 <small>vs 42</small></div><div class="l">Torn cross-modal writes under injected failure — one transaction vs three independent stores (native engine).</div></div>
       <div class="stat"><div class="n">+15.6 <small>pts</small></div><div class="l">Multi-hop joint recall@5 when the graph leg injects source-anchored context into retrieval (HotpotQA).</div></div>
-      <div class="stat"><div class="n">~0.71<small>%</small></div><div class="l">Share of the corpus examined while the streaming fused operator beat a full blocking oracle on recall.</div></div>
+      <div class="stat"><div class="n">~0.71<small>%</small></div><div class="l">Share of the 1,490-paragraph HotpotQA host reference corpus examined while the streaming fused operator beat a full blocking oracle on recall.</div></div>
     </div>
   </div>
 </section>
@@ -2509,7 +2699,7 @@ LANDING_HTML = """<!doctype html>
       <a href="#">Architecture</a>
       <a href="#">Why Wikidata</a>
     </div>
-    <div>TriDB — vector, graph, and relational retrieval fused in one Postgres process, under one write-ahead log. Wikipedia is the demonstration.</div>
+    <div>TriDB — vector, graph, and relational retrieval fused in one Postgres process, under one write-ahead log. This wiki is the offline-reader demonstration; engine results are reported at their measured scales.</div>
   </div>
 </footer>
 
@@ -2802,7 +2992,21 @@ p { line-height:1.6; }
 <div id="hovercard"></div>
 <script>
 const $ = s => document.querySelector(s);
-function wrToken(){ const m = document.querySelector('meta[name="wr-token"]'); return m ? m.content : ''; }
+// Loopback serves embed an ephemeral session token in the meta tag; remote
+// serves leave it EMPTY and the operator is prompted once per tab. The value
+// lives only in sessionStorage and travels only in the X-TriDB-Token header —
+// never in a URL, never rendered by the server.
+function wrToken(){
+  const m = document.querySelector('meta[name="wr-token"]');
+  if(m && m.content) return m.content;
+  let t = sessionStorage.getItem('wr-op-token') || '';
+  if(!t){
+    t = (prompt('Operator token (remote mode — mutations require it):') || '').trim();
+    if(t) sessionStorage.setItem('wr-op-token', t);
+  }
+  return t;
+}
+function wrAuthFailed(){ sessionStorage.removeItem('wr-op-token'); }
 async function j(u){ const r = await fetch(u); return r.json(); }
 function esc(s){ const d=document.createElement('div'); d.textContent=s; return d.innerHTML; }
 // score is cosine similarity (0..1, higher = more related).
@@ -2953,24 +3157,31 @@ async function findEnrich(id){
     (r.n_dropped ? (' · '+r.n_dropped+' unsourced dropped') : '');
   box.innerHTML = renderSuggestions(id, r);
 }
+// Accept/dismiss send ONLY subject_id + suggestion_id — the canonical fact
+// fields live server-side and are revalidated (re-grounded) at acceptance.
 async function acceptEnrich(id, i){
   const f = _enrichData[i]; if(!f) return;
-  const payload = { subject_id:id, property:f.property, value:f.value,
-    source_id:f.source_id, source_title:f.source_title, source_snippet:f.source_snippet };
-  let r;
-  try { r = await (await fetch('/enrich/accept', { method:'POST',
-    headers:{'Content-Type':'application/json', 'X-TriDB-Token':wrToken()},
-    body:JSON.stringify(payload) })).json(); }
-  catch(e){ return; }
+  let res, r;
+  try {
+    res = await fetch('/enrich/accept', { method:'POST',
+      headers:{'Content-Type':'application/json', 'X-TriDB-Token':wrToken()},
+      body:JSON.stringify({ subject_id:id, suggestion_id:f.suggestion_id }) });
+    if(res.status===403){ wrAuthFailed(); $('#enrichmsg').textContent='operator token rejected'; return; }
+    r = await res.json();
+  } catch(e){ return; }
+  if(!res.ok){ $('#enrichmsg').textContent = (r && r.error) || 'accept failed'; return; }
   const row = $('#sug'+i); if(row) row.style.display = 'none';
   if(r.facts) $('#enrichaccepted').innerHTML = renderEnrichments(r.facts);
 }
 async function dismissEnrich(id, i){
   const f = _enrichData[i]; if(!f) return;
-  try { await fetch('/enrich/dismiss', { method:'POST',
-    headers:{'Content-Type':'application/json', 'X-TriDB-Token':wrToken()},
-    body:JSON.stringify({ subject_id:id, property:f.property, value:f.value }) }); }
-  catch(e){ return; }
+  let res;
+  try {
+    res = await fetch('/enrich/dismiss', { method:'POST',
+      headers:{'Content-Type':'application/json', 'X-TriDB-Token':wrToken()},
+      body:JSON.stringify({ subject_id:id, suggestion_id:f.suggestion_id }) });
+    if(res.status===403){ wrAuthFailed(); $('#enrichmsg').textContent='operator token rejected'; return; }
+  } catch(e){ return; }
   const row = $('#sug'+i); if(row) row.style.display = 'none';
 }
 async function loadRelated(id){
@@ -3434,9 +3645,58 @@ MAX_BODY_BYTES = (
 )  # cap mutating POST bodies (accept/dismiss payloads are small)
 
 
+def is_loopback_host(host: str) -> bool:
+    """True iff `host` is a loopback bind ("localhost", 127.0.0.0/8, or ::1) —
+    the explicit bind-mode predicate (advisor 081)."""
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+MIN_OPERATOR_TOKEN_CHARS = 16
+
+
+def resolve_operator_token(host: str, environ=None) -> tuple[str, bool]:
+    """Resolve the mutation credential for a bind (advisor 081). Returns
+    (token, generated).
+
+    Loopback: `WIKI_READER_OPERATOR_TOKEN` if set, else an ephemeral per-process
+    session token (generated=True). A generated token may be embedded in the
+    served page — acceptable ONLY on loopback, where anyone who can load the
+    page is the local operator.
+
+    Non-loopback: `WIKI_READER_OPERATOR_TOKEN` is REQUIRED (provisioned out of
+    band) and must be at least MIN_OPERATOR_TOKEN_CHARS characters; raises
+    ValueError otherwise. A remote operator token is never rendered into HTML,
+    printed, logged, or placed in a URL."""
+    env = os.environ if environ is None else environ
+    configured = (env.get("WIKI_READER_OPERATOR_TOKEN") or "").strip()
+    if is_loopback_host(host):
+        if configured:
+            return configured, False
+        return secrets.token_urlsafe(24), True
+    if not configured:
+        raise ValueError(
+            "non-loopback bind requires WIKI_READER_OPERATOR_TOKEN in the "
+            "environment (remote mutation credential — see "
+            "docs/offline_wiki_reader_v0.1.0.md)"
+        )
+    if len(configured) < MIN_OPERATOR_TOKEN_CHARS:
+        raise ValueError(
+            f"WIKI_READER_OPERATOR_TOKEN is too short "
+            f"(< {MIN_OPERATOR_TOKEN_CHARS} chars) for a non-loopback bind"
+        )
+    return configured, False
+
+
 def check_token(headers, expected: str) -> bool:
     """True iff `headers` (dict-like, `.get(name, default)`) carries `expected` via
-    the `X-TriDB-Token` header or an `Authorization: Bearer <token>` header."""
+    the `X-TriDB-Token` header or an `Authorization: Bearer <token>` header.
+    Comparison is constant-time (hmac.compare_digest), so the token cannot be
+    recovered by response timing."""
     if not expected:
         return False
     supplied = headers.get("X-TriDB-Token", "") or ""
@@ -3444,7 +3704,21 @@ def check_token(headers, expected: str) -> bool:
         auth = headers.get("Authorization", "") or ""
         if auth.startswith("Bearer "):
             supplied = auth[len("Bearer ") :]
-    return supplied == expected
+    if not supplied:
+        return False
+    return hmac.compare_digest(supplied.encode("utf-8"), expected.encode("utf-8"))
+
+
+def render_index_html(token: str, embed_token: bool) -> str:
+    """The /read page. The mutation token is embedded ONLY when `embed_token`
+    (loopback ephemeral-session mode); a remote operator credential must never
+    appear in any served HTML — remote browsers prompt the operator instead."""
+    if not embed_token:
+        return INDEX_HTML
+    return INDEX_HTML.replace(
+        '<meta name="wr-token" content="">',
+        f'<meta name="wr-token" content="{html.escape(token)}">',
+    )
 
 
 def parse_body(raw: bytes, max_len: int = MAX_BODY_BYTES) -> dict:
@@ -3456,11 +3730,83 @@ def parse_body(raw: bytes, max_len: int = MAX_BODY_BYTES) -> dict:
     return json.loads(raw or b"{}")
 
 
-def make_handler(reader: Reader, token: str):
-    index_html = INDEX_HTML.replace(
-        '<meta name="wr-token" content="">',
-        f'<meta name="wr-token" content="{html.escape(token)}">',
-    )
+# --- Public GET request bounds (advisor 082) --------------------------------- #
+# The server is unbounded-threaded and public; _LLM_SLOTS caps LLM *parallelism*
+# but nothing capped *per-request* work. These bounds are enforced at the HTTP
+# boundary BEFORE any reader method runs or an LLM slot is acquired. Explicit
+# out-of-range/malformed values are rejected with 400 — never silently coerced.
+MAX_QUERY_CHARS = 512  # /search, /ask, semantic/tri-modal q, /path from/to
+MAX_CAT_CHARS = 128  # category-contains filter
+MAX_HOPS = 2  # /ask graph expansion depth (default 1)
+MAX_POOL = 1000  # /search_semantic vector pool (default 150)
+MAX_SEED = 200  # /search_trimodal vector seeds (default 40)
+MAX_FILTER_INT = 10_000_000  # min_indeg / min_len / max_len (default 0)
+
+
+class RequestValidationError(Exception):
+    """A client-supplied GET parameter is malformed or out of range.
+
+    The message is safe to return verbatim (names the parameter and the accepted
+    range; never echoes the supplied value)."""
+
+
+def _one_value(qs: dict, name: str) -> str | None:
+    """The single supplied value for `name`, or None when omitted/blank.
+
+    parse_qs drops blank values, so a bare `name=` reads as omitted — same as
+    the pre-082 handlers. Duplicate values are ambiguous: rejected."""
+    vals = qs.get(name)
+    if not vals:
+        return None
+    if len(vals) != 1:
+        raise RequestValidationError(f"{name}: expected at most one value")
+    return vals[0]
+
+
+def parse_int_param(qs: dict, name: str, default: int, lo: int, hi: int) -> int:
+    """Strict bounded integer: omitted -> default, malformed/out-of-range -> 400."""
+    raw = _one_value(qs, name)
+    if raw is None:
+        return default
+    try:
+        val = int(raw)
+    except ValueError:
+        raise RequestValidationError(f"{name}: expected an integer") from None
+    if not lo <= val <= hi:
+        raise RequestValidationError(f"{name}: expected an integer in {lo}..{hi}")
+    return val
+
+
+def parse_bool_param(qs: dict, name: str, default: bool) -> bool:
+    """Strict 0/1 flag: omitted -> default, anything else -> 400."""
+    raw = _one_value(qs, name)
+    if raw is None:
+        return default
+    if raw == "0":
+        return False
+    if raw == "1":
+        return True
+    raise RequestValidationError(f"{name}: expected 0 or 1")
+
+
+def parse_text_param(qs: dict, name: str, max_chars: int) -> str:
+    """Bounded text (Unicode code points): omitted -> empty, overlong -> 400."""
+    raw = _one_value(qs, name)
+    if raw is None:
+        return ""
+    if len(raw) > max_chars:
+        raise RequestValidationError(f"{name}: exceeds {max_chars} characters")
+    return raw
+
+
+def check_len_range(min_len: int, max_len: int) -> None:
+    """`max_len=0` means "no upper bound"; otherwise the range must be sane."""
+    if 0 < max_len < min_len:
+        raise RequestValidationError("min_len: must not exceed max_len")
+
+
+def make_handler(reader: Reader, token: str, embed_token: bool = False):
+    index_html = render_index_html(token, embed_token)
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *a):  # quiet
@@ -3491,8 +3837,8 @@ def make_handler(reader: Reader, token: str):
             self.end_headers()
             self.wfile.write(body)
 
-        def _json(self, obj) -> None:
-            self._send(200, json.dumps(obj).encode("utf-8"), "application/json")
+        def _json(self, obj, code: int = 200) -> None:
+            self._send(code, json.dumps(obj).encode("utf-8"), "application/json")
 
         def do_GET(self):
             u = urlparse(self.path)
@@ -3510,16 +3856,15 @@ def make_handler(reader: Reader, token: str):
                     r = reader.random_article()
                     self._json(r if r is not None else {"error": "no articles"})
                 elif path == "/search":
-                    q = parse_qs(u.query).get("q", [""])[0]
+                    q = parse_text_param(parse_qs(u.query), "q", MAX_QUERY_CHARS)
                     self._json(reader.search(q))
                 elif path == "/ask":
                     qs = parse_qs(u.query)
-                    q = qs.get("q", [""])[0]
-                    expand = qs.get("expand", ["1"])[0] != "0"
-                    try:
-                        hops = int(qs.get("hops", ["1"])[0] or "1")
-                    except ValueError:
-                        hops = 1
+                    q = parse_text_param(qs, "q", MAX_QUERY_CHARS)
+                    if not q:
+                        raise RequestValidationError("q: required")
+                    expand = parse_bool_param(qs, "expand", True)
+                    hops = parse_int_param(qs, "hops", 1, 0, MAX_HOPS)
                     if not _LLM_SLOTS.acquire(blocking=False):
                         self._send(429, b"busy", "text/plain")
                         return
@@ -3529,41 +3874,42 @@ def make_handler(reader: Reader, token: str):
                         _LLM_SLOTS.release()
                 elif path == "/search_semantic":
                     qs = parse_qs(u.query)
-
-                    def _int(name: str) -> int:
-                        try:
-                            return int(qs.get(name, ["0"])[0] or "0")
-                        except ValueError:
-                            return 0
-
+                    q = parse_text_param(qs, "q", MAX_QUERY_CHARS)
+                    pool = parse_int_param(qs, "pool", 150, 1, MAX_POOL)
+                    min_indeg = parse_int_param(qs, "min_indeg", 0, 0, MAX_FILTER_INT)
+                    min_len = parse_int_param(qs, "min_len", 0, 0, MAX_FILTER_INT)
+                    max_len = parse_int_param(qs, "max_len", 0, 0, MAX_FILTER_INT)
+                    check_len_range(min_len, max_len)
+                    cat = parse_text_param(qs, "cat", MAX_CAT_CHARS).strip()
                     self._json(
                         reader.search_semantic(
-                            qs.get("q", [""])[0],
-                            pool=_int("pool") or 150,
-                            min_indeg=_int("min_indeg"),
-                            min_len=_int("min_len"),
-                            max_len=_int("max_len"),
-                            cat=qs.get("cat", [""])[0].strip(),
+                            q,
+                            pool=pool,
+                            min_indeg=min_indeg,
+                            min_len=min_len,
+                            max_len=max_len,
+                            cat=cat,
                         )
                     )
                 elif path == "/search_trimodal":
                     qs = parse_qs(u.query)
-
-                    def _ti(name: str, dv: int = 0) -> int:
-                        try:
-                            return int(qs.get(name, [str(dv)])[0] or dv)
-                        except ValueError:
-                            return dv
-
+                    q = parse_text_param(qs, "q", MAX_QUERY_CHARS)
+                    seed = parse_int_param(qs, "seed", 40, 1, MAX_SEED)
+                    expand = parse_bool_param(qs, "expand", True)
+                    min_indeg = parse_int_param(qs, "min_indeg", 0, 0, MAX_FILTER_INT)
+                    min_len = parse_int_param(qs, "min_len", 0, 0, MAX_FILTER_INT)
+                    max_len = parse_int_param(qs, "max_len", 0, 0, MAX_FILTER_INT)
+                    check_len_range(min_len, max_len)
+                    cat = parse_text_param(qs, "cat", MAX_CAT_CHARS).strip()
                     self._json(
                         reader.search_trimodal(
-                            qs.get("q", [""])[0],
-                            seed=_ti("seed", 40) or 40,
-                            expand=qs.get("expand", ["1"])[0] != "0",
-                            min_indeg=_ti("min_indeg"),
-                            min_len=_ti("min_len"),
-                            max_len=_ti("max_len"),
-                            cat=qs.get("cat", [""])[0].strip(),
+                            q,
+                            seed=seed,
+                            expand=expand,
+                            min_indeg=min_indeg,
+                            min_len=min_len,
+                            max_len=max_len,
+                            cat=cat,
                         )
                     )
                 elif path.startswith("/article/"):
@@ -3612,8 +3958,11 @@ def make_handler(reader: Reader, token: str):
                     self._json(reader.related_fused(aid))
                 elif path == "/path":
                     qs = parse_qs(u.query)
-                    frm = reader.resolve(qs.get("from", [""])[0])
-                    to = reader.resolve(qs.get("to", [""])[0])
+                    frm_label = parse_text_param(qs, "from", MAX_QUERY_CHARS)
+                    to_label = parse_text_param(qs, "to", MAX_QUERY_CHARS)
+                    narrate = parse_bool_param(qs, "narrate", False)
+                    frm = reader.resolve(frm_label)
+                    to = reader.resolve(to_label)
                     if frm is None or to is None:
                         self._json(
                             {
@@ -3625,7 +3974,7 @@ def make_handler(reader: Reader, token: str):
                         )
                     else:
                         res = reader.path(frm["id"], to["id"])
-                        if res.get("found") and qs.get("narrate", ["0"])[0] == "1":
+                        if res.get("found") and narrate:
                             if not _LLM_SLOTS.acquire(blocking=False):
                                 self._send(429, b"busy", "text/plain")
                                 return
@@ -3636,6 +3985,9 @@ def make_handler(reader: Reader, token: str):
                         self._json(res)
                 else:
                     self._send(404, b"not found", "text/plain")
+            except RequestValidationError as e:
+                # client error, message is safe by construction — no traceback
+                self._send(400, str(e).encode("utf-8"), "text/plain")
             except Exception:  # never take the server down on one bad request
                 logging.exception("wiki_reader request failed")
                 self._send(500, b"internal error", "text/plain")
@@ -3656,12 +4008,14 @@ def make_handler(reader: Reader, token: str):
                 if u.path in ("/enrich/accept", "/enrich/dismiss") and not check_token(
                     self.headers, token
                 ):
-                    self._send(401, b"unauthorized", "text/plain")
+                    self._send(403, b"forbidden", "text/plain")
                     return
                 if u.path == "/enrich/accept":
-                    self._json(reader.accept_fact(body))
+                    code, obj = reader.accept_fact(body)
+                    self._json(obj, code)
                 elif u.path == "/enrich/dismiss":
-                    self._json(reader.dismiss_fact(body))
+                    code, obj = reader.dismiss_fact(body)
+                    self._json(obj, code)
                 else:
                     self._send(404, b"not found", "text/plain")
             except Exception:
@@ -3672,11 +4026,19 @@ def make_handler(reader: Reader, token: str):
 
 
 def cmd_serve(corpus: Path, host: str, port: int) -> None:
+    try:
+        token, generated = resolve_operator_token(host)
+    except ValueError as e:
+        raise SystemExit(f"[serve] {e}") from e
     reader = Reader(corpus)
-    token = os.environ.get("WIKI_READER_TOKEN") or secrets.token_urlsafe(24)
-    if not os.environ.get("WIKI_READER_TOKEN"):
-        print(f"[serve] auth token (mutating POSTs): {token}")
-    httpd = ThreadingHTTPServer((host, port), make_handler(reader, token))
+    if generated:
+        # Loopback single-user ergonomics ONLY: the ephemeral session token is
+        # printed and embedded in the page. A CONFIGURED operator token is never
+        # printed, logged, or rendered — remote browsers prompt for it instead.
+        print(f"[serve] loopback session token (mutating POSTs): {token}")
+    httpd = ThreadingHTTPServer(
+        (host, port), make_handler(reader, token, embed_token=generated)
+    )
     print(f"[serve] listening on http://{host}:{port}  (Ctrl-C to stop)")
     try:
         httpd.serve_forever()
@@ -3717,7 +4079,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if (
         args.cmd == "serve"
-        and args.host not in ("127.0.0.1", "::1", "localhost")
+        and not is_loopback_host(args.host)
         and not args.allow_remote
     ):
         ap.error(

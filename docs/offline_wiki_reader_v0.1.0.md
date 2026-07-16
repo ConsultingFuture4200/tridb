@@ -770,3 +770,106 @@ common case (loopback, no token to type):
 - Set `WIKI_READER_TOKEN` yourself if you want a stable token across restarts
   (e.g. to avoid re-copying it after every `nohup` relaunch); do not commit a token
   value into the repo.
+
+# Addendum v10 — public claim provenance (advisor 080)
+
+The landing page (`site/index.html` + the identical `LANDING_HTML` embedded in
+`tools/wiki_reader.py`) mixes two execution layers: the **offline reader** (this
+tool: SQLite metadata + NumPy CSR adjacency + cuVS CAGRA vectors, host-side)
+and the **Postgres-native TriDB engine** (measured elsewhere, at smaller
+scales). Every public metric must carry corpus + engine + evidence labels:
+
+| Public claim | Corpus | Execution engine | Evidence |
+|---|---|---|---|
+| 6.9M-article search / related / shortest-path ("Connect") | enwiki 6.9M | Offline reader (SQLite / NumPy CSR / cuVS CAGRA) | this doc |
+| Graph-inclusive fused query (`tjs_open`, reconciled) | 200,000 articles | Native TriDB engine (Postgres) | `docs/benchmark_wiki_scale_h2h_v0.2.0.md` |
+| Vector leg (HNSW durable) | 1,000,000 articles | Native TriDB engine (Postgres) | `docs/benchmark_wiki_scale_h2h_v0.2.0.md` |
+| ~0.71% of corpus examined vs blocking oracle | 1,490-paragraph HotpotQA host reference | Host reference implementation (`bench/tjs_open_ref.py`) | `docs/benchmark_tjs_open_ref_v0.1.0.md` |
+| 0 vs 42 torn cross-modal writes | consistency workload | Native TriDB engine (one WAL) vs 3-store stack | consistency bench (DEV-1354 track) |
+| +15.6 pt multi-hop joint recall@5 | HotpotQA | GraphRAG bench (graph-leg context injection) | plan 015 report |
+
+A full 6.9M **native** graph-inclusive run has **not** been performed; do not
+attribute reader-side full-corpus behavior to the native engine. Guardrails are
+enforced by `tests/test_wiki_reader_claims.py` (prohibited pairings, required
+provenance phrases, and standalone/embedded copy parity). Future public metrics
+get all three labels at authoring time.
+
+# Addendum v11 — operator auth & suggestion integrity (advisor 081)
+
+Supersedes the mutation-auth paragraphs of the earlier auth addendum (the
+`WIKI_READER_TOKEN` env var, the `401` response, and the always-embedded
+`<meta name="wr-token">` behavior described there are replaced by the rules
+below).
+
+**Bind modes.** The serve mode is now explicit (`is_loopback_host`):
+
+- **Loopback** (`localhost`, `127.0.0.0/8`, `::1`, the default): if
+  `WIKI_READER_OPERATOR_TOKEN` is unset, an **ephemeral per-process session
+  token** is generated, printed once at startup, and embedded in the served
+  `/read` page (`<meta name="wr-token">`). This is a single-user local-only
+  ergonomic: anyone who can load a loopback page is the local operator, so the
+  embedded token adds no exposure. It rotates on every restart.
+- **Non-loopback** (`--allow-remote`): startup **fails with a clear error**
+  unless `WIKI_READER_OPERATOR_TOKEN` is set in the environment and is at least
+  16 characters. A configured operator token is **never** rendered into HTML,
+  printed, logged, or placed in a URL — the meta tag stays empty, and the
+  browser prompts the operator on the first mutation attempt, keeping the value
+  in `sessionStorage` (per-tab, non-persistent) and sending it only in the
+  `X-TriDB-Token` header (or `Authorization: Bearer`). A `403` clears the
+  stored value so the operator is re-prompted. Comparison server-side is
+  constant-time (`hmac.compare_digest`). Wrong/missing tokens get `403`.
+  Rotation = restart the serve with a new env value; old tokens die with the
+  process.
+
+**Suggestion integrity (accept/dismiss by id).** `/enrich` no longer trusts
+the browser to return fact fields. Each surviving suggestion is registered in
+a thread-safe server-side pending store (`PendingSuggestions`) under a
+cryptographically random opaque `suggestion_id`, holding the canonical
+subject/source ids, property, value, source title, and grounded snippet. The
+store is bounded (200 entries, deterministic oldest-first eviction) and
+TTL-bound (30 min). `POST /enrich/accept` and `/enrich/dismiss` carry **only**
+`subject_id` + `suggestion_id`; any client-sent fact fields are ignored.
+Acceptance reloads the source article, re-derives the source title
+server-side, re-runs the `_snippet_grounded` anti-hallucination gate against
+the source text as it is *now*, and validates field shape — then persists and
+consumes the id atomically (one-use; concurrent accepts race to a single
+winner, the loser gets `409`). Unknown/expired/mismatched/replayed ids get
+`400`; altered-source or ungrounded entries get `409` and are consumed.
+Pending suggestions are ephemeral: a restart clears them (re-run "Find
+enrichments").
+
+**Scope.** This remains **single-operator authorization, not identity** — one
+shared credential gates mutations; there are no user accounts, sessions, or
+audit trails. Any future multi-user deployment needs a real per-user
+auth/audit design.
+
+# Addendum v12 — public GET request work bounds (advisor 082)
+
+The reader is public and unbounded-threaded; `_LLM_SLOTS` caps LLM
+*parallelism* but nothing capped *per-request* work — a single crafted GET
+(`hops=999999`, `pool=999999`, `seed=999999`, or a megabyte query string)
+could amplify CPU/memory/graph/LLM cost far beyond UI defaults. All GET work
+parameters are now validated at the HTTP boundary, **before** any reader
+method runs or an LLM slot is acquired (named constants + strict parsers in
+`tools/wiki_reader.py`):
+
+| Parameter | Accepted | Default when omitted |
+|---|---|---|
+| `q` (`/search`, `/ask`, `/search_semantic`, `/search_trimodal`), `from`/`to` (`/path`) | 0–512 Unicode code points (`/ask` requires nonempty) | route-specific |
+| `hops` (`/ask`) | integer 0–2 | 1 |
+| `pool` (`/search_semantic`) | integer 1–1000 | 150 |
+| `seed` (`/search_trimodal`) | integer 1–200 | 40 |
+| `min_indeg`, `min_len`, `max_len` | integer 0–10,000,000 | 0 |
+| `cat` | 0–128 Unicode code points | empty |
+| `expand`, `narrate` | `0` or `1` only | `expand=1`, `narrate=0` |
+
+`min_len <= max_len` is required whenever `max_len > 0` (`max_len=0` means
+"no upper bound"). An explicitly supplied malformed, duplicated, or
+out-of-range value gets **`400`** with a plain-text message naming the
+parameter and its accepted range — it is **never silently coerced** to a
+default (the pre-082 handlers quietly turned `hops=abc` into 1 and passed
+`min_indeg=-5` through). Omitted parameters keep their defaults, so the
+served UI — which stays within every limit — is unaffected. New public
+routes must declare per-request text/cardinality/depth bounds the same way
+and test that invalid input does no work; concurrency ceilings do not
+replace per-request cost limits.

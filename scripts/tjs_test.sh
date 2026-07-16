@@ -24,9 +24,15 @@ docker run --rm --entrypoint bash \
   B=/u01/app/postgres/product/13.4/bin
   PGC=$B/pg_config
   # PGXS build of the graph_store extension (mount is read-only, so build in a writable copy).
+  # Fail LOUD on a build error: piping make to `tail` previously masked the nonzero
+  # exit (no pipefail in this inner shell), so a broken build looked green.
   cp -r /tmp/ext /tmp/build && cd /tmp/build
-  echo "=== make graph_store ==="; make PG_CONFIG=$PGC 2>&1 | tail -6
-  echo "=== make install ==="; make PG_CONFIG=$PGC install 2>&1 | tail -4
+  echo "=== make graph_store ==="
+  make PG_CONFIG=$PGC >/tmp/make.log 2>&1 || { tail -30 /tmp/make.log; echo "BUILD FAILED"; exit 1; }
+  tail -6 /tmp/make.log
+  echo "=== make install ==="
+  make PG_CONFIG=$PGC install >/tmp/install.log 2>&1 || { tail -20 /tmp/install.log; echo "INSTALL FAILED"; exit 1; }
+  tail -4 /tmp/install.log
   D=/tmp/pg; rm -rf $D; mkdir -p $D
   $B/initdb -A trust -D $D >/dev/null 2>&1
   $B/pg_ctl -D $D -o "-p 5432" -w start >/dev/null 2>&1

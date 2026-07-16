@@ -4,13 +4,18 @@
 #
 # >>> GX10 / ENGINE-GATED — UNBUILT-HERE. <<<
 # This script drives the canonical tjs() graph-constrained retrieval on the LIVE
-# tridb/msvbase:dev engine over the HotpotQA corpus, then grades the SAME accuracy
-# (evidence recall + answer EM/F1) the host-side report computes — proving the live
-# engine returns the same retrieval the host oracle does — PLUS the live latency
-# (EXPLAIN ANALYZE + tjs_candidates_examined) at the operating term_cond, vs the
-# live multi-store baseline. The full retrieve-from-all-Wikipedia fullwiki corpus
-# (~5M paragraphs) is embedded + HNSW-built ON THE GX10 (128 GB); the x86 standin
-# runs the dev slice only and must NOT claim the full-corpus or live-latency number.
+# tridb/msvbase:dev engine over the HotpotQA corpus, then STRICTLY grades that
+# live output (bench/graphrag_live_report.py): every manifest qid must produce a
+# well-formed result-id + examined record, graded on evidence recall/joint/F1 vs
+# the gold supporting paragraphs (+ optional answer EM/F1 via GRAPHRAG_READER).
+# DONE prints only after grading exits 0 — a run that merely executed SQL fails.
+#
+# ENGINE-ONLY SCOPE: this grades the live TriDB engine and nothing else. The
+# measured live multi-system latency comparison (Milvus+Neo4j+PG baseline) is
+# scripts/bench_graphrag_h2h.sh (`make graphrag-h2h`) — NOT run or implied here.
+# The full retrieve-from-all-Wikipedia fullwiki corpus (~5M paragraphs) is
+# embedded + HNSW-built ON THE GX10 (128 GB); the x86 standin runs the dev slice
+# only and must NOT claim the full-corpus or live-latency number.
 #
 # WHAT IS MEASURED vs GATED
 #   host-side (no engine): evidence recall + answer EM/F1 — see bench/graphrag_report.py
@@ -21,6 +26,10 @@
 #
 # Usage: scripts/bench_graphrag.sh [image]
 #   env: GRAPHRAG_K=10 GRAPHRAG_TERMCOND=0  (tjs operating point; 0 -> engine default)
+#        GRAPHRAG_READER=none|extractive|anthropic|codex  (none -> evidence-only report)
+#        GRAPHRAG_OUTDIR=bench/results  (persistent artifacts: raw transcript + reports)
+#        GRAPHRAG_RAW_INJECT=<file>  TEST SEAM: grade a pre-captured transcript
+#          (skips the engine; used by tests/test_graphrag_live_report.py only)
 #
 set -euo pipefail
 IMAGE="${1:-tridb/msvbase:dev}"
@@ -30,10 +39,11 @@ cd "$ROOT"
 
 K="${GRAPHRAG_K:-10}"
 TERMCOND="${GRAPHRAG_TERMCOND:-0}"
-MANIFEST="$ROOT/data/hotpot/manifest.json"
+READER="${GRAPHRAG_READER:-none}"
+MANIFEST="${GRAPHRAG_MANIFEST:-$ROOT/data/hotpot/manifest.json}"
 
-PY="python3"
-[ -x "$ROOT/.venv/bin/python" ] && PY="$ROOT/.venv/bin/python"
+PY="${GRAPHRAG_PY:-python3}"
+[ -z "${GRAPHRAG_PY:-}" ] && [ -x "$ROOT/.venv/bin/python" ] && PY="$ROOT/.venv/bin/python"
 
 # --- corpus guard: the manifest + embeddings must exist (host build is not gated) ----
 if [ ! -f "$MANIFEST" ]; then
@@ -41,16 +51,26 @@ if [ ! -f "$MANIFEST" ]; then
   exit 1
 fi
 
+# Raw transcript + graded reports persist (they are the evidence, kept even on
+# failure); only the generated SQL lives in the throwaway workdir.
+OUTDIR="${GRAPHRAG_OUTDIR:-$ROOT/bench/results}"; mkdir -p "$OUTDIR"
+RAW="$OUTDIR/graphrag_live_raw.txt"
+WORK="$(mktemp -d)"; trap 'rm -rf "$WORK"' EXIT
+SQL="$WORK/graphrag.sql"
+
+if [ -n "${GRAPHRAG_RAW_INJECT:-}" ]; then
+  # TEST SEAM: grade a pre-captured transcript without the engine. This proves
+  # the DONE gate (tests/test_graphrag_live_report.py); it is NOT a live run.
+  echo "[graphrag-live] TEST SEAM: injecting transcript $GRAPHRAG_RAW_INJECT (no engine run)"
+  cp "$GRAPHRAG_RAW_INJECT" "$RAW"
+else
+
 # --- engine guard: the LIVE tjs() run is GX10/engine-gated; never fabricate off-target ----
 if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
   echo "image $IMAGE not built — the live GraphRAG run is ENGINE-GATED (UNBUILT-HERE)." >&2
   echo "Build on the GX10: scripts/gx10build.sh  (or x86 standin: scripts/x86build.sh --docker)" >&2
   exit 1
 fi
-
-WORK="$(mktemp -d)"; trap 'rm -rf "$WORK"' EXIT
-SQL="$WORK/graphrag.sql"
-RAW="$WORK/graphrag_raw.txt"
 
 echo "[graphrag-live] emitting canonical #BENCH SQL (tjs graph-constrained) from the corpus"
 "$PY" - "$MANIFEST" "$SQL" "$K" "$TERMCOND" <<'PYEOF'
@@ -79,7 +99,22 @@ docker run --rm --entrypoint bash \
   rc=$?; $B/pg_ctl -D $D -m fast stop >/dev/null 2>&1 || true; exit $rc
 ' 2>&1 | grep -vE 'redirecting log|logging collector' | tee "$RAW"
 
-echo "[graphrag-live] grading live tjs() ids vs host oracle + EM/F1 (parity + latency)"
-echo "  TODO(GX10): wire $RAW '#BENCH' answer ids into bench/graphrag_report grading +"
-echo "  the live multi-store baseline (baseline/graphrag.py) for the latency head-to-head."
-echo "[graphrag-live] DONE (engine-gated path; full-corpus headline is GX10-only)"
+fi  # GRAPHRAG_RAW_INJECT
+
+# --- DONE gate: strict transcript validation + measured grading (plan 085) ---------
+# bench/graphrag_live_report.py rejects any run missing '#BENCH DONE', any missing/
+# malformed/duplicate-conflicting/out-of-range per-qid record, and (in reader mode)
+# any reader failure — so DONE below can never precede a complete, graded run.
+JSON_OUT="$OUTDIR/graphrag_live_metrics.json"
+MD_OUT="$OUTDIR/graphrag_live_report.md"
+echo "[graphrag-live] grading live tjs() ids vs HotpotQA gold (strict; reader=$READER)"
+if ! "$PY" -m bench.graphrag_live_report \
+    --manifest "$MANIFEST" --raw "$RAW" --k "$K" --term-cond "$TERMCOND" \
+    --reader "$READER" --json-out "$JSON_OUT" --md-out "$MD_OUT"; then
+  echo "[graphrag-live] FAILED — grading rejected the run; raw transcript kept: $RAW" >&2
+  exit 1
+fi
+echo "[graphrag-live] artifacts: $RAW + $JSON_OUT + $MD_OUT"
+echo "[graphrag-live] NOTE: engine-only grading. The measured multi-system latency"
+echo "  head-to-head is 'make graphrag-h2h' (scripts/bench_graphrag_h2h.sh) — not this."
+echo "[graphrag-live] DONE"

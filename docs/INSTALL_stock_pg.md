@@ -14,8 +14,12 @@ docker build -f scripts/pg17/Dockerfile.release -t tridb/postgres-trimodal:pg17 
 docker run -d --name trimodal -e POSTGRES_PASSWORD=secret tridb/postgres-trimodal:pg17
 docker exec -it trimodal psql -U postgres \
   -c 'CREATE EXTENSION vector;' \
-  -c 'CREATE EXTENSION graph_store_am;'
+  -c 'CREATE EXTENSION graph_store_am;' \
+  -c 'CREATE EXTENSION tjs_pg;'
 ```
+
+The order matters: `tjs_pg` (the fused tri-modal operator) requires both `vector` and
+`graph_store_am`.
 
 `--build-arg PG_MAJOR=16` selects PostgreSQL 16. If you plan pgvector **parallel** HNSW index
 builds at scale, start the container with `--shm-size` ≥ your `maintenance_work_mem` (docker's
@@ -27,17 +31,36 @@ Prerequisites: PostgreSQL 16/17 server headers (`postgresql-server-dev-17` on De
 a C toolchain, and pgvector if you want the vector leg.
 
 ```bash
-cd src/graph_store
-make PG_CONFIG=$(which pg_config)
-sudo make PG_CONFIG=$(which pg_config) install
-psql -c 'CREATE EXTENSION graph_store_am;'
+for ext in src/graph_store src/tjs_pg; do
+  ( cd "$ext" && make PG_CONFIG=$(which pg_config) && sudo make PG_CONFIG=$(which pg_config) install )
+done
+psql -c 'CREATE EXTENSION vector;' \
+     -c 'CREATE EXTENSION graph_store_am;' \
+     -c 'CREATE EXTENSION tjs_pg;'
 ```
 
 ## Verify
 
 ```bash
 scripts/pg17_graph_test.sh                       # builds + runs the core AM suite in docker
+scripts/pg17_release_smoke.sh                    # starts the release image, runs the tri-modal smoke
 psql -c "SELECT graph_store.gph_upsert_vertex(1);"
+```
+
+Query through the canonical front door, not the private operator: `graph_store.graph_query($$...$$)`
+lowers the one canonical query (SQL/PGQ `GRAPH_TABLE(...)` + pgvector `<->`) to the fused
+`tjs_open` operator on stock PG (plan 075/ADR-0019). Minimal end-to-end example (fixture +
+query): `test/release_stock_smoke.sql`; full suite: `test/canonical_stock_e2e_test.sql`.
+
+```sql
+SELECT * FROM graph_store.graph_query($$
+    SELECT chunk
+    FROM GRAPH_TABLE ( MATCH (src:entity)-[:related_to]->(dst:entity)
+      COLUMNS ( src.embedding AS src_embedding, dst.chunk AS chunk, dst.timestamp AS timestamp ) )
+    WHERE src.id = 1 AND timestamp IN (100)
+    ORDER BY src_embedding <-> '[10,0,0,0]'
+    LIMIT 1
+$$);
 ```
 
 CI runs the full 11-suite matrix on stock PG 16 and 17 (x86_64) on every push
@@ -82,6 +105,15 @@ harness reads `WH_` first, then falls back to `WD_`:
 | `WH_HNSW_TOTAL_BUILDS` / `WD_HNSW_TOTAL_BUILDS` | HNSW builds attempted | *(undeclared → gate blocks)* |
 | `WH_BOUNDARY_PARITY` | Set `1` to acknowledge timer-boundary parity was equalized | *(unset → gate blocks)* |
 
+`tools/wikidata_engine_load.py` publishes `gate_env.WD_ENGINE_EDGES` in its load manifest
+**only from engine-observed transcript markers** (plan 079). The manifest's `load_status`
+(`emitted` | `complete` | `failed`) and `engine.graph_verified` / `engine.hnsw_healthy`
+fields keep the phases distinct: a load that fails after the graph-count assertion still
+records the observed edge/vertex counts (the graph really holds them), but its
+`load_status` stays `failed` and HNSW health stays unhealthy; an `--emit-sql` run or a
+failure before the assertion publishes no engine count at all — the expected host slice
+counts stay under `counts` and never stand in for engine observations.
+
 ## What this does and does not include
 
 - **Included:** the native graph access method (typed/directional adjacency, `gph_*` SQL
@@ -90,7 +122,15 @@ harness reads `WH_` first, then falls back to `WD_`:
   re-homed on stock PG: filter-first behind the operator surface, and vector-first/seedless
   driving pgvector's iterative HNSW scan directly (requires
   `SET hnsw.iterative_scan = relaxed_order`, pgvector ≥ 0.8) with TR-1 early termination and
-  honest budget-cap reporting (`tjs_open_budget_capped()`). Fork phase/bridge parity **landed**
+  honest, *censored* termination reporting (ADR-0019 addendum 2026-07-16):
+  `tjs_open_termination_reason()` returns `filter_first` | `term_cond` |
+  `stream_end_unknown` — pgvector does not disclose whether `hnsw.max_scan_tuples` or
+  natural index exhaustion ended its stream, so an ended stream is reported as *unknown*,
+  never as a definite budget cap. The compat boolean `tjs_open_budget_capped()` is `false`
+  for known non-budget endings and SQL `NULL` for unknown ones (never `true` today);
+  measurement scripts must treat `NULL` as possibly-capped, not count it as either side.
+  `tjs_open_candidates_examined()` on the filter-first path reports the full qualifying-row
+  count before the top-k `LIMIT` (not `min(work, k)`). Fork phase/bridge parity **landed**
   (commit `81b8023`, ADR-0012 recipe B): `tjs_open` now performs the guaranteed reachability-bridge
   injection past the vector frontier, with the `tjs_open_bridges_injected()` counter exposing how
   many bridges were forced. The remaining follow-up is the **seedless SM-4 recall-curve parity** vs
@@ -98,4 +138,7 @@ harness reads `WH_` first, then falls back to `WD_`:
   — not the bridge mechanism itself. The **filter-first** Gate A/B headline also works with no
   operator at all: a single SQL statement over `graph_store.gph_traverse_bfs(...)` (see
   `bench/wikidata_h2h.py:emit_tridb_sql`).
+- **Parity gate:** `make tjs-parity-test` (`scripts/tjs_parity_test.sh`) diffs the fork's fused
+  filter-first statement against the stock `tjs_open` filter-first mode on a shared corpus —
+  needs BOTH engine images, so it is a manual / CI-dispatch gate, not a per-PR check.
 - **PGXN:** `src/graph_store/META.json` is prepared; publication happens at release time.

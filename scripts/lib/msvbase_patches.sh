@@ -38,6 +38,16 @@ CMAKE_3_27_9_AARCH64_SHA256="11bf3d30697df465cdf43664a9473a586f010c528376a966fd3
 # REFRESH INTENTIONALLY (like the checksums above) when the base image is deliberately bumped.
 GCC_12_3_0_DIGEST="sha256:de5c5093e2ceb5c09901ed541ecab0660d1f01b7fd79587ad0294fa758a1690e"
 
+# True only when the SPTAG submodule is actually INITIALIZED, not merely registered. Git leaves
+# an EMPTY placeholder directory for a registered-but-uninitialized submodule, so a bare `-d`
+# check is a false positive (plan 084). Anchor on the load-bearing tracked file
+# thirdparty/SPTAG/CMakeLists.txt — the same file patch_modern_gcc_includes patches — as the
+# initialization marker. Side-effect-free; no network, no submodule mutation.
+sptag_initialized() {
+  local root="$1"
+  [[ -f "$root/thirdparty/SPTAG/CMakeLists.txt" ]]
+}
+
 # Sentinels proving each MSVBASE patch applied. The vendored scripts/patch.sh has no `set -e`
 # and ignores `git apply`'s exit code, so a failed patch yields a clean build of the WRONG
 # database (stock Postgres, no relaxed monotonicity). Verify the end-state and die on any miss.
@@ -51,8 +61,9 @@ verify_patches() {
   grep -rq 'ResultIterator' "$root/thirdparty/hnsw/hnswlib/" \
     || die "hnsw.patch NOT applied (no ResultIterator) — VBASE iterator missing; upstream drift?"
   # SPTAG is opt-in (WITH_SPTAG, DEV-1228); a lean build may skip the submodule entirely, so only
-  # verify the spann patch when the SPTAG tree is actually present.
-  if [[ -d "$root/thirdparty/SPTAG" ]]; then
+  # verify the spann patch when the SPTAG tree is actually INITIALIZED (an uninitialized
+  # submodule's empty placeholder dir must skip, not fail — plan 084).
+  if sptag_initialized "$root"; then
     grep -rq 'MultiIndexScan' "$root/thirdparty/SPTAG/" \
       || die "spann.patch NOT applied (no MultiIndexScan) — upstream drift?"
   fi
@@ -794,7 +805,7 @@ patch_modern_gcc_includes() {
   # (Do NOT touch the top vectordb CMakeLists — it derives CMAKE_C_FLAGS from CMAKE_CXX_FLAGS,
   # so a C++-header force-include there breaks cmake's OpenMP_C probe. Use a CXX-only genexp
   # if vectordb sources ever need it.)
-  if [[ -f "$sptag_cm" ]] && grep -q -- '-std=c++14 -fopenmp"' "$sptag_cm" && ! grep -q 'include cstdint' "$sptag_cm"; then
+  if sptag_initialized "$root" && grep -q -- '-std=c++14 -fopenmp"' "$sptag_cm" && ! grep -q 'include cstdint' "$sptag_cm"; then
     log "force-including dropped std headers into SPTAG build (modern GCC transitive-include fix)"
     sed -i "s/-std=c++14 -fopenmp\"/-std=c++14 -fopenmp ${FORCE_INC}\"/" "$sptag_cm"
   fi

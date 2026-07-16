@@ -144,4 +144,161 @@ BEGIN
     RAISE NOTICE 'PASS typed early termination: LIMIT 5 => 5 edge-steps, 2nd adj page untouched (TR-1)';
 END $$;
 
+-- ============================================================================
+-- Advisor plan 091: TYPED BATCHED insert — gph_insert_edges(src, dsts, type_id).
+-- PARITY ORACLE: N edges inserted via the typed batch must be indistinguishable
+-- from the same N via scalar gph_insert_edge(src, dst, type_id) calls fed in the
+-- same order — same return counts, same gph_traverse_typed emission order (no
+-- ORDER BY below: storage order IS the assertion), same type-filter results,
+-- same tombstone interaction, and abort atomicity (a rolled-back batch leaves
+-- nothing visible). Boundaries: empty array, single-dst, multi-page run.
+-- ============================================================================
+
+-- Boundary: empty dst array => 0 appended, store untouched.
+DO $$
+DECLARE n bigint; ec0 bigint; ec1 bigint;
+BEGIN
+    ec0 := gph_edge_count();
+    n := gph_insert_edges(7, ARRAY[]::bigint[], 2);
+    ec1 := gph_edge_count();
+    IF n <> 0 OR ec1 <> ec0 THEN
+        RAISE EXCEPTION 'typed batch empty array: returned %, edge_count % -> % (expected 0, unchanged)', n, ec0, ec1;
+    END IF;
+    RAISE NOTICE 'PASS typed batch: empty array => 0 appended, store untouched';
+END $$;
+
+-- Scalar leg (vertex 5) and batch leg (vertex 7): the SAME dst/type sequence,
+-- grouped by type (one batch call per type — the loader's (src, type_id) grouping).
+-- works_at run {1,2,4} exercises the fresh-first-page fill; the single-dst
+-- mentions call {3} exercises both the single-element boundary and the tail-fill.
+SELECT gph_insert_edge(5, 1, 2);
+SELECT gph_insert_edge(5, 2, 2);
+SELECT gph_insert_edge(5, 4, 2);
+SELECT gph_insert_edge(5, 3, 3);
+DO $$
+DECLARE n1 bigint; n2 bigint;
+BEGIN
+    n1 := gph_insert_edges(7, ARRAY[1,2,4]::bigint[], 2);
+    n2 := gph_insert_edges(7, ARRAY[3]::bigint[], 3);
+    IF (n1, n2) IS DISTINCT FROM (3::bigint, 1::bigint) THEN
+        RAISE EXCEPTION 'typed batch return counts: got (%, %) (expected (3, 1))', n1, n2;
+    END IF;
+    RAISE NOTICE 'PASS typed batch: return counts (3, 1)';
+END $$;
+
+-- Overload resolution guard: with the 3-arg form installed, the 2-arg call still
+-- resolves (no ambiguity) and still defaults to related_to (id 1).
+DO $$
+DECLARE n bigint; d bigint[];
+BEGIN
+    n := gph_insert_edges(7, ARRAY[6]::bigint[]);
+    SELECT array_agg(dst) INTO d FROM gph_traverse_typed(7, 1, 0, -1);
+    IF n <> 1 OR d IS DISTINCT FROM ARRAY[6]::bigint[] THEN
+        RAISE EXCEPTION '2-arg batch after 3-arg overload: appended %, related_to dsts % (expected 1, {6})', n, d;
+    END IF;
+    RAISE NOTICE 'PASS overload resolution: 2-arg batch still defaults to related_to';
+END $$;
+SELECT gph_insert_edge(5, 6);  -- keep the scalar leg identical (same trailing related_to edge)
+
+-- Emission-order + type-filter parity: vertex 5 (scalar) vs vertex 7 (batch).
+DO $$
+DECLARE s bigint[]; b bigint[]; t int;
+BEGIN
+    SELECT array_agg(dst) INTO s FROM gph_traverse_typed(5, 0, 0, -1);
+    SELECT array_agg(dst) INTO b FROM gph_traverse_typed(7, 0, 0, -1);
+    IF s IS DISTINCT FROM b OR s IS DISTINCT FROM ARRAY[1,2,4,3,6]::bigint[] THEN
+        RAISE EXCEPTION 'scalar/batch emission-order parity: scalar=%, batch=% (expected identical {1,2,4,3,6})', s, b;
+    END IF;
+    FOREACH t IN ARRAY ARRAY[1, 2, 3] LOOP
+        SELECT array_agg(dst) INTO s FROM gph_traverse_typed(5, t, 0, -1);
+        SELECT array_agg(dst) INTO b FROM gph_traverse_typed(7, t, 0, -1);
+        IF s IS DISTINCT FROM b THEN
+            RAISE EXCEPTION 'scalar/batch type-filter parity (type %): scalar=%, batch=%', t, s, b;
+        END IF;
+    END LOOP;
+    RAISE NOTICE 'PASS scalar/batch parity: emission order + per-type filters identical';
+END $$;
+
+-- Tombstone interaction parity: typed tombstone of the mentions edge on BOTH legs;
+-- traversals must stay identical and the mentions filter must go empty on both.
+SELECT gph_tombstone_edge(5, 3, 3);
+SELECT gph_tombstone_edge(7, 3, 3);
+DO $$
+DECLARE s bigint[]; b bigint[]; ns bigint; nb bigint;
+BEGIN
+    SELECT array_agg(dst) INTO s FROM gph_traverse_typed(5, 0, 0, -1);
+    SELECT array_agg(dst) INTO b FROM gph_traverse_typed(7, 0, 0, -1);
+    IF s IS DISTINCT FROM b OR s IS DISTINCT FROM ARRAY[1,2,4,6]::bigint[] THEN
+        RAISE EXCEPTION 'post-tombstone parity: scalar=%, batch=% (expected identical {1,2,4,6})', s, b;
+    END IF;
+    SELECT count(*) INTO ns FROM gph_traverse_typed(5, 3, 0, -1);
+    SELECT count(*) INTO nb FROM gph_traverse_typed(7, 3, 0, -1);
+    IF ns <> 0 OR nb <> 0 THEN
+        RAISE EXCEPTION 'post-tombstone mentions filter: scalar=% rows, batch=% rows (expected 0, 0)', ns, nb;
+    END IF;
+    RAISE NOTICE 'PASS tombstone parity: typed tombstone identical on scalar- and batch-inserted edges';
+END $$;
+
+-- Multi-page typed batch (vids 8 scalar / 9 batch): 1200 mentions edges span multiple
+-- adjacency pages on 8KB AND 32KB blocks, exercising the batch chain loop with the
+-- typed stamp on every page. Counts + emission order + type filter must match.
+SELECT gph_insert_vertex() FROM generate_series(1, 2);
+SELECT gph_insert_edge(8, g % 5, 3) FROM generate_series(1, 1200) g;
+DO $$
+DECLARE n bigint; s bigint[]; b bigint[]; wrong bigint;
+BEGIN
+    SELECT gph_insert_edges(9, array_agg((g % 5)::bigint), 3) INTO n
+    FROM generate_series(1, 1200) g;
+    IF n <> 1200 THEN
+        RAISE EXCEPTION 'multi-page typed batch: appended % (expected 1200)', n;
+    END IF;
+    SELECT array_agg(dst) INTO s FROM gph_traverse_typed(8, 3, 0, -1);
+    SELECT array_agg(dst) INTO b FROM gph_traverse_typed(9, 3, 0, -1);
+    IF s IS DISTINCT FROM b OR array_length(s, 1) <> 1200 THEN
+        RAISE EXCEPTION 'multi-page scalar/batch parity: % vs % dsts, arrays % (expected 1200 identical)',
+            array_length(s, 1), array_length(b, 1), (s IS NOT DISTINCT FROM b);
+    END IF;
+    SELECT count(*) INTO wrong FROM gph_traverse_typed(9, 2, 0, -1);
+    IF wrong <> 0 THEN
+        RAISE EXCEPTION 'multi-page typed batch: works_at filter saw % rows (expected 0 — every slot must be typed)', wrong;
+    END IF;
+    RAISE NOTICE 'PASS multi-page typed batch: 1200 edges, chain-loop pages typed, parity holds';
+END $$;
+
+-- Abort atomicity (FR-7): a typed batch in a rolled-back txn leaves NOTHING visible.
+SELECT gph_insert_vertex();  -- vid 10, committed, edge-less
+BEGIN;
+SELECT gph_insert_edges(10, ARRAY[1,2,3]::bigint[], 2);
+ROLLBACK;
+DO $$
+DECLARE n bigint;
+BEGIN
+    SELECT count(*) INTO n FROM gph_traverse_typed(10, 0, 0, -1);
+    IF n <> 0 THEN
+        RAISE EXCEPTION 'aborted typed batch left % visible edges (expected 0 — FR-7 atomicity)', n;
+    END IF;
+    RAISE NOTICE 'PASS abort atomicity: rolled-back typed batch => zero visible edges';
+END $$;
+
+-- Tombstoned-dst rejection parity (plan 046 contract): both the scalar and the typed
+-- batch must REJECT an edge to a tombstoned destination.
+SELECT gph_insert_vertex();  -- vid 11 — the dst we tombstone
+SELECT gph_tombstone_vertex(11);
+DO $$
+BEGIN
+    BEGIN
+        PERFORM gph_insert_edge(10, 11, 2);
+        RAISE EXCEPTION 'scalar insert to tombstoned dst did NOT raise';
+    EXCEPTION WHEN OTHERS THEN
+        IF SQLERRM LIKE '%did NOT raise%' THEN RAISE; END IF;
+    END;
+    BEGIN
+        PERFORM gph_insert_edges(10, ARRAY[11]::bigint[], 2);
+        RAISE EXCEPTION 'typed batch insert to tombstoned dst did NOT raise';
+    EXCEPTION WHEN OTHERS THEN
+        IF SQLERRM LIKE '%did NOT raise%' THEN RAISE; END IF;
+    END;
+    RAISE NOTICE 'PASS tombstoned-dst rejection: scalar and typed batch both raise';
+END $$;
+
 \echo '============ typed/directional/source-scoped traversal (plan 038, DEV-1350): ALL TESTS PASSED ============'

@@ -85,3 +85,52 @@ operator surface); when `src IS NULL` it runs **vector-first / seedless**:
 - The fork remains the reference implementation until the stock operator's SM-4 curve and the
   Gate-B-style h2h reproduce on it; then the fork moves to maintenance (launch-vehicle posture,
   ADR-0015 FAQ).
+
+## Addendum (2026-07-16, plan 074): censored termination metrics
+
+The original counter contract (Decision point 5 above, and point 3's "the result is
+BUDGET-CAPPED and the operator reports it") overclaimed in two ways:
+
+1. **`tjs_open_candidates_examined()` on the filter-first path was capped at `k`.** The
+   implementation read `SPI_processed` *after* `LIMIT k`, so a query with 101 qualifying rows
+   and `k = 5` reported 5 — the counter carried no information about the work the graph +
+   filter legs actually did. **Fixed:** the fused statement now carries `count(*) OVER ()`
+   (evaluated after `WHERE`, before `ORDER BY`/`LIMIT`; ordering and result IDs unchanged),
+   so filter-first `examined` reports the full qualifying count before top-k truncation.
+   Vector-first semantics are unchanged: candidates actually consumed from the stream.
+2. **`tjs_open_budget_capped()` manufactured a boolean pgvector does not provide.** It
+   returned `true` whenever the candidate stream ended before `term_cond` fired — but
+   pgvector's iterator API does not disclose whether `hnsw.max_scan_tuples` or natural index
+   exhaustion ended the stream. Natural exhaustion was therefore labeled a budget stop.
+   **Fixed** by representing the uncertainty instead of resolving it:
+   - New `tjs_open_termination_reason()` returns `'filter_first'` (fused single-statement
+     path, no stream), `'term_cond'` (TR-1 early termination fired), or
+     `'stream_end_unknown'` (stream ended: budget *or* exhaustion — unobservable).
+   - `tjs_open_budget_capped()` is retained as a compatibility shim: `false` for the two
+     known non-budget endings, **SQL `NULL`** for `stream_end_unknown`. It never returns
+     `true` today, because there is no upstream signal that could justify it.
+
+`stream_end_unknown` is a right-censored measurement: harnesses must treat it as
+*possibly* budget-shaped (the ADR-0015 E3.3 posture) rather than counting it as either
+capped or uncapped. If a future pgvector version exposes a definitive cap/exhaustion
+signal, `budget_capped = true` may return — only alongside a regression test proving the
+signal is real. All per-call metrics reset at a single lifecycle point per call; nothing
+leaks between backend calls (regressions: `test/tjs_pg_test.sql` 1, 2, 4, 6, 6b, 7).
+## Addendum (2026-07-16, advisor plan 075) — the canonical front door lowers to tjs_open
+
+`graph_store.graph_query(text)` (the spec §5 v1 surface, DEV-1167) previously recognized only
+the fork `tjs()` signatures, so a stock install with `vector + graph_store_am + tjs_pg` could
+call `tjs_open` directly but the documented front door failed. The lowering now adds a stock
+branch, selected only when the exact
+`public.tjs_open(regclass,integer,integer,integer,integer,text,text,vector,bigint,integer)`
+signature is installed (detection is catalog-safe: gated on `to_regtype('vector')` and the
+`pg_extension` row before probing the signature, so it cannot error on installs without
+pgvector). Mapping: `k`=LIMIT, `term_cond`=0, `m_seeds`=0, `hops`=1, `id_col`='id', the parsed
+timestamp window, the parsed query vector (brace dialect converted to pgvector brackets, bound
+as a parameter), the pinned `src.id`, and `edge_type` = the `graph_store.edge_type` catalog id
+of the canonical label `related_to` (RAISES if the row is absent — never "any edge"). Result
+ids join back to `entities` for the canonical `chunk` column in operator emit order
+(`WITH ORDINALITY`). With the v1 pinned src this is always the filter-first body;
+`graph_store.last_join_order()` reports `filter_first`. Grammar stays pinned; the only admitted
+widening is the brace/bracket vector-literal dialect pair. Proven end-to-end on PG 16 and 17 by
+`test/canonical_stock_e2e_test.sql` (STOCK_TESTS + CI `stock-pg`).

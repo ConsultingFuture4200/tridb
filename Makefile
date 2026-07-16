@@ -1,4 +1,4 @@
-.PHONY: test lint graph-test stock-graph-test smoke-test test-all baseline-up baseline-down seed bench bench-live sweep sm2 fetch-dataset bench-public bench-repro fetch-hotpot graphrag graphrag-live bench-filtered ablation recall-decay tjs-open-ref tjs-open-live graphrag-h2h rabitq-sim gpu-build-index wiki-fetch wiki-extract wiki-scale wiki-neo4j wiki-subgraph wiki-linkpred lock clean clean-data
+.PHONY: test lint graph-test stock-graph-test stock-crash-test stock-release-smoke tjs-parity-test smoke-test test-all baseline-up baseline-down seed bench bench-live sweep sm2 fetch-dataset bench-public bench-repro fetch-hotpot graphrag graphrag-live bench-filtered ablation recall-decay tjs-open-ref tjs-open-live graphrag-h2h rabitq-sim gpu-build-index gpu-setup gpu-verify gpu-lock wiki-fetch wiki-extract wiki-scale wiki-neo4j wiki-subgraph wiki-linkpred lock clean clean-data
 
 PUBLIC_DATASET ?= gist-960-euclidean
 
@@ -10,14 +10,16 @@ IMAGE ?= tridb/msvbase:dev
 # Stock-PG (un-forked) engine image + suites — the D2 pgvector path, built per PG major.
 PG_MAJOR ?= 17
 STOCK_IMAGE ?= tridb/pg$(PG_MAJOR)-unfork:dev
-# Pure-SQL graph + tjs suites run on stock PG — kept verbatim in lockstep with the
-# CI job `stock-pg` in .github/workflows/ci.yml.
+# Pure-SQL graph + tjs suites run on stock PG. SINGLE SOURCE OF TRUTH (advisor plan 090):
+# the CI job `stock-pg` (.github/workflows/ci.yml) consumes this list via
+# `make stock-graph-test PG_MAJOR=...` — never duplicate it there.
 STOCK_TESTS := test/graph_store_am_test.sql test/graph_store_test.sql \
                test/graph_traversal_test.sql test/graph_typed_traversal_test.sql \
                test/graph_delete_test.sql test/graph_edge_count_test.sql \
                test/graph_freeze_test.sql test/graph_dense_open_test.sql \
                test/graph_v0v1_parity_test.sql test/graph_vid_cache_test.sql \
-               test/graph_am_acl_test.sql test/tjs_pg_test.sql
+               test/graph_am_acl_test.sql test/tjs_pg_test.sql \
+               test/canonical_stock_e2e_test.sql
 
 ENGINE_TESTS := test/graph_store_test.sql test/trimodal_compose.sql \
                 test/trimodal_early_term.sql test/fork_distance_probe.sql \
@@ -107,6 +109,30 @@ stock-graph-test:
 	  echo "=== $$t (stock PG$(PG_MAJOR)) ==="; \
 	  bash scripts/pg17_graph_test.sh $(STOCK_IMAGE) $$t || exit 1; \
 	done
+
+# Stock-PG WAL crash-recovery (REDO) gate (advisor plan 090): the stock mirror of the
+# fork's scripts/crash_recovery_test.sh — 5 scenarios (committed / uncommitted /
+# committed tombstone / uncommitted tombstone / freeze) against `pg_ctl stop -m
+# immediate`, sharing test/crash_recovery_assert.sql. CI runs it after the SQL suites.
+stock-crash-test:
+	docker build --build-arg PG_MAJOR=$(PG_MAJOR) -t $(STOCK_IMAGE) scripts/pg17/
+	bash scripts/pg17_crash_recovery_test.sh $(STOCK_IMAGE)
+
+# Runtime smoke of the SHIPPED release image (advisor plan 076): build the prebaked
+# tridb/postgres-trimodal image for PG_MAJOR, start it as a user would, install all
+# three extensions in dependency order, and run one direct tjs_open + one canonical
+# graph_query — the local mirror of the CI `release runtime smoke` step.
+stock-release-smoke:
+	docker build --build-arg PG_MAJOR=$(PG_MAJOR) -f scripts/pg17/Dockerfile.release \
+	  -t tridb/postgres-trimodal:pg$(PG_MAJOR) .
+	bash scripts/pg17_release_smoke.sh tridb/postgres-trimodal:pg$(PG_MAJOR)
+
+# Fork<->stock filter-first PARITY gate (advisor plan 071): the SAME corpus + queries
+# through the fork's fused filter-first statement (tridb/msvbase:dev) and the stock
+# tjs_open operator's filter-first mode (tridb/pg17-unfork:dev); any top-k drift fails.
+# Heavy (needs BOTH engine images) — a manual / CI-dispatch gate, NOT per-PR.
+tjs-parity-test:
+	bash scripts/tjs_parity_test.sh
 
 smoke-test:
 	@docker image inspect $(IMAGE) >/dev/null 2>&1 || \
@@ -238,8 +264,10 @@ graphrag:
 	$(PY) -m tools.hotpot_corpus --slice data/hotpot/dev_slice.json --k 10
 	$(PY) -m bench.graphrag_report --reader $(GRAPHRAG_READER)
 
-# LIVE engine head-to-head (GX10/engine-gated): canonical tjs() + live latency vs the
-# multi-store baseline. Guards on the image like bench-public; UNBUILT-HERE off-target.
+# LIVE ENGINE-ONLY run (GX10/engine-gated): canonical tjs() on the live engine, then
+# STRICT grading of the captured output vs the HotpotQA gold — bench/graphrag_live_report.py
+# gates the DONE marker. Grades TriDB only; the measured multi-system latency head-to-head
+# is `make graphrag-h2h`. Guards on the image like bench-public; UNBUILT-HERE off-target.
 graphrag-live:
 	@docker image inspect $(IMAGE) >/dev/null 2>&1 || \
 	  { echo "image $(IMAGE) not built — graphrag-live is ENGINE-GATED (UNBUILT-HERE)"; exit 1; }
@@ -313,6 +341,20 @@ INDEX_OUT ?= data/index/cagra_hnsw.bin
 gpu-build-index:
 	@test -n "$(DATASET)" || { echo "set DATASET=<.npy/.fvecs/.hdf5> (the corpus to index)"; exit 1; }
 	bash scripts/gpu_build_index.sh --vectors $(DATASET) --out $(INDEX_OUT)
+
+# Isolated GB10 GPU environment (advisor plan 086). Lives in ${GPU_VENV:-.venv-gpu},
+# installed ONLY from requirements-gpu-gb10.lock (generated ON the GB10 from the
+# exact-pinned requirements-gpu-gb10.in) — never touches the core .venv or
+# requirements.lock. Off-target these print SKIP and change nothing; gpu-lock
+# regenerates the aarch64 closure and therefore only runs on the Spark.
+gpu-setup:
+	bash scripts/spark_gpu_setup.sh
+
+gpu-verify:
+	bash scripts/spark_gpu_setup.sh --verify
+
+gpu-lock:
+	bash scripts/spark_gpu_setup.sh --lock
 
 # =============================================================================
 # FULL-WIKIPEDIA SCALE BENCHMARK (docs/wiki_scale_benchmark_spec_v0.1.0.md, DEV-1354)

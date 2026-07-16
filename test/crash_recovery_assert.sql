@@ -1,9 +1,13 @@
 -- DEV-1166: crash-recovery (WAL redo) assertions for the tri-store FR-7 substrate.
 --
--- Driven by scripts/crash_recovery_test.sh in TWO passes against the SAME data directory,
--- selected by the psql variable :phase. The harness CHECKPOINTs a baseline, runs a tri-store
--- txn, then crashes the postmaster with `pg_ctl stop -m immediate` (SIGQUIT, NO checkpoint) so
--- the committed page changes exist ONLY in the WAL — restart forces GenericXLog generic-REDO.
+-- Driven by scripts/crash_recovery_test.sh (fork engine) AND scripts/pg17_crash_recovery_test.sh
+-- (stock PG 16/17 + pgvector, advisor plan 090) against the SAME data directory, one pass per
+-- scenario, selected by the psql variable :phase. The harness CHECKPOINTs a baseline, runs a
+-- tri-store txn, then crashes the postmaster with `pg_ctl stop -m immediate` (SIGQUIT, NO
+-- checkpoint) so the committed page changes exist ONLY in the WAL — restart forces GenericXLog
+-- generic-REDO. This file is ENGINE-NEUTRAL: the only type-divergent column (fork vectordb
+-- float8[] vs stock pgvector vector(8)) is compared in a normalized text form (see phase
+-- 'committed'), so one assert file serves both drivers and cannot drift.
 --
 --   :phase = 'committed'   -> after restart, the COMMITTED tri-store row must be present in ALL
 --                             THREE stores (redo replayed the graph pages + the heap/HNSW row).
@@ -22,6 +26,18 @@
 --                             deleting xid never committed, so gph_deleted_visible hides the
 --                             tombstone and edge 0->1 reads LIVE again (FR-7 abort-atomicity).
 --
+-- Advisor plan 090 adds the freeze REDO phase (the gph_freeze() durability claim of
+-- test/graph_freeze_test.sql, previously untested on either engine):
+--   :phase = 'freeze' -> the harness CHECKPOINTed committed edges {0->1, 0->2}, ran a COMMITTED
+--                             gph_freeze(:horizon) whose page rewrites live ONLY in the WAL, and
+--                             crashed. Post-recovery: visibility unchanged, gstore relfrozenxid
+--                             advanced to :horizon, re-freeze(:horizon) is the idempotent no-op
+--                             (metapage gm_frozen_horizon REDONE), and gph_freeze(:horizon2)
+--                             (a fresh post-restart horizon) finds 0 unfrozen records (the
+--                             RECORD-page rewrites REDONE — this closes the metapage-early-out
+--                             hole the :horizon no-op alone would leave). Requires
+--                             -v horizon=<xid> -v horizon2=<xid> from the harness.
+--
 -- Run with psql -v ON_ERROR_STOP=1 so a RAISE EXCEPTION yields a nonzero exit.
 
 SET search_path TO graph_store, public;
@@ -36,6 +52,7 @@ SET search_path TO graph_store, public;
 SELECT :'phase' = 'committed' AS is_committed \gset
 SELECT :'phase' = 'committed_tombstone' AS is_committed_tomb \gset
 SELECT :'phase' = 'uncommitted_tombstone' AS is_uncommitted_tomb \gset
+SELECT :'phase' = 'freeze' AS is_freeze \gset
 
 -- --------------------------------------------------------------------------
 -- COMMITTED scenario: the durable tri-store row survived crash + WAL redo.
@@ -61,11 +78,15 @@ BEGIN
     END IF;
 
     -- (ii) vector STORE row (heap backing of the HNSW-indexed table) survived WAL redo. We read
-    -- it via a heap path (seqscan) because the vendored HNSW INDEX itself does not redo (above).
+    -- it via a heap path (seqscan) because the vendored HNSW INDEX itself does not redo (above);
+    -- stock pgvector's HNSW IS WAL-logged, but the heap check is the shared tri-store proof. The
+    -- embedding is compared in normalized text form so the SAME predicate covers the fork's
+    -- float8[] column ('{5000,0,...}') and the stock pgvector vector(8) column ('[5000,0,...]').
     SET LOCAL enable_indexscan = off;
     SET LOCAL enable_bitmapscan = off;
     SET LOCAL enable_seqscan = on;
-    SELECT id INTO vec_hit FROM entities WHERE id = 5000 AND embedding = ARRAY[5000,0,0,0,0,0,0,0]::float8[];
+    SELECT id INTO vec_hit FROM entities
+     WHERE id = 5000 AND translate(embedding::text, '[]', '{}') = '{5000,0,0,0,0,0,0,0}';
     IF vec_hit IS NULL THEN
         RAISE EXCEPTION 'CRASH/committed: vector row 5000 (heap backing) missing after WAL redo';
     END IF;
@@ -129,6 +150,65 @@ BEGIN
         RAISE EXCEPTION 'CRASH/uncommitted_tombstone: edge 0->1 NOT live after recovery (aborted tombstone wrongly persisted — FR-7 abort-atomicity failure): neighbors=%', nbrs;
     END IF;
     RAISE NOTICE 'PASS crash/uncommitted_tombstone: tombstone from a crash-aborted txn is IGNORED after recovery (edge 0->1 reads LIVE — xid-visibility hides the physically-checkpointed tombstone)';
+END $$;
+\elif :is_freeze
+-- --------------------------------------------------------------------------
+-- FREEZE scenario (plan 090): the harness committed edges 0->1 and 0->2, CHECKPOINTed (so the
+-- PRE-freeze record pages with normal xids are durable on disk), then ran a COMMITTED
+-- gph_freeze(:horizon) — its GenericXLog page rewrites (record xids -> Frozen/Invalid, metapage
+-- gm_frozen_horizon) live ONLY in the WAL — and crashed (-m immediate). Recovery must REDO them:
+--   (i)   visibility is unchanged (freeze is a pure storage rewrite);
+--   (ii)  gstore relfrozenxid = :horizon (the non-transactional inplace catalog update replayed);
+--   (iii) re-freeze(:horizon) returns 0 — the metapage gm_frozen_horizon monotonicity early-out,
+--         proving the metapage rewrite was REDONE;
+--   (iv)  gph_freeze(:horizon2) (fresh post-restart horizon > :horizon) also returns 0 — if the
+--         RECORD-page rewrites had been lost, the checkpointed pre-freeze pages would still carry
+--         normal xids <= :horizon < :horizon2 and this pass would re-freeze them (> 0). This is
+--         the record-page proof (iii) alone cannot give, because (iii) early-outs on the metapage.
+-- (iv) must run AFTER (ii): a higher-horizon freeze pass may advance relfrozenxid again.
+-- --------------------------------------------------------------------------
+\if :{?horizon}
+\else
+\echo 'phase=freeze requires -v horizon=<xid> -v horizon2=<xid>'
+\quit
+\endif
+SELECT set_config('tridb.crash_h',  :'horizon',  false);
+SELECT set_config('tridb.crash_h2', :'horizon2', false);
+DO $$
+DECLARE nbrs bigint[]; gc bigint; n bigint; h xid; h2 xid; rf xid;
+BEGIN
+    h  := (current_setting('tridb.crash_h'))::xid;
+    h2 := (current_setting('tridb.crash_h2'))::xid;
+
+    -- (i) visibility unchanged after crash + REDO of the frozen pages
+    SELECT array_agg(x ORDER BY x) INTO nbrs FROM gph_neighbors(0) x;
+    IF nbrs IS DISTINCT FROM ARRAY[1,2]::bigint[] THEN
+        RAISE EXCEPTION 'CRASH/freeze: neighbors(0)=% after recovery (expected {1,2} — freeze changed visibility across REDO)', nbrs;
+    END IF;
+    gc := gph_vertex_count();
+    IF gc <> 6 THEN
+        RAISE EXCEPTION 'CRASH/freeze: gph_vertex_count = % after recovery (expected baseline 6)', gc;
+    END IF;
+
+    -- (ii) relfrozenxid advanced to the horizon and survived the crash
+    SELECT relfrozenxid INTO rf FROM pg_class WHERE oid = 'graph_store.gstore'::regclass;
+    IF rf <> h THEN
+        RAISE EXCEPTION 'CRASH/freeze: gstore relfrozenxid=% after recovery (expected horizon % — freeze catalog advance lost)', rf, h;
+    END IF;
+
+    -- (iii) metapage REDO: re-freeze at the SAME horizon is the idempotent no-op
+    n := graph_store.gph_freeze(h);
+    IF n <> 0 THEN
+        RAISE EXCEPTION 'CRASH/freeze: re-freeze(%) froze % records (expected 0 — metapage gm_frozen_horizon lost in redo)', h, n;
+    END IF;
+
+    -- (iv) record-page REDO: a HIGHER post-restart horizon finds nothing left to freeze
+    n := graph_store.gph_freeze(h2);
+    IF n <> 0 THEN
+        RAISE EXCEPTION 'CRASH/freeze: gph_freeze(%) froze % records (expected 0 — frozen record pages lost in redo)', h2, n;
+    END IF;
+
+    RAISE NOTICE 'PASS crash/freeze: committed gph_freeze(%) REDONE from WAL after immediate-stop crash (visibility unchanged, relfrozenxid=%, metapage no-op, 0 unfrozen records at %)', h, h, h2;
 END $$;
 \else
 -- --------------------------------------------------------------------------
