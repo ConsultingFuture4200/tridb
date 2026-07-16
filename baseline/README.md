@@ -33,6 +33,19 @@ Services and ports:
 | minio | 9000 (S3), 9001 (console) | Milvus object store |
 | postgres | 5432 | db `tridb_baseline`, `postgres/postgres` |
 
+All host ports bind **loopback (`127.0.0.1`) by default** — the stack runs with
+development credentials and must not be reachable from the surrounding network
+by accident. To expose it on all interfaces (e.g. a shared lab box), opt in
+explicitly:
+
+```bash
+BASELINE_BIND=0.0.0.0 docker compose up -d
+```
+
+Before doing so, replace the dev credentials in `docker-compose.yml` (Neo4j
+auth, MinIO keys, Postgres password) and apply host firewalling — loopback
+binding is an exposure default, not a substitute for real credentials.
+
 Data persists under `baseline/volumes/` (gitignored). Wait for healthchecks:
 
 ```bash
