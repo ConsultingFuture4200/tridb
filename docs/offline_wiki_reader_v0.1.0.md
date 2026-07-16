@@ -793,3 +793,52 @@ attribute reader-side full-corpus behavior to the native engine. Guardrails are
 enforced by `tests/test_wiki_reader_claims.py` (prohibited pairings, required
 provenance phrases, and standalone/embedded copy parity). Future public metrics
 get all three labels at authoring time.
+
+# Addendum v11 — operator auth & suggestion integrity (advisor 081)
+
+Supersedes the mutation-auth paragraphs of the earlier auth addendum (the
+`WIKI_READER_TOKEN` env var, the `401` response, and the always-embedded
+`<meta name="wr-token">` behavior described there are replaced by the rules
+below).
+
+**Bind modes.** The serve mode is now explicit (`is_loopback_host`):
+
+- **Loopback** (`localhost`, `127.0.0.0/8`, `::1`, the default): if
+  `WIKI_READER_OPERATOR_TOKEN` is unset, an **ephemeral per-process session
+  token** is generated, printed once at startup, and embedded in the served
+  `/read` page (`<meta name="wr-token">`). This is a single-user local-only
+  ergonomic: anyone who can load a loopback page is the local operator, so the
+  embedded token adds no exposure. It rotates on every restart.
+- **Non-loopback** (`--allow-remote`): startup **fails with a clear error**
+  unless `WIKI_READER_OPERATOR_TOKEN` is set in the environment and is at least
+  16 characters. A configured operator token is **never** rendered into HTML,
+  printed, logged, or placed in a URL — the meta tag stays empty, and the
+  browser prompts the operator on the first mutation attempt, keeping the value
+  in `sessionStorage` (per-tab, non-persistent) and sending it only in the
+  `X-TriDB-Token` header (or `Authorization: Bearer`). A `403` clears the
+  stored value so the operator is re-prompted. Comparison server-side is
+  constant-time (`hmac.compare_digest`). Wrong/missing tokens get `403`.
+  Rotation = restart the serve with a new env value; old tokens die with the
+  process.
+
+**Suggestion integrity (accept/dismiss by id).** `/enrich` no longer trusts
+the browser to return fact fields. Each surviving suggestion is registered in
+a thread-safe server-side pending store (`PendingSuggestions`) under a
+cryptographically random opaque `suggestion_id`, holding the canonical
+subject/source ids, property, value, source title, and grounded snippet. The
+store is bounded (200 entries, deterministic oldest-first eviction) and
+TTL-bound (30 min). `POST /enrich/accept` and `/enrich/dismiss` carry **only**
+`subject_id` + `suggestion_id`; any client-sent fact fields are ignored.
+Acceptance reloads the source article, re-derives the source title
+server-side, re-runs the `_snippet_grounded` anti-hallucination gate against
+the source text as it is *now*, and validates field shape — then persists and
+consumes the id atomically (one-use; concurrent accepts race to a single
+winner, the loser gets `409`). Unknown/expired/mismatched/replayed ids get
+`400`; altered-source or ungrounded entries get `409` and are consumed.
+Pending suggestions are ephemeral: a restart clears them (re-run "Find
+enrichments").
+
+**Scope.** This remains **single-operator authorization, not identity** — one
+shared credential gates mutations; there are no user accounts, sessions, or
+audit trails. Any future multi-user deployment needs a real per-user
+auth/audit design.

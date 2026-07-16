@@ -29,7 +29,9 @@ The corpus files, emb/ files, and baseline docker stack are READ-ONLY here.
 from __future__ import annotations
 
 import argparse
+import hmac
 import html
+import ipaddress
 import math
 from html.parser import HTMLParser
 import json
@@ -87,6 +89,14 @@ ENRICH_SOURCE_CHARS = 900  # per-source text budget (lead + a little body)
 ENRICH_TARGET_CHARS = 2000  # target-article text shown to the model (dedupe context)
 ENRICH_SECTION_MIN = 2  # a section must appear in >= N same-type neighbours to report
 ENRICH_SNIPPET_MIN = 12  # min verbatim-snippet length the grounding gate accepts
+# advisor 081: bounds on the server-side pending-suggestion store. Suggestions
+# emitted by /enrich are held server-side (canonical fields, opaque random id)
+# until the operator accepts or dismisses them BY ID; entries are one-use.
+ENRICH_PENDING_MAX = 200  # max pending suggestions held at once
+ENRICH_PENDING_TTL_S = 1800  # a suggestion must be acted on within 30 min
+# Conservative shape gate applied to canonical fact fields at the mutation
+# boundary (defense in depth — the fields are server-derived, never client-sent).
+_FACT_PROPERTY_RE = re.compile(r"^[\w][\w \-/.,'()&:%]{0,99}$")
 
 # --- Inline auto-linking config --------------------------------------------- #
 # Comprehensive linking is the DEFAULT: every word/phrase that resolves to an
@@ -467,6 +477,94 @@ def cmd_build(corpus: Path) -> None:
 # --------------------------------------------------------------------------- #
 # Serve — shared state loaded once at startup
 # --------------------------------------------------------------------------- #
+class PendingSuggestions:
+    """Server-side canonical store for enrichment suggestions awaiting operator
+    review (advisor 081). Browsers receive only an opaque random id plus
+    display-safe copies of the suggestion; accept/dismiss requests return the id,
+    and every persisted field comes from THIS store — client-supplied fact fields
+    are never trusted. Entries are TTL- and count-bounded and one-use: `claim`
+    atomically takes an entry in-flight (a concurrent claim of the same id gets
+    "replay"), `consume` retires it after a successful write, `release` returns
+    it to claimable if the write failed."""
+
+    def __init__(
+        self,
+        max_entries: int = ENRICH_PENDING_MAX,
+        ttl_s: float = ENRICH_PENDING_TTL_S,
+        clock=time.monotonic,
+    ):
+        self._lock = threading.Lock()
+        # insertion-ordered dict -> deterministic oldest-first eviction
+        self._entries: dict[str, dict] = {}
+        self._inflight: set[str] = set()
+        self.max_entries = max_entries
+        self.ttl_s = ttl_s
+        self._clock = clock
+
+    def _evict_locked(self, now: float) -> None:
+        for k in [
+            k
+            for k, e in self._entries.items()
+            if e["expires"] <= now and k not in self._inflight
+        ]:
+            del self._entries[k]
+        while len(self._entries) >= self.max_entries:
+            victim = next((k for k in self._entries if k not in self._inflight), None)
+            if victim is None:
+                break
+            del self._entries[victim]
+
+    def register(
+        self,
+        subject_id: int,
+        source_id: int,
+        prop: str,
+        value: str,
+        source_title: str,
+        source_snippet: str,
+    ) -> str:
+        """Store a canonical suggestion; returns the opaque one-use id."""
+        sug_id = secrets.token_urlsafe(16)
+        now = self._clock()
+        with self._lock:
+            self._evict_locked(now)
+            self._entries[sug_id] = {
+                "subject_id": int(subject_id),
+                "source_id": int(source_id),
+                "property": str(prop),
+                "value": str(value),
+                "source_title": str(source_title),
+                "source_snippet": str(source_snippet),
+                "expires": now + self.ttl_s,
+            }
+        return sug_id
+
+    def claim(self, sug_id: str, subject_id: int) -> tuple[str, dict | None]:
+        """Atomically take a pending entry in-flight. Returns ("ok", entry copy),
+        ("replay", None) if it is already in-flight, or ("unknown", None) for an
+        unknown/expired/consumed id or a subject mismatch."""
+        now = self._clock()
+        with self._lock:
+            e = self._entries.get(sug_id)
+            if e is not None and sug_id in self._inflight:
+                return "replay", None
+            if e is None or e["expires"] <= now or e["subject_id"] != int(subject_id):
+                return "unknown", None
+            self._inflight.add(sug_id)
+            return "ok", dict(e)
+
+    def consume(self, sug_id: str) -> None:
+        """Retire a claimed entry (one-use: it can never be claimed again)."""
+        with self._lock:
+            self._inflight.discard(sug_id)
+            self._entries.pop(sug_id, None)
+
+    def release(self, sug_id: str) -> None:
+        """Return a claimed entry to claimable (write failed; not consumed)."""
+        with self._lock:
+            self._inflight.discard(sug_id)
+
+
 class Reader:
     def __init__(self, corpus: Path):
         self.corpus = corpus
@@ -554,6 +652,9 @@ class Reader:
         self.overlay = sqlite3.connect(self.overlay_path, check_same_thread=False)
         self.overlay_lock = threading.Lock()
         self._init_overlay()
+        # advisor 081: pending (server-canonical) enrichment suggestions awaiting
+        # operator review — accept/dismiss consult THIS store by opaque id.
+        self.pending = PendingSuggestions()
         print(f"[serve] enrichment overlay: {self.overlay_path}")
         print("[serve] ready.")
 
@@ -1972,8 +2073,19 @@ class Reader:
             key = (prop.lower(), val.lower())
             if key in dismissed or key in accepted:
                 continue
+            # advisor 081: the canonical suggestion lives server-side under an
+            # opaque one-use id; the browser only ever echoes the id back.
+            sug_id = self.pending.register(
+                subject_id=aid,
+                source_id=sid,
+                prop=prop,
+                value=val,
+                source_title=src["title"],
+                source_snippet=snip,
+            )
             suggestions.append(
                 {
+                    "suggestion_id": sug_id,
                     "property": prop,
                     "value": val,
                     "source_id": sid,
@@ -1990,48 +2102,105 @@ class Reader:
             "n_dropped": dropped,
         }
 
-    def accept_fact(self, d: dict) -> dict:
-        """Persist an accepted suggestion to the overlay (idempotent per subject +
-        property + value). Returns the refreshed accepted-fact list for the subject."""
-        sid = int(d["subject_id"])
-        prop = str(d.get("property", ""))[:300]
-        val = str(d.get("value", ""))[:300]
+    def _claim_pending(self, d: dict) -> tuple[int, dict | None, str, dict | None]:
+        """Shared accept/dismiss request gate (advisor 081): parse subject_id +
+        suggestion_id (the ONLY fields honored), claim the canonical entry.
+        Returns (http_code, error_obj, sug_id, entry); error_obj is None on ok."""
         try:
-            source_id = int(d.get("source_id"))
-        except (TypeError, ValueError):
-            source_id = -1
-        with self.overlay_lock:
-            exists = self.overlay.execute(
-                "SELECT 1 FROM facts WHERE subject_id=? AND lower(property)=? "
-                "AND lower(value)=?",
-                (sid, prop.lower(), val.lower()),
-            ).fetchone()
-            if not exists:
+            sid = int(d["subject_id"])
+            sug_id = str(d["suggestion_id"])
+        except (KeyError, TypeError, ValueError):
+            return 400, {"error": "subject_id and suggestion_id are required"}, "", None
+        status, entry = self.pending.claim(sug_id, sid)
+        if status == "replay":
+            return 409, {"error": "suggestion is already being processed"}, "", None
+        if entry is None:
+            return (
+                400,
+                {"error": "unknown, expired, or mismatched suggestion"},
+                "",
+                None,
+            )
+        return 200, None, sug_id, entry
+
+    def accept_fact(self, d: dict) -> tuple[int, dict]:
+        """Accept a pending suggestion BY ID (advisor 081). The request carries
+        only subject_id + suggestion_id; every persisted field comes from the
+        server-held canonical entry, revalidated against the CURRENT source
+        article (reload + `_snippet_grounded` again) before the write. The id is
+        consumed atomically only after a successful write (one-use). Returns
+        (http_code, response_obj); the write stays idempotent per subject +
+        property + value."""
+        code, err, sug_id, entry = self._claim_pending(d)
+        if err is not None:
+            return code, err
+        sid = entry["subject_id"]
+        prop, val = entry["property"], entry["value"]
+        try:
+            if (
+                not _FACT_PROPERTY_RE.match(prop)
+                or not val
+                or len(val) > 300
+                or any(ord(c) < 32 for c in val)
+            ):
+                self.pending.consume(sug_id)
+                return 400, {"error": "suggestion fields failed validation"}
+            src = self.article(int(entry["source_id"]))
+            if src is None:
+                self.pending.consume(sug_id)
+                return 409, {"error": "source article is no longer available"}
+            # Repeat the anti-hallucination gate against the source text AS IT IS
+            # NOW (same window the extraction saw); a changed source rejects.
+            if not self._snippet_grounded(
+                entry["source_snippet"], src["body"][:ENRICH_SOURCE_CHARS]
+            ):
+                self.pending.consume(sug_id)
+                return 409, {"error": "snippet no longer grounded in current source"}
+            with self.overlay_lock:
+                exists = self.overlay.execute(
+                    "SELECT 1 FROM facts WHERE subject_id=? AND lower(property)=? "
+                    "AND lower(value)=?",
+                    (sid, prop.lower(), val.lower()),
+                ).fetchone()
+                if not exists:
+                    self.overlay.execute(
+                        "INSERT INTO facts VALUES (?,?,?,?,?,?,?)",
+                        (
+                            sid,
+                            prop[:300],
+                            val[:300],
+                            int(entry["source_id"]),
+                            str(src["title"])[:300],  # title derived server-side
+                            entry["source_snippet"][:300],
+                            time.time(),
+                        ),
+                    )
+                    self.overlay.commit()
+        except Exception:
+            self.pending.release(sug_id)  # unexpected failure: id stays usable
+            raise
+        self.pending.consume(sug_id)  # one-use, only after the successful write
+        return 200, {"ok": True, "facts": self.overlay_facts(sid)}
+
+    def dismiss_fact(self, d: dict) -> tuple[int, dict]:
+        """Dismiss a pending suggestion BY ID (advisor 081) so it does not
+        resurface on the next /enrich. The suppressed property/value come from
+        the server-held canonical entry, never from the client."""
+        code, err, sug_id, entry = self._claim_pending(d)
+        if err is not None:
+            return code, err
+        try:
+            with self.overlay_lock:
                 self.overlay.execute(
-                    "INSERT INTO facts VALUES (?,?,?,?,?,?,?)",
-                    (
-                        sid,
-                        prop,
-                        val,
-                        source_id,
-                        str(d.get("source_title", ""))[:300],
-                        str(d.get("source_snippet", ""))[:300],
-                        time.time(),
-                    ),
+                    "INSERT INTO dismissed VALUES (?,?,?)",
+                    (entry["subject_id"], entry["property"], entry["value"]),
                 )
                 self.overlay.commit()
-        return {"ok": True, "facts": self.overlay_facts(sid)}
-
-    def dismiss_fact(self, d: dict) -> dict:
-        """Suppress a suggestion so it does not resurface on the next /enrich."""
-        sid = int(d["subject_id"])
-        with self.overlay_lock:
-            self.overlay.execute(
-                "INSERT INTO dismissed VALUES (?,?,?)",
-                (sid, str(d.get("property", "")), str(d.get("value", ""))),
-            )
-            self.overlay.commit()
-        return {"ok": True}
+        except Exception:
+            self.pending.release(sug_id)
+            raise
+        self.pending.consume(sug_id)
+        return 200, {"ok": True}
 
 
 _HTML_OK = {
@@ -2807,7 +2976,21 @@ p { line-height:1.6; }
 <div id="hovercard"></div>
 <script>
 const $ = s => document.querySelector(s);
-function wrToken(){ const m = document.querySelector('meta[name="wr-token"]'); return m ? m.content : ''; }
+// Loopback serves embed an ephemeral session token in the meta tag; remote
+// serves leave it EMPTY and the operator is prompted once per tab. The value
+// lives only in sessionStorage and travels only in the X-TriDB-Token header —
+// never in a URL, never rendered by the server.
+function wrToken(){
+  const m = document.querySelector('meta[name="wr-token"]');
+  if(m && m.content) return m.content;
+  let t = sessionStorage.getItem('wr-op-token') || '';
+  if(!t){
+    t = (prompt('Operator token (remote mode — mutations require it):') || '').trim();
+    if(t) sessionStorage.setItem('wr-op-token', t);
+  }
+  return t;
+}
+function wrAuthFailed(){ sessionStorage.removeItem('wr-op-token'); }
 async function j(u){ const r = await fetch(u); return r.json(); }
 function esc(s){ const d=document.createElement('div'); d.textContent=s; return d.innerHTML; }
 // score is cosine similarity (0..1, higher = more related).
@@ -2958,24 +3141,31 @@ async function findEnrich(id){
     (r.n_dropped ? (' · '+r.n_dropped+' unsourced dropped') : '');
   box.innerHTML = renderSuggestions(id, r);
 }
+// Accept/dismiss send ONLY subject_id + suggestion_id — the canonical fact
+// fields live server-side and are revalidated (re-grounded) at acceptance.
 async function acceptEnrich(id, i){
   const f = _enrichData[i]; if(!f) return;
-  const payload = { subject_id:id, property:f.property, value:f.value,
-    source_id:f.source_id, source_title:f.source_title, source_snippet:f.source_snippet };
-  let r;
-  try { r = await (await fetch('/enrich/accept', { method:'POST',
-    headers:{'Content-Type':'application/json', 'X-TriDB-Token':wrToken()},
-    body:JSON.stringify(payload) })).json(); }
-  catch(e){ return; }
+  let res, r;
+  try {
+    res = await fetch('/enrich/accept', { method:'POST',
+      headers:{'Content-Type':'application/json', 'X-TriDB-Token':wrToken()},
+      body:JSON.stringify({ subject_id:id, suggestion_id:f.suggestion_id }) });
+    if(res.status===403){ wrAuthFailed(); $('#enrichmsg').textContent='operator token rejected'; return; }
+    r = await res.json();
+  } catch(e){ return; }
+  if(!res.ok){ $('#enrichmsg').textContent = (r && r.error) || 'accept failed'; return; }
   const row = $('#sug'+i); if(row) row.style.display = 'none';
   if(r.facts) $('#enrichaccepted').innerHTML = renderEnrichments(r.facts);
 }
 async function dismissEnrich(id, i){
   const f = _enrichData[i]; if(!f) return;
-  try { await fetch('/enrich/dismiss', { method:'POST',
-    headers:{'Content-Type':'application/json', 'X-TriDB-Token':wrToken()},
-    body:JSON.stringify({ subject_id:id, property:f.property, value:f.value }) }); }
-  catch(e){ return; }
+  let res;
+  try {
+    res = await fetch('/enrich/dismiss', { method:'POST',
+      headers:{'Content-Type':'application/json', 'X-TriDB-Token':wrToken()},
+      body:JSON.stringify({ subject_id:id, suggestion_id:f.suggestion_id }) });
+    if(res.status===403){ wrAuthFailed(); $('#enrichmsg').textContent='operator token rejected'; return; }
+  } catch(e){ return; }
   const row = $('#sug'+i); if(row) row.style.display = 'none';
 }
 async function loadRelated(id){
@@ -3439,9 +3629,58 @@ MAX_BODY_BYTES = (
 )  # cap mutating POST bodies (accept/dismiss payloads are small)
 
 
+def is_loopback_host(host: str) -> bool:
+    """True iff `host` is a loopback bind ("localhost", 127.0.0.0/8, or ::1) —
+    the explicit bind-mode predicate (advisor 081)."""
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+MIN_OPERATOR_TOKEN_CHARS = 16
+
+
+def resolve_operator_token(host: str, environ=None) -> tuple[str, bool]:
+    """Resolve the mutation credential for a bind (advisor 081). Returns
+    (token, generated).
+
+    Loopback: `WIKI_READER_OPERATOR_TOKEN` if set, else an ephemeral per-process
+    session token (generated=True). A generated token may be embedded in the
+    served page — acceptable ONLY on loopback, where anyone who can load the
+    page is the local operator.
+
+    Non-loopback: `WIKI_READER_OPERATOR_TOKEN` is REQUIRED (provisioned out of
+    band) and must be at least MIN_OPERATOR_TOKEN_CHARS characters; raises
+    ValueError otherwise. A remote operator token is never rendered into HTML,
+    printed, logged, or placed in a URL."""
+    env = os.environ if environ is None else environ
+    configured = (env.get("WIKI_READER_OPERATOR_TOKEN") or "").strip()
+    if is_loopback_host(host):
+        if configured:
+            return configured, False
+        return secrets.token_urlsafe(24), True
+    if not configured:
+        raise ValueError(
+            "non-loopback bind requires WIKI_READER_OPERATOR_TOKEN in the "
+            "environment (remote mutation credential — see "
+            "docs/offline_wiki_reader_v0.1.0.md)"
+        )
+    if len(configured) < MIN_OPERATOR_TOKEN_CHARS:
+        raise ValueError(
+            f"WIKI_READER_OPERATOR_TOKEN is too short "
+            f"(< {MIN_OPERATOR_TOKEN_CHARS} chars) for a non-loopback bind"
+        )
+    return configured, False
+
+
 def check_token(headers, expected: str) -> bool:
     """True iff `headers` (dict-like, `.get(name, default)`) carries `expected` via
-    the `X-TriDB-Token` header or an `Authorization: Bearer <token>` header."""
+    the `X-TriDB-Token` header or an `Authorization: Bearer <token>` header.
+    Comparison is constant-time (hmac.compare_digest), so the token cannot be
+    recovered by response timing."""
     if not expected:
         return False
     supplied = headers.get("X-TriDB-Token", "") or ""
@@ -3449,7 +3688,21 @@ def check_token(headers, expected: str) -> bool:
         auth = headers.get("Authorization", "") or ""
         if auth.startswith("Bearer "):
             supplied = auth[len("Bearer ") :]
-    return supplied == expected
+    if not supplied:
+        return False
+    return hmac.compare_digest(supplied.encode("utf-8"), expected.encode("utf-8"))
+
+
+def render_index_html(token: str, embed_token: bool) -> str:
+    """The /read page. The mutation token is embedded ONLY when `embed_token`
+    (loopback ephemeral-session mode); a remote operator credential must never
+    appear in any served HTML — remote browsers prompt the operator instead."""
+    if not embed_token:
+        return INDEX_HTML
+    return INDEX_HTML.replace(
+        '<meta name="wr-token" content="">',
+        f'<meta name="wr-token" content="{html.escape(token)}">',
+    )
 
 
 def parse_body(raw: bytes, max_len: int = MAX_BODY_BYTES) -> dict:
@@ -3461,11 +3714,8 @@ def parse_body(raw: bytes, max_len: int = MAX_BODY_BYTES) -> dict:
     return json.loads(raw or b"{}")
 
 
-def make_handler(reader: Reader, token: str):
-    index_html = INDEX_HTML.replace(
-        '<meta name="wr-token" content="">',
-        f'<meta name="wr-token" content="{html.escape(token)}">',
-    )
+def make_handler(reader: Reader, token: str, embed_token: bool = False):
+    index_html = render_index_html(token, embed_token)
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *a):  # quiet
@@ -3496,8 +3746,8 @@ def make_handler(reader: Reader, token: str):
             self.end_headers()
             self.wfile.write(body)
 
-        def _json(self, obj) -> None:
-            self._send(200, json.dumps(obj).encode("utf-8"), "application/json")
+        def _json(self, obj, code: int = 200) -> None:
+            self._send(code, json.dumps(obj).encode("utf-8"), "application/json")
 
         def do_GET(self):
             u = urlparse(self.path)
@@ -3661,12 +3911,14 @@ def make_handler(reader: Reader, token: str):
                 if u.path in ("/enrich/accept", "/enrich/dismiss") and not check_token(
                     self.headers, token
                 ):
-                    self._send(401, b"unauthorized", "text/plain")
+                    self._send(403, b"forbidden", "text/plain")
                     return
                 if u.path == "/enrich/accept":
-                    self._json(reader.accept_fact(body))
+                    code, obj = reader.accept_fact(body)
+                    self._json(obj, code)
                 elif u.path == "/enrich/dismiss":
-                    self._json(reader.dismiss_fact(body))
+                    code, obj = reader.dismiss_fact(body)
+                    self._json(obj, code)
                 else:
                     self._send(404, b"not found", "text/plain")
             except Exception:
@@ -3677,11 +3929,19 @@ def make_handler(reader: Reader, token: str):
 
 
 def cmd_serve(corpus: Path, host: str, port: int) -> None:
+    try:
+        token, generated = resolve_operator_token(host)
+    except ValueError as e:
+        raise SystemExit(f"[serve] {e}") from e
     reader = Reader(corpus)
-    token = os.environ.get("WIKI_READER_TOKEN") or secrets.token_urlsafe(24)
-    if not os.environ.get("WIKI_READER_TOKEN"):
-        print(f"[serve] auth token (mutating POSTs): {token}")
-    httpd = ThreadingHTTPServer((host, port), make_handler(reader, token))
+    if generated:
+        # Loopback single-user ergonomics ONLY: the ephemeral session token is
+        # printed and embedded in the page. A CONFIGURED operator token is never
+        # printed, logged, or rendered — remote browsers prompt for it instead.
+        print(f"[serve] loopback session token (mutating POSTs): {token}")
+    httpd = ThreadingHTTPServer(
+        (host, port), make_handler(reader, token, embed_token=generated)
+    )
     print(f"[serve] listening on http://{host}:{port}  (Ctrl-C to stop)")
     try:
         httpd.serve_forever()
@@ -3722,7 +3982,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if (
         args.cmd == "serve"
-        and args.host not in ("127.0.0.1", "::1", "localhost")
+        and not is_loopback_host(args.host)
         and not args.allow_remote
     ):
         ap.error(
