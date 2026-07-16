@@ -18,11 +18,13 @@ sys.path.insert(0, str(ROOT))
 
 np = pytest.importorskip("numpy")
 
+import bench.live_report as live_report_mod  # noqa: E402
 from bench.live_report import (  # noqa: E402
     baseline_query_canonical,
     build_report,
     parse_bench_output,
     rebuild_corpus,
+    resolve_seed,
 )
 
 
@@ -182,3 +184,109 @@ def test_build_report_incomplete_raises():
     m = _manifest()
     with pytest.raises(SystemExit):
         build_report("#BENCH TRIDB_RESULT qid=0 ids=1\n", m, m["seed"])  # no DONE
+
+
+# --------------------------------------------------------------------------- #
+# Plan 089: the manifest's recorded seed is authoritative for grading; --seed
+# is only an explicit override that must AGREE (conflict = hard error).
+# --------------------------------------------------------------------------- #
+
+
+def test_resolve_seed_manifest_used_by_default():
+    assert resolve_seed({"seed": 7}, None) == 7
+
+
+def test_resolve_seed_conflicting_flag_errors():
+    with pytest.raises(SystemExit):
+        resolve_seed({"seed": 7}, 42)
+
+
+def test_resolve_seed_both_agree():
+    assert resolve_seed({"seed": 7}, 7) == 7
+
+
+def test_resolve_seed_legacy_manifest_uses_flag(capsys):
+    assert resolve_seed({}, 9) == 9
+    assert "WARNING" in capsys.readouterr().out
+
+
+def test_resolve_seed_legacy_manifest_no_flag_defaults(capsys):
+    assert resolve_seed({}, None) == 42
+    assert "WARNING" in capsys.readouterr().out
+
+
+def _write_live_run(tmp_path, m):
+    """Write a self-consistent transcript + manifest for main()-level tests."""
+    corpus = rebuild_corpus(m, m["seed"])
+    q = m["queries"][0]
+    from bench.driver import _l2_sq
+
+    order = sorted(
+        (1, 2, 3, 4),
+        key=lambda d: _l2_sq(corpus.entities[d]["embedding"], q["embedding"]),
+    )
+    ids = ",".join(str(x) for x in order[: m["k"]])
+    text = (
+        f"#BENCH QSTART qid=0 src=0 k=3\n"
+        f"#BENCH TRIDB_RESULT qid=0 ids={ids}\n"
+        f"#BENCH TRIDB_EXAMINED qid=0 examined=5\n"
+        f"#BENCH EXPLAIN_BEGIN qid=0\n Execution Time: 0.5 ms\n#BENCH EXPLAIN_END qid=0\n"
+        f"#BENCH ORACLE qid=0 ids={ids}\n"
+        f"#BENCH ORACLE_COUNTS qid=0 reached=4 filtered=4\n"
+        f"#BENCH QEND qid=0\n#BENCH DONE\n"
+    )
+    bench_out = tmp_path / "bench.out"
+    bench_out.write_text(text)
+    manifest_p = tmp_path / "manifest.json"
+    import json
+
+    manifest_p.write_text(json.dumps(m))
+    return bench_out, manifest_p
+
+
+def test_main_grades_with_manifest_seed_by_default(tmp_path, monkeypatch):
+    # manifest recorded seed 7; no --seed flag -> rebuild_corpus must get 7,
+    # NOT a silent flag default (the plan-089 negative control).
+    m = _manifest(tmp_seed=7)
+    bench_out, manifest_p = _write_live_run(tmp_path, m)
+    seen: list[int] = []
+    real = live_report_mod.rebuild_corpus
+
+    def spy(manifest, seed):
+        seen.append(seed)
+        return real(manifest, seed)
+
+    monkeypatch.setattr(live_report_mod, "rebuild_corpus", spy)
+    live_report_mod.main(
+        [
+            "--bench-out",
+            str(bench_out),
+            "--manifest",
+            str(manifest_p),
+            "--json-out",
+            str(tmp_path / "out.json"),
+            "--html-out",
+            str(tmp_path / "out.html"),
+        ]
+    )
+    assert seen == [7]
+
+
+def test_main_conflicting_seed_flag_errors(tmp_path):
+    m = _manifest(tmp_seed=7)
+    bench_out, manifest_p = _write_live_run(tmp_path, m)
+    with pytest.raises(SystemExit):
+        live_report_mod.main(
+            [
+                "--bench-out",
+                str(bench_out),
+                "--manifest",
+                str(manifest_p),
+                "--seed",
+                "42",
+                "--json-out",
+                str(tmp_path / "out.json"),
+                "--html-out",
+                str(tmp_path / "out.html"),
+            ]
+        )
