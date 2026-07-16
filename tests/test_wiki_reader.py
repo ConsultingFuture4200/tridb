@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import io
 import json
+import logging
 import sqlite3
 import sys
 import threading
@@ -741,3 +742,56 @@ def test_get_path_valid_narrate_zero_resolves(get_env):
     assert _get(handler, "/path?from=a&to=b&narrate=0") == 200
     assert ("resolve", "a") in stub.calls and ("resolve", "b") in stub.calls
     assert slots.acquires == 0
+
+
+# --------------------------------------------------------------------------- #
+# Plan 092: the public 200-path LLM-unavailable fallbacks must not leak the
+# exception repr, the ollama backend URL, or the model name. Operator detail
+# goes to the server log instead.
+
+
+def _raising_urlopen(exc):
+    def fake_urlopen(*args, **kwargs):
+        raise exc
+
+    return fake_urlopen
+
+
+def test_llm_answer_failure_body_is_scrubbed(monkeypatch, caplog):
+    r = wr.Reader.__new__(wr.Reader)
+    boom = ConnectionRefusedError("refused at backend-host-detail-xyz:11434")
+    monkeypatch.setattr(wr.urllib.request, "urlopen", _raising_urlopen(boom))
+    with caplog.at_level(logging.ERROR):
+        msg = r._llm_answer("q", [{"title": "T", "body": "B"}])
+    # no leak in the public body
+    assert "backend-host-detail-xyz" not in msg
+    assert repr(boom) not in msg
+    assert wr.OLLAMA_URL not in msg
+    assert wr.ASK_MODEL not in msg
+    # still an honest, useful message
+    assert "unavailable" in msg.lower()
+    assert "sources" in msg.lower()
+    # operator detail reaches the server log
+    assert any(
+        rec.exc_info and "backend-host-detail-xyz" in str(rec.exc_info[1])
+        for rec in caplog.records
+    )
+    assert any(wr.OLLAMA_URL in rec.getMessage() for rec in caplog.records)
+
+
+def test_narrate_path_failure_body_is_scrubbed(monkeypatch, caplog):
+    r = wr.Reader.__new__(wr.Reader)
+    boom = TimeoutError("timed out at backend-host-detail-xyz:11434")
+    monkeypatch.setattr(wr.urllib.request, "urlopen", _raising_urlopen(boom))
+    with caplog.at_level(logging.ERROR):
+        msg = r.narrate_path([{"title": "A"}, {"title": "B"}])
+    assert "backend-host-detail-xyz" not in msg
+    assert repr(boom) not in msg
+    assert wr.OLLAMA_URL not in msg
+    assert wr.ASK_MODEL not in msg
+    assert "unavailable" in msg.lower()
+    assert "chain" in msg.lower()
+    assert any(
+        rec.exc_info and "backend-host-detail-xyz" in str(rec.exc_info[1])
+        for rec in caplog.records
+    )

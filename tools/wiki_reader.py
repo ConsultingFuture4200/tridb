@@ -1211,8 +1211,17 @@ class Reader:
             with urllib.request.urlopen(req, timeout=LLM_TIMEOUT) as r:
                 resp = json.loads(r.read())
             return resp["message"]["content"].strip()
-        except Exception as e:
-            return f"[LLM unavailable: {e!r}. The hyperlink chain above still holds.]"
+        except Exception:
+            # Same scrub as _llm_answer: detail to the server log, generic body.
+            logging.exception(
+                "wiki_reader llm narration failed (model=%s url=%s)",
+                ASK_MODEL,
+                OLLAMA_URL,
+            )
+            return (
+                "[Narration is temporarily unavailable. "
+                "The hyperlink chain above still holds.]"
+            )
 
     # -- Fused related (meaning x topology) -------------------------------- #
     def related_fused(
@@ -1697,10 +1706,17 @@ class Reader:
             with urllib.request.urlopen(req, timeout=LLM_TIMEOUT) as r:
                 resp = json.loads(r.read())
             return resp["message"]["content"].strip()
-        except Exception as e:  # surface the failure honestly rather than fabricate
+        except Exception:  # surface the failure honestly rather than fabricate
+            # Operator detail (exception, backend URL, model) goes to the server
+            # log only — the public 200-path body must never carry it (plan 092).
+            logging.exception(
+                "wiki_reader llm answer failed (model=%s url=%s)",
+                ASK_MODEL,
+                OLLAMA_URL,
+            )
             return (
-                f"[LLM unavailable: {e!r}. Is ollama serving '{ASK_MODEL}' at "
-                f"{OLLAMA_URL}? The retrieved sources below are still valid.]"
+                "[Answer generation is temporarily unavailable. "
+                "The retrieved sources below are still valid.]"
             )
 
     def _score_by_query(self, qvec: np.ndarray, ids: list[int]) -> dict[int, float]:
