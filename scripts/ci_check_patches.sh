@@ -13,7 +13,7 @@
 # scripts/lib/msvbase_patches.sh — NOT hardcoded here so a re-pin re-validates automatically),
 # initializes ONLY the submodules the patches target (thirdparty/hnsw + thirdparty/Postgres;
 # SPTAG is opt-in WITH_SPTAG=OFF and verify_patches only checks the spann patch when the SPTAG
-# tree is present), then runs apply_msvbase_patches + verify_patches. It validates apply +
+# tree is initialized), then runs apply_msvbase_patches + verify_patches. It validates apply +
 # sentinels only — NOT that the C compiles. The engine job remains the compile/run gate.
 #
 # SPTAG-skip is safe: upstream scripts/patch.sh runs each `git apply` in a subshell with no
@@ -54,16 +54,13 @@ git -C "$SRC" fetch --quiet --depth 1 origin "$PIN_COMMIT"
 git -C "$SRC" checkout -q FETCH_HEAD
 
 # Initialize ONLY the submodules the patches target. SPTAG (spann.patch) is opt-in and skipped:
-# verify_patches only greps it when thirdparty/SPTAG exists, and upstream patch.sh tolerates its
-# absence (subshell + no set -e). This keeps the clone light and the run fast.
+# verify_patches only greps it when the tree is initialized (sptag_initialized, plan 084), and
+# upstream patch.sh tolerates its absence (subshell + no set -e). This keeps the clone light and
+# the run fast. The registered-but-uninitialized submodule's EMPTY placeholder directory is
+# deliberately LEFT in place so this run exercises the real initialization predicate the build
+# scripts use — do not rm it as a workaround.
 log "init submodules: thirdparty/hnsw thirdparty/Postgres (SPTAG skipped — opt-in, kept lean)"
 git -C "$SRC" submodule update --init --depth 1 thirdparty/hnsw thirdparty/Postgres
-
-# A registered-but-uninitialized submodule still leaves an EMPTY placeholder directory in the
-# working tree. verify_patches guards the spann check with `[[ -d thirdparty/SPTAG ]]`, so that
-# empty dir makes the guard true while the tree has no MultiIndexScan -> false "spann.patch NOT
-# applied". Remove the placeholder so the guard correctly SKIPS the opt-in SPTAG check (disposable clone).
-rm -rf "$SRC/thirdparty/SPTAG"
 
 # apply_msvbase_patches already calls verify_patches at the end; the explicit re-run is a cheap
 # belt-and-suspenders. Any failed apply or missing sentinel calls die() -> non-zero exit.
