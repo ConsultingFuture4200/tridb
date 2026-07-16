@@ -75,7 +75,7 @@ def exact_oracle(cur, q: dict) -> list[int]:
 
 def run_point(cur, queries, oracle, tc: int, budget: int) -> dict:
     cur.execute("SET hnsw.iterative_scan = relaxed_order")
-    cur.execute("SET hnsw.max_scan_tuples = %s", (budget,))
+    cur.execute(f"SET hnsw.max_scan_tuples = {int(budget)}")
     recalls, lats, exams = [], [], []
     capped = 0
     for q in queries:
