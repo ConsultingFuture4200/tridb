@@ -33,6 +33,7 @@ import html
 import math
 from html.parser import HTMLParser
 import json
+import logging
 import os
 import random
 import re
@@ -62,6 +63,13 @@ UNDIR_OFF_NAME = "edges_undir_off.i64.npy"
 # stay well under the GPU budget so a later heavy job has the unified pool free.
 ASK_MODEL = os.environ.get("WIKI_ASK_MODEL", "qwen2.5:7b-instruct")
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434").rstrip("/")
+# Concurrency ceiling for the blocking local-LLM routes (/ask, /enrich, narrate).
+# The server is unbounded-threaded and public; without a ceiling a burst of these
+# expensive calls exhausts CPU/GPU/threads. Over-ceiling requests get a fast 429.
+_LLM_SLOTS = threading.Semaphore(int(os.environ.get("WIKI_READER_LLM_SLOTS", "2")))
+# Wall-clock cap on each LLM HTTP call (was 120/180s — far too long for a public
+# endpoint). Kept env-overridable for slower models on the host.
+LLM_TIMEOUT = int(os.environ.get("WIKI_READER_LLM_TIMEOUT", "30"))
 ASK_K = 8  # passages fed to the LLM
 PASSAGE_CHARS = 1500  # per-passage body budget so k passages fit the context
 
@@ -1099,7 +1107,7 @@ class Reader:
             headers={"Content-Type": "application/json"},
         )
         try:
-            with urllib.request.urlopen(req, timeout=120) as r:
+            with urllib.request.urlopen(req, timeout=LLM_TIMEOUT) as r:
                 resp = json.loads(r.read())
             return resp["message"]["content"].strip()
         except Exception as e:
@@ -1585,7 +1593,7 @@ class Reader:
             headers={"Content-Type": "application/json"},
         )
         try:
-            with urllib.request.urlopen(req, timeout=180) as r:
+            with urllib.request.urlopen(req, timeout=LLM_TIMEOUT) as r:
                 resp = json.loads(r.read())
             return resp["message"]["content"].strip()
         except Exception as e:  # surface the failure honestly rather than fabricate
@@ -1844,7 +1852,7 @@ class Reader:
             headers={"Content-Type": "application/json"},
         )
         try:
-            with urllib.request.urlopen(req, timeout=180) as r:
+            with urllib.request.urlopen(req, timeout=LLM_TIMEOUT) as r:
                 content = json.loads(r.read())["message"]["content"]
             obj = json.loads(content)
         except Exception as e:
@@ -3462,6 +3470,24 @@ def make_handler(reader: Reader, token: str):
             self.send_response(code)
             self.send_header("Content-Type", ctype)
             self.send_header("Content-Length", str(len(body)))
+            # Response-hardening headers on every response.
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("X-Frame-Options", "DENY")
+            self.send_header("Referrer-Policy", "no-referrer")
+            # CSP only on HTML responses (the pages carry inline <script>/<style>).
+            # 'unsafe-inline' is a known INTERIM allowance: the page relies on inline
+            # script/style, so removing it requires nonce plumbing (out of scope here).
+            # The rest of the policy still locks image/framing/object origins, giving a
+            # backstop behind the article-body sanitizer against stored XSS.
+            if ctype.startswith("text/html"):
+                self.send_header(
+                    "Content-Security-Policy",
+                    "default-src 'self'; "
+                    "img-src 'self' https://upload.wikimedia.org data:; "
+                    "script-src 'self' 'unsafe-inline'; "
+                    "style-src 'self' 'unsafe-inline'; "
+                    "frame-ancestors 'none'; object-src 'none'",
+                )
             self.end_headers()
             self.wfile.write(body)
 
@@ -3494,7 +3520,13 @@ def make_handler(reader: Reader, token: str):
                         hops = int(qs.get("hops", ["1"])[0] or "1")
                     except ValueError:
                         hops = 1
-                    self._json(reader.ask(q, expand=expand, hops=hops))
+                    if not _LLM_SLOTS.acquire(blocking=False):
+                        self._send(429, b"busy", "text/plain")
+                        return
+                    try:
+                        self._json(reader.ask(q, expand=expand, hops=hops))
+                    finally:
+                        _LLM_SLOTS.release()
                 elif path == "/search_semantic":
                     qs = parse_qs(u.query)
 
@@ -3556,7 +3588,13 @@ def make_handler(reader: Reader, token: str):
                         self._json(art)
                 elif path.startswith("/enrich/"):
                     aid = int(unquote(path.split("/")[-1]))
-                    self._json(reader.enrich(aid))
+                    if not _LLM_SLOTS.acquire(blocking=False):
+                        self._send(429, b"busy", "text/plain")
+                        return
+                    try:
+                        self._json(reader.enrich(aid))
+                    finally:
+                        _LLM_SLOTS.release()
                 elif path.startswith("/summary/"):
                     aid = int(unquote(path.split("/")[-1]))
                     s = reader.summary(aid)
@@ -3588,12 +3626,19 @@ def make_handler(reader: Reader, token: str):
                     else:
                         res = reader.path(frm["id"], to["id"])
                         if res.get("found") and qs.get("narrate", ["0"])[0] == "1":
-                            res["narration"] = reader.narrate_path(res["path"])
+                            if not _LLM_SLOTS.acquire(blocking=False):
+                                self._send(429, b"busy", "text/plain")
+                                return
+                            try:
+                                res["narration"] = reader.narrate_path(res["path"])
+                            finally:
+                                _LLM_SLOTS.release()
                         self._json(res)
                 else:
                     self._send(404, b"not found", "text/plain")
-            except Exception as e:  # never take the server down on one bad request
-                self._send(500, html.escape(repr(e)).encode(), "text/plain")
+            except Exception:  # never take the server down on one bad request
+                logging.exception("wiki_reader request failed")
+                self._send(500, b"internal error", "text/plain")
 
         def do_POST(self):
             u = urlparse(self.path)
@@ -3619,8 +3664,9 @@ def make_handler(reader: Reader, token: str):
                     self._json(reader.dismiss_fact(body))
                 else:
                     self._send(404, b"not found", "text/plain")
-            except Exception as e:
-                self._send(500, html.escape(repr(e)).encode(), "text/plain")
+            except Exception:
+                logging.exception("wiki_reader request failed")
+                self._send(500, b"internal error", "text/plain")
 
     return Handler
 
