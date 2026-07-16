@@ -552,7 +552,7 @@ Python layer verifies here (`make test`=pytest, `make lint`=ruff). Stock-PG engi
 | 064 | Wikidata baseline recall reproducibility (deterministic Neo4j subset + oracle/engine tie-break) | P1 | S | LOW | YES (python) | **DONE** (merged; advisor-reviewed APPROVE: lexsort verified, 12 h2h tests + 379 suite green, done-criteria greps pass; residual noted: baseline reranks still lack id tie-break) |
 | 065 | Orphaned gate-env var (`WD_`/`WH_` drift) + report zero-guard + numeric-id item check | P1 | S | LOW | YES (python) | **DONE** (merged; advisor-reviewed APPROVE: WH_ or WD_ gate-env fallback, zero-latency blocker, numeric-id item guard; 382 suite + 3 new tests green) |
 | 066 | Pin the pgvector base image + assert pgvector ≥0.8 at CREATE EXTENSION | P1 | S | LOW | stock-PG engine | **DONE** (merged; advisor-reviewed APPROVE: 0.8.0-pgN pin both Dockerfiles, CREATE EXTENSION version-floor guard verified across edge cases, suite ALL PASS on rebuilt pinned image) |
-| 067 | Reconcile outward docs with D2 (README/STATUS/CLAUDE/CONTRIBUTING/ADR-0015/INSTALL) | P1 | S | LOW | docs-only (grep) | TODO |
+| 067 | Reconcile outward docs with D2 (README/STATUS/CLAUDE/CONTRIBUTING/ADR-0015/INSTALL) | P1 | S | LOW | docs-only (grep) | **DONE** (merged; advisor-reviewed APPROVE: front-door reframed to stock-PG-first + Gate A/B numbers, INSTALL bridge-parity corrected to landed, ADR-0015 Accepted; factual, no overclaim, greps pass) |
 | 068 | Public wiki_reader hardening (LLM-route DoS bound, error-leak, response headers) | P1 | S–M | LOW–MED | manual (live host) | TODO |
 
 **Recommended order**: 062 → 063 (both touch `tjs_pg.c`; land the segfault guard first, keep diffs
