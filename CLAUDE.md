@@ -20,11 +20,14 @@ Full context: `README.md`, `spec/tridb_spec_v0.1.0.md`, Linear project TriDB.
 
 ## Hardware reality
 
-Target hardware is the **GX10 (ARM64 + CUDA, 128 GB)**. The MSVBASE fork build and all
-native C work compile *only on the GX10*. A non-GX10 workstation can build/test the
-hardware-independent layer (design, build script, seed tooling, baseline harness) but
-must NOT claim the C access-method or the live benchmark is done — those are GX10-gated.
-When you produce gated C, mark it clearly as unbuilt-here and stop short of "passes".
+Target hardware is the **GX10 (ARM64 + CUDA, 128 GB)**. The MSVBASE **fork** build (PG 13.4,
+`--with-blocksize=32`, CUDA/NEON) compiles *only on the GX10*. Since the D2 un-fork, the native
+graph AM and the `src/tjs_pg` operator also build and test as stock-PG extensions **off-GX10** on
+x86_64 (PG 16/17, `scripts/pg17_graph_test.sh`, CI job `stock-pg`) — see
+`docs/INSTALL_stock_pg.md`. A non-GX10 workstation can build/test the hardware-independent layer
+AND the stock-PG extension path, but must NOT claim the ARM64 fork build sign-off or the 128 GB
+live benchmark is done — those stay GX10-gated. When you produce GX10-gated C, mark it clearly as
+unbuilt-here and stop short of "passes".
 
 ## Build & test commands
 
@@ -68,7 +71,10 @@ scripts/gx10build.sh         # builds the MSVBASE fork (PG 13.4, HNSW, --with-bl
 - Design docs: `docs/`, versioned (`*_v0.1.0.md`). ADRs: `docs/decisions/NNNN-*.md`, numbered.
 - Spec evolution: append an addendum / bump version, do not silently rewrite.
 - Commits: `type(scope): summary`. Branch names match Linear: `dustin/dev-NNNN`.
-- C for Postgres internals targets PG 13.4 access-method APIs; 32KB block size.
+- C for Postgres internals targets **PG 13.4 fork AND stock PG 16/17** access-method APIs. The
+  graph AM is BLCKSZ-capability, not fixed (`src/graph_store/gph_page.h`: `StaticAssertDecl(BLCKSZ >=
+  8192)`, layout is BLCKSZ-derived) — 8KB works on stock PG; 32KB is the high-degree performance
+  target on the fork. Zero measured PG 13→17 API drift (ADR-0015 E2).
 - Python: `uv`/`pip`, `ruff`, `pytest`.
 
 ## Issue map

@@ -73,7 +73,9 @@ def _root_buffers(cur, sql):
         if isinstance(plan, str):
             plan = json.loads(plan)
         root = plan[0]["Plan"]
-        return int(root.get("Shared Hit Blocks", 0)) + int(root.get("Shared Read Blocks", 0))
+        return int(root.get("Shared Hit Blocks", 0)) + int(
+            root.get("Shared Read Blocks", 0)
+        )
     except Exception:
         # Text fallback: cumulative root = max across nodes.
         cur.execute("EXPLAIN (ANALYZE, BUFFERS) " + sql)
@@ -104,8 +106,9 @@ def _recall_by_type(records):
 def run_tridb(port, host, queries, k, runs, password=None):
     import psycopg
 
-    conn = psycopg.connect(host=host, port=port, dbname="postgres", user="postgres",
-                            password=password)
+    conn = psycopg.connect(
+        host=host, port=port, dbname="postgres", user="postgres", password=password
+    )
     conn.autocommit = True
     cur = conn.cursor()
     cur.execute("SET enable_seqscan = off;")
@@ -113,7 +116,9 @@ def run_tridb(port, host, queries, k, runs, password=None):
     records = []
     for q in queries:
         sql = f"SELECT id FROM articles ORDER BY embedding <-> '{_lit(q['vec'])}' LIMIT {k}"
-        cur.execute(sql)  # warm-up (absorbs the one-time cold LoadIndex on the very first query)
+        cur.execute(
+            sql
+        )  # warm-up (absorbs the one-time cold LoadIndex on the very first query)
         got = [int(r[0]) for r in cur.fetchall()]
         rec = recall_at_k(got, q["oracle"], k)
         buffers = _root_buffers(cur, sql)
@@ -124,8 +129,15 @@ def run_tridb(port, host, queries, k, runs, password=None):
             cur.execute(sql)
             cur.fetchall()
             ts.append((time.perf_counter() - t0) * 1e3)
-        records.append({"type": q["type"], "recall": rec, "lat_ms": statistics.median(ts),
-                        "buffers": buffers, "fallback": fallback})
+        records.append(
+            {
+                "type": q["type"],
+                "recall": rec,
+                "lat_ms": statistics.median(ts),
+                "buffers": buffers,
+                "fallback": fallback,
+            }
+        )
     # client round-trip floor: pure libpq round-trip, no table access.
     floor = []
     for _ in range(50):
@@ -143,13 +155,16 @@ def run_tridb(port, host, queries, k, runs, password=None):
         "recall": _mean([r["recall"] for r in records]),
         "recall_excl_fallback": _mean([r["recall"] for r in kept]),
         "recall_by_type": _recall_by_type(records),
-        "p50_ms": _pct(lats, 50), "p95_ms": _pct(lats, 95),
-        "p99_ms": _pct(lats, 99), "max_ms": max(lats) if lats else float("nan"),
+        "p50_ms": _pct(lats, 50),
+        "p95_ms": _pct(lats, 95),
+        "p99_ms": _pct(lats, 99),
+        "max_ms": max(lats) if lats else float("nan"),
         "fallback_count": len(fb),
         "fallback_lats_ms": sorted(round(r["lat_ms"], 3) for r in fb),
         "fallback_max_buffers": max((r["buffers"] for r in fb), default=0),
         "floor_ms": _pct(floor, 50),
-        "n": len(records), "n_excl_fallback": len(kept),
+        "n": len(records),
+        "n_excl_fallback": len(kept),
     }
 
 
@@ -173,12 +188,18 @@ def run_milvus(host, port, collection, metric, queries, k, runs, efs):
                 t0 = time.perf_counter()
                 col.search([v], "embedding", params, limit=k, output_fields=["id"])
                 ts.append((time.perf_counter() - t0) * 1e3)
-            records.append({"type": q["type"], "recall": rec, "lat_ms": statistics.median(ts)})
+            records.append(
+                {"type": q["type"], "recall": rec, "lat_ms": statistics.median(ts)}
+            )
         lats = [r["lat_ms"] for r in records]
-        out[f"ef{ef}"] = {"recall": _mean([r["recall"] for r in records]),
-                          "recall_by_type": _recall_by_type(records),
-                          "p50_ms": _pct(lats, 50), "p95_ms": _pct(lats, 95),
-                          "p99_ms": _pct(lats, 99), "n": len(records)}
+        out[f"ef{ef}"] = {
+            "recall": _mean([r["recall"] for r in records]),
+            "recall_by_type": _recall_by_type(records),
+            "p50_ms": _pct(lats, 50),
+            "p95_ms": _pct(lats, 95),
+            "p99_ms": _pct(lats, 99),
+            "n": len(records),
+        }
     # client round-trip floor: minimal gRPC search-path round-trip (point query).
     floor = []
     for _ in range(50):
@@ -193,8 +214,9 @@ def _interp_equal_recall_p50(milvus, target_recall):
     """Linear-interpolate Milvus p50 at exactly TriDB's recall, between the two bracketing efs.
     The matched ef sits ABOVE TriDB's recall (does more work), so the raw ratio is an upper bound;
     this is the honest equal-recall number."""
-    pts = sorted((m["recall"], m["p50_ms"]) for tag, m in milvus.items()
-                 if tag.startswith("ef"))
+    pts = sorted(
+        (m["recall"], m["p50_ms"]) for tag, m in milvus.items() if tag.startswith("ef")
+    )
     lo = hi = None
     for rec, p50 in pts:
         if rec <= target_recall:
@@ -212,8 +234,9 @@ def main(argv=None):
     ap.add_argument("--queryset", required=True)
     ap.add_argument("--engine-port", type=int, required=True)
     ap.add_argument("--engine-host", default="localhost")
-    ap.add_argument("--engine-password",
-                     default=os.environ.get("TRIDB_ENGINE_PGPASSWORD", ""))
+    ap.add_argument(
+        "--engine-password", default=os.environ.get("TRIDB_ENGINE_PGPASSWORD", "")
+    )
     ap.add_argument("--milvus-host", default="localhost")
     ap.add_argument("--milvus-port", default="19531")
     ap.add_argument("--milvus-collection", default="wiki_articles")
@@ -226,23 +249,46 @@ def main(argv=None):
 
     qs = json.loads(Path(args.queryset).read_text())
     queries, k = qs["queries"], qs["k"]
-    print(f"[vecrun] {len(queries)} held-out queries (k={k}) types={qs['counts']}", flush=True)
+    print(
+        f"[vecrun] {len(queries)} held-out queries (k={k}) types={qs['counts']}",
+        flush=True,
+    )
 
     t0 = time.time()
-    tridb = run_tridb(args.engine_port, args.engine_host, queries, k, args.runs,
-                       args.engine_password or None)
-    print(f"[vecrun] TriDB recall={tridb['recall']:.4f} (excl-fallback "
-          f"{tridb['recall_excl_fallback']:.4f}) p50={tridb['p50_ms']:.3f}ms p95={tridb['p95_ms']:.3f}ms "
-          f"p99={tridb['p99_ms']:.3f}ms max={tridb['max_ms']:.3f}ms fallback={tridb['fallback_count']} "
-          f"floor={tridb['floor_ms']:.3f}ms ({time.time()-t0:.1f}s)", flush=True)
+    tridb = run_tridb(
+        args.engine_port,
+        args.engine_host,
+        queries,
+        k,
+        args.runs,
+        args.engine_password or None,
+    )
+    print(
+        f"[vecrun] TriDB recall={tridb['recall']:.4f} (excl-fallback "
+        f"{tridb['recall_excl_fallback']:.4f}) p50={tridb['p50_ms']:.3f}ms p95={tridb['p95_ms']:.3f}ms "
+        f"p99={tridb['p99_ms']:.3f}ms max={tridb['max_ms']:.3f}ms fallback={tridb['fallback_count']} "
+        f"floor={tridb['floor_ms']:.3f}ms ({time.time() - t0:.1f}s)",
+        flush=True,
+    )
     print(f"[vecrun] TriDB recall_by_type={tridb['recall_by_type']}", flush=True)
 
     efs = [int(x) for x in args.efs.split(",")]
-    milvus = run_milvus(args.milvus_host, args.milvus_port, args.milvus_collection,
-                        args.milvus_metric, queries, k, args.runs, efs)
+    milvus = run_milvus(
+        args.milvus_host,
+        args.milvus_port,
+        args.milvus_collection,
+        args.milvus_metric,
+        queries,
+        k,
+        args.runs,
+        efs,
+    )
     milvus_floor = milvus.pop("_floor_ms", None)
     for tag, m in milvus.items():
-        print(f"[vecrun] Milvus {tag} recall={m['recall']:.4f} p50={m['p50_ms']:.3f}ms", flush=True)
+        print(
+            f"[vecrun] Milvus {tag} recall={m['recall']:.4f} p50={m['p50_ms']:.3f}ms",
+            flush=True,
+        )
     print(f"[vecrun] Milvus floor={milvus_floor:.3f}ms", flush=True)
 
     # matched point: Milvus ef whose recall is closest to TriDB's within eps.
@@ -250,32 +296,51 @@ def main(argv=None):
     matched = None
     for tag, m in milvus.items():
         if abs(m["recall"] - tr) <= args.eps:
-            if matched is None or abs(m["recall"] - tr) < abs(milvus[matched]["recall"] - tr):
+            if matched is None or abs(m["recall"] - tr) < abs(
+                milvus[matched]["recall"] - tr
+            ):
                 matched = tag
 
-    result = {"n": qs["n"], "dim": qs["dim"], "k": k, "queries": len(queries),
-              "counts": qs["counts"], "eps": args.eps, "tridb": tridb, "milvus": milvus,
-              "matched_milvus_ef": matched,
-              "client_floor_ms": {"tridb_libpq": round(tridb["floor_ms"], 3),
-                                  "milvus_grpc": round(milvus_floor, 3) if milvus_floor else None}}
+    result = {
+        "n": qs["n"],
+        "dim": qs["dim"],
+        "k": k,
+        "queries": len(queries),
+        "counts": qs["counts"],
+        "eps": args.eps,
+        "tridb": tridb,
+        "milvus": milvus,
+        "matched_milvus_ef": matched,
+        "client_floor_ms": {
+            "tridb_libpq": round(tridb["floor_ms"], 3),
+            "milvus_grpc": round(milvus_floor, 3) if milvus_floor else None,
+        },
+    }
     if matched:
         m = milvus[matched]
         interp = _interp_equal_recall_p50(milvus, tr)
         result["comparison"] = {
-            "recall_tridb": round(tr, 4), "recall_milvus": round(m["recall"], 4),
-            "tridb_p50_ms": round(tridb["p50_ms"], 3), "milvus_p50_ms": round(m["p50_ms"], 3),
-            "tridb_p95_ms": round(tridb["p95_ms"], 3), "milvus_p95_ms": round(m["p95_ms"], 3),
+            "recall_tridb": round(tr, 4),
+            "recall_milvus": round(m["recall"], 4),
+            "tridb_p50_ms": round(tridb["p50_ms"], 3),
+            "milvus_p50_ms": round(m["p50_ms"], 3),
+            "tridb_p95_ms": round(tridb["p95_ms"], 3),
+            "milvus_p95_ms": round(m["p95_ms"], 3),
             # TriDB p50 is LOWER, so TriDB is FASTER: milvus_p50 / tridb_p50 > 1.
-            "tridb_faster_x": round(m["p50_ms"] / tridb["p50_ms"], 2) if tridb["p50_ms"] else None,
+            "tridb_faster_x": round(m["p50_ms"] / tridb["p50_ms"], 2)
+            if tridb["p50_ms"]
+            else None,
             # matched ef sits above TriDB's recall, so the above is an upper bound; interpolate to
             # exactly TriDB's recall for the honest equal-recall multiplier.
             "milvus_p50_at_tridb_recall_ms": round(interp, 3) if interp else None,
             "tridb_faster_x_equal_recall": round(interp / tridb["p50_ms"], 2)
-            if interp and tridb["p50_ms"] else None,
+            if interp and tridb["p50_ms"]
+            else None,
             # how much of the gap is transport, not index scan:
             "gap_ms": round(m["p50_ms"] - tridb["p50_ms"], 3),
             "transport_floor_gap_ms": round(milvus_floor - tridb["floor_ms"], 3)
-            if milvus_floor else None,
+            if milvus_floor
+            else None,
         }
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
     Path(args.out).write_text(json.dumps(result, indent=2))

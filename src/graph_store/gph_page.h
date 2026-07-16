@@ -13,8 +13,13 @@
  *   - per-tuple xmin/xmax MVCC                              (§5)  -- v1 uses txn-level + GenericXLog
  *   - custom rmgr REDO handler                             (§4.4) -- v1 uses GenericXLog's generic REDO
  *
- * Built ONLY inside the MSVBASE fork (PG 13.4, --with-blocksize=32 => BLCKSZ 32768); the
- * static asserts below fail the build if that does not hold.
+ * Page size (ADR-0015 / D2 un-fork): the layout is BLCKSZ-derived everywhere (capacities and
+ * record counts compute from the live BLCKSZ), so the AM is CORRECT on any page size >= 8KB —
+ * including stock PG 16/17 builds. 32KB (the fork's --with-blocksize=32) remains the
+ * PERFORMANCE target: at stock 8KB, edge capacity drops ~1022 -> ~254 slots/page, i.e. ~4x the
+ * adjacency-chain page reads for high-degree vertices (ADR-0015 E2). Cross-block-size reads of
+ * an existing store cannot happen through PostgreSQL (BLCKSZ is a cluster-wide compile-time
+ * invariant; relations only move between clusters via dump/restore).
  */
 #ifndef TRIDB_GRAPH_STORE_GPH_PAGE_H
 #define TRIDB_GRAPH_STORE_GPH_PAGE_H
@@ -23,8 +28,9 @@
 #include "storage/bufpage.h"
 #include "storage/block.h"
 
-/* The fork must be built with 32KB pages (docs/graph_store_layout_v0.1.0.md §2). */
-StaticAssertDecl(BLCKSZ == 32768, "graph store requires --with-blocksize=32 (BLCKSZ 32768)");
+/* Any stock page size works (layout is BLCKSZ-derived); 8KB is the smallest PG supports that
+ * keeps the geometry sane (>= 250 slots/page). 32KB remains the fork's performance target. */
+StaticAssertDecl(BLCKSZ >= 8192, "graph store requires BLCKSZ >= 8192");
 
 #define GPH_MAGIC        0x47504831   /* "GPH1" */
 #define GPH_VERSION      1

@@ -98,3 +98,21 @@ Every operator honors Open/Next/Close + early termination. Non-negotiable.
 | Shared txn manager | Inherited (never leave Postgres) |
 | SQL/PGQ surface | Postgres parser + pgvector + AGE grammar ref |
 | Tri-modal join ordering | **Build** (Chimera cost model, the 20%) |
+
+## Addendum A1 (2026-07-13) — D1 demonstrated claim is FILTER-FIRST only
+
+Scope ruling for Destination 1 of `docs/tridb_productization_roadmap_v0.1.0.md` (roadmap phase 1.1):
+
+- **Every D1 headline runs the filter-first `tjs_open` physical path** (selective typed-edge +
+  entity-type constraint first, vector ranking second) — the regime green at 1M (DEV-1290) and the
+  regime ADR-0018's Wikidata queries naturally select.
+- **The seedless / vector-first leg is OUT OF SCOPE for D1.** Its blocker — non-deterministic
+  seedless HNSW iteration in the fork (plan 043) — is explicitly NOT being fixed: per the roadmap's
+  resolved decisions, the fork iterator is retired in D2 phase 2.2 by adopting pgvector's
+  deterministic HNSW. Any seedless number before then is unpublishable by policy.
+- **Enforcement is mechanical, not editorial:** `bench.wiki_h2h.publication_gate` (reused verbatim
+  by the Wikidata harness) refuses a headline without matched recall, graph-set parity, healthy
+  HNSW builds, and `examined > 0`; the harnesses only emit filter-first calls. A seedless headline
+  cannot pass through the gate because no harness produces one.
+- SM-1..SM-5 (§7) are unchanged; they are simply *evaluated at the filter-first operating point*
+  for D1, and SM-4 parity is reported as a recall curve, not a bare percentage (DEV-1169 ruling).

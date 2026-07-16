@@ -5,7 +5,12 @@ in **one PostgreSQL query plan, one process, one transaction manager** — a cle
 AkasicDB built on a fork of MSVBASE (VBASE, OSDI '23) + Chimera's (PVLDB) co-resident graph store. If
 you're new, read in this order: [`README.md`](README.md) → [`spec/tridb_spec_v0.1.0.md`](spec/tridb_spec_v0.1.0.md)
 → [`docs/decisions/`](docs/decisions/) (the ADRs) → [`docs/STATUS.md`](docs/STATUS.md) (per-issue state)
-→ [`advisor-plans/`](advisor-plans/) + [`plans/`](plans/) (the improvement roadmap).
+→ [`advisor-plans/`](advisor-plans/) + [`plans/`](plans/) (scoped, self-contained improvement plans).
+
+The current **strategic roadmap** is [`docs/tridb_productization_roadmap_v0.1.0.md`](docs/tridb_productization_roadmap_v0.1.0.md)
+(the D1→D2→D3 spike→product ladder, with Addenda A1/A2/A3 recording the Gate A/B/CSR verdicts). That
+is the direction-setting document; `plans/` and `advisor-plans/` are the independently-numbered batches
+of scoped implementation plans that execute against it — don't confuse a plan number with a roadmap phase.
 
 ## The non-negotiable invariants (read before proposing changes)
 
@@ -62,9 +67,11 @@ not merely on `master`.
 - **Decisions that lock in structure get an ADR** in `docs/decisions/NNNN-*.md` (numbered).
 - **Specs evolve by addendum / version bump**, not silent rewrite.
 - **Python:** `ruff` for lint + format, `pytest` for tests, `requirements.txt` (no `setup.py`).
-- **C:** targets PostgreSQL 13.4 access-method APIs, 32 KB block size; MSVBASE edits ship as patches
-  under `scripts/patches/` (vendored source is re-cloned), wired idempotently into
-  `scripts/lib/msvbase_patches.sh` with a `verify_patches` sentinel.
+- **C:** targets both the **PostgreSQL 13.4 fork** and **stock PostgreSQL 16/17** access-method APIs
+  (zero measured PG 13→17 drift, ADR-0015 E2). The graph AM is BLCKSZ-capability, not fixed
+  (`gph_page.h`: `BLCKSZ >= 8192` — 8KB works on stock PG, 32KB is the high-degree performance target
+  on the fork). MSVBASE fork edits ship as patches under `scripts/patches/` (vendored source is
+  re-cloned), wired idempotently into `scripts/lib/msvbase_patches.sh` with a `verify_patches` sentinel.
 
 ## Submitting a change
 

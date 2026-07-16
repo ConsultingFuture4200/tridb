@@ -1,7 +1,25 @@
 # TriDB Build Status — per-issue gating
 
-Updated: 2026-07-08. Legend: 🟢 unblocked here · 🟡 partial (design here,
+Updated: 2026-07-16. Legend: 🟢 unblocked here · 🟡 partial (design here,
 build on GX10) · 🔴 GX10-gated (needs live MSVBASE build).
+
+> **🟢 D2 UN-FORK LANDED — stock-PG installable + fusion win reproduced off the fork (2026-07-16).**
+> The graph store un-forked: `graph_store_am` and the fused `tjs_open` operator (`src/tjs_pg`,
+> ADR-0019 accepted) now build and run as **plain extensions on stock PostgreSQL 16/17 + pgvector**,
+> no forked Postgres. An always-on `stock-pg` CI matrix (PG 16 + 17, x86_64, `.github/workflows/ci.yml`)
+> builds and tests the AM off-GX10 on every push. The fusion win survives the un-fork:
+> - **Gate A PASS** (roadmap Addendum A1) — reproducible fused filter-first win on the PG 13.4 fork:
+>   0.27 ms vs 3.16 ms multi-store = **11.90×** at matched recall (0.992/0.986), pinned 1M slice.
+> - **Gate B PASS** (roadmap Addendum A2) — same query, same slice, re-homed on **stock PG 17 +
+>   pgvector**: 0.14 ms vs 3.34 ms = **23.68×** at matched recall — the win *doubles* off the fork
+>   (`docs/gate_b_spike_v0.1.0.md`).
+> - **CSR-lite gate-(b) PASS → GO (with a cost)** (roadmap Addendum A3) — real cold-cache disk I/O on
+>   the DGX Spark confirms the read-once seek win (~2.9× full-hub, ~3.6× mega-hub) at ~33× on-disk
+>   footprint (`docs/csr_lite_gate_b_realio_v0.1.0.md`).
+>
+> The MSVBASE fork remains the **reference vehicle** for the seedless SM-4 recall curve (the
+> relaxed-monotonicity executor mechanism lives there); the un-fork is the launch path, not a
+> retirement of that reference. Strategy + gate ladder: `docs/tridb_productization_roadmap_v0.1.0.md`.
 
 > **🟢 DEV-1354 WIKI VALUE STORY — FINAL VERDICT (2026-07-08): two measured halves, speed + consistency.**
 > The wiki-scale investigation closes with TriDB's value quantified on both axes it claims, plus an

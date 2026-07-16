@@ -1,0 +1,56 @@
+-- tridb_tjs 0.1.0 — the fused tri-modal operator on stock PostgreSQL (ADR-0019).
+\echo Use "CREATE EXTENSION tjs_pg" to load this file. \quit
+
+-- pgvector version floor. The control file's `requires = 'vector'` guarantees the
+-- extension is present, but not that it is >= 0.8 — the vector-first path REQUIRES
+-- SET hnsw.iterative_scan = relaxed_order, which pgvector only exposes from 0.8.
+DO $$
+DECLARE v text;
+BEGIN
+  SELECT extversion INTO v FROM pg_extension WHERE extname = 'vector';
+  IF v IS NULL THEN
+    RAISE EXCEPTION 'tjs_pg requires the pgvector "vector" extension (CREATE EXTENSION vector first)';
+  END IF;
+  IF string_to_array(v, '.')::int[] < ARRAY[0,8]::int[] THEN
+    RAISE EXCEPTION 'tjs_pg requires pgvector >= 0.8 (found %); the vector-first path needs hnsw.iterative_scan = relaxed_order', v;
+  END IF;
+END $$;
+
+-- tjs_open: fused tri-modal top-k.
+--   src IS NOT NULL -> FILTER-FIRST (typed BFS reach -> relational filter -> exact rank);
+--   src IS NULL     -> VECTOR-FIRST/SEEDLESS (owned relaxed-order pgvector HNSW stream ->
+--                      per-candidate filter/graph predicates -> term_cond early termination).
+-- Vector-first requires: SET hnsw.iterative_scan = relaxed_order (pgvector >= 0.8).
+CREATE FUNCTION tjs_open(tbl regclass,
+                         k integer,
+                         term_cond integer,
+                         m_seeds integer,
+                         hops integer,
+                         id_col text,
+                         filter text,
+                         query vector,
+                         src bigint DEFAULT NULL,
+                         edge_type integer DEFAULT 0)
+RETURNS SETOF bigint
+AS 'MODULE_PATHNAME', 'tjs_open_pg'
+LANGUAGE C VOLATILE;
+
+-- Per-backend honesty counters (mirror the fork's SM-3 probes).
+CREATE FUNCTION tjs_open_candidates_examined() RETURNS bigint
+AS 'MODULE_PATHNAME', 'tjs_open_candidates_examined_pg'
+LANGUAGE C VOLATILE;
+
+-- TRUE iff the last vector-first call's candidate stream ended (pgvector budget
+-- hnsw.max_scan_tuples, or index exhaustion) before term_cond fired — the harness must
+-- refuse budget-shaped headlines (ADR-0015 E3.3).
+CREATE FUNCTION tjs_open_budget_capped() RETURNS boolean
+AS 'MODULE_PATHNAME', 'tjs_open_budget_capped_pg'
+LANGUAGE C VOLATILE;
+
+REVOKE EXECUTE ON FUNCTION tjs_open(regclass,integer,integer,integer,integer,text,text,vector,bigint,integer) FROM PUBLIC;
+
+-- Bridges admitted to the guaranteed budget by the last vector-first call (in-stream bridge
+-- offers + phase-3b direct fetches) — the fork's tjs_open_bridges_injected() parity counter.
+CREATE FUNCTION tjs_open_bridges_injected() RETURNS bigint
+AS 'MODULE_PATHNAME', 'tjs_open_bridges_injected_pg'
+LANGUAGE C VOLATILE;

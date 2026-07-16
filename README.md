@@ -22,7 +22,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/PostgreSQL_13.4-4169E1?style=for-the-badge&logo=postgresql&logoColor=white" alt="PostgreSQL">
+  <img src="https://img.shields.io/badge/PostgreSQL_16%2F17_(stock)_%2B_13.4_fork-4169E1?style=for-the-badge&logo=postgresql&logoColor=white" alt="PostgreSQL">
   <img src="https://img.shields.io/badge/C-A8B9CC?style=for-the-badge&logo=c&logoColor=black" alt="C">
   <img src="https://img.shields.io/badge/Python-3776AB?style=for-the-badge&logo=python&logoColor=white" alt="Python">
   <img src="https://img.shields.io/badge/Docker-2496ED?style=for-the-badge&logo=docker&logoColor=white" alt="Docker">
@@ -53,6 +53,8 @@
 TriDB collapses all three into **one query plan, in one PostgreSQL process, under one transaction manager**. The win isn't better individual retrievers. It's enforcing the global top-k *during* execution so intermediate results never blow up. It is a clean-room implementation of **AkasicDB** (SIGMOD Companion '26), built by forking **MSVBASE** (VBASE, OSDI '23) and adding a native graph store, extending **Chimera**'s (PVLDB 18(2)) dual-store design to a triple store.
 
 **Why this exists vs. AkasicDB:** AkasicDB is the design TriDB descends from; TriDB is an **open, Postgres-native, locally-runnable** realization of it: it runs on a single DGX Spark, the whole stack is reproducible from this repo, and it leans on the pgvector/Postgres ecosystem rather than a closed system. The peer-reviewed lineage (VBASE / AkasicDB / Chimera) is the credibility anchor; the open + local + reproducible angle is the contribution.
+
+**Installable on stock Postgres (D2 un-fork):** the native graph store (`graph_store_am`) and the fused `tjs_open` operator (`src/tjs_pg`) now install as **plain extensions on stock PostgreSQL 16/17 + pgvector** — no forked Postgres required (see [`docs/INSTALL_stock_pg.md`](docs/INSTALL_stock_pg.md), ADR-0019). The MSVBASE fork (PG 13.4) remains the **reference vehicle**: it holds the relaxed-monotonicity executor mechanism the seedless SM-4 recall curve is measured against, but it is the launch vehicle, not the destination. The stock-PG filter-first path already **measures a larger fusion win than the fork** (Gate B below).
 
 > [!NOTE]
 > **What v1 actually delivers (read before benchmarking):** TriDB wins decisively on **source-anchored
@@ -148,12 +150,26 @@ ORDER BY src_embedding <-> :question_embedding
 LIMIT 5;
 ```
 
-The `GRAPH_TABLE(...)` surface parses on stock PostgreSQL 13 and lowers to a single `tjs()` operator that drives all three legs with one global top-k.
+The `GRAPH_TABLE(...)` surface parses on stock PostgreSQL 16/17 and lowers to a single `tjs()` operator that drives all three legs with one global top-k.
 
 ## Quick Start
 
+### Install on stock PostgreSQL 16/17 (recommended)
+
+The graph store and the fused operator install as plain extensions on **stock PostgreSQL 16 or 17 + pgvector** — no fork. Full guide: [`docs/INSTALL_stock_pg.md`](docs/INSTALL_stock_pg.md).
+
+```bash
+docker build -f scripts/pg17/Dockerfile.release -t tridb/postgres-trimodal:pg17 .
+docker run -d --name trimodal -e POSTGRES_PASSWORD=secret tridb/postgres-trimodal:pg17
+docker exec -it trimodal psql -U postgres \
+  -c 'CREATE EXTENSION vector;' \
+  -c 'CREATE EXTENSION graph_store_am;'
+```
+
+### Build the dev/engine layers (advanced)
+
 > [!IMPORTANT]
-> The engine targets the **GX10 (ARM64 + CUDA, 128 GB)**. It builds and runs on an x86_64 standin via Docker for development; the ARM64 build sign-off and the 128 GB headline benchmark are GX10-only.
+> The **128 GB headline benchmark** and the **ARM64 fork build sign-off** target the **GX10 (ARM64 + CUDA, 128 GB)**. The MSVBASE fork also builds and runs on an x86_64 standin via Docker for development; the graph AM additionally builds on stock PG 16/17 off-GX10 (`scripts/pg17_graph_test.sh`).
 
 The repository has two layers. The hardware-independent layer (design, tooling, harnesses, Python tests) runs anywhere:
 
@@ -200,7 +216,9 @@ tests/       Python unit tests (harness, planner, corpus)
 
 ## Status
 
-Active development, tracked in Linear project **TriDB**. The **v1 tri-modal core** (native graph store, single-source TJS operator, SQL/PGQ surface, HNSW vector durability, one-WAL atomicity) is built and the **GX10 ARM64 build + engine suite are signed off** (the fork builds and the full suite passes on the DGX Spark; the first at-scale run found and fixed a TJS early-termination scale defect; see the SM-4 curve above). **Honestly scoped:** the seedless `tjs_open` multi-seed operator (ADR-0012, the open-GraphRAG retriever) now **ships as a first-cut engine operator**: recall@10 0.980 on real HotpotQA (beating vector-only 0.967) via reachability-bridge injection + VBASE early termination; the PPR-graded + rank-join-fusion refinement (host-validated at 0.987) is the next iteration. The cross-modal join-order heuristic is now **live**: the filter-first physical body shipped (DEV-1290) and the FR-6 lowering binds it to execution (DEV-1285); the **128 GB headline benchmark** and the honest SM-2 re-measurement at the corrected operating point (DEV-1284) are pending. See [`docs/STATUS.md`](docs/STATUS.md) for the per-issue breakdown and [`advisor-plans/`](advisor-plans/) for the current improvement roadmap.
+Active development, tracked in Linear project **TriDB**. The **v1 tri-modal core** (native graph store, single-source TJS operator, SQL/PGQ surface, HNSW vector durability, one-WAL atomicity) is built and the **GX10 ARM64 build + engine suite are signed off** (the fork builds and the full suite passes on the DGX Spark; the first at-scale run found and fixed a TJS early-termination scale defect; see the SM-4 curve above). **Honestly scoped:** the seedless `tjs_open` multi-seed operator (ADR-0012, the open-GraphRAG retriever) now **ships as a first-cut engine operator**: recall@10 0.980 on real HotpotQA (beating vector-only 0.967) via reachability-bridge injection + VBASE early termination; the PPR-graded + rank-join-fusion refinement (host-validated at 0.987) is the next iteration. The cross-modal join-order heuristic is now **live**: the filter-first physical body shipped (DEV-1290) and the FR-6 lowering binds it to execution (DEV-1285); the **128 GB headline benchmark** and the honest SM-2 re-measurement at the corrected operating point (DEV-1284) are pending.
+
+**D2 un-fork (landed):** the graph AM and the fused `tjs_open` operator (`src/tjs_pg`, ADR-0019) now install on **stock PostgreSQL 16/17 + pgvector**, exercised off-GX10 by the always-on `stock-pg` CI matrix (PG 16 + 17, x86_64). The fusion win reproduces off the fork: **Gate A PASS** — 11.90× on the PG 13.4 fork — and **Gate B PASS** — **23.68×** for the filter-first fused query on stock PG 17 + pgvector at matched recall (0.992/0.986), both on the same pinned 1M slice. See [`docs/tridb_productization_roadmap_v0.1.0.md`](docs/tridb_productization_roadmap_v0.1.0.md) (Addenda A1–A3) for the strategy, [`docs/STATUS.md`](docs/STATUS.md) for the per-issue breakdown, and [`advisor-plans/`](advisor-plans/) for scoped improvement plans.
 
 ## License
 

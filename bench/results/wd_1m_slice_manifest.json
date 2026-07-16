@@ -1,0 +1,195 @@
+{
+  "source": "wikidata-truthy-json",
+  "dump": "latest-all.json.gz",
+  "dump_path": "/home/bob/data/wikidata/latest-all.json.gz",
+  "extractor": "tools/wikidata_ingest.py",
+  "extractor_version": "0.1.0",
+  "created": "2026-07-14T16:09:53.536748+00:00",
+  "edge_source": "wikidata-statement",
+  "language": "en",
+  "slice": {
+    "mode": "bfs_closure",
+    "seeds": [
+      "Q2",
+      "Q15",
+      "Q48",
+      "Q46",
+      "Q49",
+      "Q18",
+      "Q51",
+      "Q538",
+      "Q30",
+      "Q142",
+      "Q183",
+      "Q145",
+      "Q148",
+      "Q17",
+      "Q159",
+      "Q668",
+      "Q155"
+    ],
+    "target": 1030000,
+    "hops_scanned": 4,
+    "kept": 1030000,
+    "note": "connected induced subgraph; memory ceiling = kept id set"
+  },
+  "id_scheme": "ext ids: entity id = Q-number, edge p_id = P-number; engine assigns dense vids at load via gph_upsert_vertex (ADR-0013), P-ids via register_edge_type (ADR-0016)",
+  "type_prop": "P31",
+  "literal_props": [],
+  "shard_size": 100000,
+  "counts": {
+    "entities": 1002331,
+    "edges": 7422959,
+    "claims": 1002331,
+    "dropped_edges_dangling": 2032746
+  },
+  "shards": {
+    "entities": {
+      "schema": "jsonl; one object/line: {\"id\": int (Q-number), \"label\": str, \"description\": str}. The VECTOR embedding source (label + \" — \" + description, normalize-at-write per ADR-0017).",
+      "files": [
+        {
+          "path": "entities-00000.jsonl",
+          "rows": 100000
+        },
+        {
+          "path": "entities-00001.jsonl",
+          "rows": 100000
+        },
+        {
+          "path": "entities-00002.jsonl",
+          "rows": 100000
+        },
+        {
+          "path": "entities-00003.jsonl",
+          "rows": 100000
+        },
+        {
+          "path": "entities-00004.jsonl",
+          "rows": 100000
+        },
+        {
+          "path": "entities-00005.jsonl",
+          "rows": 100000
+        },
+        {
+          "path": "entities-00006.jsonl",
+          "rows": 100000
+        },
+        {
+          "path": "entities-00007.jsonl",
+          "rows": 100000
+        },
+        {
+          "path": "entities-00008.jsonl",
+          "rows": 100000
+        },
+        {
+          "path": "entities-00009.jsonl",
+          "rows": 100000
+        },
+        {
+          "path": "entities-00010.jsonl",
+          "rows": 2331
+        }
+      ]
+    },
+    "edges": {
+      "schema": "tsv; no header; columns: src_id\\tp_id\\tdst_id (all int ext ids; directed truthy statement src->dst; p_id is the P-number, mapped to a typed-edge dict id at load).",
+      "files": [
+        {
+          "path": "edges-00000.tsv",
+          "rows": 794596
+        },
+        {
+          "path": "edges-00001.tsv",
+          "rows": 800390
+        },
+        {
+          "path": "edges-00002.tsv",
+          "rows": 806753
+        },
+        {
+          "path": "edges-00003.tsv",
+          "rows": 735509
+        },
+        {
+          "path": "edges-00004.tsv",
+          "rows": 571109
+        },
+        {
+          "path": "edges-00005.tsv",
+          "rows": 790718
+        },
+        {
+          "path": "edges-00006.tsv",
+          "rows": 800054
+        },
+        {
+          "path": "edges-00007.tsv",
+          "rows": 805062
+        },
+        {
+          "path": "edges-00008.tsv",
+          "rows": 730979
+        },
+        {
+          "path": "edges-00009.tsv",
+          "rows": 573581
+        },
+        {
+          "path": "edges-00010.tsv",
+          "rows": 14208
+        }
+      ]
+    },
+    "claims": {
+      "schema": "jsonl; one object/line: {\"id\": int, \"P31\": [int type ids], <literal Pxx>: [values]}. The RELATIONAL filter columns; P31 is the entity-type constraint the filter-first path selects on.",
+      "files": [
+        {
+          "path": "claims-00000.jsonl",
+          "rows": 100000
+        },
+        {
+          "path": "claims-00001.jsonl",
+          "rows": 100000
+        },
+        {
+          "path": "claims-00002.jsonl",
+          "rows": 100000
+        },
+        {
+          "path": "claims-00003.jsonl",
+          "rows": 100000
+        },
+        {
+          "path": "claims-00004.jsonl",
+          "rows": 100000
+        },
+        {
+          "path": "claims-00005.jsonl",
+          "rows": 100000
+        },
+        {
+          "path": "claims-00006.jsonl",
+          "rows": 100000
+        },
+        {
+          "path": "claims-00007.jsonl",
+          "rows": 100000
+        },
+        {
+          "path": "claims-00008.jsonl",
+          "rows": 100000
+        },
+        {
+          "path": "claims-00009.jsonl",
+          "rows": 100000
+        },
+        {
+          "path": "claims-00010.jsonl",
+          "rows": 2331
+        }
+      ]
+    }
+  }
+}

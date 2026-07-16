@@ -63,7 +63,10 @@ def main(argv=None) -> int:
 
     member_ids = _valid(mm, 0, args.n)
     nonmember_ids = _valid(mm, args.n, corpus_rows)
-    print(f"[queryset] valid members={member_ids.size} nonmembers={nonmember_ids.size}", flush=True)
+    print(
+        f"[queryset] valid members={member_ids.size} nonmembers={nonmember_ids.size}",
+        flush=True,
+    )
 
     queries = []  # {type, source_id|source_ids, vec}
     for qid in rng.choice(member_ids, size=args.members, replace=False):
@@ -72,22 +75,34 @@ def main(argv=None) -> int:
         a, b = (int(x) for x in rng.choice(member_ids, size=2, replace=False))
         mid = (base[a] + base[b]) / 2.0
         mid = mid / (np.linalg.norm(mid) + 1e-12)
-        queries.append({"type": "midpoint", "source_ids": [a, b], "vec": mid.astype(np.float32)})
+        queries.append(
+            {"type": "midpoint", "source_ids": [a, b], "vec": mid.astype(np.float32)}
+        )
     for qid in rng.choice(nonmember_ids, size=args.nonmembers, replace=False):
-        queries.append({"type": "nonmember", "source_id": int(qid),
-                        "vec": np.asarray(mm[qid], dtype=np.float32)})
+        queries.append(
+            {
+                "type": "nonmember",
+                "source_id": int(qid),
+                "vec": np.asarray(mm[qid], dtype=np.float32),
+            }
+        )
 
     # Brute-force EXACT L2 top-k over the RAW 1M slice, per query (RAM-resident matmul).
     t1 = time.time()
-    sq_norms = np.einsum("ij,ij->i", base, base)  # |x|^2 for L2 = |x|^2 - 2 q.x (+|q|^2 const)
+    sq_norms = np.einsum(
+        "ij,ij->i", base, base
+    )  # |x|^2 for L2 = |x|^2 - 2 q.x (+|q|^2 const)
     out_queries = []
     for i, q in enumerate(queries):
         v = q["vec"]
         d2 = sq_norms - 2.0 * (base @ v)  # rank-equivalent to full L2 (drops +|q|^2)
         top = np.argpartition(d2, args.k)[: args.k]
         top = top[np.argsort(d2[top])]
-        rec = {"type": q["type"], "vec": [float(x) for x in v],
-               "oracle": [int(x) for x in top]}
+        rec = {
+            "type": q["type"],
+            "vec": [float(x) for x in v],
+            "oracle": [int(x) for x in top],
+        }
         if "source_id" in q:
             rec["source_id"] = q["source_id"]
         if "source_ids" in q:
@@ -98,17 +113,28 @@ def main(argv=None) -> int:
     print(f"[queryset] oracle built in {time.time() - t1:.1f}s", flush=True)
 
     payload = {
-        "n": args.n, "dim": dim, "k": args.k, "metric": "l2_raw",
-        "corpus_rows": int(corpus_rows), "seed": args.seed,
-        "counts": {"member": args.members, "midpoint": args.midpoints,
-                   "nonmember": args.nonmembers, "total": len(out_queries)},
+        "n": args.n,
+        "dim": dim,
+        "k": args.k,
+        "metric": "l2_raw",
+        "corpus_rows": int(corpus_rows),
+        "seed": args.seed,
+        "counts": {
+            "member": args.members,
+            "midpoint": args.midpoints,
+            "nonmember": args.nonmembers,
+            "total": len(out_queries),
+        },
         "queries": out_queries,
     }
     outp = Path(args.out)
     outp.parent.mkdir(parents=True, exist_ok=True)
     outp.write_text(json.dumps(payload))
-    print(f"[queryset] {len(out_queries)} queries (k={args.k}) -> {outp} "
-          f"({outp.stat().st_size / 1e6:.1f} MB)", flush=True)
+    print(
+        f"[queryset] {len(out_queries)} queries (k={args.k}) -> {outp} "
+        f"({outp.stat().st_size / 1e6:.1f} MB)",
+        flush=True,
+    )
     return 0
 
 

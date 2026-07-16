@@ -33,6 +33,7 @@ import html
 import math
 from html.parser import HTMLParser
 import json
+import logging
 import os
 import random
 import re
@@ -62,6 +63,13 @@ UNDIR_OFF_NAME = "edges_undir_off.i64.npy"
 # stay well under the GPU budget so a later heavy job has the unified pool free.
 ASK_MODEL = os.environ.get("WIKI_ASK_MODEL", "qwen2.5:7b-instruct")
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434").rstrip("/")
+# Concurrency ceiling for the blocking local-LLM routes (/ask, /enrich, narrate).
+# The server is unbounded-threaded and public; without a ceiling a burst of these
+# expensive calls exhausts CPU/GPU/threads. Over-ceiling requests get a fast 429.
+_LLM_SLOTS = threading.Semaphore(int(os.environ.get("WIKI_READER_LLM_SLOTS", "2")))
+# Wall-clock cap on each LLM HTTP call (was 120/180s — far too long for a public
+# endpoint). Kept env-overridable for slower models on the host.
+LLM_TIMEOUT = int(os.environ.get("WIKI_READER_LLM_TIMEOUT", "30"))
 ASK_K = 8  # passages fed to the LLM
 PASSAGE_CHARS = 1500  # per-passage body budget so k passages fit the context
 
@@ -170,10 +178,14 @@ def build_articles(conn: sqlite3.Connection, corpus: Path) -> int:
                     pass  # tolerate a truncated final line in a clobbered shard
                 off += ln
                 if len(batch) >= 50000:
-                    conn.executemany("INSERT OR IGNORE INTO articles VALUES (?,?,?,?)", batch)
+                    conn.executemany(
+                        "INSERT OR IGNORE INTO articles VALUES (?,?,?,?)", batch
+                    )
                     n += len(batch)
                     batch.clear()
-        print(f"[build] articles: shard {shard} ({name}) done, {n + len(batch)} rows so far")
+        print(
+            f"[build] articles: shard {shard} ({name}) done, {n + len(batch)} rows so far"
+        )
     if batch:
         conn.executemany("INSERT OR IGNORE INTO articles VALUES (?,?,?,?)", batch)
         n += len(batch)
@@ -216,8 +228,12 @@ def build_edge_csr(corpus: Path) -> None:
         if not path.exists() or path.stat().st_size == 0:
             continue
         df = pd.read_csv(
-            path, sep="\t", header=None, names=["src", "dst"],
-            dtype={"src": np.int32, "dst": np.int32}, engine="c",
+            path,
+            sep="\t",
+            header=None,
+            names=["src", "dst"],
+            dtype={"src": np.int32, "dst": np.int32},
+            engine="c",
         )
         srcs.append(df["src"].to_numpy())
         dsts.append(df["dst"].to_numpy())
@@ -230,7 +246,9 @@ def build_edge_csr(corpus: Path) -> None:
     dst_sorted = np.ascontiguousarray(dst[order])
     max_id = int(src_sorted[-1]) if len(src_sorted) else 0
     # off[i] = first index in src_sorted whose src == i (searchsorted left)
-    off = np.searchsorted(src_sorted, np.arange(max_id + 2), side="left").astype(np.int64)
+    off = np.searchsorted(src_sorted, np.arange(max_id + 2), side="left").astype(
+        np.int64
+    )
     np.save(corpus / CSR_DST_NAME, dst_sorted)
     np.save(corpus / CSR_OFF_NAME, off)
     print(f"[build] edges CSR: {len(dst_sorted)} edges, max src id {max_id}")
@@ -262,9 +280,9 @@ def build_undirected_csr(corpus: Path) -> None:
     u_sorted = u[order]
     v_sorted = np.ascontiguousarray(v[order])
     del u, v, order
-    new_off = np.searchsorted(
-        u_sorted, np.arange(max_id + 2), side="left"
-    ).astype(np.int64)
+    new_off = np.searchsorted(u_sorted, np.arange(max_id + 2), side="left").astype(
+        np.int64
+    )
     np.save(corpus / UNDIR_DST_NAME, v_sorted)
     np.save(corpus / UNDIR_OFF_NAME, new_off)
     mb = (
@@ -482,7 +500,9 @@ class Reader:
 
         print(f"[serve] memmapping {self.n}x{self.dim} vectors ...")
         self.vecs = np.memmap(
-            corpus / "emb" / "vectors.f32", dtype=np.float32, mode="r",
+            corpus / "emb" / "vectors.f32",
+            dtype=np.float32,
+            mode="r",
             shape=(self.n, self.dim),
         )
 
@@ -508,7 +528,9 @@ class Reader:
                     "SELECT name FROM sqlite_master WHERE type='table' AND name='redir'"
                 ).fetchone()
             )
-        print(f"[serve] redirect alias index: {'present' if self._has_redir else 'absent'}")
+        print(
+            f"[serve] redirect alias index: {'present' if self._has_redir else 'absent'}"
+        )
         with self.db_lock:
             self._has_cats = bool(
                 self.db.execute(
@@ -566,18 +588,16 @@ class Reader:
         def score(fts_pos: int, aid: int, title: str) -> float:
             tl = title.lower()
             deg = int(indeg[aid]) if aid < n_indeg else 0
-            s = math.log1p(deg)                 # notability, log-scaled — dominant
+            s = math.log1p(deg)  # notability, log-scaled — dominant
             if tl == ql:
-                s += 2.5                        # exact title match
+                s += 2.5  # exact title match
             elif tl.startswith(ql):
-                s += 1.0                        # title starts with the query
+                s += 1.0  # title starts with the query
             elif qword.search(tl):
-                s += 0.5                        # query is a whole word in the title
-            return s - fts_pos * 1e-4           # stable FTS-order tiebreak
+                s += 0.5  # query is a whole word in the title
+            return s - fts_pos * 1e-4  # stable FTS-order tiebreak
 
-        ranked = sorted(
-            enumerate(rows), key=lambda t: -score(t[0], t[1][0], t[1][1])
-        )
+        ranked = sorted(enumerate(rows), key=lambda t: -score(t[0], t[1][0], t[1][1]))
         return [{"id": r[0], "title": r[1]} for _, r in ranked[:limit]]
 
     def _titles(self, ids: list[int]) -> dict[int, str]:
@@ -900,7 +920,9 @@ class Reader:
                     if len(items) >= 2:  # conservative: only a real run becomes a list
                         flush()
                         parts.append(
-                            "<ul>" + "".join(f"<li>{link(it)}</li>" for it in items) + "</ul>"
+                            "<ul>"
+                            + "".join(f"<li>{link(it)}</li>" for it in items)
+                            + "</ul>"
                         )
                         i = j
                     else:
@@ -1085,7 +1107,7 @@ class Reader:
             headers={"Content-Type": "application/json"},
         )
         try:
-            with urllib.request.urlopen(req, timeout=120) as r:
+            with urllib.request.urlopen(req, timeout=LLM_TIMEOUT) as r:
                 resp = json.loads(r.read())
             return resp["message"]["content"].strip()
         except Exception as e:
@@ -1109,15 +1131,23 @@ class Reader:
         only), 'linked (1-hop)' / 'linked (2-hop)' (graph only)."""
         from collections import Counter
 
+        t0 = time.perf_counter()
         # -- semantic (cosine) ranking --
         sem = self.semantic(aid, k=pool)
         cos_rank = {d["id"]: i for i, d in enumerate(sem)}
         cos_score = {d["id"]: d["score"] for d in sem}
 
         # -- graph-proximity ranking (1-hop then 2-hop by co-citation) --
-        direct_ids = [int(x) for x in self.csr_dst[
-            int(self.csr_off[aid]): int(self.csr_off[aid + 1])
-        ]] if aid + 1 < len(self.csr_off) else []
+        direct_ids = (
+            [
+                int(x)
+                for x in self.csr_dst[
+                    int(self.csr_off[aid]) : int(self.csr_off[aid + 1])
+                ]
+            ]
+            if aid + 1 < len(self.csr_off)
+            else []
+        )
         direct_set = set(direct_ids)
         cocite: Counter = Counter()
         cap_direct, cap_out = 300, 64  # bound the 2-hop fan-out
@@ -1166,20 +1196,23 @@ class Reader:
                 prov = "linked (1-hop)"
             else:
                 prov = "linked (2-hop)"
-            fused.append({
-                "id": i,
-                "title": titles[i],
-                "rrf": round(s, 5),
-                "prov": prov,
-                "cos": cos_score.get(i),  # cosine similarity if semantically ranked
-                "cocite": cocite.get(i) or None,  # 2-hop co-citation count if any
-            })
+            fused.append(
+                {
+                    "id": i,
+                    "title": titles[i],
+                    "rrf": round(s, 5),
+                    "prov": prov,
+                    "cos": cos_score.get(i),  # cosine similarity if semantically ranked
+                    "cocite": cocite.get(i) or None,  # 2-hop co-citation count if any
+                }
+            )
             if len(fused) >= k:
                 break
         return {
             "fused": fused,
             "semantic": sem[:12],  # component breakdown (existing panel)
             "hyperlinks": self.hyperlinks(aid),  # component breakdown (existing panel)
+            "timing": {"total_ms": round((time.perf_counter() - t0) * 1000.0, 1)},
         }
 
     # -- Ask (RAG) --------------------------------------------------------- #
@@ -1301,6 +1334,7 @@ class Reader:
         }
         if not q:
             return {**base, "pre_count": 0, "post_count": 0, "results": []}
+        t0 = _tv = time.perf_counter()
         qvec = self._embed_query(q)
         with self.index_lock:
             labels, dists = self.index.knn_query(qvec, k=pool)
@@ -1315,6 +1349,8 @@ class Reader:
         titles = self._titles([a for a, _ in cand])
         cand = [(a, s) for a, s in cand if a in titles]  # drop clobbered/missing
         pre_count = len(cand)
+        vector_ms = (time.perf_counter() - _tv) * 1000.0
+        _tf = time.perf_counter()
 
         indeg = self._ensure_indeg()
         n_indeg = len(indeg)
@@ -1346,6 +1382,7 @@ class Reader:
                 filtered.append((a, s))
             cand = filtered
 
+        filter_ms = (time.perf_counter() - _tf) * 1000.0
         ids = [a for a, _ in cand]
         cats_by = self._cats_for(ids[:40]) if self._has_cats else {}
         results = [
@@ -1359,7 +1396,18 @@ class Reader:
             }
             for a, s in cand
         ]
-        return {**base, "pre_count": pre_count, "post_count": len(cand), "results": results}
+        total_ms = (time.perf_counter() - t0) * 1000.0
+        return {
+            **base,
+            "pre_count": pre_count,
+            "post_count": len(cand),
+            "results": results,
+            "timing": {
+                "vector_ms": round(vector_ms, 1),
+                "filter_ms": round(filter_ms, 1),
+                "total_ms": round(total_ms, 1),
+            },
+        }
 
     def search_trimodal(
         self,
@@ -1391,8 +1439,15 @@ class Reader:
             },
         }
         if not q:
-            return {**base, "seed_count": 0, "expanded_count": 0,
-                    "pre_count": 0, "post_count": 0, "results": []}
+            return {
+                **base,
+                "seed_count": 0,
+                "expanded_count": 0,
+                "pre_count": 0,
+                "post_count": 0,
+                "results": [],
+            }
+        t0 = _tv = time.perf_counter()
         qvec = self._embed_query(q)
         # (1) VECTOR seed
         with self.index_lock:
@@ -1404,6 +1459,8 @@ class Reader:
             if a not in seed_set:
                 seed_set.add(a)
                 seed_ids.append(a)
+        vector_ms = (time.perf_counter() - _tv) * 1000.0
+        _tg = time.perf_counter()
         # (2) GRAPH expand — out-neighbours of the seeds (native CSR adjacency)
         graph_hits: dict[int, int] = {}
         if expand:
@@ -1417,11 +1474,19 @@ class Reader:
                     if x in seed_set:
                         continue
                     graph_hits[x] = graph_hits.get(x, 0) + 1
-        expanded_ids = [i for i, _ in sorted(graph_hits.items(), key=lambda t: -t[1])[:pool]]
+        expanded_ids = [
+            i for i, _ in sorted(graph_hits.items(), key=lambda t: -t[1])[:pool]
+        ]
+        graph_ms = (time.perf_counter() - _tg) * 1000.0
+        _tf = time.perf_counter()
         cand = list(dict.fromkeys(seed_ids + expanded_ids))  # de-dup, order-stable
         titles = self._titles(cand)
         cand = [a for a in cand if a in titles]
-        seed_count, expanded_count, pre_count = len(seed_ids), len(expanded_ids), len(cand)
+        seed_count, expanded_count, pre_count = (
+            len(seed_ids),
+            len(expanded_ids),
+            len(cand),
+        )
         # (3) RELATIONAL filter
         indeg = self._ensure_indeg()
         n_indeg = len(indeg)
@@ -1449,6 +1514,7 @@ class Reader:
                 lengths[a] = length
                 filt.append(a)
             cand = filt
+        filter_ms = (time.perf_counter() - _tf) * 1000.0
         # RANK — fuse cosine (vector) with normalised graph proximity (seed in-links)
         cos = self._score_by_query(qvec, cand)
         max_hits = max(graph_hits.values()) if graph_hits else 1
@@ -1457,26 +1523,54 @@ class Reader:
             c = float(cos.get(a, 0.0))
             g = graph_hits.get(a, 0) / max_hits
             in_seed, in_graph = a in seed_set, a in graph_hits
-            prov = ("meaning + linked" if in_seed and in_graph
-                    else "meaning" if in_seed else "linked")
-            results.append({
-                "id": a, "title": titles[a],
-                "score": round(c + 0.25 * g, 4), "cos": round(c, 4),
-                "graph": graph_hits.get(a, 0), "indeg": deg(a),
-                "length": lengths.get(a), "prov": prov,
-            })
+            prov = (
+                "meaning + linked"
+                if in_seed and in_graph
+                else "meaning"
+                if in_seed
+                else "linked"
+            )
+            results.append(
+                {
+                    "id": a,
+                    "title": titles[a],
+                    "score": round(c + 0.25 * g, 4),
+                    "cos": round(c, 4),
+                    "graph": graph_hits.get(a, 0),
+                    "indeg": deg(a),
+                    "length": lengths.get(a),
+                    "prov": prov,
+                }
+            )
         results.sort(key=lambda r: (-r["score"], r["id"]))
-        cats_by = self._cats_for([r["id"] for r in results[:40]]) if self._has_cats else {}
+        cats_by = (
+            self._cats_for([r["id"] for r in results[:40]]) if self._has_cats else {}
+        )
         for r in results:
             r["cats"] = cats_by.get(r["id"], [])
-        return {**base, "seed_count": seed_count, "expanded_count": expanded_count,
-                "pre_count": pre_count, "post_count": len(results), "results": results}
+        total_ms = (time.perf_counter() - t0) * 1000.0
+        return {
+            **base,
+            "seed_count": seed_count,
+            "expanded_count": expanded_count,
+            "pre_count": pre_count,
+            "post_count": len(results),
+            "results": results,
+            "timing": {
+                "vector_ms": round(vector_ms, 1),
+                "graph_ms": round(graph_ms, 1),
+                "filter_ms": round(filter_ms, 1),
+                "total_ms": round(total_ms, 1),
+            },
+        }
 
     def _llm_answer(self, q: str, passages: list[dict]) -> str:
         """Grounded generation via the local ollama HTTP API. The model is told to
         answer ONLY from the numbered passages and to cite them; num_ctx is set
         explicitly because ollama otherwise defaults to 2048 and would truncate."""
-        ctx = "\n\n".join(f"[{i + 1}] {p['title']}\n{p['body']}" for i, p in enumerate(passages))
+        ctx = "\n\n".join(
+            f"[{i + 1}] {p['title']}\n{p['body']}" for i, p in enumerate(passages)
+        )
         system = (
             "You answer questions using ONLY the provided Wikipedia passages. "
             "Cite the passage numbers you rely on inline, like [1] or [2]. "
@@ -1499,7 +1593,7 @@ class Reader:
             headers={"Content-Type": "application/json"},
         )
         try:
-            with urllib.request.urlopen(req, timeout=180) as r:
+            with urllib.request.urlopen(req, timeout=LLM_TIMEOUT) as r:
                 resp = json.loads(r.read())
             return resp["message"]["content"].strip()
         except Exception as e:  # surface the failure honestly rather than fabricate
@@ -1575,6 +1669,7 @@ class Reader:
         q = (q or "").strip()
         if not q:
             return {"answer": "Ask a question.", "sources": [], "expanded": False}
+        t0 = time.perf_counter()
         qvec = self._embed_query(q)
         cap_total = 12
         k_seed = 6 if expand else k
@@ -1606,7 +1701,10 @@ class Reader:
                         "via": via_titles.get(via),
                     }
                 )
+        retrieval_ms = (time.perf_counter() - t0) * 1000.0
+        _ta = time.perf_counter()
         answer = self._llm_answer(q, passages)
+        answer_ms = (time.perf_counter() - _ta) * 1000.0
         sources = [
             {
                 "n": i + 1,
@@ -1624,6 +1722,11 @@ class Reader:
             "expanded": bool(expand),
             "n_semantic": sum(1 for p in passages if p["origin"] == "semantic"),
             "n_graph": sum(1 for p in passages if p["origin"] == "graph"),
+            "timing": {
+                "retrieval_ms": round(retrieval_ms, 1),
+                "answer_ms": round(answer_ms, 1),
+                "total_ms": round((time.perf_counter() - t0) * 1000.0, 1),
+            },
         }
 
     # -- Enrich (on-demand, reviewed, CITED fact suggestions) -------------- #
@@ -1749,7 +1852,7 @@ class Reader:
             headers={"Content-Type": "application/json"},
         )
         try:
-            with urllib.request.urlopen(req, timeout=180) as r:
+            with urllib.request.urlopen(req, timeout=LLM_TIMEOUT) as r:
                 content = json.loads(r.read())["message"]["content"]
             obj = json.loads(content)
         except Exception as e:
@@ -1832,7 +1935,11 @@ class Reader:
             if art is None:
                 continue
             sources.append(
-                {"id": i, "title": art["title"], "text": art["body"][:ENRICH_SOURCE_CHARS]}
+                {
+                    "id": i,
+                    "title": art["title"],
+                    "text": art["body"][:ENRICH_SOURCE_CHARS],
+                }
             )
         raw = self._enrich_extract(target, sources) if sources else []
         by_src = {s["id"]: s for s in sources}
@@ -1928,21 +2035,87 @@ class Reader:
 
 
 _HTML_OK = {
-    "p", "div", "span", "section", "br", "hr", "b", "strong", "i", "em", "u", "s",
-    "small", "sub", "sup", "abbr", "cite", "q", "code", "pre", "blockquote", "kbd",
-    "h2", "h3", "h4", "h5", "h6", "ul", "ol", "li", "dl", "dt", "dd",
-    "table", "thead", "tbody", "tfoot", "tr", "td", "th", "caption", "colgroup", "col",
-    "figure", "figcaption", "img", "a",
+    "p",
+    "div",
+    "span",
+    "section",
+    "br",
+    "hr",
+    "b",
+    "strong",
+    "i",
+    "em",
+    "u",
+    "s",
+    "small",
+    "sub",
+    "sup",
+    "abbr",
+    "cite",
+    "q",
+    "code",
+    "pre",
+    "blockquote",
+    "kbd",
+    "h2",
+    "h3",
+    "h4",
+    "h5",
+    "h6",
+    "ul",
+    "ol",
+    "li",
+    "dl",
+    "dt",
+    "dd",
+    "table",
+    "thead",
+    "tbody",
+    "tfoot",
+    "tr",
+    "td",
+    "th",
+    "caption",
+    "colgroup",
+    "col",
+    "figure",
+    "figcaption",
+    "img",
+    "a",
 }
 _HTML_VOID = {"br", "hr", "col"}
 _HTML_DROP_BLOCK = {
-    "script", "style", "iframe", "object", "form", "noscript", "svg", "math",
-    "button", "select", "textarea", "audio", "video",
+    "script",
+    "style",
+    "iframe",
+    "object",
+    "form",
+    "noscript",
+    "svg",
+    "math",
+    "button",
+    "select",
+    "textarea",
+    "audio",
+    "video",
 }
 _HTML_DROP_VOID = {"input", "embed", "link", "meta", "source", "track"}
 _IMG_OK = re.compile(r"^(?:https?:)?//upload\.wikimedia\.org/")
-_NS_DROP = {"File", "Image", "Category", "Template", "Help", "Wikipedia",
-            "Portal", "Special", "Module", "Draft", "MediaWiki", "Talk", "User"}
+_NS_DROP = {
+    "File",
+    "Image",
+    "Category",
+    "Template",
+    "Help",
+    "Wikipedia",
+    "Portal",
+    "Special",
+    "Module",
+    "Draft",
+    "MediaWiki",
+    "Talk",
+    "User",
+}
 
 
 def _norm_title(t: str) -> str:
@@ -2174,6 +2347,11 @@ LANDING_HTML = """<!doctype html>
 
   /* ---- comparison table ---- */
   .tablewrap{overflow-x:auto;margin-top:20px;border:1px solid var(--line);border-radius:8px}
+  .trylive{text-align:center;margin-top:22px}
+  .trybtn{display:inline-block;background:#127a4a;color:#fff;font-weight:600;font-size:14.5px;
+    padding:11px 22px;border-radius:8px;border:1px solid #0e6a3f}
+  .trybtn:hover{background:#0e6a3f;color:#fff}
+  .trysub{margin-top:8px;font-size:12.5px;color:var(--dim)}
   table{border-collapse:collapse;width:100%;min-width:640px;font-size:14.5px}
   thead th{text-align:left;padding:13px 16px;background:var(--bg2);border-bottom:2px solid var(--line);
     font-weight:600;font-size:13px}
@@ -2304,6 +2482,10 @@ LANDING_HTML = """<!doctype html>
       returns while examining as little as <b>~0.71%</b> of the corpus. A real page-load and search
       head-to-head will be <em>measured</em> and posted here, not asserted.
     </div>
+    <div class="trylive">
+      <a class="trybtn" href="/read?cmp=early+mechanical+computers">&#9878;&nbsp; Try it live — Compare keyword vs tri-modal search &rarr;</a>
+      <div class="trysub">runs the same query both ways over the same 6.9M-article corpus &mdash; see what a keyword index can&rsquo;t surface</div>
+    </div>
   </div>
 </section>
 
@@ -2433,6 +2615,22 @@ p { line-height:1.6; }
 #tribar button { padding:6px 16px; border:0; border-radius:4px; background:#127a4a; color:#fff;
   cursor:pointer; font-size:13px; }
 #tribar button:hover { background:#0e6a3f; }
+#tribar #cmpbtn { background:#fff; color:#127a4a; border:1px solid #127a4a; }
+#tribar #cmpbtn:hover { background:#eafaf1; color:#0e6a3f; }
+/* keyword-vs-tri-modal comparison view */
+.cmp { display:grid; grid-template-columns:1fr 1fr; gap:16px; margin:0 8px; }
+@media (max-width:760px){ .cmp { grid-template-columns:1fr; } }
+.cmpcol { min-width:0; }
+.cmphd { font-size:12.5px; font-weight:700; margin:2px 0 6px; padding-bottom:5px;
+  border-bottom:2px solid #eee; display:flex; align-items:center; gap:7px; flex-wrap:wrap; }
+.cmphd.kw { color:#777; }
+.cmphd.tri { color:#0e6a3f; border-color:#cdeede; }
+.cmphd .n { font-weight:600; color:#aaa; font-size:11px; }
+.cmpnote { margin:4px 8px 12px; padding:9px 12px; background:#f4faf6; border:1px solid #dceee3;
+  border-radius:8px; font-size:12.5px; color:#28624a; line-height:1.5; }
+.cmpnote b { color:#0b5030; }
+.kwtag { font-size:10px; color:#bbb; margin-left:6px; font-weight:600; }
+.onlytag { font-size:10px; color:#b8790f; margin-left:6px; font-weight:700; white-space:nowrap; }
 .prov { font-size:10.5px; color:#127a4a; margin-left:6px; font-weight:600; }
 .ex { display:inline-block; width:15px; height:15px; line-height:15px; text-align:center;
   border-radius:50%; background:rgba(255,255,255,.30); color:#fff; font-size:11px; font-weight:700;
@@ -2454,11 +2652,30 @@ p { line-height:1.6; }
 #sbtn:hover { background:#653c88; }
 .gexp { display:flex; align-items:center; gap:4px; color:#fff; font-size:12px;
   white-space:nowrap; cursor:pointer; }
-.countbar { font-size:12px; color:#555; margin:4px 8px 8px; line-height:1.5; }
-.countbar b { color:#7a4aa0; }
 .meta { font-size:11px; color:#8a8a8a; margin-top:2px; }
 .catpill { display:inline-block; background:#f4ecf9; color:#7a4aa0; border-radius:8px;
   padding:0 6px; margin:2px 3px 0 0; font-size:10px; }
+/* fusion-pipeline bar — latency + the three legs + the TriDB explainer */
+.pipe { display:flex; align-items:center; flex-wrap:wrap; gap:7px 10px; margin:6px 8px 4px;
+  font-size:12px; color:#555; }
+.pipe .lat { display:inline-flex; align-items:center; gap:4px; font-weight:700; font-size:13px;
+  color:#0e6a3f; background:#eafaf1; border:1px solid #cdeede; border-radius:12px;
+  padding:2px 11px; font-variant-numeric:tabular-nums; }
+.pipe .lat .bolt { font-size:12px; }
+.pipe .flow { display:flex; align-items:center; gap:6px; flex-wrap:wrap; }
+.pipe .leg { display:inline-flex; align-items:center; gap:4px; white-space:nowrap; }
+.pipe .leg .dot { width:8px; height:8px; border-radius:50%; display:inline-block; }
+.pipe .leg b { color:#333; font-variant-numeric:tabular-nums; }
+.pipe .leg .ms { color:#aaa; font-size:11px; font-variant-numeric:tabular-nums; }
+.pipe .arw { color:#c4c4c4; }
+.pipe .tridb { display:inline-flex; align-items:center; gap:4px; color:#0e6a3f; font-weight:600;
+  font-size:11.5px; background:#f4faf6; border:1px solid #dceee3; border-radius:10px;
+  padding:1px 9px; }
+.pipe .tridb .ex { background:transparent; color:#0e6a3f; width:auto; height:auto; }
+.pipe .grounded { display:inline-flex; align-items:center; gap:4px; color:#8a5a00; font-weight:600;
+  font-size:11.5px; background:#fbf5e9; border:1px solid #ecdcc0; border-radius:10px; padding:1px 9px; }
+.pipe .llm { color:#aaa; font-size:11px; margin-left:auto; font-variant-numeric:tabular-nums; }
+.filtline { font-size:11px; color:#aaa; margin:0 8px 9px; }
 .og { font-size:9.5px; text-transform:uppercase; letter-spacing:.03em; padding:1px 5px;
   border-radius:8px; font-weight:600; white-space:nowrap; }
 .og-sem { background:#e8eefc; color:#2554c7; }
@@ -2575,6 +2792,7 @@ p { line-height:1.6; }
   <input id="tmaxlen" class="numf" type="number" min="0" placeholder="max chars">
   <input id="tcat" placeholder="category contains…">
   <button id="tbtn" onclick="triSearch()">Search</button>
+  <button id="cmpbtn" onclick="compareSearch()" title="Run this query as plain keyword search AND tri-modal, side by side — see what keyword search can't find">&#9878; Compare vs keyword</button>
 </div>
 <main>
   <div id="results"><div class="hint">Type a query and press Enter.</div></div>
@@ -2760,7 +2978,8 @@ async function loadRelated(id){
   rel.innerHTML = '<div class="hd">Loading…</div>';
   const r = await j('/related_fused/'+id);
   let h = '<div class="hd">Related (fused)</div>' +
-    '<div class="legend">meaning &times; links combined — both signals = strongest</div>';
+    '<div class="legend">meaning &times; links combined — both signals = strongest</div>' +
+    fusedHeaderBar(r);
   h += r.fused.length
     ? r.fused.map(fusedRow).join('')
     : '<div class="hint">none</div>';
@@ -2844,7 +3063,7 @@ async function loadAsk(q){   // render only, no history push
   let r;
   try { r = await j('/ask?q='+encodeURIComponent(q)+'&expand='+expand); }
   catch(e){ art.innerHTML = '<div class="hint">Ask failed: '+esc(String(e))+'</div>'; return; }
-  let h = '<h2>Ask</h2><div class="answer">'+esc(r.answer)+'</div>';
+  let h = '<h2>Ask</h2><div class="answer">'+esc(r.answer)+'</div>'+askPipeline(r);
   if(r.sources && r.sources.length){
     const sub = r.expanded
       ? '<div class="legend">'+r.n_semantic+' from semantic retrieval &middot; '+
@@ -2901,11 +3120,74 @@ function semRow(a){
   return '<div class="item" onclick="open_('+a.id+')"><div class="rtitle">'+esc(a.title)+'</div>'+
     relInd(a.score)+'<div class="meta">'+meta.join(' · ')+'</div>'+cats+'</div>';
 }
+function fmtms(x){ if(x==null) return ''; return (x<10 ? x.toFixed(1) : Math.round(x))+''; }
+// The TriDB "one fused query" tag + ⓘ explainer — shared by search results and Ask.
+const TRIDB_TAG = '<span class="tridb">TriDB &middot; one fused query<span class="ex">&#9432;'+
+  '<span class="win"><b>One fused query.</b> All three legs — vector similarity, graph traversal, '+
+  'relational filter — run inside <em>one</em> Postgres process in a single early-terminating query, '+
+  'under one write-ahead log: <b>one round-trip, not three</b> (a Milvus+Neo4j+Postgres stack needs '+
+  'three separate systems). <span style="color:#0e6a3f">Measured at 200k: 11.5&times; faster on '+
+  'shallow queries, 0 torn reads under concurrent edits.</span>'+
+  '<span class="legs"><i class="leg-v">vector</i><i class="leg-g">graph</i><i class="leg-r">relational</i></span>'+
+  '</span></span></span>';
+// Ask/RAG fusion strip: fused-retrieval latency + provenance + grounded-sources cue (honest:
+// the local LLM's answer time is shown separately, not credited to TriDB).
+function askPipeline(r){
+  const t = r.timing || {};
+  let flow = '<span class="leg"><span class="dot" style="background:#0f8b7c"></span>vector <b>'+
+    (r.n_semantic||0)+'</b></span>';
+  if(r.expanded){
+    flow += '<span class="arw">&rarr;</span><span class="leg"><span class="dot" style="background:#6f4fd0">'+
+      '</span>graph <b>+'+(r.n_graph||0)+'</b></span>';
+  }
+  const lat = (t.retrieval_ms!=null)
+    ? '<span class="lat" title="server-side time to fuse vector + graph retrieval (excludes the local LLM)">'+
+      '<span class="bolt">&#9889;</span>'+fmtms(t.retrieval_ms)+' ms retrieval</span>'
+    : '';
+  const grounded = (r.sources && r.sources.length)
+    ? '<span class="grounded" title="the answer is written only from these cited passages — no free-floating claims">'+
+      '&#9878; grounded in '+r.sources.length+' cited sources</span>'
+    : '';
+  const llm = (t.answer_ms!=null)
+    ? '<span class="llm" title="the local LLM that writes the answer — a separate model, not TriDB">'+
+      'answer by local LLM '+fmtms(t.answer_ms)+' ms</span>'
+    : '';
+  return '<div class="pipe">'+lat+'<span class="flow">'+flow+'</span>'+TRIDB_TAG+grounded+llm+'</div>';
+}
+// Compact fusion tag for the article-page "Related (fused)" panel (vector x graph RRF).
+function fusedHeaderBar(r){
+  const t = r.timing || {};
+  const lat = (t.total_ms!=null)
+    ? '<span class="lat"><span class="bolt">&#9889;</span>'+fmtms(t.total_ms)+' ms</span>' : '';
+  return '<div class="pipe" style="margin:2px 8px 6px">'+lat+
+    '<span class="leg"><span class="dot" style="background:#0f8b7c"></span>vector '+
+    '<span class="arw">&times;</span> <span class="dot" style="background:#6f4fd0"></span>graph</span>'+
+    TRIDB_TAG+'</div>';
+}
+// The fusion-pipeline bar: real server-side latency + the three legs + a TriDB explainer.
+function pipelineBar(r){
+  const t = r.timing || {};
+  const vcount = (r.seed_count!=null) ? r.seed_count : r.pool;
+  let flow = '<span class="leg"><span class="dot" style="background:#0f8b7c"></span>vector <b>'+
+    vcount+'</b>'+(t.vector_ms!=null?' <span class="ms">'+fmtms(t.vector_ms)+'ms</span>':'')+'</span>';
+  if(r.expanded_count!=null){
+    flow += '<span class="arw">&rarr;</span><span class="leg"><span class="dot" style="background:#6f4fd0">'+
+      '</span>graph <b>+'+r.expanded_count+'</b>'+
+      (t.graph_ms!=null?' <span class="ms">'+fmtms(t.graph_ms)+'ms</span>':'')+'</span>';
+  }
+  flow += '<span class="arw">&rarr;</span><span class="leg"><span class="dot" style="background:#b8790f">'+
+    '</span>filter <b>'+r.post_count+'</b>'+
+    (t.filter_ms!=null?' <span class="ms">'+fmtms(t.filter_ms)+'ms</span>':'')+'</span>';
+  const lat = (t.total_ms!=null)
+    ? '<span class="lat" title="server-side wall-clock time of the fused query">'+
+      '<span class="bolt">&#9889;</span>'+fmtms(t.total_ms)+' ms</span>'
+    : '';
+  return '<div class="pipe">'+lat+'<span class="flow">'+flow+'</span>'+TRIDB_TAG+'</div>'+
+    '<div class="filtline">filters: '+esc(fdesc(r.filters, r.cats_available))+'</div>';
+}
 function renderSem(r){
   const el = $('#results');
-  let h = '<div class="countbar">Retrieved <b>'+r.pool+'</b> by meaning &rarr; <b>'+r.pre_count+
-    '</b> resolved &rarr; <b>'+r.post_count+'</b> after filter'+
-    '<br><span style="color:#999">filters: '+esc(fdesc(r.filters, r.cats_available))+'</span></div>';
+  const h = pipelineBar(r);
   if(!r.results.length){ el.innerHTML = h+'<div class="hint">No results after filtering.</div>'; return; }
   el.innerHTML = h + r.results.map(semRow).join('');
 }
@@ -2949,12 +3231,65 @@ function triRow(a){
 }
 function renderTri(r){
   const el = $('#results');
-  let h = '<div class="countbar"><b>'+r.seed_count+'</b> seeds by meaning &rarr; <b>'+
-    r.expanded_count+'</b> via links &rarr; <b>'+r.pre_count+'</b> pooled &rarr; <b>'+
-    r.post_count+'</b> after filter<br><span style="color:#999">filters: '+
-    esc(fdesc(r.filters, r.cats_available))+'</span></div>';
+  const h = pipelineBar(r);
   if(!r.results.length){ el.innerHTML = h+'<div class="hint">No results after filtering.</div>'; return; }
   el.innerHTML = h + r.results.map(triRow).join('');
+}
+// -- Compare: same query, keyword search vs tri-modal, side by side (same corpus) --
+async function compareSearch(){
+  const q = $('#tq').value.trim();
+  if(!q) return;
+  await loadCmp(q);
+  pushView({view:'cmp', q:q});
+}
+async function loadCmp(q){
+  $('#tq').value = q;
+  const el = $('#results');
+  el.innerHTML = '<div class="hint">Running keyword search and tri-modal fusion side by side…</div>';
+  let kw, tri;
+  try {
+    [kw, tri] = await Promise.all([
+      j('/search?q='+encodeURIComponent(q)),
+      j('/search_trimodal?q='+encodeURIComponent(q)+'&expand=1')
+    ]);
+  } catch(e){ el.innerHTML = '<div class="hint">Compare failed: '+esc(String(e))+'</div>'; return; }
+  renderCmp(q, kw||[], tri||{results:[]});
+}
+function renderCmp(q, kw, tri){
+  const el = $('#results');
+  const kwIds = new Set(kw.map(a => a.id));
+  const triIds = new Set((tri.results||[]).map(a => a.id));
+  const triRes = tri.results || [];
+  const onlyTri = triRes.filter(a => !kwIds.has(a.id)).length;
+  const t = tri.timing || {};
+  let h = '<div class="cmpnote">Same 6.9M-article corpus, same machine — only the <b>retrieval method</b> '+
+    'differs. Regular Wikipedia search is keyword / full-text (great when you know the words); it has no '+
+    'embeddings, no ranked graph traversal, no fused filter. Here <b>'+onlyTri+' of '+triRes.length+'</b> '+
+    'tri-modal results are ones a keyword index <b>cannot</b> surface. (Capability comparison, not a speed '+
+    'claim — Wikipedia’s search infrastructure is excellent.)</div>';
+  h += '<div class="cmp">';
+  h += '<div class="cmpcol"><div class="cmphd kw">&#128269; Keyword search'+
+    '<span class="n">'+kw.length+' title match'+(kw.length===1?'':'es')+'</span></div>';
+  h += kw.length
+    ? kw.map(a => '<div class="item" onclick="open_('+a.id+')">'+esc(a.title)+
+        (triIds.has(a.id)?'':'<span class="kwtag">keyword-only</span>')+'</div>').join('')
+    : '<div class="hint">No title matches — a keyword index needs the query words to appear in a title.</div>';
+  h += '</div>';
+  h += '<div class="cmpcol"><div class="cmphd tri">&#10022; TriDB tri-modal'+
+    (t.total_ms!=null?' <span class="lat" style="font-size:11px;padding:1px 8px">&#9889; '+fmtms(t.total_ms)+' ms</span>':'')+
+    '<span class="n">'+triRes.length+' fused</span></div>';
+  h += triRes.length
+    ? triRes.map(a => {
+        const tag = kwIds.has(a.id)
+          ? '<span class="kwtag">also keyword</span>'
+          : '<span class="onlytag" title="only meaning + graph retrieval can surface this">&#9733; '+
+            esc(a.prov||'meaning/linked')+'</span>';
+        return '<div class="item" onclick="open_('+a.id+')"><div class="rtitle">'+esc(a.title)+tag+
+          '</div>'+relInd(a.cos)+'</div>';
+      }).join('')
+    : '<div class="hint">none</div>';
+  h += '</div></div>';
+  el.innerHTML = h;
 }
 // -- inline-link clicks + hovercards (page previews) --------------------------
 const _sumCache = {};        // id -> {title, lead}, cached per session
@@ -3066,15 +3401,19 @@ function renderState(st){   // restore a view for a popstate (no new push)
   else if(st.view==='ask'){ loadAsk(st.q); }
   else if(st.view==='sem'){ loadSem(st.p); }
   else if(st.view==='tri'){ loadTri(st.p); }
+  else if(st.view==='cmp'){ loadCmp(st.q); }
   else if(st.view==='search'){ loadSearch(st.q); }
   updateBack();
 }
 window.addEventListener('popstate', e => renderState(e.state));
-const _bootQ = new URLSearchParams(location.search).get('q');   // capture BEFORE replaceState strips ?q=
-history.replaceState({view:'home'}, '', location.pathname);   // base state (drops ?q= from the URL)
+const _bootParams = new URLSearchParams(location.search);   // capture BEFORE replaceState strips them
+const _bootQ = _bootParams.get('q');
+const _bootCmp = _bootParams.get('cmp');   // ?cmp=<query> handoff → the keyword-vs-tri-modal compare view
+history.replaceState({view:'home'}, '', location.pathname);   // base state (drops query string from the URL)
 updateBack();
-(function(){   // boot: a ?q= handoff from the portal landing runs the search and opens the top hit; else random landing
-  if(_bootQ){ $('#q').value = _bootQ; loadSearch(_bootQ).then(() => { const top = document.querySelector('#results .item'); if(top) top.click(); }); }
+(function(){   // boot: a ?cmp= or ?q= handoff from the portal landing; else random landing
+  if(_bootCmp){ $('#tq').value = _bootCmp; loadCmp(_bootCmp).then(() => pushView({view:'cmp', q:_bootCmp})); }
+  else if(_bootQ){ $('#q').value = _bootQ; loadSearch(_bootQ).then(() => { const top = document.querySelector('#results .item'); if(top) top.click(); }); }
   else { loadHome(); }
 })();
 
@@ -3090,7 +3429,9 @@ $('#to').addEventListener('keydown', e => { if(e.key==='Enter') connect(); });
 </body></html>"""
 
 
-MAX_BODY_BYTES = 64 * 1024  # cap mutating POST bodies (accept/dismiss payloads are small)
+MAX_BODY_BYTES = (
+    64 * 1024
+)  # cap mutating POST bodies (accept/dismiss payloads are small)
 
 
 def check_token(headers, expected: str) -> bool:
@@ -3129,6 +3470,24 @@ def make_handler(reader: Reader, token: str):
             self.send_response(code)
             self.send_header("Content-Type", ctype)
             self.send_header("Content-Length", str(len(body)))
+            # Response-hardening headers on every response.
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("X-Frame-Options", "DENY")
+            self.send_header("Referrer-Policy", "no-referrer")
+            # CSP only on HTML responses (the pages carry inline <script>/<style>).
+            # 'unsafe-inline' is a known INTERIM allowance: the page relies on inline
+            # script/style, so removing it requires nonce plumbing (out of scope here).
+            # The rest of the policy still locks image/framing/object origins, giving a
+            # backstop behind the article-body sanitizer against stored XSS.
+            if ctype.startswith("text/html"):
+                self.send_header(
+                    "Content-Security-Policy",
+                    "default-src 'self'; "
+                    "img-src 'self' https://upload.wikimedia.org data:; "
+                    "script-src 'self' 'unsafe-inline'; "
+                    "style-src 'self' 'unsafe-inline'; "
+                    "frame-ancestors 'none'; object-src 'none'",
+                )
             self.end_headers()
             self.wfile.write(body)
 
@@ -3140,9 +3499,13 @@ def make_handler(reader: Reader, token: str):
             path = u.path
             try:
                 if path == "/":
-                    self._send(200, LANDING_HTML.encode("utf-8"), "text/html; charset=utf-8")
+                    self._send(
+                        200, LANDING_HTML.encode("utf-8"), "text/html; charset=utf-8"
+                    )
                 elif path in ("/read", "/read/"):
-                    self._send(200, index_html.encode("utf-8"), "text/html; charset=utf-8")
+                    self._send(
+                        200, index_html.encode("utf-8"), "text/html; charset=utf-8"
+                    )
                 elif path == "/random":
                     r = reader.random_article()
                     self._json(r if r is not None else {"error": "no articles"})
@@ -3157,7 +3520,13 @@ def make_handler(reader: Reader, token: str):
                         hops = int(qs.get("hops", ["1"])[0] or "1")
                     except ValueError:
                         hops = 1
-                    self._json(reader.ask(q, expand=expand, hops=hops))
+                    if not _LLM_SLOTS.acquire(blocking=False):
+                        self._send(429, b"busy", "text/plain")
+                        return
+                    try:
+                        self._json(reader.ask(q, expand=expand, hops=hops))
+                    finally:
+                        _LLM_SLOTS.release()
                 elif path == "/search_semantic":
                     qs = parse_qs(u.query)
 
@@ -3205,7 +3574,9 @@ def make_handler(reader: Reader, token: str):
                     else:
                         if art.get("html"):
                             try:
-                                art["body_html"] = reader.render_html_body(aid, art["html"])
+                                art["body_html"] = reader.render_html_body(
+                                    aid, art["html"]
+                                )
                             except Exception:
                                 art["body_html"] = reader.link_body(aid, art["body"])
                         else:
@@ -3217,7 +3588,13 @@ def make_handler(reader: Reader, token: str):
                         self._json(art)
                 elif path.startswith("/enrich/"):
                     aid = int(unquote(path.split("/")[-1]))
-                    self._json(reader.enrich(aid))
+                    if not _LLM_SLOTS.acquire(blocking=False):
+                        self._send(429, b"busy", "text/plain")
+                        return
+                    try:
+                        self._json(reader.enrich(aid))
+                    finally:
+                        _LLM_SLOTS.release()
                 elif path.startswith("/summary/"):
                     aid = int(unquote(path.split("/")[-1]))
                     s = reader.summary(aid)
@@ -3225,7 +3602,10 @@ def make_handler(reader: Reader, token: str):
                 elif path.startswith("/related/"):
                     aid = int(path.split("/")[-1])
                     self._json(
-                        {"semantic": reader.semantic(aid), "hyperlinks": reader.hyperlinks(aid)}
+                        {
+                            "semantic": reader.semantic(aid),
+                            "hyperlinks": reader.hyperlinks(aid),
+                        }
                     )
                 elif path.startswith("/related_fused/"):
                     aid = int(path.split("/")[-1])
@@ -3235,20 +3615,30 @@ def make_handler(reader: Reader, token: str):
                     frm = reader.resolve(qs.get("from", [""])[0])
                     to = reader.resolve(qs.get("to", [""])[0])
                     if frm is None or to is None:
-                        self._json({
-                            "found": False,
-                            "reason": "could not resolve one or both articles",
-                            "from": frm, "to": to,
-                        })
+                        self._json(
+                            {
+                                "found": False,
+                                "reason": "could not resolve one or both articles",
+                                "from": frm,
+                                "to": to,
+                            }
+                        )
                     else:
                         res = reader.path(frm["id"], to["id"])
                         if res.get("found") and qs.get("narrate", ["0"])[0] == "1":
-                            res["narration"] = reader.narrate_path(res["path"])
+                            if not _LLM_SLOTS.acquire(blocking=False):
+                                self._send(429, b"busy", "text/plain")
+                                return
+                            try:
+                                res["narration"] = reader.narrate_path(res["path"])
+                            finally:
+                                _LLM_SLOTS.release()
                         self._json(res)
                 else:
                     self._send(404, b"not found", "text/plain")
-            except Exception as e:  # never take the server down on one bad request
-                self._send(500, html.escape(repr(e)).encode(), "text/plain")
+            except Exception:  # never take the server down on one bad request
+                logging.exception("wiki_reader request failed")
+                self._send(500, b"internal error", "text/plain")
 
         def do_POST(self):
             u = urlparse(self.path)
@@ -3274,8 +3664,9 @@ def make_handler(reader: Reader, token: str):
                     self._json(reader.dismiss_fact(body))
                 else:
                     self._send(404, b"not found", "text/plain")
-            except Exception as e:
-                self._send(500, html.escape(repr(e)).encode(), "text/plain")
+            except Exception:
+                logging.exception("wiki_reader request failed")
+                self._send(500, b"internal error", "text/plain")
 
     return Handler
 

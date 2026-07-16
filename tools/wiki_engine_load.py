@@ -444,7 +444,9 @@ def _build_load_sql(
     w("\\echo #WL COPY_EDGES_DONE")
     w("\\echo #WL EDGE_INSERT_START")
     w("SELECT sum(graph_store.gph_insert_edges(src, dst_arr)) FROM (")
-    w("  SELECT src, array_agg(dst) AS dst_arr FROM edge_stage GROUP BY src ORDER BY src")
+    w(
+        "  SELECT src, array_agg(dst) AS dst_arr FROM edge_stage GROUP BY src ORDER BY src"
+    )
     w(") g;")
     w("\\echo #WL EDGE_INSERT_DONE")
     w("DROP TABLE edge_stage;")
