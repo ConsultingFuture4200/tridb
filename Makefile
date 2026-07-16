@@ -1,4 +1,4 @@
-.PHONY: test lint graph-test stock-graph-test tjs-parity-test smoke-test test-all baseline-up baseline-down seed bench bench-live sweep sm2 fetch-dataset bench-public bench-repro fetch-hotpot graphrag graphrag-live bench-filtered ablation recall-decay tjs-open-ref tjs-open-live graphrag-h2h rabitq-sim gpu-build-index wiki-fetch wiki-extract wiki-scale wiki-neo4j wiki-subgraph wiki-linkpred lock clean clean-data
+.PHONY: test lint graph-test stock-graph-test tjs-parity-test smoke-test test-all baseline-up baseline-down seed bench bench-live sweep sm2 fetch-dataset bench-public bench-repro fetch-hotpot graphrag graphrag-live bench-filtered ablation recall-decay tjs-open-ref tjs-open-live graphrag-h2h rabitq-sim gpu-build-index gpu-setup gpu-verify gpu-lock wiki-fetch wiki-extract wiki-scale wiki-neo4j wiki-subgraph wiki-linkpred lock clean clean-data
 
 PUBLIC_DATASET ?= gist-960-euclidean
 
@@ -322,6 +322,20 @@ INDEX_OUT ?= data/index/cagra_hnsw.bin
 gpu-build-index:
 	@test -n "$(DATASET)" || { echo "set DATASET=<.npy/.fvecs/.hdf5> (the corpus to index)"; exit 1; }
 	bash scripts/gpu_build_index.sh --vectors $(DATASET) --out $(INDEX_OUT)
+
+# Isolated GB10 GPU environment (advisor plan 086). Lives in ${GPU_VENV:-.venv-gpu},
+# installed ONLY from requirements-gpu-gb10.lock (generated ON the GB10 from the
+# exact-pinned requirements-gpu-gb10.in) — never touches the core .venv or
+# requirements.lock. Off-target these print SKIP and change nothing; gpu-lock
+# regenerates the aarch64 closure and therefore only runs on the Spark.
+gpu-setup:
+	bash scripts/spark_gpu_setup.sh
+
+gpu-verify:
+	bash scripts/spark_gpu_setup.sh --verify
+
+gpu-lock:
+	bash scripts/spark_gpu_setup.sh --lock
 
 # =============================================================================
 # FULL-WIKIPEDIA SCALE BENCHMARK (docs/wiki_scale_benchmark_spec_v0.1.0.md, DEV-1354)

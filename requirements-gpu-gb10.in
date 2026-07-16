@@ -1,0 +1,23 @@
+# Direct GPU-workload requirements for the DGX Spark / GB10 (aarch64 + CUDA 13)
+# — advisor plan 086. Exact pins ONLY; transitives are resolved into
+# requirements-gpu-gb10.lock ON the GB10 (scripts/spark_gpu_setup.sh --lock).
+# Never install these into the core .venv — they live in ${GPU_VENV:-.venv-gpu}.
+#
+# Top-level versions are the GB10-verified coexistence set from
+# docs/spark_gpu_path_findings_v0.1.0.md (torch cu130 aarch64 + cuVS CAGRA,
+# both re-verified working in ONE env). The single-pass resolver replaces the
+# old sequential-pip install-order dance (cuvs then torch downgraded shared
+# nvidia-* libs): one resolve picks one consistent nvidia-* set, and the
+# GPU verification gate re-proves it on the GB10.
+torch==2.12.1
+cuvs-cu13==26.6.0
+pylibraft-cu13==26.6.0        # device_ndarray for cuVS search queries
+sentence-transformers==5.6.0
+numpy==2.5.0
+scipy==1.18.0
+# Direct imports of the GPU-workload tools (tools/wiki_linkpredict*.py,
+# tools/wiki_embed_hybrid.py, scripts/gpu_build_index.py), pinned to the
+# versions resolved on the GB10 at lock time:
+pandas==3.0.3
+fastembed==0.8.0              # CPU embed path in wiki_linkpredict (ORT is CPU-only on aarch64)
+hnswlib==0.8.0                # ANN fallback + CAGRA->HNSW export target (sdist; builds on GB10)
