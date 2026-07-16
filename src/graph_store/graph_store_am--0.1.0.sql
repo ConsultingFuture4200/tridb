@@ -397,6 +397,15 @@ REVOKE EXECUTE ON FUNCTION remove_edge(bigint, bigint) FROM PUBLIC;
 --   attr_exp='id, chunk' (1st col MUST be the candidate graph id per tjs contract);
 --   filter_exp=the timestamp predicate; orderby_exp='embedding <-> ''<vector>''' (dst embedding).
 --
+-- STOCK-PG lowering (advisor plan 075 / ADR-0019 addendum): when the fork tjs() is absent, the
+-- SAME pinned template lowers to src/tjs_pg's
+--   tjs_open(regclass,k,term_cond,m_seeds,hops,id_col,filter,query vector,src,edge_type)
+--   = ('entities', k=LIMIT, term_cond=0, m_seeds=0, hops=1, 'id', ts filter, parsed vector,
+--      pinned src.id, edge_type = the graph_store.edge_type catalog id of the canonical label
+--      'related_to' — never "any edge").
+-- tjs_open returns entity ids; they are joined back to `entities` for the canonical chunk
+-- column in the operator's OWN emit order (WITH ORDINALITY — never heap order after the join).
+--
 -- SRC-BINDING note (surface<->operator contract): the canonical MATCH binds `src` as a
 -- pattern VARIABLE (a SET of sources), but tjs() takes ONE `src bigint`. The runnable v1
 -- oracle (test/trimodal_compose.sql, test/canonical_e2e_test.sql) pins a single src vertex.
@@ -423,6 +432,8 @@ DECLARE
     est_matches  bigint;
     jorder       text;
     plan_json    text;
+    etype        int;
+    stock_ok     boolean := false;
 BEGIN
     -- Normalize: collapse whitespace runs to single spaces, trim. Keeps the matcher a single
     -- fixed template regardless of how the caller line-wrapped the canonical query.
@@ -447,7 +458,11 @@ BEGIN
         -- The graph-disabled src=-1 parity case stays available via DIRECT tjs() calls only
         -- (advisor plan 024).
         || 'WHERE\s+src\.id\s*=\s*(\d+)\s+AND\s+timestamp\s+IN\s*\((\d+(?:\s*,\s*\d+)*)\)\s+'
-        || 'ORDER\s+BY\s+src_embedding\s*<->\s*''(\{[^'']+\})''\s+'
+        -- Vector literal: the fork brace dialect ('{...}', float8[] form) OR the pgvector
+        -- bracket dialect ('[...]'); delimiters must match. Each lowering below converts the
+        -- accepted literal to its engine's dialect (plan 075) — this dialect pair is the ONLY
+        -- admitted widening; no other template expansion.
+        || 'ORDER\s+BY\s+src_embedding\s*<->\s*''(\{[^'']+\}|\[[^'']+\])''\s+'
         || 'LIMIT\s+(\d+)\s*;?\s*$',
         'i'
     );
@@ -506,19 +521,70 @@ BEGIN
     -- its WHERE, graph as predicate) or filter_first (graph drain drives, exact rank). On an
     -- older engine (no 8-arg tjs) the decision stays recorded-but-inert and the hardwired
     -- vector-first body runs — same answers, pre-DEV-1290 behavior.
+    -- (Both fork branches take the fork's brace dialect: an accepted bracket literal is
+    -- converted with translate(); a brace literal passes through unchanged. Plan 075.)
     IF to_regprocedure('tjs(text,integer,integer,bigint,text,text,text,text)') IS NOT NULL THEN
         RETURN QUERY EXECUTE format(
             'SELECT t.chunk FROM tjs(%L, %s, 0, %s::bigint, %L, %L, %L, %L) AS t(id bigint, chunk text)',
             'entities', k_val, src_id, 'id, chunk', ts_filter,
-            'embedding <-> ''' || query_vec || '''',
+            'embedding <-> ''' || translate(query_vec, '[]', '{}') || '''',
             jorder                                    -- the Stage-2 FR-6 decision, now binding
         );
-    ELSE
+    ELSIF to_regprocedure('tjs(text,integer,integer,bigint,text,text,text)') IS NOT NULL THEN
         RETURN QUERY EXECUTE format(
             'SELECT t.chunk FROM tjs(%L, %s, 0, %s::bigint, %L, %L, %L) AS t(id bigint, chunk text)',
             'entities', k_val, src_id, 'id, chunk', ts_filter,
-            'embedding <-> ''' || query_vec || ''''
+            'embedding <-> ''' || translate(query_vec, '[]', '{}') || ''''
         );
+    ELSE
+        -- STOCK-PG lowering (advisor plan 075 / ADR-0019): no fork tjs() — target the re-homed
+        -- operator public.tjs_open (src/tjs_pg) IF its exact signature is installed. Detection
+        -- is catalog-SAFE: probing to_regprocedure with `vector` in the signature can error on
+        -- installs where the pgvector type is absent, so gate on to_regtype('vector') (NULL-safe)
+        -- and the tjs_pg extension row FIRST, and only then resolve the exact signature.
+        IF to_regtype('vector') IS NOT NULL
+           AND EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'tjs_pg') THEN
+            stock_ok := to_regprocedure(
+                'public.tjs_open(regclass,integer,integer,integer,integer,text,text,vector,bigint,integer)'
+            ) IS NOT NULL;
+        END IF;
+        IF NOT stock_ok THEN
+            RAISE EXCEPTION 'graph_query: no compatible lowering target installed. The canonical '
+                'query lowers to the fork tjs() operator (vectordb) or the stock tjs_open() '
+                'operator (CREATE EXTENSION tjs_pg, requires pgvector >= 0.8 + graph_store_am). '
+                'See ADR-0019.';
+        END IF;
+
+        -- Catalog-justified edge type: the canonical label `related_to` is resolved through the
+        -- graph_store.edge_type dictionary (seeded id 1 at CREATE EXTENSION; the 2-arg
+        -- add_edge/gph_insert_edge default). A missing row RAISES — the lowering never silently
+        -- widens the typed traversal to "any edge".
+        SELECT id INTO etype FROM graph_store.edge_type WHERE name = 'related_to';
+        IF etype IS NULL THEN
+            RAISE EXCEPTION 'graph_query: canonical edge label related_to has no id in '
+                'graph_store.edge_type (catalog row removed?); cannot lower the typed traversal';
+        END IF;
+
+        -- With the v1 pinned src, tjs_open ALWAYS runs its FILTER-FIRST body (typed BFS reach ->
+        -- relational filter -> exact rank; src IS NOT NULL selects it — src/tjs_pg contract).
+        -- Record the physical truth, overriding the Stage-2 default above: there is no
+        -- vector-first body to choose on this path.
+        jorder := 'filter_first';
+        PERFORM set_config('graph_store.last_join_order', jorder, false);
+
+        -- Argument mapping (spec §5 -> tjs_open): k=LIMIT, term_cond=0, m_seeds=0 (ignored by
+        -- filter-first), hops=1 (single-hop template), id_col='id', filter=the parsed window,
+        -- query=the parsed vector (brace dialect converted to pgvector brackets, passed as a
+        -- bound PARAMETER, cast-validated by ::vector), src=pinned src.id, edge_type=the catalog
+        -- id above. tjs_open emits ranked entity ids; join back to the pinned relation for the
+        -- canonical chunk column, preserving the operator's emit order via WITH ORDINALITY.
+        RETURN QUERY EXECUTE format(
+            'SELECT e.%I::text FROM public.tjs_open(%L::regclass, %s, 0, 0, 1, %L, %L, '
+            '$1::vector, %s::bigint, %s) WITH ORDINALITY AS t(id, ord) '
+            'JOIN %I e ON e.%I = t.id ORDER BY t.ord',
+            'chunk', 'entities', k_val, 'id', ts_filter, src_id, etype,
+            'entities', 'id')
+        USING translate(query_vec, '{}', '[]');
     END IF;
     RETURN;
 END;
@@ -526,8 +592,9 @@ $fn$;
 
 COMMENT ON FUNCTION graph_store.graph_query(text) IS
     'TriDB SQL/PGQ canonical surface (DEV-1167). Lowers the ONE canonical query (spec §5) to a '
-    'single tjs() call. Off-template queries RAISE (scope guard: one canonical query for v1). '
-    'Requires WHERE to pin src.id = <const> (v1 single-src binding). See ADR-0008.';
+    'single fused-operator call: the fork tjs() when installed, else the stock tjs_open() '
+    '(tjs_pg, ADR-0019 / plan 075). Off-template queries RAISE (scope guard: one canonical '
+    'query for v1). Requires WHERE to pin src.id = <const> (v1 single-src binding). See ADR-0008.';
 
 -- last_join_order(): what the Stage-2 lowering decided for the MOST RECENT graph_query()
 -- call in this session ('filter_first' / 'vector_first'), or NULL before the first call.

@@ -17,7 +17,8 @@ STOCK_TESTS := test/graph_store_am_test.sql test/graph_store_test.sql \
                test/graph_delete_test.sql test/graph_edge_count_test.sql \
                test/graph_freeze_test.sql test/graph_dense_open_test.sql \
                test/graph_v0v1_parity_test.sql test/graph_vid_cache_test.sql \
-               test/graph_am_acl_test.sql test/tjs_pg_test.sql
+               test/graph_am_acl_test.sql test/tjs_pg_test.sql \
+               test/canonical_stock_e2e_test.sql
 
 ENGINE_TESTS := test/graph_store_test.sql test/trimodal_compose.sql \
                 test/trimodal_early_term.sql test/fork_distance_probe.sql \

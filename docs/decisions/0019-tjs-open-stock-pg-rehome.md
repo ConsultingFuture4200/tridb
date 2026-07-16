@@ -85,3 +85,22 @@ operator surface); when `src IS NULL` it runs **vector-first / seedless**:
 - The fork remains the reference implementation until the stock operator's SM-4 curve and the
   Gate-B-style h2h reproduce on it; then the fork moves to maintenance (launch-vehicle posture,
   ADR-0015 FAQ).
+
+## Addendum (2026-07-16, advisor plan 075) — the canonical front door lowers to tjs_open
+
+`graph_store.graph_query(text)` (the spec §5 v1 surface, DEV-1167) previously recognized only
+the fork `tjs()` signatures, so a stock install with `vector + graph_store_am + tjs_pg` could
+call `tjs_open` directly but the documented front door failed. The lowering now adds a stock
+branch, selected only when the exact
+`public.tjs_open(regclass,integer,integer,integer,integer,text,text,vector,bigint,integer)`
+signature is installed (detection is catalog-safe: gated on `to_regtype('vector')` and the
+`pg_extension` row before probing the signature, so it cannot error on installs without
+pgvector). Mapping: `k`=LIMIT, `term_cond`=0, `m_seeds`=0, `hops`=1, `id_col`='id', the parsed
+timestamp window, the parsed query vector (brace dialect converted to pgvector brackets, bound
+as a parameter), the pinned `src.id`, and `edge_type` = the `graph_store.edge_type` catalog id
+of the canonical label `related_to` (RAISES if the row is absent — never "any edge"). Result
+ids join back to `entities` for the canonical `chunk` column in operator emit order
+(`WITH ORDINALITY`). With the v1 pinned src this is always the filter-first body;
+`graph_store.last_join_order()` reports `filter_first`. Grammar stays pinned; the only admitted
+widening is the brace/bracket vector-literal dialect pair. Proven end-to-end on PG 16 and 17 by
+`test/canonical_stock_e2e_test.sql` (STOCK_TESTS + CI `stock-pg`).
