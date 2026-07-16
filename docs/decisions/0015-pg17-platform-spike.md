@@ -1,6 +1,11 @@
 # ADR-0015: PG17 platform feasibility — what binds TriDB to the 13.4 fork, and what a stock-PG port costs
 
-- **Status:** Proposed (decision is the maintainer's; this ADR supplies the evidence)
+> **Realized / executed.** Status: Accepted (2026-07-15). This spike's recommendation (Option C — un-fork
+> the graph + planner onto stock PG, keep the fork as the vector vehicle) was executed and is superseded
+> operationally by [ADR-0019](0019-tjs-open-stock-pg-rehome.md) (the `tjs_open` re-home); Gate B PASS
+> (roadmap Addendum A2). The body below is the original append-only evidence — unchanged.
+
+- **Status:** Accepted (2026-07-15) — realized by ADR-0019 + roadmap Addendum A2 (Gate B PASS)
 - **Date:** 2026-07-03
 - **Inputs:** advisor plan 028 spike artifacts under `spike/pg17/` — `fork_dependency_inventory.md`,
   `compile_{graph_store,planner,ext}.log` (+ `*_noassert` variants), `pgvector_iterative_probe.sql`/`.out`

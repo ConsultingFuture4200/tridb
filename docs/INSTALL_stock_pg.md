@@ -53,9 +53,12 @@ available on this repository's plan, so ARM is not (yet) in the per-push matrix.
   re-homed on stock PG: filter-first behind the operator surface, and vector-first/seedless
   driving pgvector's iterative HNSW scan directly (requires
   `SET hnsw.iterative_scan = relaxed_order`, pgvector ≥ 0.8) with TR-1 early termination and
-  honest budget-cap reporting (`tjs_open_budget_capped()`). Exact fork phase/bridge parity
-  (ADR-0012/0017 seed-bridge injection) is follow-up; the harness counters expose enough to
-  grade recall honestly either way. The **filter-first** Gate A/B headline also works with no
+  honest budget-cap reporting (`tjs_open_budget_capped()`). Fork phase/bridge parity **landed**
+  (commit `81b8023`, ADR-0012 recipe B): `tjs_open` now performs the guaranteed reachability-bridge
+  injection past the vector frontier, with the `tjs_open_bridges_injected()` counter exposing how
+  many bridges were forced. The remaining follow-up is the **seedless SM-4 recall-curve parity** vs
+  the fork (the pgvector budget-capped recall ceiling of ADR-0015 E3, re-measured per pgvector minor)
+  — not the bridge mechanism itself. The **filter-first** Gate A/B headline also works with no
   operator at all: a single SQL statement over `graph_store.gph_traverse_bfs(...)` (see
   `bench/wikidata_h2h.py:emit_tridb_sql`).
 - **PGXN:** `src/graph_store/META.json` is prepared; publication happens at release time.
