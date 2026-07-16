@@ -38,14 +38,27 @@ to **GO** — with one quantified cost (below).
   (2-5 pages) that the sorted layout per-Next overhead dominates the negligible seek. Not the
   target regime — the design targets large-degree hub scans, where it wins ~3x.
 
-## The cost (quantified, honest)
+## The cost (quantified, honest) — worse than §7's 20k-edge run suggested
 
-- **~4x on-disk footprint**: sorted data dir = ~40 GB vs baseline ~10.6 GB for the same 328M edges.
-  This is the migrate-on-grow relayout write-amplification + orphaned old-extent pages that
-  §8.1(e) / §7.2 flagged. The seek win is real, but a production CSR-lite MUST ship the orphan-page
-  compaction pass (already named as required) — this bench gives it a size: 4x reclaimable.
-- 2GB OOM on the sorted scan (fixed by 4GB) is a harness memory note, not a layout defect: the
-  read-once scan buffers a full extent; a deg-511000 mega hub = 500 x 32KB pages held per scan.
+A dedicated full-load run (per-round fresh containers, load-to-completion) measured the costs the
+§7 tiny corpus hid. These are the load-bearing caveats on the GO:
+
+- **~33x on-disk footprint**: sorted data dir base = **349 GB** vs baseline **10.6 GB** for the same
+  328M edges (live hub adjacency is only ~10 GB — the rest is orphaned old-chain pages left by every
+  migrate-on-grow relayout). §7's warm run reported ~parity; at scale the orphan accumulation is the
+  dominant cost. A production CSR-lite **MUST** ship the §8.1(e) orphan-page compaction — this is not
+  a footnote, it is a blocking prerequisite, and the bench sizes it at ~33x reclaimable.
+- **Bulk load +25%** (sorted 3943 s vs chain 3155 s for the full 328M-edge load) — NOT the −1%
+  "within noise" §7's 20k corpus showed. The migrate-on-grow relayout is a real write tax at scale.
+- 2GB OOM on the sorted scan under the initial bound is a harness memory note, not a layout defect:
+  the read-once scan buffers a full extent (a deg-511000 mega hub = 500 x 32KB pages per scan); the
+  A/B was re-taken at 4GB (still >=10x under the 40GB+ working set, so the cold-seek regime holds).
+
+> **Note (2026-07-16):** two independent runs — a chained 4GB-bound A/B (wall-clock medians in the
+> table above) and a dedicated 2GB per-round full-load run (the +25% load / 33x space costs) —
+> agree on the verdict (seek win 2.6-2.9x on hub/mega scans) and differ only in which cost each
+> measured to completion. The dedicated run's completed-load footprint (349 GB) supersedes an
+> earlier mid-load estimate (~40 GB).
 
 ## Gate-(b) checklist (docs/graph_store_csr_lite_v0.1.0.md §8.1)
 

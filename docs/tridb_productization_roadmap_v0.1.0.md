@@ -224,9 +224,11 @@ working set, io.stat-confirmed NVMe reads). Full evidence: **docs/csr_lite_gate_
   on mega-hub scans, ~1.7x on EXISTS probes — from ~1000x fewer page reads (read-once vs
   re-read-per-neighbor) AND sequential vs scattered block order. Contiguity holds at 328M scale
   under interleaved load (`contiguous=t` span==npages-1 vs baseline `contiguous=f` span 315,000).
-- **The cost, now quantified**: ~**4x on-disk footprint** (sorted 40GB vs baseline 10.6GB for the
-  same edges) from migrate-on-grow relayout + orphaned old-extent pages — so a production CSR-lite
-  MUST ship the §8.1(e) orphan-page compaction + relayout crash-atomicity work; this run sizes it.
+- **The cost, now quantified (worse than the 20k-edge §7 run implied)**: ~**33x on-disk footprint**
+  (sorted **349GB** vs baseline 10.6GB for the same 328M edges — live set is ~10GB, the rest is
+  relayout orphan pages) AND **+25% bulk-load tax** (3943s vs 3155s), not §7's ~parity. A production
+  CSR-lite MUST ship the §8.1(e) orphan-page compaction — a blocking prerequisite, now sized at ~33x
+  reclaimable — plus relayout crash-atomicity.
 - **Regime caveat**: the baseline wins only on k=5 early-termination (2-5 page scans, too small for
   the seek to matter) — not the large-hub regime CSR targets.
 
