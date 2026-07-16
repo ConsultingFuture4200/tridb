@@ -155,3 +155,62 @@ scripts/spark_gpu_setup.sh            # install + verify (prints "ALL GPU PATHS 
 scripts/spark_gpu_setup.sh --verify   # re-verify without reinstalling
 # In another shell, watch the GPU:  nvidia-smi -l 1  (utilization %, memory shows N/A on GB10)
 ```
+
+---
+
+## Addendum A (2026-07-16, advisor plan 086): isolated, locked GPU environment
+
+The floating-install flow above (sequential `pip install` into the core `.venv`)
+is retired. The GPU environment is now its own venv with a platform lock:
+
+| Artifact | Role |
+|---|---|
+| `${GPU_VENV:-.venv-gpu}` | dedicated GPU venv — the core `.venv` is never touched |
+| `requirements-gpu-gb10.in` | exact-pinned DIRECT requirements (top-level verified set + direct imports of the GPU tools: pandas/scipy/fastembed/hnswlib) |
+| `requirements-gpu-gb10.lock` | full aarch64/Linux transitive closure WITH sha256 hashes, generated ON the GB10 |
+
+### Prerequisites (the only environment this lock is valid for)
+- DGX Spark / NVIDIA GB10: `aarch64`, CUDA 13.0 driver (`580.159.03` at lock time),
+  compute cap 12.1 (sm_121)
+- Python 3.12 (locked/verified with 3.12.3)
+- `uv` for lock generation (0.11.25 at lock time); installs use
+  `pip/uv pip install --require-hashes`
+
+### Commands
+```bash
+make gpu-setup    # scripts/spark_gpu_setup.sh — create .venv-gpu if absent,
+                  # hash-enforced install of requirements-gpu-gb10.lock, pip check,
+                  # then the full GPU verification ("ALL GPU PATHS VERIFIED")
+make gpu-verify   # --verify: verification only, no venv creation, no installs
+make gpu-lock     # --lock:   regenerate the lock from requirements-gpu-gb10.in
+```
+All three are a clean `SKIP: GB10/CUDA unavailable` (exit 0, nothing created or
+modified) on any host without `nvidia-smi` OR not `aarch64` — the lock carries its
+platform in its name; an x86 CUDA box is NOT this target.
+
+### Install-order rationale (supersedes the sequential-pip caveat above)
+The old flow installed `cuvs-cu13` then `torch`, letting pip downgrade shared
+`nvidia-*` libs mid-flight. The lock replaces order-dependence with ONE resolver
+pass over the full closure: the resolver picks a single consistent `nvidia-*` set
+and the GB10 verification gate re-proves it. Comment ordering in the `.in` is
+documentation only.
+
+### Provenance of the committed lock (generated + verified 2026-07-16)
+- Host: DGX Spark, Linux 6.17.0-1021-nvidia aarch64, NVIDIA GB10 cc 12.1,
+  driver 580.159.03; Python 3.12.3; uv 0.11.25. 83 pinned packages, all hashed.
+- Two CLEAN venvs installed from this lock: `pip check` clean in both,
+  `pip freeze` byte-identical across both, and BOTH re-ran the full GPU gate
+  (torch CUDA embed + cuVS CAGRA build/search) to `ALL GPU PATHS VERIFIED`
+  (`torch 2.12.1+cu130`, GPU embed (2048, 384), CAGRA self-recall@1=1.000).
+- Key versions vs the §"Verified versions" set: torch/cuvs/pylibraft/
+  sentence-transformers/numpy/scipy/nvidia-cuda-runtime identical. Transitive
+  drift accepted after live re-verification: `transformers 5.13.0 → 5.14.1`,
+  `nvidia-cublas 13.1.1.3 → 13.1.0.3` (the resolver's single-pass pick).
+
+### Refresh rule
+Only a clean GB10 run may refresh this lock: `make gpu-lock`, then install into a
+FRESH venv and re-run `make gpu-setup`/`gpu-verify` to the success marker before
+committing. Never hand-edit the lock, never generate it off-target, and never
+install GPU extras into the core `.venv` (its lock, `requirements.lock`, is a
+separate closure — see the `lock` Make target). A future CUDA/architecture target
+needs its own `requirements-gpu-<target>.in/.lock` pair, not edits to this one.

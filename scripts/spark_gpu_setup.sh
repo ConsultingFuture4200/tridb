@@ -1,18 +1,27 @@
 #!/usr/bin/env bash
 #
-# spark_gpu_setup.sh — repeatable GPU compute-path setup for the DGX Spark (GB10).
+# spark_gpu_setup.sh — repeatable, ISOLATED GPU compute-path setup for the DGX
+# Spark (GB10). Advisor plan 086: the GPU environment is its own locked venv.
 #
 # WHAT THIS DOES
 # --------------
-# Installs, into the repo .venv, the wheels that give TriDB a REAL GPU path on the
+# Installs, into a DEDICATED venv (${GPU_VENV:-<repo>/.venv-gpu} — NEVER the core
+# .venv), the exact locked wheel set that gives TriDB a REAL GPU path on the
 # Spark for the two operations a fused wiki-scale benchmark needs:
 #   (a) GPU embeddings  — torch 2.12 (cu130, aarch64/sbsa) + sentence-transformers
 #   (b) GPU ANN index   — NVIDIA cuVS (cuvs-cu13) CAGRA build + search
 # then VERIFIES each actually executes on the GPU (not a silent CPU fallback).
 #
+# All installs come from requirements-gpu-gb10.lock — the full ARM64/Linux
+# transitive closure (with hashes) generated ON the GB10 from the exact-pinned
+# direct requirements in requirements-gpu-gb10.in. No floating installs: the
+# old sequential `pip install cuvs; pip install torch` dance (which downgraded
+# shared nvidia-* libs mid-flight) is replaced by one resolver pass + one lock.
+#
 # TARGET: DGX Spark ONLY — NVIDIA GB10 (Grace ARM64 + Blackwell GPU, sm_121,
 # CUDA 13.0 driver, 128 GB coherent unified memory). Run it over `ssh spark`.
-# It is a clean no-op / early-exit on any non-CUDA box (the x86 standin).
+# On any other host (no nvidia-smi, or non-aarch64 — the lock is aarch64-only)
+# it prints SKIP and exits 0 without creating or modifying ANY venv.
 #
 # WHY NOT onnxruntime-gpu (the fastembed CUDAExecutionProvider path)
 # -----------------------------------------------------------------
@@ -23,55 +32,73 @@
 # docs/spark_gpu_path_findings_v0.1.0.md for the exact command + error and the
 # NVIDIA-hosted-ORT alternative if the ORT path is ever wanted.
 #
-# VERIFIED WORKING 2026-07-06 on the Spark — see the findings doc for versions,
-# timings, and observed nvidia-smi utilization. This script records the exact
-# commands that produced that result; it is hardware-independent to keep in the
-# repo but only does real work on the Spark.
-#
 # Usage (on the Spark):
-#   scripts/spark_gpu_setup.sh            # install + verify
-#   scripts/spark_gpu_setup.sh --verify   # verify only (skip installs)
+#   scripts/spark_gpu_setup.sh            # create .venv-gpu if absent, install lock, verify
+#   scripts/spark_gpu_setup.sh --verify   # verify only (no venv creation, no installs)
+#   scripts/spark_gpu_setup.sh --lock     # regenerate requirements-gpu-gb10.lock from the .in
+#                                         # (GB10-only; rerun install+verify in a CLEAN venv after)
 #
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-VENV="$ROOT/.venv"
-VERIFY_ONLY=0
-[[ "${1:-}" == "--verify" ]] && VERIFY_ONLY=1
+VENV="${GPU_VENV:-$ROOT/.venv-gpu}"
+LOCK="$ROOT/requirements-gpu-gb10.lock"
+REQ_IN="$ROOT/requirements-gpu-gb10.in"
 
-# --- CUDA guard: real work only on a CUDA box (the Spark) -------------------
+MODE="install"
+case "${1:-}" in
+  "")         ;;
+  --verify)   MODE="verify" ;;
+  --lock)     MODE="lock" ;;
+  *) echo "usage: $0 [--verify|--lock]" >&2; exit 2 ;;
+esac
+
+# --- GB10 guard: real work only on the Spark ---------------------------------
+# The lock names its platform (gb10 = aarch64 + CUDA 13); any other combination
+# is unverified and out of scope. SKIP must not create or modify anything.
 if ! command -v nvidia-smi >/dev/null 2>&1; then
-  echo "[spark_gpu_setup] no nvidia-smi — this is not the Spark. Nothing to do."
-  echo "[spark_gpu_setup] GPU wheels (torch cu130 / cuvs-cu13) install & run only on GB10."
+  echo "SKIP: GB10/CUDA unavailable (no nvidia-smi) — this is not the Spark."
+  echo "      No venv created or modified. GPU wheels install & run only on GB10."
+  exit 0
+fi
+if [[ "$(uname -m)" != "aarch64" ]]; then
+  echo "SKIP: GB10/CUDA unavailable ($(uname -m) != aarch64) — the GB10 lock is aarch64-only."
+  echo "      No venv created or modified."
   exit 0
 fi
 
 echo "[spark_gpu_setup] GPU:"
 nvidia-smi --query-gpu=name,compute_cap,driver_version --format=csv,noheader || true
 
-[[ -x "$VENV/bin/python" ]] || { echo "[spark_gpu_setup] no .venv at $VENV — create it first" >&2; exit 1; }
-# shellcheck disable=SC1091
-source "$VENV/bin/activate"
-PY="$VENV/bin/python"
-
-if [[ "$VERIFY_ONLY" -eq 0 ]]; then
-  echo "[spark_gpu_setup] installing GPU wheels into $VENV ..."
-  # (1) cuVS for CUDA 13 (aarch64) — CAGRA build+search on the GPU.
-  #     Pulls its own CUDA 13.3 runtime stack (rmm/pylibraft/libcuvs/nvidia-*).
-  pip install "cuvs-cu13==26.6.0"
-
-  # (2) torch — the DEFAULT PyPI aarch64 wheel IS the CUDA (cu130) build; it pulls
-  #     nvidia-* cu13 libs and, on GB10, reports torch.cuda.is_available()==True.
-  #     NOTE: torch pins slightly older nvidia-* libs than cuVS did and pip will
-  #     DOWNGRADE cublas/cusolver/cusparse/nccl. This is fine — cuVS CAGRA and
-  #     torch were both re-verified working AFTER this downgrade (findings doc).
-  #     (Do NOT use the download.pytorch.org cu130 index here: its R2 CDN threw an
-  #     SSL handshake failure from the Spark — PyPI is the reliable route.)
-  pip install torch
-
-  # (3) sentence-transformers — real embedding models on cuda (all-MiniLM-L6-v2).
-  pip install sentence-transformers
+# --- lock mode: regenerate the full-closure lock from the exact-pinned .in ---
+if [[ "$MODE" == "lock" ]]; then
+  command -v uv >/dev/null 2>&1 || { echo "[spark_gpu_setup] uv required for --lock" >&2; exit 1; }
+  echo "[spark_gpu_setup] compiling $LOCK from $REQ_IN (aarch64/CUDA closure, with hashes) ..."
+  UV_CUSTOM_COMPILE_COMMAND="scripts/spark_gpu_setup.sh --lock  # ON the GB10 only" \
+    uv pip compile --python-version 3.12 --generate-hashes -o "$LOCK" "$REQ_IN"
+  echo "[spark_gpu_setup] wrote $LOCK ($(grep -cE '^[a-zA-Z0-9]' "$LOCK") pinned lines)."
+  echo "[spark_gpu_setup] now re-run install+verify in a CLEAN venv before committing it."
+  exit 0
 fi
+
+# --- install mode: dedicated venv, lock-only install --------------------------
+if [[ "$MODE" == "install" ]]; then
+  [[ -f "$LOCK" ]] || { echo "[spark_gpu_setup] $LOCK missing — run: $0 --lock" >&2; exit 1; }
+  if [[ ! -x "$VENV/bin/python" ]]; then
+    echo "[spark_gpu_setup] creating GPU venv at $VENV (python3: $(python3 --version)) ..."
+    python3 -m venv "$VENV"
+  fi
+  echo "[spark_gpu_setup] installing the GB10 lock into $VENV (hash-enforced) ..."
+  if command -v uv >/dev/null 2>&1; then
+    uv pip install --require-hashes --python "$VENV/bin/python" -r "$LOCK"
+  else
+    "$VENV/bin/python" -m pip install --require-hashes -r "$LOCK"
+  fi
+  "$VENV/bin/python" -m pip check
+fi
+
+[[ -x "$VENV/bin/python" ]] || { echo "[spark_gpu_setup] no GPU venv at $VENV — run $0 (install) first" >&2; exit 1; }
+PY="$VENV/bin/python"
 
 echo "[spark_gpu_setup] verifying GPU execution ..."
 "$PY" - <<'PYEOF'
