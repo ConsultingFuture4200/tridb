@@ -250,3 +250,28 @@ def test_typed_reach_excludes_src_on_cycle():
     (gph_traverse_bfs excludes the seed). Caught live on the 1M slice (P47)."""
     adj = {0: [(1, 1)], 1: [(1, 0), (1, 2)]}
     assert typed_reach(adj, 0, 1, 2) == {1, 2}
+
+
+def test_oracle_tie_break_is_deterministic_id_ascending():
+    """At equal distance to the anchor, compute_oracle must pin ties by id ascending
+    (np.lexsort), so the ranking is reproducible run-to-run and matches the engine's
+    `ORDER BY <->, e.id`. Candidates 0 and 1 sit at the SAME cosine to X; 2 is farther."""
+    # emb indexed by dense id. X=dense 5. 0 and 1 identical (tie); 2 orthogonal (farther).
+    emb = np.array(
+        [
+            [1.0, 0.0, 0.0],  # 0  tie with 1
+            [1.0, 0.0, 0.0],  # 1  tie with 0
+            [0.0, 1.0, 0.0],  # 2  farther
+            [0.0, 0.0, 0.0],  # 3  unused
+            [0.0, 0.0, 0.0],  # 4  unused
+            [1.0, 0.0, 0.0],  # 5  = anchor X
+        ],
+        dtype=np.float64,
+    )
+    adj = {5: [(50, 0), (50, 1), (50, 2)]}  # (property, dst): X --P50--> {0,1,2}
+    types = {0: {3}, 1: {3}, 2: {3}}
+    q = [{"x": 5, "p": 50, "t": 3}]
+    first = compute_oracle(emb, adj, types, q, k=10, hops=1)
+    second = compute_oracle(emb, adj, types, q, k=10, hops=1)
+    assert first == second  # reproducible across calls
+    assert first[0] == [0, 1, 2]  # tie (0,1) broken id-ascending, then farther 2

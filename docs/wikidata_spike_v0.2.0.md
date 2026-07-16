@@ -32,7 +32,7 @@ reproduces at ≥1M under matched recall; the consistency-only kill-criterion is
 ONE fused SQL statement per query — native typed multi-hop BFS in C
 (`graph_store.gph_traverse_bfs(seed, max_depth, type_id)`) → relational `P31 @>` filter →
 exact vector distance rank — one round-trip, one system, one snapshot. Semantically identical
-to the oracle, so recall is matched by construction (residual <1.0 is float/tie noise, gated).
+to the oracle, so recall is matched — measured and tie-break-pinned (residual <1.0 is float noise, gated).
 
 - **`tjs_open` is NOT part of this claim.** Its typed-traversal integration is the plan 038
   residual (typed traversal landed as native AM SRFs, not operator arguments); the v0.1.0

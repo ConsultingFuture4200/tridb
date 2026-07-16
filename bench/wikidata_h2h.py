@@ -261,7 +261,10 @@ def compute_oracle(
             continue
         cand_arr = np.fromiter(cand, dtype=np.int64, count=len(cand))
         sims = emb[cand_arr] @ emb[qy["x"]]
-        top = cand_arr[np.argsort(-sims)][:k].tolist()
+        # lexsort: last key is primary. Primary -sims (nearest first), secondary cand_arr
+        # (id ascending) pins ties the same way the engine's `ORDER BY <->, e.id` does.
+        order = np.lexsort((cand_arr, -sims))
+        top = cand_arr[order][:k].tolist()
         oracle[qi] = [int(x) for x in top]
     return oracle
 
@@ -317,7 +320,7 @@ def sample_queries(
 # filter-first query is therefore realized as ONE fused SQL statement over the native
 # surfaces: C multi-hop typed BFS -> relational P31 filter -> exact vector rank, one
 # round-trip, one system, one snapshot — semantically identical to the oracle (both sides
-# exact => recall matched at 1.0 by construction; the h2h measures single-system fusion vs
+# exact => recall matched at 1.0, measured and tie-break-pinned; the h2h measures single-system fusion vs
 # 3-system app-side assembly at identical semantics). The gate's examined>0 seqscan guard is
 # fed by the backend-local graph visit counter delta (gph_visits) — >0 proves the native AM
 # actually traversed; the operator's SM-3 counter does not exist on this shape.
@@ -377,7 +380,7 @@ def emit_tridb_sql(
             f"SELECT e.id FROM graph_store.gph_traverse_bfs({qy['x']}, {hops}, {type_id}) "
             f"AS t(dst) JOIN {cfg.engine_table} e ON e.id = t.dst "
             f"WHERE e.P31 @> ARRAY[{qy['t']}] AND e.id <> {qy['x']} "
-            f"ORDER BY e.embedding <-> '{qv}' LIMIT {k}"
+            f"ORDER BY e.embedding <-> '{qv}', e.id LIMIT {k}"
         )
         w(f"\\echo #WD TRIDB qid={qi} combo={tag}")
         w("SELECT graph_store.gph_visits() AS wdv0 \\gset")
@@ -461,7 +464,7 @@ def run_baseline(
         cy = (
             f"MATCH (a:{cfg.neo4j_node_label})-[:P{p}*1..{hops}]->"
             f"(b:{cfg.neo4j_node_label}) WHERE a.id IN $ids AND b <> a "
-            f"RETURN DISTINCT b.id AS id LIMIT {frontier}"
+            f"RETURN DISTINCT b.id AS id ORDER BY b.id LIMIT {frontier}"
         )
         with driver.session() as s:
             rows = s.run(cy, ids=[str(x)])
@@ -512,14 +515,16 @@ def run_baseline(
                     (t3 - t2) * 1e3,
                 )
 
-            top, _ = one()  # warm-up (excluded)
+            # warm-up call grades the ids (excluded from timing), mirroring the TriDB side;
+            # the timed repeats below capture ONLY latency and must not overwrite graded_top.
+            graded_top, _ = one()
             times, legs_last = [], None
             for _ in range(runs):
-                top, legs = one()
+                _, legs = one()
                 times.append(sum(legs))
                 legs_last = legs
             per[qi] = {
-                "ids": top,
+                "ids": graded_top,
                 "median_ms": float(statistics.median(times)),
                 "neo4j_ms": legs_last[0],
                 "pg_filter_ms": legs_last[1],
