@@ -548,7 +548,7 @@ Python layer verifies here (`make test`=pytest, `make lint`=ruff). Stock-PG engi
 | Plan | Title | Priority | Effort | Risk | Verify | Status |
 |------|-------|----------|--------|------|--------|--------|
 | 062 | `tjs_open` NULL-arg guards (stop backend segfault; regression vs fork STRICT) | P1 | S | LOW | stock-PG engine | **DONE** (merged `59539a4`; advisor-reviewed APPROVE: PASS 3b + ALL PASS PG16+PG17, exit 0, clean scope) |
-| 063 | `tjs_open` filter-first ranks by the index's actual metric (not hardcoded L2 `<->`) | P1 | S | LOW | stock-PG engine | TODO |
+| 063 | `tjs_open` filter-first ranks by the index's actual metric (not hardcoded L2 `<->`) | P1 | S | LOW | stock-PG engine | **DONE** (merged; advisor-reviewed APPROVE: PASS 1c cosine-discriminating test + ALL PASS PG16+PG17, neg-control confirms fail-pre-fix; 2 justified deviations — syscache OPERATOR render + real discriminating test) |
 | 064 | Wikidata baseline recall reproducibility (deterministic Neo4j subset + oracle/engine tie-break) | P1 | S | LOW | YES (python) | TODO |
 | 065 | Orphaned gate-env var (`WD_`/`WH_` drift) + report zero-guard + numeric-id item check | P1 | S | LOW | YES (python) | TODO |
 | 066 | Pin the pgvector base image + assert pgvector ≥0.8 at CREATE EXTENSION | P1 | S | LOW | stock-PG engine | TODO |
