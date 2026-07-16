@@ -1859,6 +1859,252 @@ gph_traverse_bfs(PG_FUNCTION_ARGS)
 }
 
 /* ------------------------------------------------------------------ */
+/* Bounded pull-based multi-hop traversal (plan 077 / ADR-0020)        */
+/* ------------------------------------------------------------------ */
+
+/*
+ * gph_traverse_bounded(seed bigint, max_depth integer, type_id integer, budget bigint)
+ * RETURNS SETOF bigint -- the TR-1-honest counterpart to gph_traverse_bfs above: distinct
+ * vertices reachable from `seed` within `max_depth` out-hops (excluding the seed), same
+ * depth-ordered BFS + adjacency-page slot order, but pulled INCREMENTALLY instead of run to
+ * completion at Open:
+ *
+ *   Open  (SRF_IS_FIRSTCALL) allocates only an empty visited hash, an empty frontier queue,
+ *         and fixed bookkeeping -- ZERO edge-steps, never walks the graph.
+ *   Next  (SRF_PERCALL_SETUP) advances the underlying single-hop gs_open/gs_getnext/gs_close
+ *         engine by AT MOST one newly-reached vertex, checking CHECK_FOR_INTERRUPTS() and the
+ *         caller-supplied edge-step `budget` before every edge-step.
+ *   Close releases the current single-hop scan (if any) on BOTH normal completion (frontier
+ *         empties) and early abandon (a LIMIT above stops calling Next, or the budget is hit).
+ *
+ * `budget` bounds the TOTAL edge-steps this ONE call may spend: every gs_getnext() that
+ * returns an edge counts, whether or not its destination is newly reached -- the same unit
+ * gph_visits() counts, so a caller can measure a call's consumption via that counter's deltas
+ * without this function exposing a redundant counter of its own. If the frontier empties
+ * before the budget is exhausted, the reach is exact and gph_traverse_bounded_censored()
+ * reports false; if the budget is exhausted first, iteration stops with a deterministic,
+ * reproducible prefix (depth-ascending, then adjacency-page slot order within a depth) and
+ * gph_traverse_bounded_censored() reports true -- a real boolean, reset every Open, read via
+ * the per-backend probe below (mirrors the gph_visits() pattern). type_id 0 = any type
+ * (GPH_EDGE_TYPE_ANY). Memory (visited hash + frontier queue) grows only on first-visit, and
+ * first-visits <= edge-steps <= budget, so it is O(min(budget, |V|)) -- independent of |V|/|E|.
+ *
+ * The store Relation is (re)opened fresh inside EVERY SRF_PERCALL_SETUP and closed before
+ * returning -- whether via SRF_RETURN_NEXT or SRF_RETURN_DONE -- and is NEVER retained across
+ * calls: this is the abort-path-safe convention plan 061 settled on for gph_neighbors /
+ * gph_neighbors_ext_cached after plan 049's held-Relation leak (a memory-context reset
+ * callback is UNSAFE on transaction abort -- see
+ * advisor-plans/061-graph-srf-abort-safe-relation-cleanup.md). The per-vertex single-hop
+ * GraphScanDesc DOES persist across calls (a hub's edges are served one per Next(), possibly
+ * spanning many calls before the next NEW vertex turns up), but per its own contract
+ * (graphstore.h) it holds no buffer pin and no Relation reference between calls, so an
+ * abandoned mid-hub scan leaks nothing beyond ordinary backend memory reclaimed at query end.
+ *
+ * Consumed by tjs_pg (ADR-0005 cross-extension composition): via SPI, over an SPI cursor on a
+ * bare "SELECT graph_store.gph_traverse_bounded(...)" target-list position, fetched one row at
+ * a time -- never a FROM-clause FunctionScan, never SPI_execute draining every row at once.
+ */
+typedef struct GphBoundedQItem
+{
+	int64		vid;
+	int32		depth;
+} GphBoundedQItem;
+
+typedef struct GphBoundedCtx
+{
+	HTAB	   *visited;		/* int64 set: every vertex enqueued so far (incl. seed) */
+
+	GphBoundedQItem *queue;		/* FIFO of (vid, depth) pairs still to expand; doubles on fill */
+	int64		qcap;
+	int64		qn;				/* items appended so far */
+	int64		qhead;			/* next queue slot to dequeue for expansion */
+
+	bool		scan_open;		/* whether cur_scan is mid-expansion of a frontier vertex */
+	GraphScanDesc cur_scan;
+	int32		cur_depth;		/* depth of the vertex cur_scan is expanding (children: cur_depth+1) */
+
+	int32		max_depth;
+	uint32		type_filter;
+
+	int64		budget;			/* edge-steps allowed this call, TOTAL */
+	int64		used;			/* edge-steps consumed so far */
+	bool		censored;		/* true iff the budget was hit before the frontier emptied */
+} GphBoundedCtx;
+
+/* Per-backend, mirrors gph_visits()'s probe pattern: the last call's censoring outcome, reset
+ * every Open so a caller reading it after SRF_RETURN_DONE sees THIS call's outcome only. */
+static bool gph_bounded_censored_last = false;
+
+static void
+gph_bounded_enqueue(GphBoundedCtx *ctx, int64 vid, int32 depth)
+{
+	if (ctx->qn == ctx->qcap)
+	{
+		ctx->qcap *= 2;
+		ctx->queue = (GphBoundedQItem *) repalloc(ctx->queue, ctx->qcap * sizeof(GphBoundedQItem));
+	}
+	ctx->queue[ctx->qn].vid = vid;
+	ctx->queue[ctx->qn].depth = depth;
+	ctx->qn++;
+}
+
+PG_FUNCTION_INFO_V1(gph_traverse_bounded);
+Datum
+gph_traverse_bounded(PG_FUNCTION_ARGS)
+{
+	FuncCallContext *funcctx;
+	GphBoundedCtx *ctx;
+	Relation	rel;
+	int64		emit_vid = 0;
+	bool		have_emit;
+	MemoryContext callctx;
+
+	if (SRF_IS_FIRSTCALL())		/* === Open: ZERO edge-steps === */
+	{
+		MemoryContext oldctx;
+		int64		seed = PG_GETARG_INT64(0);
+		int32		max_depth = PG_GETARG_INT32(1);
+		int32		arg_type = PG_GETARG_INT32(2);
+		int64		budget = PG_GETARG_INT64(3);
+		HASHCTL		hctl;
+		int64		key;
+		bool		found;
+
+		if (budget <= 0)
+			ereport(ERROR,
+					(errmsg("gph_traverse_bounded: budget must be positive (got " INT64_FORMAT ")",
+							budget)));
+
+		funcctx = SRF_FIRSTCALL_INIT();
+		oldctx = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
+
+		ctx = (GphBoundedCtx *) palloc0(sizeof(GphBoundedCtx));
+
+		memset(&hctl, 0, sizeof(hctl));
+		hctl.keysize = sizeof(int64);
+		hctl.entrysize = sizeof(int64);
+		ctx->visited = hash_create("gph_bounded_visited", 256, &hctl, HASH_ELEM | HASH_BLOBS);
+
+		ctx->qcap = 256;
+		ctx->queue = (GphBoundedQItem *) palloc(ctx->qcap * sizeof(GphBoundedQItem));
+		ctx->qn = 0;
+		ctx->qhead = 0;
+
+		key = seed;
+		(void) hash_search(ctx->visited, &key, HASH_ENTER, &found);	/* mark seed; never emitted */
+		gph_bounded_enqueue(ctx, seed, 0);
+
+		ctx->scan_open = false;
+		ctx->max_depth = max_depth;
+		ctx->type_filter = (arg_type == 0) ? GPH_EDGE_TYPE_ANY : (uint32) arg_type;
+		ctx->budget = budget;
+		ctx->used = 0;
+		ctx->censored = false;
+
+		funcctx->user_fctx = ctx;
+		gph_bounded_censored_last = false;	/* reset now; only THIS call's Close can flip it */
+		MemoryContextSwitchTo(oldctx);
+	}
+
+	funcctx = SRF_PERCALL_SETUP();	/* === Next: at most one newly-reached vertex === */
+	ctx = (GphBoundedCtx *) funcctx->user_fctx;
+
+	/*
+	 * gs_open() (called below, possibly several times per Next() -- once per frontier vertex
+	 * dequeued) allocates ctx->cur_scan.page_buf via a plain palloc() in CurrentMemoryContext.
+	 * That buffer must survive to the NEXT Next() call (a hub's edges are served one per call
+	 * from the SAME buffered page), so every allocation here must land in the SRF's durable
+	 * multi_call_memory_ctx, never in whatever short-lived per-tuple/per-fetch context this
+	 * call happens to run under -- an SPI cursor's repeated SPI_cursor_fetch(portal, true, 1)
+	 * (the ADR-0005 consumption path tjs_pg uses) resets its per-tuple context between fetches,
+	 * so skipping this switch corrupts page_buf on the very next call (observed: a stray
+	 * "could not access status of transaction" from gs_getnext reading a clobbered slot).
+	 */
+	callctx = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
+
+	have_emit = false;
+	rel = gph_open_store(AccessShareLock);	/* re-derived every call -- plan 061, never held */
+
+	while (!have_emit)
+	{
+		GraphElement elem;
+
+		CHECK_FOR_INTERRUPTS();
+
+		if (!ctx->scan_open)
+		{
+			GphBoundedQItem item;
+
+			if (ctx->qhead >= ctx->qn)
+				break;			/* frontier empty: natural exhaustion, not censored */
+
+			item = ctx->queue[ctx->qhead++];
+			if (item.depth >= ctx->max_depth)
+				continue;		/* at the hop bound: reached, but never expanded further */
+
+			(void) gs_open(&ctx->cur_scan, rel, (GraphVertexId) item.vid, GRAPH_SCAN_OUTGOING,
+						   ctx->type_filter, (GraphVertexId) GRAPHSTORE_INVALID_ID);
+			ctx->cur_depth = item.depth;
+			ctx->scan_open = true;
+		}
+
+		if (ctx->used >= ctx->budget)
+		{
+			gs_close(&ctx->cur_scan);
+			ctx->scan_open = false;
+			ctx->censored = true;
+			break;				/* budget exhausted before the frontier emptied */
+		}
+
+		if (!gs_getnext(rel, &ctx->cur_scan, &elem))
+		{
+			gs_close(&ctx->cur_scan);
+			ctx->scan_open = false;
+			continue;			/* this frontier vertex is drained; try the next one */
+		}
+
+		ctx->used++;			/* one edge-step, whether or not dst is newly reached */
+
+		{
+			int64		dst = (int64) elem.edge_dst;
+			bool		found;
+
+			(void) hash_search(ctx->visited, &dst, HASH_ENTER, &found);
+			if (!found)
+			{
+				gph_bounded_enqueue(ctx, dst, ctx->cur_depth + 1);
+				emit_vid = dst;
+				have_emit = true;
+			}
+		}
+	}
+
+	relation_close(rel, AccessShareLock);
+	MemoryContextSwitchTo(callctx);
+
+	if (have_emit)
+		SRF_RETURN_NEXT(funcctx, Int64GetDatum(emit_vid));
+
+	/* === Close: frontier empty or budget exhausted -- either way, nothing left open === */
+	gph_bounded_censored_last = ctx->censored;
+	SRF_RETURN_DONE(funcctx);
+}
+
+PG_FUNCTION_INFO_V1(gph_traverse_bounded_censored);
+
+/*
+ * gph_traverse_bounded_censored() RETURNS boolean -- per-backend flag reporting whether the
+ * MOST RECENT gph_traverse_bounded() call stopped because its budget was exhausted before the
+ * frontier emptied (true) or exhausted the reach naturally within budget (false). Reset to
+ * false at every gph_traverse_bounded() Open, so it always reflects the last completed call.
+ */
+Datum
+gph_traverse_bounded_censored(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_BOOL(gph_bounded_censored_last);
+}
+
+/* ------------------------------------------------------------------ */
 /* Backend-local reverse id cache (plan 034 / DEV-1345, PERF-03)       */
 /* ------------------------------------------------------------------ */
 

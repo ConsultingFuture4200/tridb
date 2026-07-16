@@ -1,7 +1,7 @@
 # ADR-0020: Stock TJS graph leg — bounded pull-based traversal replaces full-reach materialization
 
-Status: Proposed (plan 077 Step 2 design gate — maintainer approval required before any
-operator C changes). 2026-07-16.
+Status: Accepted (2026-07-16). Maintainer approved all five open decisions (§7) as proposed;
+plan 077 Steps 3-5 implement this contract.
 
 ## Context
 
@@ -144,9 +144,9 @@ recall-curve gate (ADR-0012 addendum) and is out of scope here (open decision, �
 documented as such, banned from the operator path); whether to also rewrite or deprecate
 it is left open (§Open decisions).
 
-## Proposed spec addendum (draft — lands with Step 3+, NOT edited into the spec now)
+## Spec addendum (landed: `spec/tridb_spec_v0.1.0.md` Addendum A3, Step 0)
 
-> ## Addendum A3 (TBD) — TR-1 graph-work bound for the stock operator (plan 077)
+> ## Addendum A3 (2026-07-16) — TR-1 graph-work bound for the stock operator (plan 077)
 >
 > §8's Open/Next/Close + early-termination invariant is made mechanical for the stock
 > `tjs_pg` operator: the graph leg of one `tjs_open` call performs at most
@@ -187,15 +187,19 @@ it is left open (§Open decisions).
 - **PPR-graded scoring now**: changes ranked results, breaks 071 fork parity without its
   own recall gate; deferred (see §6/§7).
 
-## Open decisions (for the maintainer at this gate)
+## Resolved decisions (maintainer, 2026-07-16)
 
-1. **Default `tjs.graph_work_budget` value** (proposed 65536 edge-steps) and range.
-2. **Seedless budget sharing**: one shared pool consumed nearest-seed-first (proposed) vs
-   an equal per-seed slice (`budget / m_seeds`).
-3. **Membership scoring now, PPR later** (proposed) vs adopting ADR-0012's PPR reserves in
-   Step 3 directly (breaks parity; needs a recall-curve gate first).
-4. **Fate of `gph_traverse_bfs`**: keep as documented materializing test/oracle helper
-   (proposed) vs rewrite it incrementally too vs deprecate.
-5. **Censor surfacing in `graph_query`** (ADR-0008/plan 075 lowering): expose
-   `tjs_open_graph_censored()` alongside `last_join_order()` now, or defer to the
-   benchmark-gate wiring in Step 5.
+1. **Default `tjs.graph_work_budget` value**: **65536** edge-steps, range **128..2^30**, as
+   proposed.
+2. **Seedless budget sharing**: **one shared pool consumed nearest-seed-first**, as proposed
+   (not an equal per-seed slice).
+3. **Scoring**: **reachability-membership now** (byte-identical uncensored results; the plan
+   071 parity harness is the acceptance gate). ADR-0012's PPR-graded reserves remain the
+   documented follow-on that rides this same iterator — not adopted in Step 3.
+4. **Fate of `gph_traverse_bfs`**: **kept as the documented materializing TEST/ORACLE helper**,
+   banned from the operator path by a static guard (Step 5) — not rewritten, not deprecated.
+5. **Censor surfacing in `graph_query`**: **deferred** — the lowering (ADR-0008/plan 075) is
+   not changed to expose `tjs_open_graph_censored()` alongside `last_join_order()` in this
+   plan. `tjs_open_graph_censored()` remains directly callable after a `graph_query()` call in
+   the same backend (it is backend-local state, not lowering-level plumbing), and Step 4's
+   test suite exercises exactly that call sequence.

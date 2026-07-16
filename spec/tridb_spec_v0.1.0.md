@@ -140,3 +140,20 @@ operator is installed, `graph_query` RAISES an explicit no-compatible-lowering e
 
 Proof: `test/canonical_stock_e2e_test.sql` (STOCK_TESTS + CI job `stock-pg`, PG 16 and 17),
 including direct-vs-canonical ordered parity on the same fixture.
+
+## Addendum A3 (2026-07-16) — TR-1 graph-work bound for the stock operator (plan 077)
+
+§8's Open/Next/Close + early-termination invariant is made mechanical for the stock
+`tjs_pg` operator: the graph leg of one `tjs_open` call performs at most
+`tjs.graph_work_budget` edge-steps (default 65536) and holds graph-leg state bounded by
+the same budget, independent of |V|/|E|. Reach acquisition is a pull-based multi-hop
+iterator over the native AM; no complete reachable set is ever materialized. A
+budget-capped call returns a deterministic-prefix result and MUST disclose it:
+`tjs_open_graph_censored() = true`, with `tjs_open_graph_examined()` reporting
+edge-steps; an uncensored result is byte-identical to the pre-077 contract (071 parity
+harness green). Seedless retains plan 087 fork-parity semantics: seed_window =
+max(m_seeds*8, m_seeds+32) with nearest-in-window seed selection, floor(k/2)-min-1
+bridge cap, uniform drop accounting. Benchmarks/harnesses MUST report the censor flag
+next to any headline (a capped run is a different operating point, not a win).
+
+See `docs/decisions/0020-stock-tjs-incremental-graph-leg.md` for the full contract.

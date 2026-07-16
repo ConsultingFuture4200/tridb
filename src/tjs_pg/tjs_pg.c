@@ -8,9 +8,14 @@
  *
  * TWO PHYSICAL PATHS, selected by `src`:
  *
- *   FILTER-FIRST (src IS NOT NULL): the Gate-B winning plan behind the operator surface —
- *   one SPI statement: native typed BFS reach (graph_store.gph_traverse_bfs) joined to the
- *   table, relational filter, exact vector rank, LIMIT k. The graph + filter legs are the
+ *   FILTER-FIRST (src IS NOT NULL): the Gate-B winning plan behind the operator surface,
+ *   re-cut on the bounded pull iterator (plan 077 / ADR-0020) — a budget-bounded
+ *   graph_store.gph_traverse_bounded traversal (pulled via an SPI cursor, one vertex at a
+ *   time), per-vertex relational filter probe, distance recompute, bounded top-k of k.
+ *   term_cond = 0 (every existing caller's default) disables early termination, so an
+ *   uncensored call examines the WHOLE bounded reach and is byte-identical to the pre-077
+ *   fused-statement contract; term_cond > 0 additionally applies the same ADR-0007
+ *   consecutive-drops rule vector-first uses below. The graph + filter legs are the
  *   selective seed; the vector leg is an exact rank over the small survivor set.
  *
  *   VECTOR-FIRST / SEEDLESS (src IS NULL): the operator OWNS the index scan loop over
@@ -36,8 +41,10 @@
  * buffers the first seed_window = max(m_seeds*8, m_seeds+32) FILTER-PASSING stream
  * candidates and seeds from the m_seeds NEAREST within that window (the relaxed-order
  * stream is only approximately nearest-first — first-emitted is not nearest); the
- * reachable set is the union of the seeds' `hops`-bounded typed out-reach
- * (graph_store.gph_traverse_bfs via SPI, one probe per seed, cached in a per-call hash).
+ * reachable set is the union of the seeds' `hops`-bounded typed out-reach, now acquired via
+ * the bounded pull iterator (graph_store.gph_traverse_bounded via an SPI cursor, one probe
+ * per seed, seeds visited nearest-first, sharing ONE tjs.graph_work_budget edge-step pool
+ * across all seeds — plan 077 / ADR-0020 decision 2 — collected into a per-call hash).
  * Every streamed candidate competes for the vector top-k and the TR-1 drop counter sees
  * the uniform improve-or-drop outcome (the window itself is exempt, fork phase 1/3a); a
  * reach member is ADDITIONALLY offered to a guaranteed bridge budget, and reach members
@@ -51,6 +58,9 @@
  * tjs_open_termination_reason() — 'filter_first' | 'term_cond' | 'stream_end_unknown'.
  * tjs_open_budget_capped() — compat shim over the reason: false for known non-budget
  * endings, SQL NULL for 'stream_end_unknown'; never true (no observable budget signal).
+ * tjs_open_graph_examined() / tjs_open_graph_censored() (plan 077 / ADR-0020) — edge-steps
+ * the graph leg consumed, and whether tjs.graph_work_budget was hit before the bounded
+ * reach exhausted naturally; orthogonal to the stream-termination metrics above.
  */
 #include "postgres.h"
 
@@ -64,7 +74,6 @@
 #include "catalog/namespace.h"
 #include "catalog/pg_am.h"
 #include "catalog/pg_opclass.h"
-#include "catalog/pg_operator.h"
 #include "commands/defrem.h"
 #include "catalog/pg_type.h"
 #include "executor/spi.h"
@@ -77,10 +86,40 @@
 #include "utils/rel.h"
 #include "utils/regproc.h"
 #include "utils/snapmgr.h"
-#include "utils/syscache.h"
 #include "utils/hsearch.h"
 
 PG_MODULE_MAGIC;
+
+/*
+ * tjs.graph_work_budget (plan 077 / ADR-0020): per-backend GUC, edge-steps -- the same unit
+ * graph_store.gph_visits() counts. Bounds the TOTAL graph-leg work of ONE tjs_open() call
+ * (shared across all seeds in seedless mode, nearest-seed-first — ADR-0020 decision 2), and by
+ * construction bounds graph-leg memory too (visited/frontier entries grow only on first-visit,
+ * and first-visits <= edge-steps <= budget). tjs_pg owns this knob (graph_store does not know
+ * about it — gph_traverse_bounded takes budget as an explicit argument, never a shared GUC
+ * read across the extension boundary). Default 65536, range 128..2^30 (ADR-0020 decision 1).
+ */
+static int	tjs_graph_work_budget = 65536;
+
+void		_PG_init(void);
+void
+_PG_init(void)
+{
+	DefineCustomIntVariable("tjs.graph_work_budget",
+							"Edge-step budget for one tjs_open() call's graph leg (plan 077 / ADR-0020).",
+							"Shared across all seeds in seedless mode, consumed nearest-seed-first. "
+							"A call that exhausts its bounded reach within budget is exact "
+							"(byte-identical to the pre-077 contract); one that hits the budget "
+							"first returns a deterministic-prefix result with "
+							"tjs_open_graph_censored() = true (never silently exact).",
+							&tjs_graph_work_budget,
+							65536,
+							128,
+							1073741824,	/* 2^30 */
+							PGC_USERSET,
+							0,
+							NULL, NULL, NULL);
+}
 
 /*
  * How the last call ended (plan 074). TJS_TERM_STREAM_END_UNKNOWN is right-censored:
@@ -99,6 +138,17 @@ static int64 tjs_examined = 0;
 static int64 tjs_bridges_injected = 0;
 /* pre-first-call state is also unknown — the censored default, not a claim */
 static TjsTermReason tjs_term_reason = TJS_TERM_STREAM_END_UNKNOWN;
+
+/*
+ * Graph-leg honesty counters (plan 077 / ADR-0020), orthogonal to tjs_term_reason above: the
+ * graph cap is a property of the reach acquisition, not of how the candidate stream ended.
+ * tjs_graph_examined: edge-steps consumed by the last call's graph leg (0 for a pure vector-
+ * first call with m_seeds = 0, which never touches the graph). tjs_graph_censored: true iff
+ * ANY seed's (or filter-first's single) bounded traversal hit tjs.graph_work_budget before its
+ * reach exhausted -- a real boolean, never NULL, reset every call.
+ */
+static int64 tjs_graph_examined = 0;
+static bool tjs_graph_censored = false;
 
 /* ---------------------------------------------------------------------------------- */
 
@@ -183,15 +233,24 @@ topk_offer(Topk *t, int64 id, float8 dist)
 	return true;
 }
 
+/*
+ * Ascending distance, ties broken by ascending id (plan 077 / ADR-0020 §5 pins the tie-break —
+ * this qsort was tie-unstable before). Used for both the vector-first/bridge heaps and
+ * filter-first's final ranking.
+ */
 static int
 topk_cmp_dist(const void *a, const void *b)
 {
-	float8		da = ((const TopkItem *) a)->dist;
-	float8		db = ((const TopkItem *) b)->dist;
+	const TopkItem *ia = (const TopkItem *) a;
+	const TopkItem *ib = (const TopkItem *) b;
 
-	if (da < db)
+	if (ia->dist < ib->dist)
 		return -1;
-	if (da > db)
+	if (ia->dist > ib->dist)
+		return 1;
+	if (ia->id < ib->id)
+		return -1;
+	if (ia->id > ib->id)
 		return 1;
 	return 0;
 }
@@ -252,8 +311,8 @@ qident(const char *raw)
 }
 
 /*
- * Reachability set for the seedless graph predicate: union of gph_traverse_bfs(seed, hops,
- * edge_type) over the seed vids, collected into a per-call int64 hash. SPI must be connected.
+ * Reachability set for the seedless graph predicate: union of the bounded traversal's reach
+ * over the seed vids, collected into a per-call int64 hash. SPI must be connected.
  */
 static HTAB *
 reach_create(void)
@@ -267,31 +326,108 @@ reach_create(void)
 	return hash_create("tjs_open reach", 4096, &ctl, HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
 }
 
-static void
-reach_add_from_seed(HTAB *reach, int64 seed, int hops, int edge_type)
+/*
+ * tjs_read_graph_visits / tjs_read_graph_censored -- single-row SPI probes reading the graph
+ * store's per-backend counters. Small, uncached SPI_execute calls (no cursor needed: exactly
+ * one row). SPI must already be connected.
+ */
+static int64
+tjs_read_graph_visits(void)
 {
-	char		sql[256];
-	int			rc;
-	uint64		i;
+	bool		isnull;
+	int64		v;
 
-	/* the fork's bridge set INCLUDES the seeds themselves (gph_traverse_bfs excludes its seed) */
+	if (SPI_execute("SELECT graph_store.gph_visits()", true, 0) != SPI_OK_SELECT ||
+		SPI_processed != 1)
+		ereport(ERROR, (errmsg("tjs_open: graph_store.gph_visits() probe failed")));
+	v = DatumGetInt64(SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isnull));
+	return isnull ? 0 : v;
+}
+
+static bool
+tjs_read_graph_censored(void)
+{
+	bool		isnull;
+	bool		v;
+
+	if (SPI_execute("SELECT graph_store.gph_traverse_bounded_censored()", true, 0) != SPI_OK_SELECT ||
+		SPI_processed != 1)
+		ereport(ERROR, (errmsg("tjs_open: graph_store.gph_traverse_bounded_censored() probe failed")));
+	v = DatumGetBool(SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isnull));
+	return isnull ? false : v;
+}
+
+/*
+ * graph_reach_pull -- pull ONE seed's bounded reach (ADR-0020 §1) into `reach`, via an SPI
+ * cursor over a bare "SELECT graph_store.gph_traverse_bounded(...)" target-list call (ADR-0005
+ * cross-extension composition: SPI, never a static link across the extension boundary, and
+ * never a FROM-clause FunctionScan -- fetched ONE row at a time, so the underlying pull
+ * iterator's Open/Next/Close bound is preserved end to end). Replaces the old whole-BFS SPI
+ * helper call (the pre-077 graph store's materializing multi-hop function, banned from this
+ * operator path by the Step 5 static guard -- whole reach materialized before this function
+ * ever saw a row).
+ *
+ * `*budget_remaining` is the shared pool (ADR-0020 decision 2: one pool, consumed
+ * nearest-seed-first -- the caller already visits seeds in nearest-first order); this call
+ * consumes its share and decrements the pool by the edge-steps actually spent. The seed itself
+ * is ALWAYS added to `reach` (the fork's bridge set includes the seeds themselves; the bounded
+ * pull traversal excludes its own seed from its output, matching the pre-077 helper), even if
+ * the pool is already empty -- in that case this seed's OWN reach beyond itself contributes
+ * nothing and *graph_censored is set: a deterministic prefix, disclosed, never silently exact.
+ */
+static void
+graph_reach_pull(HTAB *reach, int64 seed, int hops, int edge_type,
+				  int64 *budget_remaining, int64 *graph_examined, bool *graph_censored)
+{
+	Oid			argtypes[4] = {INT8OID, INT4OID, INT4OID, INT8OID};
+	Datum		values[4];
+	Portal		portal;
+	int64		v0,
+				v1;
+
 	(void) hash_search(reach, &seed, HASH_ENTER, NULL);
 
-	snprintf(sql, sizeof(sql),
-			 "SELECT graph_store.gph_traverse_bfs(" INT64_FORMAT ", %d, %d)",
-			 seed, hops, edge_type);
-	rc = SPI_execute(sql, true, 0);
-	if (rc != SPI_OK_SELECT)
-		ereport(ERROR, (errmsg("tjs_open: graph reach probe failed (%d)", rc)));
-	for (i = 0; i < SPI_processed; i++)
+	if (*budget_remaining <= 0)
+	{
+		*graph_censored = true;
+		return;
+	}
+
+	values[0] = Int64GetDatum(seed);
+	values[1] = Int32GetDatum(hops);
+	values[2] = Int32GetDatum(edge_type);
+	values[3] = Int64GetDatum(*budget_remaining);
+
+	v0 = tjs_read_graph_visits();
+	portal = SPI_cursor_open_with_args(NULL,
+									   "SELECT graph_store.gph_traverse_bounded($1, $2, $3, $4)",
+									   4, argtypes, values, NULL, true, 0);
+	for (;;)
 	{
 		bool		isnull;
-		int64		v = DatumGetInt64(SPI_getbinval(SPI_tuptable->vals[i],
-													SPI_tuptable->tupdesc, 1, &isnull));
+		Datum		d;
 
+		CHECK_FOR_INTERRUPTS();
+		SPI_cursor_fetch(portal, true, 1);
+		if (SPI_processed == 0)
+			break;
+		d = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isnull);
 		if (!isnull)
+		{
+			int64		v = DatumGetInt64(d);
+
 			(void) hash_search(reach, &v, HASH_ENTER, NULL);
+		}
 	}
+	SPI_cursor_close(portal);
+	v1 = tjs_read_graph_visits();
+
+	*graph_examined += (v1 - v0);
+	*budget_remaining -= (v1 - v0);
+	if (*budget_remaining < 0)
+		*budget_remaining = 0;
+	if (tjs_read_graph_censored())
+		*graph_censored = true;
 }
 
 /*
@@ -308,16 +444,22 @@ reach_add_from_seed(HTAB *reach, int64 seed, int hops, int edge_type)
 static void
 seedless_seed_and_admit(TopkItem *seed_buf, int n_buf, int m_seeds, int hops,
 						int edge_type, HTAB *reach, Topk *topk, Topk *bridge_topk,
-						int *drops)
+						int *drops, int64 *budget_remaining, int64 *graph_examined,
+						bool *graph_censored)
 {
 	int			i;
 	int			n_seeds;
 
-	/* nearest-first: seed selection and admission both use distance order */
+	/*
+	 * Nearest-first: seed selection AND admission both use distance order, and the shared
+	 * graph-work budget (ADR-0020 decision 2) is consumed in that same nearest-seed-first
+	 * order below -- the closer a seed is, the more of the shared pool it gets first.
+	 */
 	qsort(seed_buf, n_buf, sizeof(TopkItem), topk_cmp_dist);
 	n_seeds = Min(m_seeds, n_buf);
 	for (i = 0; i < n_seeds; i++)
-		reach_add_from_seed(reach, seed_buf[i].id, hops, edge_type);
+		graph_reach_pull(reach, seed_buf[i].id, hops, edge_type,
+						  budget_remaining, graph_examined, graph_censored);
 
 	for (i = 0; i < n_buf; i++)
 	{
@@ -401,6 +543,8 @@ tjs_open_pg(PG_FUNCTION_ARGS)
 	tjs_examined = 0;
 	tjs_bridges_injected = 0;
 	tjs_term_reason = TJS_TERM_STREAM_END_UNKNOWN;
+	tjs_graph_examined = 0;
+	tjs_graph_censored = false;
 
 	if (SPI_connect() != SPI_OK_CONNECT)
 		ereport(ERROR, (errmsg("tjs_open: SPI_connect failed")));
@@ -408,101 +552,135 @@ tjs_open_pg(PG_FUNCTION_ARGS)
 	if (have_src)
 	{
 		/*
-		 * FILTER-FIRST: one fused SPI statement — the Gate B plan behind the operator
-		 * surface. The graph reach is the selective seed; exact rank orders survivors.
+		 * FILTER-FIRST (plan 077 / ADR-0020): pull traversal (graph_store.gph_traverse_bounded,
+		 * ADR-0020 §1) -> per-vertex filter probe -> distance recompute (the vector-first
+		 * distance machinery, reused below) -> bounded top-k of k. Replaces the old fused
+		 * single-SQL statement (a FROM-clause join against the pre-077 whole-BFS helper), which
+		 * paid the WHOLE bounded-depth traversal before the first row. term_cond = 0 (the meaning every
+		 * existing filter-first caller already uses) disables early termination, so an
+		 * uncensored call is byte-identical to the pre-077 contract: the WHOLE bounded reach is
+		 * examined and ranked, exactly as before. term_cond > 0 additionally applies the SAME
+		 * ADR-0007 consecutive-drops rule vector-first uses, bounding graph work independent of
+		 * reach size (an approximate, disclosed tradeoff -- the same epistemic status as
+		 * vector-first's own term_cond, not a fourth termination_reason value).
 		 */
-		StringInfoData q;
-		int			rc;
-		uint64		i;
-		Oid			argtypes[1];
-		Datum		values[1];
+		int64		graph_budget_remaining = tjs_graph_work_budget;
+		Relation	heap;
+		AttrNumber	vec_attno = InvalidAttrNumber;
+		Oid			distproc = InvalidOid;
+		Oid			ignore_op = InvalidOid;
+		FmgrInfo	distfn;
+		char	   *vec_col;
 		char	   *relname = get_rel_name(reloid);
 		char	   *nspname = get_namespace_name(get_rel_namespace(reloid));
-		char	   *vec_col;
-		Oid			distop = InvalidOid;
+		StringInfoData fq;
+		Oid			fargs[2] = {INT8OID, INT8OID};
+		SPIPlanPtr	fetch_plan;
+		Oid			cargtypes[4] = {INT8OID, INT4OID, INT4OID, INT8OID};
+		Datum		cvalues[4];
+		Portal		portal;
+		Topk		topk;
+		int			drops = 0;
+		int64		v0,
+					v1;
+		int			i;
 
 		/*
-		 * The vector column AND its distance operator come from the table's
-		 * hnsw index, same as vector-first — rank by whatever metric the index
-		 * was built for (l2 <->, cosine <=>, ip <#>), never a hardcoded L2.
+		 * The vector column AND its distance function come from the table's hnsw index, same
+		 * as vector-first — rank by whatever metric the index was built for (l2, cosine, ip),
+		 * never a hardcoded L2.
 		 */
-		{
-			Relation	heap = table_open(reloid, AccessShareLock);
-			AttrNumber	vattno = InvalidAttrNumber;
-			Oid			dp = InvalidOid;
+		heap = table_open(reloid, AccessShareLock);
+		(void) find_hnsw_index(heap, &vec_attno, &distproc, &ignore_op);
+		vec_col = get_attname(reloid, vec_attno, false);
+		table_close(heap, AccessShareLock);
+		fmgr_info(distproc, &distfn);
 
-			(void) find_hnsw_index(heap, &vattno, &dp, &distop);
-			vec_col = get_attname(reloid, vattno, false);
-			table_close(heap, AccessShareLock);
-		}
-
-		/*
-		 * count(*) OVER () evaluates after WHERE but before ORDER BY/LIMIT: every
-		 * emitted row carries the FULL qualifying count, so tjs_examined reports the
-		 * work the filter legs actually did, not min(work, k) — no second C-side
-		 * materialization, ordering untouched (plan 074).
-		 */
-		initStringInfo(&q);
-		appendStringInfo(&q,
-						 "SELECT e.%s, count(*) OVER () FROM graph_store.gph_traverse_bfs(" INT64_FORMAT ", %d, %d) AS t(dst) "
-						 "JOIN %s.%s e ON e.%s = t.dst WHERE e.%s <> " INT64_FORMAT,
-						 qident(id_col), src, hops, edge_type,
-						 qident(nspname), qident(relname), qident(id_col),
-						 qident(id_col), src);
+		/* per-candidate fetch: the vector, iff it passes the id/self/relational-filter checks
+		 * the old fused statement's WHERE clause applied (id <> src is defensive: the pull
+		 * traversal already excludes the seed from its own output, matching the pre-077
+		 * whole-BFS helper's contract). */
+		initStringInfo(&fq);
+		appendStringInfo(&fq, "SELECT %s FROM %s.%s WHERE %s = $1 AND %s <> $2",
+						 qident(vec_col), qident(nspname), qident(relname),
+						 qident(id_col), qident(id_col));
 		if (filter[0] != '\0')
-			appendStringInfo(&q, " AND (%s)", filter);
-		/*
-		 * Rank by the index's own distance operator (l2 <->, cosine <=>, ip
-		 * <#>), schema-qualified via OPERATOR(nsp.op) so it resolves regardless
-		 * of search_path. (format_operator() is unusable here — it emits the
-		 * regoperator form `<->(vector,vector)`, which is invalid infix.)
-		 */
-		{
-			HeapTuple	optup = SearchSysCache1(OPEROID, ObjectIdGetDatum(distop));
-			Form_pg_operator opform;
-			char	   *opnsp;
-			char	   *opname;
+			appendStringInfo(&fq, " AND (%s)", filter);
+		fetch_plan = SPI_prepare(fq.data, 2, fargs);
+		if (fetch_plan == NULL)
+			ereport(ERROR, (errmsg("tjs_open: filter-first fetch plan failed: %s", fq.data)));
 
-			if (!HeapTupleIsValid(optup))
-				ereport(ERROR, (errmsg("tjs_open: cache lookup failed for operator %u", distop)));
-			opform = (Form_pg_operator) GETSTRUCT(optup);
-			opnsp = get_namespace_name(opform->oprnamespace);
-			opname = pstrdup(NameStr(opform->oprname));
-			ReleaseSysCache(optup);
-			appendStringInfo(&q, " ORDER BY e.%s OPERATOR(%s.%s) $1 LIMIT %d",
-							 qident(vec_col), quote_identifier(opnsp), opname, k);
-		}
+		topk_init(&topk, k);
 
-		argtypes[0] = get_fn_expr_argtype(fcinfo->flinfo, 7);
-		values[0] = query_vec;
-		rc = SPI_execute_with_args(q.data, 1, argtypes, values, NULL, true, 0);
-		if (rc != SPI_OK_SELECT)
-			ereport(ERROR, (errmsg("tjs_open: filter-first statement failed (%d)", rc)));
-		tjs_term_reason = TJS_TERM_FILTER_FIRST;
-		if (SPI_processed > 0)
-		{
-			/* qualifying count rides column 2 of any returned row */
-			bool		qnull;
-			Datum		qd = SPI_getbinval(SPI_tuptable->vals[0],
-										   SPI_tuptable->tupdesc, 2, &qnull);
+		cvalues[0] = Int64GetDatum(src);
+		cvalues[1] = Int32GetDatum(hops);
+		cvalues[2] = Int32GetDatum(edge_type);
+		cvalues[3] = Int64GetDatum(graph_budget_remaining);
 
-			tjs_examined = qnull ? (int64) SPI_processed : DatumGetInt64(qd);
-		}
-		else
-			tjs_examined = 0;	/* zero rows -> no window row carries the count */
-		for (i = 0; i < SPI_processed; i++)
+		v0 = tjs_read_graph_visits();
+		portal = SPI_cursor_open_with_args(NULL,
+										   "SELECT graph_store.gph_traverse_bounded($1, $2, $3, $4)",
+										   4, cargtypes, cvalues, NULL, true, 0);
+		for (;;)
 		{
+			int64		cand;
 			bool		isnull;
-			Datum		d = SPI_getbinval(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 1, &isnull);
+			Datum		d;
+			Datum		fv[2];
+			int			rc;
 
-			if (!isnull)
+			CHECK_FOR_INTERRUPTS();
+			SPI_cursor_fetch(portal, true, 1);
+			if (SPI_processed == 0)
+				break;			/* pull traversal exhausted (naturally or budget-capped) */
+			d = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isnull);
+			if (isnull)
+				continue;
+			cand = DatumGetInt64(d);
+
+			fv[0] = Int64GetDatum(cand);
+			fv[1] = Int64GetDatum(src);
+			rc = SPI_execute_plan(fetch_plan, fv, NULL, true, 1);
+			if (rc != SPI_OK_SELECT)
+				ereport(ERROR, (errmsg("tjs_open: filter-first fetch failed (%d)", rc)));
+			if (SPI_processed != 1)
+				continue;		/* relational filter (or the defensive id<>src) excluded it */
+
 			{
-				Datum		row[1] = {d};
-				bool		nulls[1] = {false};
+				bool		vnull;
+				Datum		vd = SPI_getbinval(SPI_tuptable->vals[0],
+											   SPI_tuptable->tupdesc, 1, &vnull);
 
-				tuplestore_putvalues(tupstore, tupdesc, row, nulls);
+				if (vnull)
+					continue;
+
+				tjs_examined++;	/* a qualifying (filter-passing) reach member (plan 074) */
+				{
+					float8		dist = DatumGetFloat8(
+									FunctionCall2Coll(&distfn, InvalidOid, vd, query_vec));
+
+					if (topk_offer(&topk, cand, dist))
+						drops = 0;
+					else if (topk.n == k && term_cond > 0 && ++drops >= term_cond)
+						break;	/* ADR-0007 consecutive-drops, reused for filter-first */
+				}
 			}
 		}
+		SPI_cursor_close(portal);
+		v1 = tjs_read_graph_visits();
+		tjs_graph_examined += (v1 - v0);
+		tjs_graph_censored = tjs_read_graph_censored();
+		tjs_term_reason = TJS_TERM_FILTER_FIRST;
+
+		qsort(topk.items, topk.n, sizeof(TopkItem), topk_cmp_dist);
+		for (i = 0; i < topk.n; i++)
+		{
+			Datum		row[1] = {Int64GetDatum(topk.items[i].id)};
+			bool		nulls[1] = {false};
+
+			tuplestore_putvalues(tupstore, tupdesc, row, nulls);
+		}
+
 		SPI_finish();
 		pfree(id_col);
 		pfree(filter);
@@ -537,6 +715,7 @@ tjs_open_pg(PG_FUNCTION_ARGS)
 		int			n_buf = 0;
 		bool		seeded = false;
 		ItemPointer tid;
+		int64		graph_budget_remaining = tjs_graph_work_budget;	/* plan 077: shared pool */
 
 		if (iter == NULL || strcmp(iter, "relaxed_order") != 0)
 			ereport(ERROR,
@@ -655,7 +834,9 @@ tjs_open_pg(PG_FUNCTION_ARGS)
 					if (n_buf < seed_window)
 						continue;
 					seedless_seed_and_admit(seed_buf, n_buf, m_seeds, hops, edge_type,
-											reach, &topk, &bridge_topk, &drops);
+											reach, &topk, &bridge_topk, &drops,
+											&graph_budget_remaining, &tjs_graph_examined,
+											&tjs_graph_censored);
 					seeded = true;
 					continue;
 				}
@@ -686,7 +867,9 @@ tjs_open_pg(PG_FUNCTION_ARGS)
 		if (reach != NULL && !seeded)
 		{
 			seedless_seed_and_admit(seed_buf, n_buf, m_seeds, hops, edge_type,
-									reach, &topk, &bridge_topk, &drops);
+									reach, &topk, &bridge_topk, &drops,
+									&graph_budget_remaining, &tjs_graph_examined,
+									&tjs_graph_censored);
 			seeded = true;
 		}
 
@@ -860,6 +1043,34 @@ Datum
 tjs_open_bridges_injected_pg(PG_FUNCTION_ARGS)
 {
 	PG_RETURN_INT64(tjs_bridges_injected);
+}
+
+/*
+ * tjs_open_graph_examined() RETURNS bigint (plan 077 / ADR-0020) -- edge-steps the last call's
+ * graph leg consumed (0 for a pure vector-first call with m_seeds = 0, which never touches the
+ * graph). Orthogonal to tjs_open_candidates_examined(): that counts qualifying rows against the
+ * relational/vector legs; this counts graph_store.gph_visits()-unit traversal work.
+ */
+PG_FUNCTION_INFO_V1(tjs_open_graph_examined_pg);
+Datum
+tjs_open_graph_examined_pg(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_INT64(tjs_graph_examined);
+}
+
+/*
+ * tjs_open_graph_censored() RETURNS boolean (plan 077 / ADR-0020) -- true iff the last call's
+ * graph leg hit tjs.graph_work_budget before its bounded reach exhausted naturally. A REAL
+ * boolean, never NULL (unlike tjs_open_budget_capped(): the graph leg's cap is a signal this
+ * operator owns and can always observe, not pgvector's unobservable stream end). Orthogonal to
+ * tjs_open_termination_reason(): the graph cap is a property of reach acquisition, not of how
+ * the candidate stream ended, so it is never a fourth reason value.
+ */
+PG_FUNCTION_INFO_V1(tjs_open_graph_censored_pg);
+Datum
+tjs_open_graph_censored_pg(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_BOOL(tjs_graph_censored);
 }
 
 PG_FUNCTION_INFO_V1(tjs_open_termination_reason_pg);

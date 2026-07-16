@@ -117,6 +117,23 @@ CREATE FUNCTION gph_traverse_bfs(bigint, integer, integer) RETURNS SETOF bigint
 CREATE FUNCTION gph_visits() RETURNS bigint
   AS 'MODULE_PATHNAME' LANGUAGE C VOLATILE;
 
+-- Bounded pull-based multi-hop traversal (plan 077 / ADR-0020): the TR-1-honest counterpart to
+-- gph_traverse_bfs above. Same reach (distinct vertices within max_depth out-hops, excluding
+-- the seed) and the same depth-ordered/adjacency-slot-order emission, but pulled ONE vertex per
+-- Next() -- Open performs ZERO edge-steps -- and bounded by the caller-supplied `budget`
+-- (edge-steps, the same unit gph_visits() counts): a call exhausts the reach within budget
+-- (exact; gph_traverse_bounded_censored() = false) or stops at a deterministic prefix when the
+-- budget runs out first (gph_traverse_bounded_censored() = true). type_id 0 = any type. Use in
+-- a target-list / ProjectSet position (SELECT gph_traverse_bounded(...)), pulled incrementally
+-- via an SPI cursor by cross-extension consumers (ADR-0005) -- never a FROM-clause FunctionScan.
+CREATE FUNCTION gph_traverse_bounded(bigint, integer, integer, bigint) RETURNS SETOF bigint
+  AS 'MODULE_PATHNAME' LANGUAGE C VOLATILE STRICT;
+
+-- Per-backend: did the MOST RECENT gph_traverse_bounded() call stop because its budget was
+-- exhausted before the frontier emptied? Reset to false at every gph_traverse_bounded() Open.
+CREATE FUNCTION gph_traverse_bounded_censored() RETURNS boolean
+  AS 'MODULE_PATHNAME' LANGUAGE C VOLATILE;
+
 -- Per-backend adjacency-page-read counter (read-once scan probe): one increment per adjacency page
 -- a traversal reads, NOT per neighbor emitted. Backend-local + monotonic; read DELTAS. Demonstrates
 -- that a degree-D hub over P chained pages now costs ~P page reads instead of ~D.
