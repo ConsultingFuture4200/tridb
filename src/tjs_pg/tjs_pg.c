@@ -314,6 +314,10 @@ tjs_open_pg(PG_FUNCTION_ARGS)
 		ereport(ERROR, (errmsg("tjs_open: hops must be in 0..8 (got %d)", hops)));
 	if (term_cond < 0)
 		ereport(ERROR, (errmsg("tjs_open: term_cond must be >= 0")));
+	if (m_seeds < 0 || m_seeds > 10000)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("tjs_open: m_seeds must be in 0..10000 (got %d)", m_seeds)));
 
 	/* materialize-mode SRF plumbing */
 	if (rsinfo == NULL || !IsA(rsinfo, ReturnSetInfo))

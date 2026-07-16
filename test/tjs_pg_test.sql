@@ -130,6 +130,30 @@ BEGIN
   RAISE NOTICE 'PASS 3b: NULL required args raise cleanly (no backend crash)';
 END $$;
 
+-- (3c) m_seeds bounds: values outside 0..10000 are rejected before any work begins.
+-- 10000 is accepted by argument validation alone (filter-first ignores the seed count,
+-- so no traversal cost); m_seeds = 0 zero-mode stays supported (PASS 1/2/1c above).
+DO $$
+BEGIN
+  BEGIN
+    PERFORM t FROM tjs_open('entities', 5, 0, -1, 2, 'id', '',
+      '[0.5,0,0,0,0,0,0,0]'::vector, 2, current_setting('tjs.ptype')::int) AS t;
+    RAISE EXCEPTION 'm_seeds = -1 did not raise';
+  EXCEPTION WHEN others THEN
+    IF SQLERRM NOT LIKE '%m_seeds%0..10000%' THEN RAISE; END IF;
+  END;
+  BEGIN
+    PERFORM t FROM tjs_open('entities', 5, 0, 10001, 2, 'id', '',
+      '[0.5,0,0,0,0,0,0,0]'::vector, 2, current_setting('tjs.ptype')::int) AS t;
+    RAISE EXCEPTION 'm_seeds = 10001 did not raise';
+  EXCEPTION WHEN others THEN
+    IF SQLERRM NOT LIKE '%m_seeds%0..10000%' THEN RAISE; END IF;
+  END;
+  PERFORM t FROM tjs_open('entities', 5, 0, 10000, 2, 'id', '',
+    '[0.5,0,0,0,0,0,0,0]'::vector, 2, current_setting('tjs.ptype')::int) AS t;
+  RAISE NOTICE 'PASS 3c: m_seeds bounded to 0..10000 (rejects -1/10001, accepts 10000)';
+END $$;
+
 SET hnsw.iterative_scan = relaxed_order;
 SET hnsw.max_scan_tuples = 20000;
 
