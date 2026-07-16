@@ -212,3 +212,25 @@ executor: **stock PG is ~2× faster than the fork.** Phase 2.1 is landed (BLCKSZ
 Remaining: 2.3 CSR (scale-motivated), 2.4 packaging/CI (pg17 image is the seed), 2.5 operator
 re-home for the vector-first legs (the ADR-0015 E3 gaps — the second half of Gate B, scoped to
 the seedless mode D1 already excludes). Plan 043 is moot on the target platform, as predicted.
+
+## Addendum A3 (2026-07-16) — D2 phase 2.3 (CSR-lite) gate-(b): PASS → GO (with a cost)
+
+The one unmeasured gate of the CSR-lite footprint redesign — the disk-seek magnitude a warm x86
+cache could not show (docs/graph_store_csr_lite_v0.1.0.md §8.1(b)) — was measured on the DGX Spark
+under real cold-cache disk pressure (328M-edge corpus, cgroup-bounded container >>10x below the
+working set, io.stat-confirmed NVMe reads). Full evidence: **docs/csr_lite_gate_b_realio_v0.1.0.md**.
+
+- **The seek win is real and material**: ~**2.9x** wall-clock on full-hub scans (47ms→16ms), ~**3.6x**
+  on mega-hub scans, ~1.7x on EXISTS probes — from ~1000x fewer page reads (read-once vs
+  re-read-per-neighbor) AND sequential vs scattered block order. Contiguity holds at 328M scale
+  under interleaved load (`contiguous=t` span==npages-1 vs baseline `contiguous=f` span 315,000).
+- **The cost, now quantified**: ~**4x on-disk footprint** (sorted 40GB vs baseline 10.6GB for the
+  same edges) from migrate-on-grow relayout + orphaned old-extent pages — so a production CSR-lite
+  MUST ship the §8.1(e) orphan-page compaction + relayout crash-atomicity work; this run sizes it.
+- **Regime caveat**: the baseline wins only on k=5 early-termination (2-5 page scans, too small for
+  the seek to matter) — not the large-hub regime CSR targets.
+
+**Verdict: phase 2.3 is GO for the large-degree-hub regime, gated on the orphan-compaction +
+crash-atomicity follow-on (2.3b).** With 2.1/2.2/2.4/2.5 done and Gate A/B passed, this closes the
+open measurement on D2's remaining engineering phase; only the productionization (compaction,
+un-fork of the CSR path) and D3 remain.

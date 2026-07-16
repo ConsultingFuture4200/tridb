@@ -1,0 +1,120 @@
+psql:/tools/measure.sql:98: NOTICE:  BENCH contig vid=2951 npages=64 first=10268871 last=10268934 span=63 contiguous=t
+psql:/tools/measure.sql:98: NOTICE:  BENCH contig vid=5000 npages=500 first=10649507 last=10650006 span=499 contiguous=t
+psql:/tools/measure.sql:98: NOTICE:  BENCH contig vid=5001 npages=500 first=10650007 last=10650506 span=499 contiguous=t
+psql:/tools/measure.sql:114: NOTICE:  BENCH sanity fullscan vid=101 count=65408 pages=65
+psql:/tools/measure.sql:114: NOTICE:  BENCH sanity order vid=101 nondecreasing=t
+ MEASURE_ROUND_DONE
+ROUND layout=sorted wall_secs=8.9 rc=0
+IOSTAT cold1 layout=sorted PRE rbytes=623845376 wbytes=139264 rios=18993 wios=13
+IOSTAT cold1 layout=sorted POST rbytes=1342586880 wbytes=421888 rios=28153 wios=2323
+==== ROUND cold2 layout=baseline (pre: rbytes=1342586880 wbytes=421888 rios=28153 wios=2323) ====
+psql:/tools/measure.sql:24: NOTICE:  BENCH k5 n=2000 pages=10000 pages_per=5.00 ms_total=581.2 ms_per=0.2906
+psql:/tools/measure.sql:40: NOTICE:  BENCH fullhub scans=200 edges=13081600 pages=13094400 pages_per_scan=65472.0 ms_total=8804.4 ms_per_scan=44.022
+psql:/tools/measure.sql:53: NOTICE:  BENCH mega vid=5000 edges=511000 pages=511500 ms=479.8
+psql:/tools/measure.sql:53: NOTICE:  BENCH mega vid=5001 edges=511000 pages=511500 ms=295.0
+psql:/tools/measure.sql:86: NOTICE:  BENCH exists kind=present probes=200 hits=200 pages=13094400 ms_per=25.587
+psql:/tools/measure.sql:86: NOTICE:  BENCH exists kind=absent probes=100 hits=0 pages=6547200 ms_per=18.867
+psql:/tools/measure.sql:98: NOTICE:  BENCH contig vid=101 npages=64 first=108 last=315108 span=315000 contiguous=f
+psql:/tools/measure.sql:98: NOTICE:  BENCH contig vid=1051 npages=64 first=1058 last=316058 span=315000 contiguous=f
+psql:/tools/measure.sql:98: NOTICE:  BENCH contig vid=2951 npages=64 first=2958 last=317958 span=315000 contiguous=f
+psql:/tools/measure.sql:98: NOTICE:  BENCH contig vid=5000 npages=500 first=320007 last=321005 span=998 contiguous=f
+psql:/tools/measure.sql:98: NOTICE:  BENCH contig vid=5001 npages=500 first=320008 last=321006 span=998 contiguous=f
+psql:/tools/measure.sql:114: NOTICE:  BENCH sanity fullscan vid=101 count=65408 pages=65472
+psql:/tools/measure.sql:114: NOTICE:  BENCH sanity order vid=101 nondecreasing=f
+ MEASURE_ROUND_DONE
+ROUND layout=baseline wall_secs=17.3 rc=0
+IOSTAT cold2 layout=baseline PRE rbytes=1342586880 wbytes=421888 rios=28153 wios=2323
+IOSTAT cold2 layout=baseline POST rbytes=1966415872 wbytes=946176 rios=47145 wios=2363
+==== ROUND cold2 layout=sorted (pre: rbytes=1966415872 wbytes=946176 rios=47145 wios=2363) ====
+psql:/tools/measure.sql:24: NOTICE:  BENCH k5 n=2000 pages=4000 pages_per=2.00 ms_total=809.0 ms_per=0.4045
+psql:/tools/measure.sql:40: NOTICE:  BENCH fullhub scans=200 edges=13081600 pages=13000 pages_per_scan=65.0 ms_total=3107.4 ms_per_scan=15.537
+psql:/tools/measure.sql:53: NOTICE:  BENCH mega vid=5000 edges=511000 pages=501 ms=123.5
+psql:/tools/measure.sql:53: NOTICE:  BENCH mega vid=5001 edges=511000 pages=501 ms=120.0
+psql:/tools/measure.sql:86: NOTICE:  BENCH exists kind=present probes=200 hits=200 pages=13000 ms_per=14.329
+psql:/tools/measure.sql:86: NOTICE:  BENCH exists kind=absent probes=100 hits=0 pages=6500 ms_per=15.003
+psql:/tools/measure.sql:98: NOTICE:  BENCH contig vid=101 npages=64 first=10086471 last=10086534 span=63 contiguous=t
+psql:/tools/measure.sql:98: NOTICE:  BENCH contig vid=1051 npages=64 first=10147271 last=10147334 span=63 contiguous=t
+psql:/tools/measure.sql:98: NOTICE:  BENCH contig vid=2951 npages=64 first=10268871 last=10268934 span=63 contiguous=t
+psql:/tools/measure.sql:98: NOTICE:  BENCH contig vid=5000 npages=500 first=10649507 last=10650006 span=499 contiguous=t
+psql:/tools/measure.sql:98: NOTICE:  BENCH contig vid=5001 npages=500 first=10650007 last=10650506 span=499 contiguous=t
+psql:/tools/measure.sql:114: NOTICE:  BENCH sanity fullscan vid=101 count=65408 pages=65
+psql:/tools/measure.sql:114: NOTICE:  BENCH sanity order vid=101 nondecreasing=t
+ MEASURE_ROUND_DONE
+ROUND layout=sorted wall_secs=8.6 rc=0
+IOSTAT cold2 layout=sorted PRE rbytes=1966415872 wbytes=946176 rios=47145 wios=2363
+IOSTAT cold2 layout=sorted POST rbytes=2685169664 wbytes=1208320 rios=56307 wios=2383
+==== ROUND cold3 layout=baseline (pre: rbytes=2685169664 wbytes=1208320 rios=56307 wios=2383) ====
+psql:/tools/measure.sql:24: NOTICE:  BENCH k5 n=2000 pages=10000 pages_per=5.00 ms_total=695.7 ms_per=0.3478
+psql:/tools/measure.sql:40: NOTICE:  BENCH fullhub scans=200 edges=13081600 pages=13094400 pages_per_scan=65472.0 ms_total=9367.9 ms_per_scan=46.839
+psql:/tools/measure.sql:53: NOTICE:  BENCH mega vid=5000 edges=511000 pages=511500 ms=357.4
+psql:/tools/measure.sql:53: NOTICE:  BENCH mega vid=5001 edges=511000 pages=511500 ms=263.6
+psql:/tools/measure.sql:86: NOTICE:  BENCH exists kind=present probes=200 hits=200 pages=13094400 ms_per=23.573
+psql:/tools/measure.sql:86: NOTICE:  BENCH exists kind=absent probes=100 hits=0 pages=6547200 ms_per=19.566
+psql:/tools/measure.sql:98: NOTICE:  BENCH contig vid=101 npages=64 first=108 last=315108 span=315000 contiguous=f
+psql:/tools/measure.sql:98: NOTICE:  BENCH contig vid=1051 npages=64 first=1058 last=316058 span=315000 contiguous=f
+psql:/tools/measure.sql:98: NOTICE:  BENCH contig vid=2951 npages=64 first=2958 last=317958 span=315000 contiguous=f
+psql:/tools/measure.sql:98: NOTICE:  BENCH contig vid=5000 npages=500 first=320007 last=321005 span=998 contiguous=f
+psql:/tools/measure.sql:98: NOTICE:  BENCH contig vid=5001 npages=500 first=320008 last=321006 span=998 contiguous=f
+psql:/tools/measure.sql:114: NOTICE:  BENCH sanity fullscan vid=101 count=65408 pages=65472
+psql:/tools/measure.sql:114: NOTICE:  BENCH sanity order vid=101 nondecreasing=f
+ MEASURE_ROUND_DONE
+ROUND layout=baseline wall_secs=17.4 rc=0
+IOSTAT cold3 layout=baseline PRE rbytes=2685169664 wbytes=1208320 rios=56307 wios=2383
+IOSTAT cold3 layout=baseline POST rbytes=3308998656 wbytes=1441792 rios=75299 wios=2401
+==== ROUND cold3 layout=sorted (pre: rbytes=3308998656 wbytes=1441792 rios=75299 wios=2401) ====
+psql:/tools/measure.sql:24: NOTICE:  BENCH k5 n=2000 pages=4000 pages_per=2.00 ms_total=1282.0 ms_per=0.6410
+psql:/tools/measure.sql:40: NOTICE:  BENCH fullhub scans=200 edges=13081600 pages=13000 pages_per_scan=65.0 ms_total=3268.3 ms_per_scan=16.341
+psql:/tools/measure.sql:53: NOTICE:  BENCH mega vid=5000 edges=511000 pages=501 ms=126.7
+psql:/tools/measure.sql:53: NOTICE:  BENCH mega vid=5001 edges=511000 pages=501 ms=124.8
+psql:/tools/measure.sql:86: NOTICE:  BENCH exists kind=present probes=200 hits=200 pages=13000 ms_per=15.094
+psql:/tools/measure.sql:86: NOTICE:  BENCH exists kind=absent probes=100 hits=0 pages=6500 ms_per=15.376
+psql:/tools/measure.sql:98: NOTICE:  BENCH contig vid=101 npages=64 first=10086471 last=10086534 span=63 contiguous=t
+psql:/tools/measure.sql:98: NOTICE:  BENCH contig vid=1051 npages=64 first=10147271 last=10147334 span=63 contiguous=t
+psql:/tools/measure.sql:98: NOTICE:  BENCH contig vid=2951 npages=64 first=10268871 last=10268934 span=63 contiguous=t
+psql:/tools/measure.sql:98: NOTICE:  BENCH contig vid=5000 npages=500 first=10649507 last=10650006 span=499 contiguous=t
+psql:/tools/measure.sql:98: NOTICE:  BENCH contig vid=5001 npages=500 first=10650007 last=10650506 span=499 contiguous=t
+psql:/tools/measure.sql:114: NOTICE:  BENCH sanity fullscan vid=101 count=65408 pages=65
+psql:/tools/measure.sql:114: NOTICE:  BENCH sanity order vid=101 nondecreasing=t
+ MEASURE_ROUND_DONE
+ROUND layout=sorted wall_secs=9.4 rc=0
+IOSTAT cold3 layout=sorted PRE rbytes=3308998656 wbytes=1441792 rios=75299 wios=2401
+IOSTAT cold3 layout=sorted POST rbytes=4027752448 wbytes=1703936 rios=84461 wios=2421
+==== ROUND warm1 layout=baseline (pre: rbytes=4027752448 wbytes=1703936 rios=84461 wios=2421) ====
+WARM ROUND: fadvise drop skipped
+psql:/tools/measure.sql:24: NOTICE:  BENCH k5 n=2000 pages=10000 pages_per=5.00 ms_total=749.1 ms_per=0.3746
+psql:/tools/measure.sql:40: NOTICE:  BENCH fullhub scans=200 edges=13081600 pages=13094400 pages_per_scan=65472.0 ms_total=7332.2 ms_per_scan=36.661
+psql:/tools/measure.sql:53: NOTICE:  BENCH mega vid=5000 edges=511000 pages=511500 ms=269.6
+psql:/tools/measure.sql:53: NOTICE:  BENCH mega vid=5001 edges=511000 pages=511500 ms=228.6
+psql:/tools/measure.sql:86: NOTICE:  BENCH exists kind=present probes=200 hits=200 pages=13094400 ms_per=22.581
+psql:/tools/measure.sql:86: NOTICE:  BENCH exists kind=absent probes=100 hits=0 pages=6547200 ms_per=19.862
+psql:/tools/measure.sql:98: NOTICE:  BENCH contig vid=101 npages=64 first=108 last=315108 span=315000 contiguous=f
+psql:/tools/measure.sql:98: NOTICE:  BENCH contig vid=1051 npages=64 first=1058 last=316058 span=315000 contiguous=f
+psql:/tools/measure.sql:98: NOTICE:  BENCH contig vid=2951 npages=64 first=2958 last=317958 span=315000 contiguous=f
+psql:/tools/measure.sql:98: NOTICE:  BENCH contig vid=5000 npages=500 first=320007 last=321005 span=998 contiguous=f
+psql:/tools/measure.sql:98: NOTICE:  BENCH contig vid=5001 npages=500 first=320008 last=321006 span=998 contiguous=f
+psql:/tools/measure.sql:114: NOTICE:  BENCH sanity fullscan vid=101 count=65408 pages=65472
+psql:/tools/measure.sql:114: NOTICE:  BENCH sanity order vid=101 nondecreasing=f
+ MEASURE_ROUND_DONE
+ROUND layout=baseline wall_secs=15.2 rc=0
+IOSTAT warm1 layout=baseline PRE rbytes=4027752448 wbytes=1703936 rios=84461 wios=2421
+IOSTAT warm1 layout=baseline POST rbytes=4651556864 wbytes=1765376 rios=103449 wios=2436
+==== ROUND warm1 layout=sorted (pre: rbytes=4651556864 wbytes=1765376 rios=103449 wios=2436) ====
+WARM ROUND: fadvise drop skipped
+psql:/tools/measure.sql:24: NOTICE:  BENCH k5 n=2000 pages=4000 pages_per=2.00 ms_total=90.6 ms_per=0.0453
+psql:/tools/measure.sql:40: NOTICE:  BENCH fullhub scans=200 edges=13081600 pages=13000 pages_per_scan=65.0 ms_total=3075.7 ms_per_scan=15.378
+psql:/tools/measure.sql:53: NOTICE:  BENCH mega vid=5000 edges=511000 pages=501 ms=121.6
+psql:/tools/measure.sql:53: NOTICE:  BENCH mega vid=5001 edges=511000 pages=501 ms=121.6
+psql:/tools/measure.sql:86: NOTICE:  BENCH exists kind=present probes=200 hits=200 pages=13000 ms_per=14.953
+psql:/tools/measure.sql:86: NOTICE:  BENCH exists kind=absent probes=100 hits=0 pages=6500 ms_per=15.457
+psql:/tools/measure.sql:98: NOTICE:  BENCH contig vid=101 npages=64 first=10086471 last=10086534 span=63 contiguous=t
+psql:/tools/measure.sql:98: NOTICE:  BENCH contig vid=1051 npages=64 first=10147271 last=10147334 span=63 contiguous=t
+psql:/tools/measure.sql:98: NOTICE:  BENCH contig vid=2951 npages=64 first=10268871 last=10268934 span=63 contiguous=t
+psql:/tools/measure.sql:98: NOTICE:  BENCH contig vid=5000 npages=500 first=10649507 last=10650006 span=499 contiguous=t
+psql:/tools/measure.sql:98: NOTICE:  BENCH contig vid=5001 npages=500 first=10650007 last=10650506 span=499 contiguous=t
+psql:/tools/measure.sql:114: NOTICE:  BENCH sanity fullscan vid=101 count=65408 pages=65
+psql:/tools/measure.sql:114: NOTICE:  BENCH sanity order vid=101 nondecreasing=t
+ MEASURE_ROUND_DONE
+ROUND layout=sorted wall_secs=8.0 rc=0
+IOSTAT warm1 layout=sorted PRE rbytes=4651556864 wbytes=1765376 rios=103449 wios=2436
+IOSTAT warm1 layout=sorted POST rbytes=4651556864 wbytes=1826816 rios=103449 wios=2450
+ALL ROUNDS DONE
