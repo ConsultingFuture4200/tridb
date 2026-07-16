@@ -557,7 +557,7 @@ Python layer verifies here (`make test`=pytest, `make lint`=ruff). Stock-PG engi
 | 068 | Public wiki_reader hardening (LLM-route DoS bound, error-leak, response headers) | P1 | S–M | LOW–MED | manual (live host) | **DONE** (merged; advisor-reviewed APPROVE: LLM routes semaphore+timeout bounded (3/3 acquire/release balanced, 429 on limit), repr-leak gone, hardening headers + CSP-on-HTML; lint clean. Live-behavior smoke = verify on reader host) |
 | 069 | Close 3 benchmark test/determinism residuals (baseline rerank tie-break, SM-4 recall seam+test, stock-dialect loader tests) | P2 | S | LOW | YES (python) | **DONE** (merged; advisor-reviewed APPROVE: baseline rerank id tie-break both legs, SM-4 recall_at_k seam + boundary tests, stock-dialect loader tests; 389 suite +7 new, lint green) |
 | 070 | Stock-PG DX: `make stock-graph-test` target + harness env-var reference in INSTALL doc | P2 | S | LOW | YES (docker+grep) | **DONE** (merged; advisor-reviewed APPROVE: make stock-graph-test = 12 ci.yml suites verbatim, tabs correct, executor ran 12/12 green; INSTALL env-var table + gate keys; make test 389 unchanged) |
-| 071 | Fork↔stock tjs_open filter-first parity harness (golden differential test, anti-false-green) | P2 | M | LOW | YES (both engine images) | TODO |
+| 071 | Fork↔stock tjs_open filter-first parity harness (golden differential test, anti-false-green) | P2 | M | LOW | YES (both engine images) | **DONE** (`0ebc290`; advisor-reviewed APPROVE: 11/11 PARITY OK re-run by advisor on both images, anti-false-green proven (k+1 → 10× MISMATCH exit 1); accepted surface correction: fork filter-first reference is the Gate-A fused SQL (fork tjs_open has no filter-first form), which is the ADR-0019 contract; operator↔operator seedless parity remains 087/follow-up) |
 
 **Recommended order**: 062 → 063 (both touch `tjs_pg.c`; land the segfault guard first, keep diffs
 clean), then 064, 065, 066 (independent, any order), 067 + 068 (docs / service, independent). Plans
@@ -575,21 +575,21 @@ surface is also serialized because plans 080, 081, and 082 edit `tools/wiki_read
 
 | Plan | Title | Priority | Effort | Risk | Depends on | Verify | Status |
 |------|-------|----------|--------|------|------------|--------|--------|
-| 072 | Make engine harnesses preserve build failures | P1 | S | LOW | — | host + negative shell control | TODO |
-| 073 | Bound stock `tjs_open` `m_seeds` while preserving zero mode | P1 | S | LOW | 072 | stock PG16/17 | TODO |
-| 074 | Make TJS examined/termination counters honest | P1 | M | MED | 072, 073 | stock PG16/17 | TODO |
-| 075 | Lower the canonical v1 query through stock `tjs_open` | P1 | M | MED | 071, 072 | parity + stock PG16/17 | TODO |
-| 076 | Smoke the complete stock release image and quickstart | P1 | S | LOW | 072, 075 | release PG16/17 | TODO |
-| 077 | Replace full-reach stock TJS materialization with a bounded pull graph leg | P1 | L | HIGH | 071, 072, 074, 075 | design gate + stock PG16/17 | TODO |
-| 078 | Publish Wikidata compact sidecars atomically with verified identity | P1 | M | LOW | — | Python fault injection | TODO |
-| 079 | Gate Wikidata reports on observed engine state | P1 | S | LOW | — | Python transcript tests | TODO |
-| 080 | Attribute public Wiki-scale claims to their actual engine/corpus | P1 | S | LOW | — | Python claim guard + browser | TODO |
-| 081 | Secure Wiki operator auth and server-side suggestion integrity | P1 | M | MED | 068 | Python security tests | TODO |
-| 082 | Reject unbounded Wiki reader GET work parameters | P1 | S | LOW | 081 | Python boundary tests | TODO |
-| 083 | Bind baseline datastore ports to loopback by default | P1 | S | LOW | — | Python + Compose config | TODO |
-| 084 | Detect initialized SPTAG rather than an empty submodule directory | P1 | S | LOW | — | patch-chain shell gate | TODO |
-| 085 | Grade live GraphRAG output before reporting completion | P2 | M | MED | 072 | Python + engine-gated live run | TODO |
-| 086 | Isolate and lock the GB10 GPU Python environment | P2 | M | MED | — | host static + GB10 gate | TODO |
+| 072 | Make engine harnesses preserve build failures | P1 | S | LOW | — | host + negative shell control | **DONE** (`30179f0` on `advisor/integr-0716`; advisor-reviewed APPROVE: 6-test static guard w/ 6/6 pre-fix negative control, live bogus-target run EXIT=1 re-verified by advisor, 3 real harness runs green, 395 host tests + lint) |
+| 073 | Bound stock `tjs_open` `m_seeds` while preserving zero mode | P1 | S | LOW | 072 | stock PG16/17 | **DONE** (`e7d3d11`; advisor-reviewed APPROVE: 0..10000 guard w/ ERRCODE, PASS 3c + ALL PASS on PG16+PG17, PG17 re-run by advisor, pre-fix negative control observed) |
+| 074 | Make TJS examined/termination counters honest | P1 | M | MED | 072, 073 | stock PG16/17 | **DONE** (`25e2119`; advisor-reviewed APPROVE: count(*) OVER() pre-LIMIT examined, TjsTermReason enum + `tjs_open_termination_reason()`, boolean now false/NULL/never-true, ALL PASS PG16+PG17 (PG17 re-run by advisor incl. PASS 6b natural-exhaustion negative); RESIDUAL: `bench/wikidata_sm4_seedless.py` budget_capped_fraction is now vacuously 0.0 — switch it to reason='stream_end_unknown' counting) |
+| 075 | Lower the canonical v1 query through stock `tjs_open` | P1 | M | MED | 071, 072 | parity + stock PG16/17 | **DONE** (`bda4988`; advisor-reviewed APPROVE: catalog-safe fail-closed stock branch, edge label via graph_store.edge_type (no "any edge"), WITH ORDINALITY chunk projection (topology stays native), 9-assertion e2e re-run by advisor on PG17 + combined-tree recheck w/ 074, fork canonical suites unregressed, 13 stock suites green) |
+| 076 | Smoke the complete stock release image and quickstart | P1 | S | LOW | 072, 075 | release PG16/17 | **DONE** (`34de25c`; advisor-reviewed APPROVE: lifecycle-safe runner (no host port, exec-only, trap cleanup — re-run by advisor, PASS + zero leftovers), both PG16/17 release images rebuilt+smoked, negative control exit 3, CI smoke step per matrix leg, INSTALL Option 1/2 now install all three extensions) |
+| 077 | Replace full-reach stock TJS materialization with a bounded pull graph leg | P1 | L | HIGH | 071, 072, 074, 075 | design gate + stock PG16/17 | **READY — deliberately not auto-executed** (all four dependencies now DONE; its Step-2 ADR-0020 design review requires maintainer approval mid-plan, so it needs an interactive session: run `execute 077`, stop at the gate) |
+| 078 | Publish Wikidata compact sidecars atomically with verified identity | P1 | M | LOW | — | Python fault injection | **DONE** (`ee83f88`; advisor-reviewed APPROVE: temp+fsync+replace data-then-meta, size+SHA-256 verified at ingest, injected-failure matrix green, 18 tests re-verified; NOTE: pre-078 sidecars now fail closed — re-run compaction once on Spark/GX10) |
+| 079 | Gate Wikidata reports on observed engine state | P1 | S | LOW | — | Python transcript tests | **DONE** (`56e310f`; advisor-reviewed APPROVE: ASSERT/FINAL/LOAD_COMPLETE parsed independently, expected-count fallback removed (grep-proven), gate keys observed-only, 19 tests re-verified; judgment call accepted: post-assert observed counts still publish, HNSW gates block separately) |
+| 080 | Attribute public Wiki-scale claims to their actual engine/corpus | P1 | S | LOW | — | Python claim guard + browser | **DONE** (`dfdc65d`; advisor-reviewed APPROVE: 28-assert guardrail suite (26 failed pre-fix), both HTML surfaces identically corrected, 0.71% labeled w/ HotpotQA host provenance, documented in-scope deviation accepted (title/meta/footer same defect class); browser render check deferred to next deploy) |
+| 081 | Secure Wiki operator auth and server-side suggestion integrity | P1 | M | MED | 068 | Python security tests | **DONE** (`6e3b971`; advisor-reviewed APPROVE: remote bind requires ≥16-char `WIKI_READER_OPERATOR_TOKEN` (never rendered; hmac.compare_digest), server-canonical PendingSuggestions (TTL+cap+one-use, 8-thread race test), acceptance re-grounds vs current source; 66 focused tests + secret grep re-verified; OPERATIONAL: next Spark reader restart on a remote bind needs the env var provisioned) |
+| 082 | Reject unbounded Wiki reader GET work parameters | P1 | S | LOW | 081 | Python boundary tests | **DONE** (`b73c115`; advisor-reviewed APPROVE: named-constant bounds table, typed 400 before any reader call or LLM slot (19 pre-fix negative controls), live-socket smoke, 106 focused tests re-verified; behavior change: pool/seed=0 & malformed ints now 400 instead of silent defaults — UI never sends those) |
+| 083 | Bind baseline datastore ports to loopback by default | P1 | S | LOW | — | Python + Compose config | **DONE** (`1201279`; advisor-reviewed APPROVE: 7/7 ports loopback-default + 0.0.0.0 opt-in, both renders re-verified by advisor, 8-test guard w/ pre-fix negative control) |
+| 084 | Detect initialized SPTAG rather than an empty submodule directory | P1 | S | LOW | — | patch-chain shell gate | **DONE** (`82ef7ea`; advisor-reviewed APPROVE: shared `sptag_initialized` predicate at both call sites, CI rm-rf workaround removed, live checker OK w/ placeholder present, 8 tests re-verified) |
+| 085 | Grade live GraphRAG output before reporting completion | P2 | M | MED | 072 | Python + engine-gated live run | **DONE** (`2260369`; advisor-reviewed APPROVE: strict validator + DONE gate (17 tests re-verified), evidence/answer grading on live IDs, denominator-stable reader failure, engine-only scope docs; live GX10 run still gated) |
+| 086 | Isolate and lock the GB10 GPU Python environment | P2 | M | MED | — | host static + GB10 gate | **DONE** (`e9c2258`; advisor-reviewed APPROVE: `.venv-gpu` + hash-enforced `requirements-gpu-gb10.lock` (83 pins/1085 hashes) generated ON the Spark, 2× clean-install reproduced + `ALL GPU PATHS VERIFIED` twice, core lock byte-identical (re-verified), off-target SKIP re-verified on this box; accepted deviations: aarch64 arch guard, `--lock` mode, live-verified transitive drift documented) |
 
 ### Recommended execution order
 
@@ -685,12 +685,12 @@ live code (all confirmed; two premise corrections noted below) and planned six s
 
 | Plan | Title | Priority | Effort | Risk | Depends on | Verify | Status |
 |------|-------|----------|--------|------|------------|--------|--------|
-| 087 | Stock seedless fork-parity semantics (bridge k/2 cap, seed window, stream accounting) — findings #1/#2/#3 | P1 | S–M | MED | 073, 074 | stock PG16/17 | TODO |
-| 088 | `src/graph_store/README.md` D2 truth pass — finding #8 | P2 | S | LOW | — | docs greps | TODO |
-| 089 | Bench grading honesty residuals (SM-4 empty-oracle, live_report manifest seed) — findings #9/#10 | P2 | S | LOW | — | YES (python) | TODO |
-| 090 | Stock crash-recovery gate + STOCK_TESTS↔CI lockstep (+ freeze REDO scenario) — findings #13/#14 | P1 | M | MED | 072 | stock PG16/17 + CI | TODO |
-| 091 | Typed batched edge insert for the Wikidata loader — finding #16 | P2 | M | MED | 079, 072 | stock engine + python | TODO |
-| 092 | Wiki reader LLM-fallback message leak — finding #17 | P2 | S | LOW | 081, 082 | YES (python) | TODO |
+| 087 | Stock seedless fork-parity semantics (bridge k/2 cap, seed window, stream accounting) — findings #1/#2/#3 | P1 | S–M | MED | 073, 074 | stock PG16/17 | **DONE** (`b1a949b`; advisor-reviewed APPROVE: floor(k/2)-min-1 bridge cap, nearest-in-window seed_window=max(8m, m+32), uniform drop accounting — all matched to actual fork patch hunks; PASS 5/8/9/10 + ALL PASS PG16+PG17 + 11/11 filter-first parity re-verified by advisor; accepted deviation: deterministic-footprint seed test in lieu of flaky HNSW-order fixture (→ 071 seedless follow-up)) |
+| 088 | `src/graph_store/README.md` D2 truth pass — finding #8 | P2 | S | LOW | — | docs greps | **DONE** (`4199422`; advisor-reviewed APPROVE: BLCKSZ>=8192 + dual fork/stock framing, all claims code-verified, docs-only) |
+| 089 | Bench grading honesty residuals (SM-4 empty-oracle, live_report manifest seed) — findings #9/#10 | P2 | S | LOW | — | YES (python) | **DONE** (`2972ce6`; advisor-reviewed APPROVE: shared recall_at_k import (local copy deleted), resolve_seed manifest-authoritative w/ conflict error, 46 seed/recall tests re-verified; accepted judgment: dropped duplicate-oracle assertion) |
+| 090 | Stock crash-recovery gate + STOCK_TESTS↔CI lockstep (+ freeze REDO scenario) — findings #13/#14 | P1 | M | MED | 072 | stock PG16/17 + CI | **DONE** (`fcfd1c5`; advisor-reviewed APPROVE: stock 5-scenario WAL-REDO driver green on PG16+PG17 (PG17 re-run by advisor) + fork x86, freeze scenario in both drivers, CI collapsed onto make targets (list single-sourced), negative control exit 3; NEW FINDING recorded below: xid-less `gph_freeze` commit is async-flushed) |
+| 091 | Typed batched edge insert for the Wikidata loader — finding #16 | P2 | M | MED | 079, 072 | stock engine + python | **DONE** (`0e1d94d`; advisor-reviewed APPROVE: 3-arg `gph_insert_edges` overload (PG_NARGS pattern), parity oracle incl. abort/tombstone/1200-edge chain green PG16+PG17 (PG17 re-run by advisor), loader batched w/ intact count assert + #WDL markers, measured ~3.2x edge-insert speedup on a local x86 200k-edge slice — floor, not an at-scale claim) |
+| 092 | Wiki reader LLM-fallback message leak — finding #17 | P2 | S | LOW | 081, 082 | YES (python) | **DONE** (`424f54f`; advisor-reviewed APPROVE: both `_llm_answer` AND `narrate_path` bodies scrubbed (executor caught the second leak), detail to logging.exception, 2 scrub tests re-verified) |
 
 Finding-table reconciliation (screenshot numbering): #1/#2/#3→**087**; #4/#5→081; #6→073; #7→076;
 #8→**088**; #9/#10→**089**; #11→082; #12→074; #13/#14→**090**; #15→conscious [PERF] residual (see
@@ -705,3 +705,19 @@ typed batch variant first.
 Sequencing into the 072-086 order: 088/089 join the independent host wave; 090 joins after 072;
 087 slots into the stock chain after 073→074 (same `tjs_pg.c`) and before 077; 091 after 079
 (same loader file); 092 closes the wiki serialize chain after 082.
+
+### New residuals surfaced during execution (not yet planned)
+
+- **`gph_freeze()` commit is async-flushed (090 finding, proven w/ pg_waldump):** the freeze txn
+  assigns no xid, so its COMMIT takes `XLogSetAsyncXactLSN` — an immediate crash inside the async
+  window silently loses a *committed* freeze (idempotent, re-runnable, but a durability surprise
+  for the anti-wraparound gate). Candidate S fix: `XLogFlush()` at the end of `gph_freeze` (or
+  assign an xid). Engine C, both targets. The crash drivers document the mechanism.
+- **SM-4 seedless `budget_capped_fraction` is vacuous post-074:** the boolean can never be true;
+  switch `bench/wikidata_sm4_seedless.py` to count `tjs_open_termination_reason() =
+  'stream_end_unknown'`. Historical `bench/results/wd_1m_sm4_seedless.json` fractions actually
+  measured "stream ended before term_cond", not proven budget caps. S.
+- **Pre-078 compact sidecars fail closed:** existing sidecars on Spark/GX10 lack
+  `compact_sha256` metadata and are now rejected — re-run compaction once per corpus. Operational.
+- **Wiki reader ops:** next restart of the public reader on a remote bind requires
+  `WIKI_READER_OPERATOR_TOKEN` (081); pending suggestions are restart-ephemeral. Operational.
