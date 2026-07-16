@@ -362,16 +362,17 @@ tjs_read_graph_censored(void)
  * cursor over a bare "SELECT graph_store.gph_traverse_bounded(...)" target-list call (ADR-0005
  * cross-extension composition: SPI, never a static link across the extension boundary, and
  * never a FROM-clause FunctionScan -- fetched ONE row at a time, so the underlying pull
- * iterator's Open/Next/Close bound is preserved end to end). Replaces the old
- * graph_store.gph_traverse_bfs SPI_execute call (whole-BFS materialized before this function
+ * iterator's Open/Next/Close bound is preserved end to end). Replaces the old whole-BFS SPI
+ * helper call (the pre-077 graph store's materializing multi-hop function, banned from this
+ * operator path by the Step 5 static guard -- whole reach materialized before this function
  * ever saw a row).
  *
  * `*budget_remaining` is the shared pool (ADR-0020 decision 2: one pool, consumed
  * nearest-seed-first -- the caller already visits seeds in nearest-first order); this call
  * consumes its share and decrements the pool by the edge-steps actually spent. The seed itself
- * is ALWAYS added to `reach` (the fork's bridge set includes the seeds themselves;
- * gph_traverse_bounded excludes its own seed from its output, matching gph_traverse_bfs), even
- * if the pool is already empty -- in that case this seed's OWN reach beyond itself contributes
+ * is ALWAYS added to `reach` (the fork's bridge set includes the seeds themselves; the bounded
+ * pull traversal excludes its own seed from its output, matching the pre-077 helper), even if
+ * the pool is already empty -- in that case this seed's OWN reach beyond itself contributes
  * nothing and *graph_censored is set: a deterministic prefix, disclosed, never silently exact.
  */
 static void
@@ -554,8 +555,8 @@ tjs_open_pg(PG_FUNCTION_ARGS)
 		 * FILTER-FIRST (plan 077 / ADR-0020): pull traversal (graph_store.gph_traverse_bounded,
 		 * ADR-0020 §1) -> per-vertex filter probe -> distance recompute (the vector-first
 		 * distance machinery, reused below) -> bounded top-k of k. Replaces the old fused
-		 * single-SQL statement (a FROM-clause graph_store.gph_traverse_bfs join), which paid
-		 * the WHOLE bounded-depth BFS before the first row. term_cond = 0 (the meaning every
+		 * single-SQL statement (a FROM-clause join against the pre-077 whole-BFS helper), which
+		 * paid the WHOLE bounded-depth traversal before the first row. term_cond = 0 (the meaning every
 		 * existing filter-first caller already uses) disables early termination, so an
 		 * uncensored call is byte-identical to the pre-077 contract: the WHOLE bounded reach is
 		 * examined and ranked, exactly as before. term_cond > 0 additionally applies the SAME
@@ -597,7 +598,8 @@ tjs_open_pg(PG_FUNCTION_ARGS)
 
 		/* per-candidate fetch: the vector, iff it passes the id/self/relational-filter checks
 		 * the old fused statement's WHERE clause applied (id <> src is defensive: the pull
-		 * traversal already excludes the seed from its own output, matching gph_traverse_bfs). */
+		 * traversal already excludes the seed from its own output, matching the pre-077
+		 * whole-BFS helper's contract). */
 		initStringInfo(&fq);
 		appendStringInfo(&fq, "SELECT %s FROM %s.%s WHERE %s = $1 AND %s <> $2",
 						 qident(vec_col), qident(nspname), qident(relname),
