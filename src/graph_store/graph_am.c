@@ -1957,6 +1957,7 @@ gph_traverse_bounded(PG_FUNCTION_ARGS)
 	Relation	rel;
 	int64		emit_vid = 0;
 	bool		have_emit;
+	MemoryContext callctx;
 
 	if (SRF_IS_FIRSTCALL())		/* === Open: ZERO edge-steps === */
 	{
@@ -2007,6 +2008,19 @@ gph_traverse_bounded(PG_FUNCTION_ARGS)
 
 	funcctx = SRF_PERCALL_SETUP();	/* === Next: at most one newly-reached vertex === */
 	ctx = (GphBoundedCtx *) funcctx->user_fctx;
+
+	/*
+	 * gs_open() (called below, possibly several times per Next() -- once per frontier vertex
+	 * dequeued) allocates ctx->cur_scan.page_buf via a plain palloc() in CurrentMemoryContext.
+	 * That buffer must survive to the NEXT Next() call (a hub's edges are served one per call
+	 * from the SAME buffered page), so every allocation here must land in the SRF's durable
+	 * multi_call_memory_ctx, never in whatever short-lived per-tuple/per-fetch context this
+	 * call happens to run under -- an SPI cursor's repeated SPI_cursor_fetch(portal, true, 1)
+	 * (the ADR-0005 consumption path tjs_pg uses) resets its per-tuple context between fetches,
+	 * so skipping this switch corrupts page_buf on the very next call (observed: a stray
+	 * "could not access status of transaction" from gs_getnext reading a clobbered slot).
+	 */
+	callctx = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
 
 	have_emit = false;
 	rel = gph_open_store(AccessShareLock);	/* re-derived every call -- plan 061, never held */
@@ -2066,6 +2080,7 @@ gph_traverse_bounded(PG_FUNCTION_ARGS)
 	}
 
 	relation_close(rel, AccessShareLock);
+	MemoryContextSwitchTo(callctx);
 
 	if (have_emit)
 		SRF_RETURN_NEXT(funcctx, Int64GetDatum(emit_vid));
