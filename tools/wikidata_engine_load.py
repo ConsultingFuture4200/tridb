@@ -24,8 +24,9 @@ container (docker exec -i <container> psql -f -, the bench/wiki_h2h.py conventio
       via pgvector (USING hnsw (embedding vector_l2_ops) WITH (m=16, ef_construction=64),
       the ADR-0015 E3 probe parameters) — plus a top-k health probe either way;
   (e) prints final counts and writes a load-manifest JSON (--out) with counts +
-      durations, including the WD_ENGINE_EDGES gate value (the WH_ENGINE_EDGES
-      analogue bench/wikidata_h2h.publication_gate needs).
+      durations, including the WD_ENGINE_EDGES gate value (read under that same
+      WD_ENGINE_EDGES name by bench/wikidata_h2h.oracle_meta_from_env, which also
+      accepts the legacy WH_ENGINE_EDGES for the fork harness).
 
 EDGE-COUNT PARITY DEFINITION (shared with the baseline loader): an edge counts iff BOTH
 endpoints are in-slice (present in the dense map); duplicates in the shards are preserved.
@@ -614,7 +615,7 @@ def main(argv: list[str] | None = None) -> int:
         "counts": stats,
         "engine": engine,
         "durations": {"total_secs": round(secs, 2)},
-        # the WH_ENGINE_EDGES analogue for bench/wikidata_h2h's publication gate
+        # read under this WD_ENGINE_EDGES name by bench/wikidata_h2h's publication gate
         "gate_env": {"WD_ENGINE_EDGES": engine.get("edges", stats.get("edges_kept"))},
     }
     out.write_text(json.dumps(load_manifest, indent=2))

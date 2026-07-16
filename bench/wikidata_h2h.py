@@ -602,13 +602,16 @@ def oracle_meta_from_env(meta: dict, cfg: WCfg) -> dict:
     return {
         "k": meta.get("k"),
         "hops": meta.get("hops"),
-        "engine_edges": os.environ.get("WH_ENGINE_EDGES"),
-        "neo4j_edges": os.environ.get(
-            "WH_NEO4J_EDGES", str(induced) if induced is not None else None
-        ),
+        "engine_edges": os.environ.get("WH_ENGINE_EDGES")
+        or os.environ.get("WD_ENGINE_EDGES"),
+        "neo4j_edges": os.environ.get("WH_NEO4J_EDGES")
+        or os.environ.get("WD_NEO4J_EDGES")
+        or (str(induced) if induced is not None else None),
         "tjs_max_examined": cfg.tjs_max_examined,
-        "hnsw_healthy_builds": os.environ.get("WH_HNSW_HEALTHY_BUILDS"),
-        "hnsw_total_builds": os.environ.get("WH_HNSW_TOTAL_BUILDS"),
+        "hnsw_healthy_builds": os.environ.get("WH_HNSW_HEALTHY_BUILDS")
+        or os.environ.get("WD_HNSW_HEALTHY_BUILDS"),
+        "hnsw_total_builds": os.environ.get("WH_HNSW_TOTAL_BUILDS")
+        or os.environ.get("WD_HNSW_TOTAL_BUILDS"),
     }
 
 
@@ -651,6 +654,9 @@ def render_report(
             L.append(f"> - {b}")
         return "\n".join(L) + "\n", blockers
     t_lat = tp[1]["median_latency_ms"]
+    if not t_lat or t_lat <= 0:
+        L.append("> **COMPARISON INVALID — TriDB latency is zero/undefined.**")
+        return "\n".join(L) + "\n", ["tridb median_latency_ms is zero or missing"]
     b_lat = bp[1]["median_latency_ms"]
     L.append(
         f"**Matched recall** (target {target:.2f}): TriDB {tp[0]} at "

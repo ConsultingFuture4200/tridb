@@ -164,6 +164,24 @@ def test_entity_edges_sorted_deduped_truthy():
     assert entity_edges(FIXTURE[2]["claims"]) == [(31, 2)]
 
 
+def test_entity_edges_drops_numeric_id_without_id():
+    """An entity-id datavalue carrying only 'numeric-id' (no authoritative 'id') cannot be
+    confirmed item-typed, so it must be dropped rather than mis-kept as a raw int edge."""
+    bare = {
+        "mainsnak": {
+            "snaktype": "value",
+            "property": "P31",
+            "datavalue": {
+                "type": "wikibase-entityid",
+                "value": {"entity-type": "item", "numeric-id": 5},  # no 'id'
+            },
+        },
+        "type": "statement",
+        "rank": "normal",
+    }
+    assert entity_edges({"P31": [bare]}) == []
+
+
 def test_entity_types_and_claims():
     assert entity_types(FIXTURE[0]["claims"]) == [5]
     row = entity_claims(FIXTURE[2]["claims"], literal_props=["P569"])

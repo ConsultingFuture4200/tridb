@@ -25,6 +25,7 @@ from bench.wikidata_h2h import (  # noqa: E402
     load_manifest,
     load_types,
     load_typed_adj,
+    oracle_meta_from_env,
     publication_gate,
     render_report,
     sample_queries,
@@ -275,3 +276,46 @@ def test_oracle_tie_break_is_deterministic_id_ascending():
     second = compute_oracle(emb, adj, types, q, k=10, hops=1)
     assert first == second  # reproducible across calls
     assert first[0] == [0, 1, 2]  # tie (0,1) broken id-ascending, then farther 2
+
+
+def test_oracle_meta_reads_wd_namespace(monkeypatch):
+    """The loaders write gate values under WD_* (WD_ENGINE_EDGES etc.); the harness must
+    source them so a user following the loader output isn't left with an orphaned var.
+    The legacy WH_* names (fork harness / spike pins) still work."""
+    for k in ("WH_ENGINE_EDGES", "WD_ENGINE_EDGES", "WH_HNSW_HEALTHY_BUILDS"):
+        monkeypatch.delenv(k, raising=False)
+    monkeypatch.setenv("WD_ENGINE_EDGES", "1000")
+    monkeypatch.setenv("WD_HNSW_HEALTHY_BUILDS", "3")
+    meta = oracle_meta_from_env({"k": 10, "hops": 2, "induced_edges": 1000}, WCfg())
+    assert meta["engine_edges"] == "1000"
+    assert meta["hnsw_healthy_builds"] == "3"
+
+    # WH_ still wins / works on its own
+    monkeypatch.setenv("WH_ENGINE_EDGES", "2000")
+    meta2 = oracle_meta_from_env({"k": 10, "hops": 2, "induced_edges": 1000}, WCfg())
+    assert meta2["engine_edges"] == "2000"
+
+
+def test_render_report_guards_zero_tridb_latency(monkeypatch):
+    """A zero/undefined TriDB median latency must NOT crash the speedup division —
+    render_report returns a blocker instead of raising ZeroDivisionError."""
+    monkeypatch.setenv("WH_BOUNDARY_PARITY", "1")
+    monkeypatch.setenv("WH_MIN_HEALTHY_BUILDS", "3")
+    tridb = {
+        "m16h2t128": {
+            "recall_at_k": 0.95,
+            "median_latency_ms": 0.0,  # degenerate
+            "median_examined": 120,
+        }
+    }
+    baseline = {"neo_pg_milvus": {"recall_at_k": 0.95, "median_latency_ms": 22.0}}
+    meta = {
+        "engine_edges": 1000,
+        "neo4j_edges": 1000,
+        "hnsw_healthy_builds": 3,
+        "hnsw_total_builds": 3,
+        "tjs_max_examined": 4000,
+    }
+    md, blockers = render_report(tridb, baseline, meta, target=0.90)
+    assert blockers and "zero or missing" in blockers[0]
+    assert "COMPARISON INVALID" in md and "speedup" not in md

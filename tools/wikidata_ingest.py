@@ -118,9 +118,11 @@ def _mainsnak_entity_target(statement: dict) -> int | None:
     if dv.get("type") != "wikibase-entityid":
         return None
     val = dv.get("value") or {}
-    # 'id' is authoritative; 'numeric-id' is a convenience mirror. Prefer id so a future
+    # 'id' is authoritative; 'numeric-id' is a convenience mirror. Require id so a
     # non-item entity type (property/lexeme value) is rejected by qid_to_int, not mis-kept.
-    return qid_to_int(val.get("id", "")) if val.get("id") else val.get("numeric-id")
+    # A bare numeric-id without id can't be confirmed item-typed -> reject it.
+    qid = val.get("id")
+    return qid_to_int(qid) if qid else None
 
 
 def entity_edges(claims: dict) -> list[tuple[int, int]]:
