@@ -278,9 +278,9 @@ tjs_open_pg(PG_FUNCTION_ARGS)
 	int32		term_cond = PG_GETARG_INT32(2);
 	int32		m_seeds = PG_GETARG_INT32(3);
 	int32		hops = PG_GETARG_INT32(4);
-	text	   *id_col_t = PG_GETARG_TEXT_PP(5);
-	text	   *filter_t = PG_GETARG_TEXT_PP(6);
-	Datum		query_vec = PG_GETARG_DATUM(7);
+	text	   *id_col_t;
+	text	   *filter_t;
+	Datum		query_vec;
 	bool		have_src = !PG_ARGISNULL(8);
 	int64		src = have_src ? PG_GETARG_INT64(8) : 0;
 	int32		edge_type = PG_ARGISNULL(9) ? 0 : PG_GETARG_INT32(9);
@@ -290,8 +290,20 @@ tjs_open_pg(PG_FUNCTION_ARGS)
 	TupleDesc	tupdesc;
 	MemoryContext per_query_ctx,
 				oldctx;
-	char	   *id_col = text_to_cstring(id_col_t);
-	char	   *filter = text_to_cstring(filter_t);
+	char	   *id_col;
+	char	   *filter;
+
+	if (PG_ARGISNULL(0) || PG_ARGISNULL(1) || PG_ARGISNULL(2) || PG_ARGISNULL(3) ||
+		PG_ARGISNULL(4) || PG_ARGISNULL(5) || PG_ARGISNULL(6) || PG_ARGISNULL(7))
+		ereport(ERROR,
+				(errmsg("tjs_open: args tbl, k, term_cond, m_seeds, hops, id_col, filter, "
+						"query must all be non-NULL (src and edge_type may be NULL)")));
+
+	id_col_t = PG_GETARG_TEXT_PP(5);
+	filter_t = PG_GETARG_TEXT_PP(6);
+	query_vec = PG_GETARG_DATUM(7);
+	id_col = text_to_cstring(id_col_t);
+	filter = text_to_cstring(filter_t);
 
 	if (k <= 0 || k > 10000)
 		ereport(ERROR, (errmsg("tjs_open: k must be in 1..10000 (got %d)", k)));

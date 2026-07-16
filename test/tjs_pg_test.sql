@@ -68,6 +68,32 @@ BEGIN
   RAISE NOTICE 'PASS 3: vector-first requires hnsw.iterative_scan = relaxed_order';
 END $$;
 
+-- (3b) NULL required args raise a clean error, never crash the backend
+DO $$
+BEGIN
+  BEGIN
+    PERFORM t FROM tjs_open('entities', 5, 0, 0, 2, NULL, '',
+      '[0.5,0,0,0,0,0,0,0]'::vector, 2) AS t;
+    RAISE EXCEPTION 'NULL id_col did not raise';
+  EXCEPTION WHEN others THEN
+    IF SQLERRM NOT LIKE '%non-NULL%' THEN RAISE; END IF;
+  END;
+  BEGIN
+    PERFORM t FROM tjs_open('entities', 5, 0, 0, 2, 'id', NULL,
+      '[0.5,0,0,0,0,0,0,0]'::vector, 2) AS t;
+    RAISE EXCEPTION 'NULL filter did not raise';
+  EXCEPTION WHEN others THEN
+    IF SQLERRM NOT LIKE '%non-NULL%' THEN RAISE; END IF;
+  END;
+  BEGIN
+    PERFORM t FROM tjs_open('entities', 5, 0, 0, 2, 'id', '', NULL::vector, 2) AS t;
+    RAISE EXCEPTION 'NULL query did not raise';
+  EXCEPTION WHEN others THEN
+    IF SQLERRM NOT LIKE '%non-NULL%' THEN RAISE; END IF;
+  END;
+  RAISE NOTICE 'PASS 3b: NULL required args raise cleanly (no backend crash)';
+END $$;
+
 SET hnsw.iterative_scan = relaxed_order;
 SET hnsw.max_scan_tuples = 20000;
 
