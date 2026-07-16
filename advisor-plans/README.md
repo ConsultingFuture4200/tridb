@@ -554,6 +554,7 @@ Python layer verifies here (`make test`=pytest, `make lint`=ruff). Stock-PG engi
 | 066 | Pin the pgvector base image + assert pgvector ≥0.8 at CREATE EXTENSION | P1 | S | LOW | stock-PG engine | **DONE** (merged; advisor-reviewed APPROVE: 0.8.0-pgN pin both Dockerfiles, CREATE EXTENSION version-floor guard verified across edge cases, suite ALL PASS on rebuilt pinned image) |
 | 067 | Reconcile outward docs with D2 (README/STATUS/CLAUDE/CONTRIBUTING/ADR-0015/INSTALL) | P1 | S | LOW | docs-only (grep) | **DONE** (merged; advisor-reviewed APPROVE: front-door reframed to stock-PG-first + Gate A/B numbers, INSTALL bridge-parity corrected to landed, ADR-0015 Accepted; factual, no overclaim, greps pass) |
 | 068 | Public wiki_reader hardening (LLM-route DoS bound, error-leak, response headers) | P1 | S–M | LOW–MED | manual (live host) | **DONE** (merged; advisor-reviewed APPROVE: LLM routes semaphore+timeout bounded (3/3 acquire/release balanced, 429 on limit), repr-leak gone, hardening headers + CSP-on-HTML; lint clean. Live-behavior smoke = verify on reader host) |
+| 069 | Close 3 benchmark test/determinism residuals (baseline rerank tie-break, SM-4 recall seam+test, stock-dialect loader tests) | P2 | S | LOW | YES (python) | TODO |
 
 **Recommended order**: 062 → 063 (both touch `tjs_pg.c`; land the segfault guard first, keep diffs
 clean), then 064, 065, 066 (independent, any order), 067 + 068 (docs / service, independent). No
