@@ -116,3 +116,27 @@ Scope ruling for Destination 1 of `docs/tridb_productization_roadmap_v0.1.0.md` 
   cannot pass through the gate because no harness produces one.
 - SM-1..SM-5 (§7) are unchanged; they are simply *evaluated at the filter-first operating point*
   for D1, and SM-4 parity is reported as a recall curve, not a bare percentage (DEV-1169 ruling).
+
+## Addendum A2 (2026-07-16) — §5 canonical query executes on stock PG 16/17 via tjs_open (plan 075)
+
+The v1 front door `graph_store.graph_query(text)` (DEV-1167) now lowers the ONE §5 template on
+BOTH engines:
+
+- **Fork (MSVBASE)**: unchanged — a single `tjs(...)` call (7- or 8-arg, DEV-1169/1290).
+- **Stock PG 16/17**: when the fork `tjs()` is absent and the `tjs_pg` extension (ADR-0019) is
+  installed, the same template lowers to a single `public.tjs_open(regclass, k, term_cond=0,
+  m_seeds=0, hops=1, id_col='id', filter, query vector, src, edge_type)` call. The canonical
+  edge label `related_to` is resolved through the `graph_store.edge_type` catalog (seeded id 1);
+  an absent catalog row RAISES — the lowering never widens to "any edge". `tjs_open`'s ranked
+  entity ids are joined back to `entities` for the projected `chunk` column in the operator's
+  own emit order (`WITH ORDINALITY`), never heap order. With the v1 pinned `src.id`, `tjs_open`
+  always runs its filter-first body; `graph_store.last_join_order()` reports `filter_first`.
+
+Grammar ruling: the accepted template is unchanged except that the `:question_embedding`
+literal now admits BOTH the fork brace dialect (`'{...}'`) and the pgvector bracket dialect
+(`'[...]'`), matched delimiters only; each lowering converts to its engine's dialect. No other
+template expansion — off-template text still fails closed (golden rule 4). Where neither
+operator is installed, `graph_query` RAISES an explicit no-compatible-lowering error.
+
+Proof: `test/canonical_stock_e2e_test.sql` (STOCK_TESTS + CI job `stock-pg`, PG 16 and 17),
+including direct-vs-canonical ordered parity on the same fixture.
