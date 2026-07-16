@@ -298,16 +298,136 @@ def test_sql_rejects_short_embeddings(tmp_path):
 # transcript parsing (the load-manifest inputs)
 # --------------------------------------------------------------------------- #
 def test_parse_transcript():
-    text = (
-        "NOTICE: #WDL VERTEX_UPSERT verified=5\n"
-        "NOTICE: #WDL HNSW_HEALTH rows=5 OK\n"
-        "#WDL FINAL entities=5 edges=5 vertices=5\n"
-        "#WDL ETYPE P31=2\n"
-        "#WDL ETYPE P50=3\n"
-        "#WDL ETYPE P279=4\n"
-    )
-    got = parse_transcript(text)
+    got = parse_transcript(T_COMPLETE)
     assert got["entities"] == got["edges"] == got["vertices"] == 5
     assert got["hnsw_healthy"] is True
+    assert got["graph_verified"] is True
+    assert got["load_complete"] is True
     assert got["edge_type_map"] == {"P31": 2, "P50": 3, "P279": 4}
-    assert parse_transcript("nothing")["hnsw_healthy"] is False
+    empty = parse_transcript("nothing")
+    assert empty["hnsw_healthy"] is False
+    assert empty["graph_verified"] is False
+    assert empty["load_complete"] is False
+    assert "edges" not in empty and "vertices" not in empty
+
+
+# --------------------------------------------------------------------------- #
+# transcript states -> load manifest gates (plan 079: observed-only gate values)
+# --------------------------------------------------------------------------- #
+# The four transcript states the loader must keep distinct: full success; a
+# failure AFTER the graph-count assertion (HNSW build died: observed graph
+# evidence retained, load still failed); a failure BEFORE the assertion (no
+# engine observation at all); and --emit-sql (SQL produced, nothing executed).
+T_COMPLETE = (
+    "NOTICE:  #WDL VERTEX_UPSERT verified=5\n"
+    "NOTICE:  #WDL ASSERT edges=5 vertices=5 OK\n"
+    "NOTICE:  #WDL HNSW_HEALTH rows=5 OK\n"
+    "#WDL FINAL entities=5 edges=5 vertices=5\n"
+    "#WDL ETYPE P31=2\n"
+    "#WDL ETYPE P50=3\n"
+    "#WDL ETYPE P279=4\n"
+    "#WDL LOAD_COMPLETE\n"
+)
+T_FAIL_POST_ASSERT = (
+    "NOTICE:  #WDL VERTEX_UPSERT verified=5\n"
+    "NOTICE:  #WDL ASSERT edges=5 vertices=5 OK\n"
+    "psql:<stdin>: ERROR:  could not resize shared memory segment: No space left\n"
+)
+T_FAIL_PRE_ASSERT = (
+    '#WDL TABLE_CREATE\npsql:<stdin>: ERROR:  relation "entities" already exists\n'
+)
+
+
+def test_parse_transcript_assert_marker_without_final():
+    got = parse_transcript(T_FAIL_POST_ASSERT)
+    assert got["graph_verified"] is True
+    assert got["edges"] == 5 and got["vertices"] == 5
+    assert "entities" not in got  # only FINAL reports the table count
+    assert got["hnsw_healthy"] is False  # ASSERT must never imply HNSW health
+    assert got["load_complete"] is False
+
+
+def test_parse_transcript_duplicate_assert_last_wins():
+    text = (
+        "NOTICE:  #WDL ASSERT edges=3 vertices=3 OK\n"
+        "NOTICE:  #WDL ASSERT edges=5 vertices=5 OK\n"
+    )
+    got = parse_transcript(text)
+    assert got["edges"] == 5 and got["vertices"] == 5
+
+
+def test_parse_transcript_malformed_assert_is_ignored():
+    got = parse_transcript("NOTICE:  #WDL ASSERT edges=abc vertices=5 OK\n")
+    assert got["graph_verified"] is False
+    assert "edges" not in got and "vertices" not in got
+
+
+def _run_main(tmp_path, monkeypatch, *, rc, transcript, emit=False):
+    """Drive main() over the synthetic slice with docker stubbed out."""
+    import tools.wikidata_engine_load as wel
+
+    _write_slice(tmp_path)
+    (tmp_path / "emb").mkdir()
+    np.save(tmp_path / "emb" / "dense_id_aligned.npy", _emb())
+    out = tmp_path / "load_manifest.json"
+    argv = ["--slice", str(tmp_path), "--dim", str(DIM), "--out", str(out)]
+    if emit:
+        argv += ["--emit-sql", str(tmp_path / "load.sql")]
+    else:
+        monkeypatch.setattr(wel, "container_running", lambda c: True)
+
+        def fake_run_load(container, db, sql_iter):
+            for _ in sql_iter:  # drain: populates stats exactly as a real run
+                pass
+            return rc, transcript
+
+        monkeypatch.setattr(wel, "run_load", fake_run_load)
+    got_rc = wel.main(argv)
+    return got_rc, json.loads(out.read_text())
+
+
+def test_manifest_complete_load(tmp_path, monkeypatch):
+    rc, man = _run_main(tmp_path, monkeypatch, rc=0, transcript=T_COMPLETE)
+    assert rc == 0
+    assert man["load_status"] == "complete"
+    eng = man["engine"]
+    assert eng["executed"] is True
+    assert eng["graph_verified"] is True
+    assert eng["hnsw_healthy"] is True
+    assert eng["load_complete"] is True
+    assert man["gate_env"] == {"WD_ENGINE_EDGES": 5}
+
+
+def test_manifest_post_assert_failure_keeps_observed_graph(tmp_path, monkeypatch):
+    rc, man = _run_main(tmp_path, monkeypatch, rc=3, transcript=T_FAIL_POST_ASSERT)
+    assert rc == 3  # nonzero loader exit preserved
+    assert man["load_status"] == "failed"
+    eng = man["engine"]
+    assert eng["graph_verified"] is True
+    assert eng["edges"] == 5 and eng["vertices"] == 5  # observed evidence retained
+    assert eng["hnsw_healthy"] is False
+    assert eng["load_complete"] is False
+    # engine-OBSERVED count may gate: the graph really holds these edges
+    assert man["gate_env"] == {"WD_ENGINE_EDGES": 5}
+
+
+def test_manifest_pre_assert_failure_has_no_engine_gate(tmp_path, monkeypatch):
+    rc, man = _run_main(tmp_path, monkeypatch, rc=3, transcript=T_FAIL_PRE_ASSERT)
+    assert rc == 3
+    assert man["load_status"] == "failed"
+    eng = man["engine"]
+    assert eng["graph_verified"] is False
+    assert "edges" not in eng and "vertices" not in eng
+    # THE plan-079 bug: expected slice counts must NOT stand in for engine counts
+    assert "WD_ENGINE_EDGES" not in man["gate_env"]
+    # host slice expectations stay under counts (expected, not observed)
+    assert man["counts"]["edges_kept"] == 5
+
+
+def test_manifest_emit_mode_has_no_engine_gate(tmp_path, monkeypatch):
+    rc, man = _run_main(tmp_path, monkeypatch, rc=0, transcript="", emit=True)
+    assert rc == 0
+    assert man["load_status"] == "emitted"
+    assert man["engine"] == {"executed": False}
+    assert "WD_ENGINE_EDGES" not in man["gate_env"]
+    assert man["counts"]["edges_kept"] == 5

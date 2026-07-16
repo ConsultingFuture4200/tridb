@@ -24,9 +24,11 @@ container (docker exec -i <container> psql -f -, the bench/wiki_h2h.py conventio
       via pgvector (USING hnsw (embedding vector_l2_ops) WITH (m=16, ef_construction=64),
       the ADR-0015 E3 probe parameters) — plus a top-k health probe either way;
   (e) prints final counts and writes a load-manifest JSON (--out) with counts +
-      durations, including the WD_ENGINE_EDGES gate value (read under that same
-      WD_ENGINE_EDGES name by bench/wikidata_h2h.oracle_meta_from_env, which also
-      accepts the legacy WH_ENGINE_EDGES for the fork harness).
+      durations + load_status (emitted | complete | failed), including the
+      WD_ENGINE_EDGES gate value (read under that same WD_ENGINE_EDGES name by
+      bench/wikidata_h2h.oracle_meta_from_env, which also accepts the legacy
+      WH_ENGINE_EDGES for the fork harness). Gate values come ONLY from
+      engine-observed transcript markers — never from the expected host counts.
 
 EDGE-COUNT PARITY DEFINITION (shared with the baseline loader): an edge counts iff BOTH
 endpoints are in-slice (present in the dense map); duplicates in the shards are preserved.
@@ -436,18 +438,40 @@ def iter_load_sql(
 # Transcript parsing (pure)
 # ======================================================================================
 _FINAL_RE = re.compile(r"#WDL FINAL entities=(\d+) edges=(\d+) vertices=(\d+)")
+_ASSERT_RE = re.compile(r"#WDL ASSERT edges=(\d+) vertices=(\d+) OK")
 _ETYPE_RE = re.compile(r"#WDL ETYPE P(\d+)=(\d+)")
 _HEALTH_RE = re.compile(r"#WDL HNSW_HEALTH rows=(\d+) OK")
+_COMPLETE_RE = re.compile(r"#WDL LOAD_COMPLETE")
 
 
 def parse_transcript(text: str) -> dict:
-    """Harvest the engine-reported counts + edge-type map from the psql transcript."""
-    out: dict = {"hnsw_healthy": bool(_HEALTH_RE.search(text)), "edge_type_map": {}}
-    m = _FINAL_RE.search(text)
-    if m:
-        out["entities"] = int(m.group(1))
-        out["edges"] = int(m.group(2))
-        out["vertices"] = int(m.group(3))
+    """Harvest engine-OBSERVED state from the psql transcript (plan 079).
+
+    The load phases are kept distinct so a failure after the graph asserts still
+    retains its observed graph evidence without implying HNSW health or completion:
+      - graph_verified + edges/vertices  <- the post-edge-insert ASSERT marker,
+        superseded by FINAL when the epilogue ran (FINAL also carries entities)
+      - hnsw_healthy                     <- the HNSW health-probe marker only
+      - load_complete                    <- the trailing LOAD_COMPLETE marker only
+    Counts appear ONLY when an engine marker was parsed — never from expected input.
+    """
+    out: dict = {
+        "graph_verified": False,
+        "hnsw_healthy": bool(_HEALTH_RE.search(text)),
+        "load_complete": bool(_COMPLETE_RE.search(text)),
+        "edge_type_map": {},
+    }
+    asserts = _ASSERT_RE.findall(text)
+    if asserts:  # last marker wins (a re-run transcript can repeat phases)
+        out["graph_verified"] = True
+        out["edges"] = int(asserts[-1][0])
+        out["vertices"] = int(asserts[-1][1])
+    finals = _FINAL_RE.findall(text)
+    if finals:
+        out["graph_verified"] = True
+        out["entities"] = int(finals[-1][0])
+        out["edges"] = int(finals[-1][1])
+        out["vertices"] = int(finals[-1][2])
     for pid, tid in _ETYPE_RE.findall(text):
         out["edge_type_map"][f"P{pid}"] = int(tid)
     return out
@@ -581,6 +605,7 @@ def main(argv: list[str] | None = None) -> int:
             for chunk in sql_iter:
                 f.write(chunk)
         engine: dict = {"executed": False}
+        load_status = "emitted"
         rc = 0
         print(
             f"[wikidata_engine_load] EMITTED (not executed): {args.emit_sql} — "
@@ -597,6 +622,9 @@ def main(argv: list[str] | None = None) -> int:
             )
         rc, transcript = run_load(args.container, args.db, sql_iter)
         engine = {"executed": True, **parse_transcript(transcript)}
+        # "complete" needs BOTH a zero exit and the engine's own completion marker;
+        # anything less is a failed load (possibly with partial observed evidence).
+        load_status = "complete" if rc == 0 and engine["load_complete"] else "failed"
         if rc != 0:
             print(f"[wikidata_engine_load] LOAD FAILED (psql rc={rc})", file=sys.stderr)
     secs = time.time() - t0
@@ -612,11 +640,18 @@ def main(argv: list[str] | None = None) -> int:
         "table": args.table,
         "dim": args.dim,
         "force": args.force,
-        "counts": stats,
+        "load_status": load_status,  # emitted | complete | failed (plan 079)
+        "counts": stats,  # host slice EXPECTATIONS — never engine observations
         "engine": engine,
         "durations": {"total_secs": round(secs, 2)},
-        # read under this WD_ENGINE_EDGES name by bench/wikidata_h2h's publication gate
-        "gate_env": {"WD_ENGINE_EDGES": engine.get("edges", stats.get("edges_kept"))},
+        # read under this WD_ENGINE_EDGES name by bench/wikidata_h2h's publication
+        # gate — populated ONLY from an engine-observed marker (ASSERT/FINAL). An
+        # emitted-only run or a pre-assert failure publishes no engine count.
+        "gate_env": (
+            {"WD_ENGINE_EDGES": engine["edges"]}
+            if engine.get("edges") is not None
+            else {}
+        ),
     }
     out.write_text(json.dumps(load_manifest, indent=2))
     print(
