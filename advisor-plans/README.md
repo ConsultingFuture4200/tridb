@@ -547,7 +547,7 @@ Python layer verifies here (`make test`=pytest, `make lint`=ruff). Stock-PG engi
 
 | Plan | Title | Priority | Effort | Risk | Verify | Status |
 |------|-------|----------|--------|------|--------|--------|
-| 062 | `tjs_open` NULL-arg guards (stop backend segfault; regression vs fork STRICT) | P1 | S | LOW | stock-PG engine | **DONE-UNMERGED** (`242b728` on worktree branch `worktree-agent-a0c70f89884c07409` = feat/d2-unfork+1; advisor-reviewed APPROVE: PASS 3b + ALL PASS on PG16+PG17, exit 0, clean scope/diff; cherry-pick to merge) |
+| 062 | `tjs_open` NULL-arg guards (stop backend segfault; regression vs fork STRICT) | P1 | S | LOW | stock-PG engine | **DONE** (merged `59539a4`; advisor-reviewed APPROVE: PASS 3b + ALL PASS PG16+PG17, exit 0, clean scope) |
 | 063 | `tjs_open` filter-first ranks by the index's actual metric (not hardcoded L2 `<->`) | P1 | S | LOW | stock-PG engine | TODO |
 | 064 | Wikidata baseline recall reproducibility (deterministic Neo4j subset + oracle/engine tie-break) | P1 | S | LOW | YES (python) | TODO |
 | 065 | Orphaned gate-env var (`WD_`/`WH_` drift) + report zero-guard + numeric-id item check | P1 | S | LOW | YES (python) | TODO |
