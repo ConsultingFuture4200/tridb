@@ -98,4 +98,7 @@ harness reads `WH_` first, then falls back to `WD_`:
   — not the bridge mechanism itself. The **filter-first** Gate A/B headline also works with no
   operator at all: a single SQL statement over `graph_store.gph_traverse_bfs(...)` (see
   `bench/wikidata_h2h.py:emit_tridb_sql`).
+- **Parity gate:** `make tjs-parity-test` (`scripts/tjs_parity_test.sh`) diffs the fork's fused
+  filter-first statement against the stock `tjs_open` filter-first mode on a shared corpus —
+  needs BOTH engine images, so it is a manual / CI-dispatch gate, not a per-PR check.
 - **PGXN:** `src/graph_store/META.json` is prepared; publication happens at release time.
