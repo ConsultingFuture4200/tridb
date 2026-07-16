@@ -14,8 +14,12 @@ docker build -f scripts/pg17/Dockerfile.release -t tridb/postgres-trimodal:pg17 
 docker run -d --name trimodal -e POSTGRES_PASSWORD=secret tridb/postgres-trimodal:pg17
 docker exec -it trimodal psql -U postgres \
   -c 'CREATE EXTENSION vector;' \
-  -c 'CREATE EXTENSION graph_store_am;'
+  -c 'CREATE EXTENSION graph_store_am;' \
+  -c 'CREATE EXTENSION tjs_pg;'
 ```
+
+The order matters: `tjs_pg` (the fused tri-modal operator) requires both `vector` and
+`graph_store_am`.
 
 `--build-arg PG_MAJOR=16` selects PostgreSQL 16. If you plan pgvector **parallel** HNSW index
 builds at scale, start the container with `--shm-size` ≥ your `maintenance_work_mem` (docker's
@@ -27,17 +31,36 @@ Prerequisites: PostgreSQL 16/17 server headers (`postgresql-server-dev-17` on De
 a C toolchain, and pgvector if you want the vector leg.
 
 ```bash
-cd src/graph_store
-make PG_CONFIG=$(which pg_config)
-sudo make PG_CONFIG=$(which pg_config) install
-psql -c 'CREATE EXTENSION graph_store_am;'
+for ext in src/graph_store src/tjs_pg; do
+  ( cd "$ext" && make PG_CONFIG=$(which pg_config) && sudo make PG_CONFIG=$(which pg_config) install )
+done
+psql -c 'CREATE EXTENSION vector;' \
+     -c 'CREATE EXTENSION graph_store_am;' \
+     -c 'CREATE EXTENSION tjs_pg;'
 ```
 
 ## Verify
 
 ```bash
 scripts/pg17_graph_test.sh                       # builds + runs the core AM suite in docker
+scripts/pg17_release_smoke.sh                    # starts the release image, runs the tri-modal smoke
 psql -c "SELECT graph_store.gph_upsert_vertex(1);"
+```
+
+Query through the canonical front door, not the private operator: `graph_store.graph_query($$...$$)`
+lowers the one canonical query (SQL/PGQ `GRAPH_TABLE(...)` + pgvector `<->`) to the fused
+`tjs_open` operator on stock PG (plan 075/ADR-0019). Minimal end-to-end example (fixture +
+query): `test/release_stock_smoke.sql`; full suite: `test/canonical_stock_e2e_test.sql`.
+
+```sql
+SELECT * FROM graph_store.graph_query($$
+    SELECT chunk
+    FROM GRAPH_TABLE ( MATCH (src:entity)-[:related_to]->(dst:entity)
+      COLUMNS ( src.embedding AS src_embedding, dst.chunk AS chunk, dst.timestamp AS timestamp ) )
+    WHERE src.id = 1 AND timestamp IN (100)
+    ORDER BY src_embedding <-> '[10,0,0,0]'
+    LIMIT 1
+$$);
 ```
 
 CI runs the full 11-suite matrix on stock PG 16 and 17 (x86_64) on every push
