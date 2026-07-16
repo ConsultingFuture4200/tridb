@@ -20,7 +20,10 @@ FORMAT — `<out>/compact.tsv.gz`, one line per Q-id entity IN DUMP ORDER:
 
 The rank/usability logic is IMPORTED from wikidata_ingest, never reimplemented, so the
 two paths cannot drift. `usable` is lang-dependent: the sidecar records `lang` in
-`compact.meta.json` and the ingest CLI refuses a mismatched sidecar.
+`compact.meta.json` and ingest refuses a mismatched sidecar. The pair is published
+ATOMICALLY (same-directory temp files, fsync, os.replace data-then-meta) and the
+metadata carries the compact file's byte count + SHA-256; ingest verifies both before
+consuming a single row, so a crashed or tampered publication can never be consumed.
 
 The gzip output is MULTI-MEMBER (each worker batch is compressed independently with
 mtime=0); that is a valid gzip stream for gzip.open and pigz alike, keeps the writer
@@ -42,10 +45,12 @@ from __future__ import annotations
 import argparse
 import bz2
 import gzip
+import hashlib
 import json
 import os
 import shutil
 import subprocess
+import tempfile
 import time
 from datetime import datetime, timezone
 from functools import partial
@@ -60,7 +65,7 @@ from tools.wikidata_ingest import (
     qid_to_int,
 )
 
-COMPACT_VERSION = "0.1.0"
+COMPACT_VERSION = "0.2.0"  # 0.2.0: atomic publication + compact_size/compact_sha256
 COMPACT_NAME = "compact.tsv.gz"
 META_NAME = "compact.meta.json"
 DEFAULT_BATCH_BYTES = 8 * 1024 * 1024
@@ -183,6 +188,22 @@ def _batches(fh: BinaryIO, hint: int) -> Iterator[list[bytes]]:
         yield lines
 
 
+def _replace(tmp: Path, final: Path) -> None:
+    """Publication seam: atomic same-directory rename (monkeypatchable in tests)."""
+    os.replace(tmp, final)
+
+
+def _fsync_dir(path: Path) -> None:
+    """fsync a directory so the just-published renames survive a crash (best effort)."""
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    except OSError:  # pragma: no cover - some filesystems refuse directory fsync
+        pass
+    finally:
+        os.close(fd)
+
+
 def build_compact(
     dump: Path,
     out: Path,
@@ -193,7 +214,16 @@ def build_compact(
     batch_bytes: int = DEFAULT_BATCH_BYTES,
     progress_every: int = PROGRESS_EVERY,
 ) -> dict:
-    """Run the parallel scan; write compact.tsv.gz + compact.meta.json. Returns meta."""
+    """Run the parallel scan; write compact.tsv.gz + compact.meta.json. Returns meta.
+
+    ATOMIC PUBLICATION (plan 078). Data and metadata are streamed to unique temp
+    files in `out` (same filesystem), fsynced, then published data-first via
+    os.replace. Metadata records the compact file's exact compressed byte count and
+    SHA-256 (updated incrementally as members are copied), so a crash at ANY point —
+    including between the two replaces — leaves either the wholly-old pair, the
+    wholly-new pair, or a mismatched pair that wikidata_ingest rejects fail-closed.
+    A pre-existing final pair is never opened for in-place writing.
+    """
     out.mkdir(parents=True, exist_ok=True)
     cpath = out / COMPACT_NAME
     workers = workers or os.cpu_count() or 1
@@ -201,56 +231,87 @@ def build_compact(
     entities = usable = edges = 0
     next_report = progress_every
     stopped_early = False
-    fh, progress, cleanup = _open_dump_stream(dump)
+    sha = hashlib.sha256()
+    nbytes = 0
+    tmp_data: Path | None = None
+    tmp_meta: Path | None = None
     try:
-        with open(cpath, "wb") as cf, Pool(workers) as pool:
-            work = pool.imap(partial(compact_batch, lang), _batches(fh, batch_bytes))
-            for blob, n, u, e in work:
-                if limit is not None and entities + n >= limit:
-                    blob, n, u, e = _trim_blob(blob, limit - entities)
-                    stopped_early = True
-                if blob:
-                    cf.write(blob)
-                entities += n
-                usable += u
-                edges += e
-                if stopped_early:
-                    break
-                while entities >= next_report:
-                    done, total = progress()
-                    elapsed = time.monotonic() - t0
-                    rate = entities / elapsed if elapsed else 0.0
-                    eta = elapsed * (total - done) / done if done else float("inf")
-                    print(
-                        f"[wikidata_compact] {entities:,} entities  "
-                        f"{rate:,.0f}/s  {100.0 * done / total:.1f}% of dump  "
-                        f"ETA {eta / 60:.0f} min",
-                        flush=True,
-                    )
-                    next_report += progress_every
+        fh, progress, cleanup = _open_dump_stream(dump)
+        try:
+            dfd, dname = tempfile.mkstemp(
+                dir=out, prefix=COMPACT_NAME + ".", suffix=".tmp"
+            )
+            tmp_data = Path(dname)
+            with os.fdopen(dfd, "wb") as cf, Pool(workers) as pool:
+                work = pool.imap(
+                    partial(compact_batch, lang), _batches(fh, batch_bytes)
+                )
+                for blob, n, u, e in work:
+                    if limit is not None and entities + n >= limit:
+                        blob, n, u, e = _trim_blob(blob, limit - entities)
+                        stopped_early = True
+                    if blob:
+                        cf.write(blob)
+                        sha.update(blob)
+                        nbytes += len(blob)
+                    entities += n
+                    usable += u
+                    edges += e
+                    if stopped_early:
+                        break
+                    while entities >= next_report:
+                        done, total = progress()
+                        elapsed = time.monotonic() - t0
+                        rate = entities / elapsed if elapsed else 0.0
+                        eta = elapsed * (total - done) / done if done else float("inf")
+                        print(
+                            f"[wikidata_compact] {entities:,} entities  "
+                            f"{rate:,.0f}/s  {100.0 * done / total:.1f}% of dump  "
+                            f"ETA {eta / 60:.0f} min",
+                            flush=True,
+                        )
+                        next_report += progress_every
+                cf.flush()
+                os.fsync(cf.fileno())
+        finally:
+            cleanup(not stopped_early)
+        st = dump.stat()
+        meta = {
+            "tool": "tools/wikidata_compact.py",
+            "version": COMPACT_VERSION,
+            "created": datetime.now(timezone.utc).isoformat(),
+            "dump": dump.name,
+            "dump_path": str(dump),
+            "dump_size": st.st_size,
+            "dump_mtime": st.st_mtime,
+            "lang": lang,
+            "limit": limit,
+            "workers": workers,
+            "entities": entities,
+            "usable": usable,
+            "edges": edges,
+            "compact_size": nbytes,
+            "compact_sha256": sha.hexdigest(),
+            "elapsed_s": round(time.monotonic() - t0, 3),
+        }
+        mfd, mname = tempfile.mkstemp(dir=out, prefix=META_NAME + ".", suffix=".tmp")
+        tmp_meta = Path(mname)
+        with os.fdopen(mfd, "w", encoding="utf-8") as mf:
+            json.dump(meta, mf, ensure_ascii=False, indent=2)
+            mf.flush()
+            os.fsync(mf.fileno())
+        # data first, then the metadata that names it; old-meta + new-data is
+        # detectable (size/sha mismatch), new-meta + old-data can never occur
+        _replace(tmp_data, cpath)
+        _replace(tmp_meta, out / META_NAME)
+        _fsync_dir(out)
+        return meta
     finally:
-        cleanup(not stopped_early)
-    st = dump.stat()
-    meta = {
-        "tool": "tools/wikidata_compact.py",
-        "version": COMPACT_VERSION,
-        "created": datetime.now(timezone.utc).isoformat(),
-        "dump": dump.name,
-        "dump_path": str(dump),
-        "dump_size": st.st_size,
-        "dump_mtime": st.st_mtime,
-        "lang": lang,
-        "limit": limit,
-        "workers": workers,
-        "entities": entities,
-        "usable": usable,
-        "edges": edges,
-        "elapsed_s": round(time.monotonic() - t0, 3),
-    }
-    (out / META_NAME).write_text(
-        json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
-    return meta
+        # clean only THIS run's temp paths; a successful replace already consumed
+        # them (missing_ok) and pre-existing finals are never touched on failure
+        for tmp in (tmp_data, tmp_meta):
+            if tmp is not None:
+                tmp.unlink(missing_ok=True)
 
 
 def main(argv: list[str] | None = None) -> int:

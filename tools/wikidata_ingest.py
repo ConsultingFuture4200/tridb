@@ -55,6 +55,7 @@ from __future__ import annotations
 import argparse
 import bz2
 import gzip
+import hashlib
 import json
 import re
 from collections import deque
@@ -478,6 +479,77 @@ def present_ids(dump: Path, kept: set[int], lang: str) -> set[int]:
 _HEAD_QID = re.compile(rb'^\s*\{"type":\s*"[a-z]+",\s*"id":\s*"Q([1-9][0-9]*)"')
 
 
+class CompactSidecarError(ValueError):
+    """A --compact sidecar failed identity verification (plan 078). Fail-closed."""
+
+
+def verify_compact_sidecar(compact: Path, dump: Path, lang: str) -> dict:
+    """Verify the sidecar's identity metadata BEFORE any row is consumed; return it.
+
+    Fail-closed: requires `compact.meta.json` next to the sidecar and exact agreement
+    on language, full-dump provenance (no --limit prefix), source dump size, compact
+    byte size, and compact SHA-256 over the exact published bytes. Any miss raises
+    CompactSidecarError naming the failed check — a truncated-but-valid gzip prefix,
+    an appended member, a byte flip, or a crash between the data/meta publications
+    all land here instead of silently contaminating the corpus.
+    """
+    meta_path = compact.with_name("compact.meta.json")
+    rerun = "; re-run tools/wikidata_compact.py"
+    if not meta_path.exists():
+        raise CompactSidecarError(
+            f"--compact metadata missing: {meta_path} not found{rerun}"
+        )
+    try:
+        cmeta = json.loads(meta_path.read_text(encoding="utf-8"))
+    except ValueError as exc:
+        raise CompactSidecarError(
+            f"--compact metadata malformed: {meta_path} is not valid JSON{rerun}"
+        ) from exc
+    if not isinstance(cmeta, dict):
+        raise CompactSidecarError(
+            f"--compact metadata malformed: {meta_path} is not a JSON object{rerun}"
+        )
+    for key in ("lang", "limit", "dump_size", "compact_size", "compact_sha256"):
+        if key not in cmeta:
+            raise CompactSidecarError(
+                f"--compact metadata malformed: {meta_path} lacks {key!r} "
+                f"(sidecar predates the identity format?){rerun}"
+            )
+    if cmeta["lang"] != lang:
+        raise CompactSidecarError(
+            f"--compact was built with --lang {cmeta['lang']!r}, "
+            f"this run uses {lang!r}{rerun}"
+        )
+    if cmeta["limit"] is not None:
+        raise CompactSidecarError(
+            "--compact was built with --limit (a smoke prefix, not the full dump); "
+            "rebuild it without --limit"
+        )
+    if dump.exists() and cmeta["dump_size"] != dump.stat().st_size:
+        raise CompactSidecarError(
+            f"--compact was built from a dump of {cmeta['dump_size']} bytes; "
+            f"{dump} is {dump.stat().st_size} bytes{rerun}"
+        )
+    size = compact.stat().st_size
+    if cmeta["compact_size"] != size:
+        raise CompactSidecarError(
+            f"--compact size mismatch: metadata records {cmeta['compact_size']} "
+            f"bytes, {compact} is {size} bytes (truncated or partially "
+            f"published?){rerun}"
+        )
+    sha = hashlib.sha256()
+    with open(compact, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            sha.update(chunk)
+    if cmeta["compact_sha256"] != sha.hexdigest():
+        raise CompactSidecarError(
+            f"--compact sha256 mismatch: metadata records "
+            f"{cmeta['compact_sha256']}, {compact} hashes to "
+            f"{sha.hexdigest()}{rerun}"
+        )
+    return cmeta
+
+
 def _compact_lines(compact: Path) -> Iterator[bytes]:
     """Stream raw sidecar lines (bytes). Multi-member gzip reads transparently."""
     opener = gzip.open if compact.suffix == ".gz" else open
@@ -710,8 +782,12 @@ def ingest(
 
     `compact` (optional) is a tools/wikidata_compact.py sidecar for `dump`; when given,
     the slice/present scans consume it instead of re-parsing the dump (fast path,
-    byte-identical output — see the compact section above).
+    byte-identical output — see the compact section above). The sidecar's identity
+    metadata is verified fail-closed before any row is consumed
+    (verify_compact_sidecar; raises CompactSidecarError).
     """
+    if compact is not None:
+        verify_compact_sidecar(compact, dump, lang)
     out.mkdir(parents=True, exist_ok=True)
     literal_props = [p for p in literal_props if p != TYPE_PROP]
     if spec.seeds:
@@ -822,41 +898,20 @@ def main(argv: list[str] | None = None) -> int:
     if not seeds and not args.limit:
         ap.error("provide --limit (prefix slice) or --seeds (bfs slice)")
     literal_props = [p.strip() for p in args.claim_props.split(",") if p.strip()]
-    if args.compact is not None:
-        # refuse a sidecar that provably does not match this run (wrong language flips
-        # the usable column; a --limit sidecar is a prefix, not the dump; a different
-        # dump size means a different dump). Missing meta: trust the caller.
-        meta_path = args.compact.with_name("compact.meta.json")
-        if meta_path.exists():
-            cmeta = json.loads(meta_path.read_text(encoding="utf-8"))
-            if cmeta.get("lang") != args.lang:
-                ap.error(
-                    f"--compact was built with --lang {cmeta.get('lang')!r}, "
-                    f"this run uses {args.lang!r}"
-                )
-            if cmeta.get("limit") is not None:
-                ap.error(
-                    "--compact was built with --limit (a smoke prefix, not the "
-                    "full dump); rebuild it without --limit"
-                )
-            if args.dump.exists() and cmeta.get("dump_size") not in (
-                None,
-                args.dump.stat().st_size,
-            ):
-                ap.error(
-                    f"--compact was built from a dump of {cmeta.get('dump_size')} "
-                    f"bytes; {args.dump} is {args.dump.stat().st_size} bytes"
-                )
-
-    manifest = ingest(
-        args.dump,
-        args.out,
-        SliceSpec(limit=args.limit, seeds=seeds, target=args.target),
-        lang=args.lang,
-        literal_props=literal_props,
-        shard_size=args.shard_size,
-        compact=args.compact,
-    )
+    try:
+        # ingest() verifies the sidecar's identity metadata fail-closed
+        # (verify_compact_sidecar) before consuming a single row
+        manifest = ingest(
+            args.dump,
+            args.out,
+            SliceSpec(limit=args.limit, seeds=seeds, target=args.target),
+            lang=args.lang,
+            literal_props=literal_props,
+            shard_size=args.shard_size,
+            compact=args.compact,
+        )
+    except CompactSidecarError as exc:
+        ap.error(str(exc))
     c = manifest["counts"]
     print(
         f"[wikidata_ingest] {c['entities']} entities, {c['edges']} edges, "
