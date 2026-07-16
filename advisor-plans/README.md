@@ -530,3 +530,102 @@ hunks are entangled.
 - `EndFaginsState` UAF/mismatched-free — **already compensated** by TriDB's snapshot/UAF patch (the
   upstream defect is real but TriDB fixed it; other forks inherit it).
 - No committed secrets, no prompt-injection/instruction-bearing content in any audited upstream file.
+
+---
+
+## 2026-07-15 batch — post-D1/D2 deep audit (planned against `a41b0c7`)
+
+Deep `/improve` audit (6 parallel category auditors + advisor re-vet against source) after the D1
+demonstrated-architecture pass (Gate A, tag `v0.1.0`) and the D2 un-fork (Gate B PASS on stock
+PG17+pgvector, `src/tjs_pg` operator, ADR-0019). Findings target this session's **new** surfaces:
+the stock-PG C operator, the Wikidata benchmark pipeline, the fork↔stock duality, and the outward
+docs. Every planned finding was re-opened against live code at `a41b0c7` and verified by the advisor.
+
+Python layer verifies here (`make test`=pytest, `make lint`=ruff). Stock-PG engine builds off-GX10:
+`docker build -t tridb/pg17-unfork:dev scripts/pg17/` then
+`bash scripts/pg17_graph_test.sh <image> test/<suite>.sql` (PG16 via `--build-arg PG_MAJOR=16`).
+
+| Plan | Title | Priority | Effort | Risk | Verify | Status |
+|------|-------|----------|--------|------|--------|--------|
+| 062 | `tjs_open` NULL-arg guards (stop backend segfault; regression vs fork STRICT) | P1 | S | LOW | stock-PG engine | TODO |
+| 063 | `tjs_open` filter-first ranks by the index's actual metric (not hardcoded L2 `<->`) | P1 | S | LOW | stock-PG engine | TODO |
+| 064 | Wikidata baseline recall reproducibility (deterministic Neo4j subset + oracle/engine tie-break) | P1 | S | LOW | YES (python) | TODO |
+| 065 | Orphaned gate-env var (`WD_`/`WH_` drift) + report zero-guard + numeric-id item check | P1 | S | LOW | YES (python) | TODO |
+| 066 | Pin the pgvector base image + assert pgvector ≥0.8 at CREATE EXTENSION | P1 | S | LOW | stock-PG engine | TODO |
+| 067 | Reconcile outward docs with D2 (README/STATUS/CLAUDE/CONTRIBUTING/ADR-0015/INSTALL) | P1 | S | LOW | docs-only (grep) | TODO |
+| 068 | Public wiki_reader hardening (LLM-route DoS bound, error-leak, response headers) | P1 | S–M | LOW–MED | manual (live host) | TODO |
+
+**Recommended order**: 062 → 063 (both touch `tjs_pg.c`; land the segfault guard first, keep diffs
+clean), then 064, 065, 066 (independent, any order), 067 + 068 (docs / service, independent). No
+plan depends on another; 062 before 063 is a diff-hygiene preference, not a hard dependency.
+
+### Considered — verified real, not yet planned (available on request; lower leverage or larger)
+
+- **[C] `budget_capped` over-reports** (`tjs_pg.c:534-543` flags any stream end without term_cond,
+  incl. natural index exhaustion / `term_cond==0`) — measurement-integrity, S. **[C] filter-first
+  `tjs_examined` reports post-LIMIT survivor count, not work** (`tjs_pg.c:365`) — skews cross-path
+  work comparison, S. Bundle into a "tjs_pg counter honesty" plan.
+- **[PERF] per-candidate SPI in the seedless path** — the dominant, self-admitted MVP cost
+  (`tjs_pg.c:479-486` re-fetches a row already in `slot`; `:577-607` one SPI per bridge; `:242-267`
+  one SPI per seed). M/MED-risk (touches operator core) — a real optimization plan, worth doing when
+  seedless latency matters (filter-first, the headline, is unaffected).
+- **[PERF] engine loader does two full disk passes over edge shards** (`wikidata_engine_load.py:404,427`),
+  M. **[PERF] oracle computes each query's candidate set twice** (`wikidata_h2h.py:722-726`), S.
+  **[PERF] `wikidata_ingest` pure path re-scans the dump per hop with no guard/warning** (S).
+- **[TECH-DEBT] two divergent `tjs_open` implementations (fork C++ vs stock C) with parity in prose
+  only** — add a differential golden-output test (M, test-only). **[TECH-DEBT] slice-loading logic
+  duplicated between `wikidata_engine_load` and `wikidata_h2h`** (extract a shared `wikidata_slice`
+  module, M). **[TECH-DEBT] string-typed `dialect` threaded through 6+ sites, silent fork default**
+  (introduce a dialect descriptor, M). **[TECH-DEBT] two plan dirs numbered independently**
+  (`plans/` 001-015 vs `advisor-plans/` 001-068) — namespace note, S.
+- **[TESTS] stock-dialect engine-loader branch untested** (`test_wikidata_engine_load.py` only
+  exercises `dialect="fork"`), S. **[TESTS] `bench/wikidata_sm4_seedless.py` has zero host tests**
+  (extract the recall reducer into a testable seam), S. **[DX] stock-PG build/test path absent from
+  CLAUDE.md + no Makefile target** (add `make stock-graph-test`), S. **[DX] new harness env vars
+  undocumented** (`WD_ENGINE_DIALECT`/`WD_SLICE`/`WD_EMB`/`WH_*`) — env table in INSTALL doc, S.
+  (DX-01/02 partially covered by plan 067; the Makefile target is the residual.)
+- **[SECURITY] wiki_reader overlay-mutation trust** — `accept_fact` (`wiki_reader.py:1985-2015`)
+  persists client fields without re-running the grounding check, gated only by a page-embedded token
+  (content-spoofing on the public wiki), M/MED. Separate from plan 068 (needs an operator secret not
+  rendered into HTML + server-side re-validation). **[SECURITY] baseline compose binds datastores on
+  `0.0.0.0` with weak default creds** (`baseline/docker-compose.yml`) — prefix `127.0.0.1:`, S.
+  **[SECURITY] `tjs_open` interpolates raw `filter` text into SPI SQL** (`tjs_pg.c:357,432,571`) —
+  mitigated by `REVOKE EXECUTE`; document the trusted-caller contract, defense-in-depth only.
+
+### Considered and rejected (do not re-audit)
+
+- **tjs_pg resource/lock leaks on error paths** — verified NOT a leak: transaction/subtransaction
+  abort releases the index scan, locks, buffer pins, and SPI connection; exactly one `SPI_finish`
+  per path; no double-finish. (The real backend risk is the NULL-arg segfault — plan 062 — which
+  *bypasses* this cleanup.)
+- **tjs_pg top-k heap / snapshot / SPI-nesting correctness** — verified correct (bounded max-heap,
+  finalize dedups within k, `gph_traverse_bfs` is pure-C so no nested `SPI_connect`).
+- **un-fork PG14/15 version guards + BLCKSZ≥8192 geometry** — verified correct on both 8KB and 32KB.
+- **dense-id contract drift (embed/loaders/harness)** — verified byte-identical first-wins across all
+  four; not a finding. **orjson pinned** (`requirements.lock:31`), not drift.
+- **wikidata SQL/Cypher f-string building** — values come from the controlled slice + operator CLI,
+  not network input; safe as local benchmark tooling (flag only if ever fed untrusted input).
+
+### Direction (options for the maintainer — grounded, not ranked against bugs)
+
+Design/spike-shaped; each cites in-repo evidence. Not written as plans yet — pick to spec.
+
+1. **Lift the seedless recall ceiling on stock PG** — SM-4 measured a ~0.83–0.85 recall@10 plateau
+   (`docs/sm4_seedless_stock_v0.1.0.md`); two levers are already validated in-repo (advisor plan 008
+   4-bit RaBitQ rerank → recall 1.0 at 7.5× compression; plan 007 FR-fusion → 0.987). Spike: wire one
+   into `src/tjs_pg` and re-measure. M.
+2. **Native executor for PG19 `GRAPH_TABLE`** — the landscape review (F3) + ADR-0015 flag that PG19
+   lowers `GRAPH_TABLE` to relational joins; the un-fork makes "serve the stock parser natively" the
+   adjacent possible. Design ADR mapping the canonical query to the PG19 grammar. L, longer bet.
+3. **GraphRAG / agent-memory adapter + MCP server on the stock image** — landscape §2 #4/#8 + the
+   roadmap's named "proven fits"; a gBrain adapter prototype already exists. D2's installable image
+   makes this the highest-leverage post-benchmark credibility artifact. M–L (cross-repo).
+4. **"TriBench" — the reproducible cross-modal benchmark the field lacks** — the Wikidata spike +
+   `publication_gate` are already the seed; generalize into an externally-citable standard. L,
+   positioning.
+5. **Certified rank-join bound for `term_cond`** — landscape §2 #5 (HRJN/Tziavelis); turns SM-4's
+   recall *curve* into a guarantee-vs-latency curve and answers the DEV-1169 defect class
+   structurally. L, research-grade, least certain.
+6. **Complete the seedless SM-4 parity vs the fork** — bridge *mechanism* parity already landed
+   (`81b8023`); the remaining gap is measuring the stock seedless SM-4 curve against the fork's, so
+   the un-fork is a proven strict superset. M, sequences naturally after the above.
