@@ -65,8 +65,11 @@ LANGUAGE C VOLATILE;
 
 REVOKE EXECUTE ON FUNCTION tjs_open(regclass,integer,integer,integer,integer,text,text,vector,bigint,integer) FROM PUBLIC;
 
--- Bridges admitted to the guaranteed budget by the last vector-first call (in-stream bridge
--- offers + phase-3b direct fetches) — the fork's tjs_open_bridges_injected() parity counter.
+-- Bridges OFFERED to the guaranteed budget by the last vector-first call: every
+-- filter-passing reach member exactly once (in-stream offers + phase-3b direct fetches),
+-- counted whether or not it survives the bounded bridge heap — the fork's
+-- tjs_open_bridges_injected() counts each materialized bridge row the same way (plan 087).
+-- NOT a count of bridges that land in the FINAL k (that share is capped at k/2).
 CREATE FUNCTION tjs_open_bridges_injected() RETURNS bigint
 AS 'MODULE_PATHNAME', 'tjs_open_bridges_injected_pg'
 LANGUAGE C VOLATILE;
