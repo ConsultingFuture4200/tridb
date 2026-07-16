@@ -423,3 +423,321 @@ def test_post_correct_token_dispatches():
     code = _post(handler, "/enrich/accept", body, {"X-TriDB-Token": STRONG_TOKEN})
     assert code == 200
     assert stub.calls == [body]
+
+
+# --------------------------------------------------------------------------- #
+# Advisor plan 082 — GET request work bounds (validate before any reader work)
+# --------------------------------------------------------------------------- #
+
+from urllib.parse import quote  # noqa: E402
+
+from tools.wiki_reader import (  # noqa: E402
+    RequestValidationError,
+    check_len_range,
+    parse_bool_param,
+    parse_int_param,
+    parse_text_param,
+)
+
+
+def test_parse_int_omitted_returns_default():
+    assert parse_int_param({}, "hops", 1, 0, 2) == 1
+
+
+def test_parse_int_accepts_both_boundaries():
+    assert parse_int_param({"hops": ["0"]}, "hops", 1, 0, 2) == 0
+    assert parse_int_param({"hops": ["2"]}, "hops", 1, 0, 2) == 2
+
+
+def test_parse_int_rejects_just_outside_boundaries():
+    with pytest.raises(RequestValidationError):
+        parse_int_param({"hops": ["3"]}, "hops", 1, 0, 2)
+    with pytest.raises(RequestValidationError):
+        parse_int_param({"pool": ["0"]}, "pool", 150, 1, 1000)
+
+
+def test_parse_int_rejects_negative():
+    with pytest.raises(RequestValidationError):
+        parse_int_param({"hops": ["-1"]}, "hops", 1, 0, 2)
+
+
+def test_parse_int_rejects_non_integer():
+    for bad in ("abc", "1.5", "1e3", "0x10"):
+        with pytest.raises(RequestValidationError):
+            parse_int_param({"n": [bad]}, "n", 0, 0, 10)
+
+
+def test_parse_int_rejects_duplicates():
+    with pytest.raises(RequestValidationError):
+        parse_int_param({"hops": ["1", "2"]}, "hops", 1, 0, 2)
+
+
+def test_parse_int_error_message_never_echoes_value():
+    with pytest.raises(RequestValidationError) as ei:
+        parse_int_param({"hops": ["31337"]}, "hops", 1, 0, 2)
+    assert "31337" not in str(ei.value)
+
+
+def test_parse_bool_omitted_returns_default():
+    assert parse_bool_param({}, "expand", True) is True
+    assert parse_bool_param({}, "narrate", False) is False
+
+
+def test_parse_bool_accepts_zero_and_one_only():
+    assert parse_bool_param({"expand": ["0"]}, "expand", True) is False
+    assert parse_bool_param({"expand": ["1"]}, "expand", False) is True
+    for bad in ("2", "true", "yes", "-1"):
+        with pytest.raises(RequestValidationError):
+            parse_bool_param({"expand": [bad]}, "expand", True)
+
+
+def test_parse_text_omitted_returns_empty():
+    assert parse_text_param({}, "q", 512) == ""
+
+
+def test_parse_text_counts_unicode_code_points():
+    assert parse_text_param({"q": ["λ" * 512]}, "q", 512) == "λ" * 512
+    with pytest.raises(RequestValidationError):
+        parse_text_param({"q": ["λ" * 513]}, "q", 512)
+
+
+def test_parse_text_rejects_duplicates():
+    with pytest.raises(RequestValidationError):
+        parse_text_param({"q": ["a", "b"]}, "q", 512)
+
+
+def test_check_len_range_ignored_when_max_len_unset():
+    check_len_range(500, 0)  # max_len=0 means "no upper bound"
+
+
+def test_check_len_range_rejects_inverted_bounds():
+    check_len_range(4, 4)  # equal is fine
+    with pytest.raises(RequestValidationError):
+        check_len_range(5, 3)
+
+
+class _GetStubReader:
+    """Records every reader call; any call on an invalid request is a failure."""
+
+    def __init__(self):
+        self.calls: list[tuple] = []
+
+    def search(self, q):
+        self.calls.append(("search", q))
+        return []
+
+    def ask(self, q, expand=True, hops=1):
+        self.calls.append(("ask", q, expand, hops))
+        return {"answer": ""}
+
+    def search_semantic(self, q, pool=150, min_indeg=0, min_len=0, max_len=0, cat=""):
+        self.calls.append(
+            ("search_semantic", q, pool, min_indeg, min_len, max_len, cat)
+        )
+        return {}
+
+    def search_trimodal(
+        self, q, seed=40, expand=True, min_indeg=0, min_len=0, max_len=0, cat=""
+    ):
+        self.calls.append(
+            ("search_trimodal", q, seed, expand, min_indeg, min_len, max_len, cat)
+        )
+        return {}
+
+    def resolve(self, label):
+        self.calls.append(("resolve", label))
+        return None
+
+    def path(self, a, b):
+        self.calls.append(("path", a, b))
+        return {"found": False}
+
+    def narrate_path(self, p):
+        self.calls.append(("narrate_path",))
+        return ""
+
+
+class _SlotRecorder:
+    """Stands in for wr._LLM_SLOTS; counts acquisitions."""
+
+    def __init__(self):
+        self.acquires = 0
+
+    def acquire(self, blocking=True):
+        self.acquires += 1
+        return True
+
+    def release(self):
+        pass
+
+
+def _get(handler_cls, path_qs):
+    h = handler_cls.__new__(handler_cls)
+    h.headers = {}
+    h.rfile = io.BytesIO(b"")
+    h.wfile = io.BytesIO()
+    h.path = path_qs
+    h.command = "GET"
+    h.request_version = "HTTP/1.1"
+    h.requestline = f"GET {path_qs} HTTP/1.1"
+    h.client_address = ("127.0.0.1", 0)
+    h.do_GET()
+    return int(h.wfile.getvalue().split(b" ", 2)[1])
+
+
+@pytest.fixture()
+def get_env(monkeypatch):
+    """(stub reader, handler class, slot recorder) with LLM slots instrumented."""
+    stub = _GetStubReader()
+    handler = wr.make_handler(stub, STRONG_TOKEN, embed_token=False)
+    slots = _SlotRecorder()
+    monkeypatch.setattr(wr, "_LLM_SLOTS", slots)
+    return stub, handler, slots
+
+
+def _assert_rejected(get_env, path_qs):
+    stub, handler, slots = get_env
+    assert _get(handler, path_qs) == 400
+    assert stub.calls == []
+    assert slots.acquires == 0
+
+
+# -- invalid explicit values: 400, zero reader calls, zero LLM slots --------- #
+
+
+def test_get_ask_huge_hops_rejected(get_env):
+    _assert_rejected(get_env, "/ask?q=x&hops=999999")
+
+
+def test_get_ask_hops_just_above_max_rejected(get_env):
+    _assert_rejected(get_env, "/ask?q=x&hops=3")
+
+
+def test_get_ask_negative_hops_rejected(get_env):
+    _assert_rejected(get_env, "/ask?q=x&hops=-1")
+
+
+def test_get_ask_non_integer_hops_rejected(get_env):
+    _assert_rejected(get_env, "/ask?q=x&hops=abc")
+
+
+def test_get_ask_empty_query_rejected(get_env):
+    _assert_rejected(get_env, "/ask?hops=1")
+
+
+def test_get_ask_invalid_expand_rejected(get_env):
+    _assert_rejected(get_env, "/ask?q=x&expand=2")
+
+
+def test_get_semantic_huge_pool_rejected(get_env):
+    _assert_rejected(get_env, "/search_semantic?q=x&pool=999999")
+
+
+def test_get_semantic_zero_pool_rejected(get_env):
+    _assert_rejected(get_env, "/search_semantic?q=x&pool=0")
+
+
+def test_get_semantic_negative_min_indeg_rejected(get_env):
+    _assert_rejected(get_env, "/search_semantic?q=x&min_indeg=-5")
+
+
+def test_get_semantic_min_len_above_max_len_rejected(get_env):
+    _assert_rejected(get_env, "/search_semantic?q=x&min_len=5&max_len=3")
+
+
+def test_get_semantic_overlong_cat_rejected(get_env):
+    _assert_rejected(get_env, "/search_semantic?q=x&cat=" + quote("λ" * 129))
+
+
+def test_get_trimodal_huge_seed_rejected(get_env):
+    _assert_rejected(get_env, "/search_trimodal?q=x&seed=999999")
+
+
+def test_get_trimodal_zero_seed_rejected(get_env):
+    _assert_rejected(get_env, "/search_trimodal?q=x&seed=0")
+
+
+def test_get_trimodal_min_len_above_max_len_rejected(get_env):
+    _assert_rejected(get_env, "/search_trimodal?q=x&min_len=9&max_len=1")
+
+
+def test_get_search_overlong_query_rejected(get_env):
+    _assert_rejected(get_env, "/search?q=" + quote("λ" * 513))
+
+
+def test_get_search_duplicate_query_rejected(get_env):
+    _assert_rejected(get_env, "/search?q=a&q=b")
+
+
+def test_get_path_overlong_from_rejected(get_env):
+    _assert_rejected(get_env, "/path?from=" + quote("x" * 513) + "&to=y")
+
+
+def test_get_path_overlong_to_rejected(get_env):
+    _assert_rejected(get_env, "/path?from=x&to=" + quote("x" * 513))
+
+
+def test_get_path_invalid_narrate_rejected(get_env):
+    _assert_rejected(get_env, "/path?from=a&to=b&narrate=2")
+
+
+# -- boundary-valid values: accepted, exact parsed values reach the reader --- #
+
+
+def test_get_ask_defaults(get_env):
+    stub, handler, slots = get_env
+    assert _get(handler, "/ask?q=hello") == 200
+    assert stub.calls == [("ask", "hello", True, 1)]
+    assert slots.acquires == 1
+
+
+def test_get_ask_hops_boundaries(get_env):
+    stub, handler, _ = get_env
+    assert _get(handler, "/ask?q=x&hops=0") == 200
+    assert _get(handler, "/ask?q=x&hops=2&expand=0") == 200
+    assert stub.calls == [("ask", "x", True, 0), ("ask", "x", False, 2)]
+
+
+def test_get_search_query_at_limit_accepted(get_env):
+    stub, handler, _ = get_env
+    q = "λ" * 512
+    assert _get(handler, "/search?q=" + quote(q)) == 200
+    assert stub.calls == [("search", q)]
+
+
+def test_get_semantic_defaults_and_boundaries(get_env):
+    stub, handler, slots = get_env
+    assert _get(handler, "/search_semantic?q=x") == 200
+    assert _get(handler, "/search_semantic?q=x&pool=1&min_len=4&max_len=4") == 200
+    assert _get(handler, "/search_semantic?q=x&pool=1000&min_indeg=10000000") == 200
+    assert stub.calls == [
+        ("search_semantic", "x", 150, 0, 0, 0, ""),
+        ("search_semantic", "x", 1, 0, 4, 4, ""),
+        ("search_semantic", "x", 1000, 10_000_000, 0, 0, ""),
+    ]
+    assert slots.acquires == 0
+
+
+def test_get_semantic_min_len_without_max_len_accepted(get_env):
+    stub, handler, _ = get_env
+    assert _get(handler, "/search_semantic?q=x&min_len=500&max_len=0") == 200
+    assert stub.calls == [("search_semantic", "x", 150, 0, 500, 0, "")]
+
+
+def test_get_trimodal_defaults_and_boundaries(get_env):
+    stub, handler, _ = get_env
+    assert _get(handler, "/search_trimodal?q=x") == 200
+    assert _get(handler, "/search_trimodal?q=x&seed=1&expand=0") == 200
+    assert _get(handler, "/search_trimodal?q=x&seed=200&expand=1") == 200
+    assert stub.calls == [
+        ("search_trimodal", "x", 40, True, 0, 0, 0, ""),
+        ("search_trimodal", "x", 1, False, 0, 0, 0, ""),
+        ("search_trimodal", "x", 200, True, 0, 0, 0, ""),
+    ]
+
+
+def test_get_path_valid_narrate_zero_resolves(get_env):
+    stub, handler, slots = get_env
+    assert _get(handler, "/path?from=a&to=b&narrate=0") == 200
+    assert ("resolve", "a") in stub.calls and ("resolve", "b") in stub.calls
+    assert slots.acquires == 0

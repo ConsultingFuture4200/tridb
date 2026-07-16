@@ -842,3 +842,34 @@ enrichments").
 shared credential gates mutations; there are no user accounts, sessions, or
 audit trails. Any future multi-user deployment needs a real per-user
 auth/audit design.
+
+# Addendum v12 — public GET request work bounds (advisor 082)
+
+The reader is public and unbounded-threaded; `_LLM_SLOTS` caps LLM
+*parallelism* but nothing capped *per-request* work — a single crafted GET
+(`hops=999999`, `pool=999999`, `seed=999999`, or a megabyte query string)
+could amplify CPU/memory/graph/LLM cost far beyond UI defaults. All GET work
+parameters are now validated at the HTTP boundary, **before** any reader
+method runs or an LLM slot is acquired (named constants + strict parsers in
+`tools/wiki_reader.py`):
+
+| Parameter | Accepted | Default when omitted |
+|---|---|---|
+| `q` (`/search`, `/ask`, `/search_semantic`, `/search_trimodal`), `from`/`to` (`/path`) | 0–512 Unicode code points (`/ask` requires nonempty) | route-specific |
+| `hops` (`/ask`) | integer 0–2 | 1 |
+| `pool` (`/search_semantic`) | integer 1–1000 | 150 |
+| `seed` (`/search_trimodal`) | integer 1–200 | 40 |
+| `min_indeg`, `min_len`, `max_len` | integer 0–10,000,000 | 0 |
+| `cat` | 0–128 Unicode code points | empty |
+| `expand`, `narrate` | `0` or `1` only | `expand=1`, `narrate=0` |
+
+`min_len <= max_len` is required whenever `max_len > 0` (`max_len=0` means
+"no upper bound"). An explicitly supplied malformed, duplicated, or
+out-of-range value gets **`400`** with a plain-text message naming the
+parameter and its accepted range — it is **never silently coerced** to a
+default (the pre-082 handlers quietly turned `hops=abc` into 1 and passed
+`min_indeg=-5` through). Omitted parameters keep their defaults, so the
+served UI — which stays within every limit — is unaffected. New public
+routes must declare per-request text/cardinality/depth bounds the same way
+and test that invalid input does no work; concurrency ceilings do not
+replace per-request cost limits.

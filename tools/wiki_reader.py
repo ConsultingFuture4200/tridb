@@ -3714,6 +3714,81 @@ def parse_body(raw: bytes, max_len: int = MAX_BODY_BYTES) -> dict:
     return json.loads(raw or b"{}")
 
 
+# --- Public GET request bounds (advisor 082) --------------------------------- #
+# The server is unbounded-threaded and public; _LLM_SLOTS caps LLM *parallelism*
+# but nothing capped *per-request* work. These bounds are enforced at the HTTP
+# boundary BEFORE any reader method runs or an LLM slot is acquired. Explicit
+# out-of-range/malformed values are rejected with 400 — never silently coerced.
+MAX_QUERY_CHARS = 512  # /search, /ask, semantic/tri-modal q, /path from/to
+MAX_CAT_CHARS = 128  # category-contains filter
+MAX_HOPS = 2  # /ask graph expansion depth (default 1)
+MAX_POOL = 1000  # /search_semantic vector pool (default 150)
+MAX_SEED = 200  # /search_trimodal vector seeds (default 40)
+MAX_FILTER_INT = 10_000_000  # min_indeg / min_len / max_len (default 0)
+
+
+class RequestValidationError(Exception):
+    """A client-supplied GET parameter is malformed or out of range.
+
+    The message is safe to return verbatim (names the parameter and the accepted
+    range; never echoes the supplied value)."""
+
+
+def _one_value(qs: dict, name: str) -> str | None:
+    """The single supplied value for `name`, or None when omitted/blank.
+
+    parse_qs drops blank values, so a bare `name=` reads as omitted — same as
+    the pre-082 handlers. Duplicate values are ambiguous: rejected."""
+    vals = qs.get(name)
+    if not vals:
+        return None
+    if len(vals) != 1:
+        raise RequestValidationError(f"{name}: expected at most one value")
+    return vals[0]
+
+
+def parse_int_param(qs: dict, name: str, default: int, lo: int, hi: int) -> int:
+    """Strict bounded integer: omitted -> default, malformed/out-of-range -> 400."""
+    raw = _one_value(qs, name)
+    if raw is None:
+        return default
+    try:
+        val = int(raw)
+    except ValueError:
+        raise RequestValidationError(f"{name}: expected an integer") from None
+    if not lo <= val <= hi:
+        raise RequestValidationError(f"{name}: expected an integer in {lo}..{hi}")
+    return val
+
+
+def parse_bool_param(qs: dict, name: str, default: bool) -> bool:
+    """Strict 0/1 flag: omitted -> default, anything else -> 400."""
+    raw = _one_value(qs, name)
+    if raw is None:
+        return default
+    if raw == "0":
+        return False
+    if raw == "1":
+        return True
+    raise RequestValidationError(f"{name}: expected 0 or 1")
+
+
+def parse_text_param(qs: dict, name: str, max_chars: int) -> str:
+    """Bounded text (Unicode code points): omitted -> empty, overlong -> 400."""
+    raw = _one_value(qs, name)
+    if raw is None:
+        return ""
+    if len(raw) > max_chars:
+        raise RequestValidationError(f"{name}: exceeds {max_chars} characters")
+    return raw
+
+
+def check_len_range(min_len: int, max_len: int) -> None:
+    """`max_len=0` means "no upper bound"; otherwise the range must be sane."""
+    if 0 < max_len < min_len:
+        raise RequestValidationError("min_len: must not exceed max_len")
+
+
 def make_handler(reader: Reader, token: str, embed_token: bool = False):
     index_html = render_index_html(token, embed_token)
 
@@ -3765,16 +3840,15 @@ def make_handler(reader: Reader, token: str, embed_token: bool = False):
                     r = reader.random_article()
                     self._json(r if r is not None else {"error": "no articles"})
                 elif path == "/search":
-                    q = parse_qs(u.query).get("q", [""])[0]
+                    q = parse_text_param(parse_qs(u.query), "q", MAX_QUERY_CHARS)
                     self._json(reader.search(q))
                 elif path == "/ask":
                     qs = parse_qs(u.query)
-                    q = qs.get("q", [""])[0]
-                    expand = qs.get("expand", ["1"])[0] != "0"
-                    try:
-                        hops = int(qs.get("hops", ["1"])[0] or "1")
-                    except ValueError:
-                        hops = 1
+                    q = parse_text_param(qs, "q", MAX_QUERY_CHARS)
+                    if not q:
+                        raise RequestValidationError("q: required")
+                    expand = parse_bool_param(qs, "expand", True)
+                    hops = parse_int_param(qs, "hops", 1, 0, MAX_HOPS)
                     if not _LLM_SLOTS.acquire(blocking=False):
                         self._send(429, b"busy", "text/plain")
                         return
@@ -3784,41 +3858,42 @@ def make_handler(reader: Reader, token: str, embed_token: bool = False):
                         _LLM_SLOTS.release()
                 elif path == "/search_semantic":
                     qs = parse_qs(u.query)
-
-                    def _int(name: str) -> int:
-                        try:
-                            return int(qs.get(name, ["0"])[0] or "0")
-                        except ValueError:
-                            return 0
-
+                    q = parse_text_param(qs, "q", MAX_QUERY_CHARS)
+                    pool = parse_int_param(qs, "pool", 150, 1, MAX_POOL)
+                    min_indeg = parse_int_param(qs, "min_indeg", 0, 0, MAX_FILTER_INT)
+                    min_len = parse_int_param(qs, "min_len", 0, 0, MAX_FILTER_INT)
+                    max_len = parse_int_param(qs, "max_len", 0, 0, MAX_FILTER_INT)
+                    check_len_range(min_len, max_len)
+                    cat = parse_text_param(qs, "cat", MAX_CAT_CHARS).strip()
                     self._json(
                         reader.search_semantic(
-                            qs.get("q", [""])[0],
-                            pool=_int("pool") or 150,
-                            min_indeg=_int("min_indeg"),
-                            min_len=_int("min_len"),
-                            max_len=_int("max_len"),
-                            cat=qs.get("cat", [""])[0].strip(),
+                            q,
+                            pool=pool,
+                            min_indeg=min_indeg,
+                            min_len=min_len,
+                            max_len=max_len,
+                            cat=cat,
                         )
                     )
                 elif path == "/search_trimodal":
                     qs = parse_qs(u.query)
-
-                    def _ti(name: str, dv: int = 0) -> int:
-                        try:
-                            return int(qs.get(name, [str(dv)])[0] or dv)
-                        except ValueError:
-                            return dv
-
+                    q = parse_text_param(qs, "q", MAX_QUERY_CHARS)
+                    seed = parse_int_param(qs, "seed", 40, 1, MAX_SEED)
+                    expand = parse_bool_param(qs, "expand", True)
+                    min_indeg = parse_int_param(qs, "min_indeg", 0, 0, MAX_FILTER_INT)
+                    min_len = parse_int_param(qs, "min_len", 0, 0, MAX_FILTER_INT)
+                    max_len = parse_int_param(qs, "max_len", 0, 0, MAX_FILTER_INT)
+                    check_len_range(min_len, max_len)
+                    cat = parse_text_param(qs, "cat", MAX_CAT_CHARS).strip()
                     self._json(
                         reader.search_trimodal(
-                            qs.get("q", [""])[0],
-                            seed=_ti("seed", 40) or 40,
-                            expand=qs.get("expand", ["1"])[0] != "0",
-                            min_indeg=_ti("min_indeg"),
-                            min_len=_ti("min_len"),
-                            max_len=_ti("max_len"),
-                            cat=qs.get("cat", [""])[0].strip(),
+                            q,
+                            seed=seed,
+                            expand=expand,
+                            min_indeg=min_indeg,
+                            min_len=min_len,
+                            max_len=max_len,
+                            cat=cat,
                         )
                     )
                 elif path.startswith("/article/"):
@@ -3867,8 +3942,11 @@ def make_handler(reader: Reader, token: str, embed_token: bool = False):
                     self._json(reader.related_fused(aid))
                 elif path == "/path":
                     qs = parse_qs(u.query)
-                    frm = reader.resolve(qs.get("from", [""])[0])
-                    to = reader.resolve(qs.get("to", [""])[0])
+                    frm_label = parse_text_param(qs, "from", MAX_QUERY_CHARS)
+                    to_label = parse_text_param(qs, "to", MAX_QUERY_CHARS)
+                    narrate = parse_bool_param(qs, "narrate", False)
+                    frm = reader.resolve(frm_label)
+                    to = reader.resolve(to_label)
                     if frm is None or to is None:
                         self._json(
                             {
@@ -3880,7 +3958,7 @@ def make_handler(reader: Reader, token: str, embed_token: bool = False):
                         )
                     else:
                         res = reader.path(frm["id"], to["id"])
-                        if res.get("found") and qs.get("narrate", ["0"])[0] == "1":
+                        if res.get("found") and narrate:
                             if not _LLM_SLOTS.acquire(blocking=False):
                                 self._send(429, b"busy", "text/plain")
                                 return
@@ -3891,6 +3969,9 @@ def make_handler(reader: Reader, token: str, embed_token: bool = False):
                         self._json(res)
                 else:
                     self._send(404, b"not found", "text/plain")
+            except RequestValidationError as e:
+                # client error, message is safe by construction — no traceback
+                self._send(400, str(e).encode("utf-8"), "text/plain")
             except Exception:  # never take the server down on one bad request
                 logging.exception("wiki_reader request failed")
                 self._send(500, b"internal error", "text/plain")
