@@ -33,3 +33,9 @@ AS 'MODULE_PATHNAME', 'tjs_open_budget_capped_pg'
 LANGUAGE C VOLATILE;
 
 REVOKE EXECUTE ON FUNCTION tjs_open(regclass,integer,integer,integer,integer,text,text,vector,bigint,integer) FROM PUBLIC;
+
+-- Bridges admitted to the guaranteed budget by the last vector-first call (in-stream bridge
+-- offers + phase-3b direct fetches) — the fork's tjs_open_bridges_injected() parity counter.
+CREATE FUNCTION tjs_open_bridges_injected() RETURNS bigint
+AS 'MODULE_PATHNAME', 'tjs_open_bridges_injected_pg'
+LANGUAGE C VOLATILE;

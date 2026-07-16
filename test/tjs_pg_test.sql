@@ -91,19 +91,22 @@ BEGIN
   RAISE NOTICE 'PASS 4: vector-first filtered recall %/5, examined % (0 < ex < 2000)', hits, ex;
 END $$;
 
--- (5) seedless graph predicate: with m_seeds=1 the first candidate (id 1000, nearest to
--- [0.5..]) becomes the seed. Vertex 1000 has NO out-edges, so its reach is EMPTY — every
--- subsequent candidate must be excluded and only the seed itself may be emitted. This is
--- the strictest possible proof that the reach constraint actually gates emission.
+-- (5) seedless BRIDGE INJECTION (fork parity, ADR-0012 recipe B): query [0.001..] makes
+-- id 2 the nearest candidate; with m_seeds=1 it seeds the bridge set = {2} + reach(2)
+-- = {2, 1000..1100}. The band 1000..1100 is vector-FAR (dist ~0.5) so the ANN stream
+-- never reaches it before term_cond — phase 3b must fetch those bridges DIRECTLY and
+-- they are GUARANTEED into the budget, displacing nearer non-bridge candidates (1,3,4..).
 DO $$
-DECLARE got bigint[]; bad int;
+DECLARE got bigint[]; nb bigint;
 BEGIN
-  SELECT array_agg(t) INTO got FROM tjs_open('entities', 5, 64, 1, 2, 'id', '',
-    '[0.5,0,0,0,0,0,0,0]'::vector) AS t;
-  IF got IS NULL THEN RAISE EXCEPTION 'seedless returned nothing'; END IF;
-  SELECT count(*) INTO bad FROM unnest(got) u WHERE u <> 1000;
-  IF bad > 0 THEN RAISE EXCEPTION 'seedless emitted out-of-reach ids: %', got; END IF;
-  RAISE NOTICE 'PASS 5: seedless graph predicate constrains to the seed reach: %', got;
+  SELECT array_agg(t) INTO got FROM tjs_open('entities', 5, 32, 1, 2, 'id', '',
+    '[0.001,0,0,0,0,0,0,0]'::vector) AS t;
+  nb := tjs_open_bridges_injected();
+  IF got <> ARRAY[2,1000,1001,1002,1003]::bigint[] THEN
+    RAISE EXCEPTION 'bridge injection: got % (bridges_injected=%)', got, nb;
+  END IF;
+  IF nb < 5 THEN RAISE EXCEPTION 'bridges_injected=% (expected >= 5)', nb; END IF;
+  RAISE NOTICE 'PASS 5: bridges guaranteed into the budget past the frontier: % (injected %)', got, nb;
 END $$;
 
 -- (6) budget-cap honesty: a tiny scan budget ends the stream before term_cond -> flag set

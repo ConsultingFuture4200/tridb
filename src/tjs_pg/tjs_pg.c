@@ -70,6 +70,7 @@ PG_MODULE_MAGIC;
 
 /* per-backend counters (mirror the fork's SM-3 probes) */
 static int64 tjs_examined = 0;
+static int64 tjs_bridges_injected = 0;
 static bool tjs_budget_capped = false;
 
 /* ---------------------------------------------------------------------------------- */
@@ -245,6 +246,9 @@ reach_add_from_seed(HTAB *reach, int64 seed, int hops, int edge_type)
 	int			rc;
 	uint64		i;
 
+	/* the fork's bridge set INCLUDES the seeds themselves (gph_traverse_bfs excludes its seed) */
+	(void) hash_search(reach, &seed, HASH_ENTER, NULL);
+
 	snprintf(sql, sizeof(sql),
 			 "SELECT graph_store.gph_traverse_bfs(" INT64_FORMAT ", %d, %d)",
 			 seed, hops, edge_type);
@@ -310,6 +314,7 @@ tjs_open_pg(PG_FUNCTION_ARGS)
 	MemoryContextSwitchTo(oldctx);
 
 	tjs_examined = 0;
+	tjs_bridges_injected = 0;
 	tjs_budget_capped = false;
 
 	if (SPI_connect() != SPI_OK_CONNECT)
@@ -397,6 +402,8 @@ tjs_open_pg(PG_FUNCTION_ARGS)
 		bool		terminated = false;
 		SPIPlanPtr	filter_plan = NULL;
 		HTAB	   *reach = NULL;
+		HTAB	   *seen = NULL;
+		Topk		bridge_topk;
 		int			seeds_taken = 0;
 		ItemPointer tid;
 
@@ -430,7 +437,11 @@ tjs_open_pg(PG_FUNCTION_ARGS)
 				ereport(ERROR, (errmsg("tjs_open: filter plan preparation failed: %s", fq.data)));
 		}
 		if (m_seeds > 0)
+		{
 			reach = reach_create();
+			seen = reach_create();	/* same shape: an int64 membership hash */
+			topk_init(&bridge_topk, k);
+		}
 
 		topk_init(&topk, k);
 
@@ -477,25 +488,35 @@ tjs_open_pg(PG_FUNCTION_ARGS)
 			if (!passes)
 				continue;
 
-			/* seedless graph predicate: first m_seeds filter-passing candidates seed the reach */
+			/* recomputed rank authority (E3 gap 1) */
+			dist = DatumGetFloat8(FunctionCall2Coll(&distfn, InvalidOid, vecd, query_vec));
+
+			/*
+			 * Seedless bridge semantics (fork parity, ADR-0012 recipe B): the first m_seeds
+			 * filter-passing candidates seed the bridge set (seeds + their hops-reach, seeds
+			 * included). A BRIDGE candidate is admitted to its own guaranteed-budget heap and
+			 * NEVER touches the consecutive-drops counter (admission past the vector frontier
+			 * must not defeat VBASE early termination). Non-bridges take the ordinary
+			 * improve-or-drop path.
+			 */
 			if (reach != NULL)
 			{
+				bool		dummy;
+
+				(void) hash_search(seen, &cand, HASH_ENTER, &dummy);
 				if (seeds_taken < m_seeds)
 				{
 					reach_add_from_seed(reach, cand, hops, edge_type);
 					seeds_taken++;
-					/* seeds themselves are candidates too (they are trivially in scope) */
 				}
-				else
+				(void) hash_search(reach, &cand, HASH_FIND, &found);
+				if (found)
 				{
-					(void) hash_search(reach, &cand, HASH_FIND, &found);
-					if (!found)
-						continue;
+					if (topk_offer(&bridge_topk, cand, dist))
+						tjs_bridges_injected++;
+					continue;	/* bridges never touch the drop counter */
 				}
 			}
-
-			/* recomputed rank authority (E3 gap 1) */
-			dist = DatumGetFloat8(FunctionCall2Coll(&distfn, InvalidOid, vecd, query_vec));
 
 			if (topk_offer(&topk, cand, dist))
 				drops = 0;
@@ -526,14 +547,101 @@ tjs_open_pg(PG_FUNCTION_ARGS)
 		index_close(index, AccessShareLock);
 		table_close(heap, AccessShareLock);
 
-		/* emit ascending by recomputed distance */
-		qsort(topk.items, topk.n, sizeof(TopkItem), topk_cmp_dist);
+		/*
+		 * PHASE 3b (fork parity): bridges the ANN stream never emitted before termination are
+		 * fetched DIRECTLY by id (filter respected) and offered to the guaranteed bridge
+		 * budget — "a graph-reachable candidate is admitted even when its vector rank is past
+		 * the frontier". Each direct fetch counts as examined work (the fork's work-bound
+		 * counts the drain the same way).
+		 */
+		if (reach != NULL)
 		{
-			int			i;
+			StringInfoData bq;
+			SPIPlanPtr	fetch_plan;
+			Oid			bargs[1] = {INT8OID};
+			HASH_SEQ_STATUS hs;
+			int64	   *bid;
 
-			for (i = 0; i < topk.n; i++)
+			initStringInfo(&bq);
+			appendStringInfo(&bq, "SELECT %s FROM %s.%s WHERE %s = $1",
+							 qident(get_attname(reloid, vec_attno, false)),
+							 qident(get_namespace_name(get_rel_namespace(reloid))),
+							 qident(get_rel_name(reloid)), qident(id_col));
+			if (filter[0] != '\0')
+				appendStringInfo(&bq, " AND (%s)", filter);
+			fetch_plan = SPI_prepare(bq.data, 1, bargs);
+			if (fetch_plan == NULL)
+				ereport(ERROR, (errmsg("tjs_open: bridge fetch plan failed: %s", bq.data)));
+
+			hash_seq_init(&hs, reach);
+			while ((bid = (int64 *) hash_seq_search(&hs)) != NULL)
 			{
-				Datum		row[1] = {Int64GetDatum(topk.items[i].id)};
+				bool		in_stream;
+				Datum		fv[1];
+				int			rc;
+
+				CHECK_FOR_INTERRUPTS();
+				(void) hash_search(seen, bid, HASH_FIND, &in_stream);
+				if (in_stream)
+					continue;	/* already offered from the stream */
+				fv[0] = Int64GetDatum(*bid);
+				rc = SPI_execute_plan(fetch_plan, fv, NULL, true, 1);
+				if (rc != SPI_OK_SELECT)
+					ereport(ERROR, (errmsg("tjs_open: bridge fetch failed (%d)", rc)));
+				tjs_examined++;
+				if (SPI_processed == 1)
+				{
+					bool		vnull;
+					Datum		vd = SPI_getbinval(SPI_tuptable->vals[0],
+												   SPI_tuptable->tupdesc, 1, &vnull);
+
+					if (!vnull)
+					{
+						float8		bdist = DatumGetFloat8(
+									FunctionCall2Coll(&distfn, InvalidOid, vd, query_vec));
+
+						if (topk_offer(&bridge_topk, *bid, bdist))
+							tjs_bridges_injected++;
+					}
+				}
+			}
+		}
+
+		/*
+		 * FINALIZE (fork parity): bridges are GUARANTEED into the final budget — best-k
+		 * bridges by distance first, remaining slots filled from the vector winners
+		 * (dedup'd), the merged set emitted ascending by distance.
+		 */
+		{
+			TopkItem   *final_items = palloc(sizeof(TopkItem) * k);
+			int			n_final = 0;
+			int			i,
+					j;
+
+			if (reach != NULL)
+			{
+				qsort(bridge_topk.items, bridge_topk.n, sizeof(TopkItem), topk_cmp_dist);
+				for (i = 0; i < bridge_topk.n && n_final < k; i++)
+					final_items[n_final++] = bridge_topk.items[i];
+			}
+			qsort(topk.items, topk.n, sizeof(TopkItem), topk_cmp_dist);
+			for (i = 0; i < topk.n && n_final < k; i++)
+			{
+				bool		dup = false;
+
+				for (j = 0; j < n_final; j++)
+					if (final_items[j].id == topk.items[i].id)
+					{
+						dup = true;
+						break;
+					}
+				if (!dup)
+					final_items[n_final++] = topk.items[i];
+			}
+			qsort(final_items, n_final, sizeof(TopkItem), topk_cmp_dist);
+			for (i = 0; i < n_final; i++)
+			{
+				Datum		row[1] = {Int64GetDatum(final_items[i].id)};
 				bool		nulls[1] = {false};
 
 				tuplestore_putvalues(tupstore, tupdesc, row, nulls);
@@ -552,6 +660,13 @@ Datum
 tjs_open_candidates_examined_pg(PG_FUNCTION_ARGS)
 {
 	PG_RETURN_INT64(tjs_examined);
+}
+
+PG_FUNCTION_INFO_V1(tjs_open_bridges_injected_pg);
+Datum
+tjs_open_bridges_injected_pg(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_INT64(tjs_bridges_injected);
 }
 
 PG_FUNCTION_INFO_V1(tjs_open_budget_capped_pg);
