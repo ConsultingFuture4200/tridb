@@ -4,9 +4,12 @@ The fork's seedless recall knob is term_cond alone (the stream never ends before
 decides). On stock PG the stream is pgvector's iterative scan, whose budget
 (hnsw.max_scan_tuples) can end the stream first — so recall is (term_cond, budget)-shaped.
 This harness MEASURES that surface at 1M: filtered ANN (the ADR-0015 E3 probe shape, scaled),
-exact oracle, client-clocked latency, per-point budget-capped fraction. Honesty: a point where
-most queries ended budget-capped is labeled; recall is reported per point, never averaged
-across the sweep.
+exact oracle, client-clocked latency, per-point stream-end-unknown and graph-censored
+fractions (plan 093: tjs_open_budget_capped() can never return true post-plan-074, so the
+old "budget_capped_fraction" was replaced with the honest termination-reason and
+graph-censor counters). Honesty: a point where most queries ended unknown/censored is
+labeled as such, never claimed as a proven budget cap; recall is reported per point, never
+averaged across the sweep.
 
 Runs ON the Spark against the stock PG17 container (tjs_pg + graph_store_am + pgvector, the
 1M Wikidata slice loaded by the Gate B pass). Query set: seeded-random entities with a P31
@@ -77,11 +80,45 @@ def exact_oracle(cur, q: dict) -> list[int]:
     return [r[0] for r in cur.fetchall()]
 
 
+def summarize_point(
+    *,
+    tc: int,
+    budget: int,
+    recalls: list[float],
+    lats: list[float],
+    examined: list[int],
+    graph_examined: list[int],
+    reasons: list[str],
+    graph_censored: list[bool],
+) -> dict:
+    """Pure reducer: per-query counters -> the point dict (plan 093).
+
+    stream_end_unknown_fraction is the honest successor of the old (vacuous, post-074)
+    budget_capped_fraction: it counts tjs_open_termination_reason() == 'stream_end_unknown'
+    (the stream ended before term_cond — possibly budget-shaped on this fixed
+    hnsw.max_scan_tuples sweep, but never a proven cap). graph_censored_fraction counts
+    tjs_open_graph_censored() = true (the independent graph-leg budget from plan 077).
+    """
+    n = len(reasons)
+    stream_end_unknown = sum(1 for r in reasons if r == "stream_end_unknown")
+    graph_censored_n = sum(1 for c in graph_censored if c)
+    return {
+        "term_cond": tc,
+        "max_scan_tuples": budget,
+        "recall_at_10": round(statistics.mean(recalls), 4),
+        "median_latency_ms": round(statistics.median(lats), 3),
+        "median_examined": statistics.median(examined),
+        "mean_graph_examined": round(statistics.mean(graph_examined), 3),
+        "stream_end_unknown_fraction": round(stream_end_unknown / n, 3),
+        "graph_censored_fraction": round(graph_censored_n / n, 3),
+        "n_queries": n,
+    }
+
+
 def run_point(cur, queries, oracle, tc: int, budget: int) -> dict:
     cur.execute("SET hnsw.iterative_scan = relaxed_order")
     cur.execute(f"SET hnsw.max_scan_tuples = {int(budget)}")
-    recalls, lats, exams = [], [], []
-    capped = 0
+    recalls, lats, exams, graph_exams, reasons, graph_censored = [], [], [], [], [], []
     for q in queries:
         filt = f"p31 @> ARRAY[{int(q['t'])}] AND id <> {int(q['x'])}"
         # warm-up + graded ids
@@ -91,11 +128,15 @@ def run_point(cur, queries, oracle, tc: int, budget: int) -> dict:
             (filt, q["x"]),
         )
         ids = [r[0] for r in cur.fetchall()]
-        cur.execute("SELECT tjs_open_candidates_examined(), tjs_open_budget_capped()")
-        ex, cap = cur.fetchone()
+        cur.execute(
+            "SELECT tjs_open_candidates_examined(), tjs_open_termination_reason(), "
+            "tjs_open_graph_censored(), tjs_open_graph_examined()"
+        )
+        ex, reason, censored, graph_ex = cur.fetchone()
         exams.append(ex)
-        if cap:
-            capped += 1
+        reasons.append(reason)
+        graph_censored.append(censored)
+        graph_exams.append(graph_ex)
         recalls.append(recall_at_k(ids, oracle[q["x"]]))
         # timed repeats (median of 3, client-clocked over TCP)
         reps = []
@@ -109,15 +150,16 @@ def run_point(cur, queries, oracle, tc: int, budget: int) -> dict:
             cur.fetchall()
             reps.append((time.perf_counter() - t0) * 1000)
         lats.append(statistics.median(reps))
-    return {
-        "term_cond": tc,
-        "max_scan_tuples": budget,
-        "recall_at_10": round(statistics.mean(recalls), 4),
-        "median_latency_ms": round(statistics.median(lats), 3),
-        "median_examined": statistics.median(exams),
-        "budget_capped_fraction": round(capped / len(queries), 3),
-        "n_queries": len(queries),
-    }
+    return summarize_point(
+        tc=tc,
+        budget=budget,
+        recalls=recalls,
+        lats=lats,
+        examined=exams,
+        graph_examined=graph_exams,
+        reasons=reasons,
+        graph_censored=graph_censored,
+    )
 
 
 def main() -> int:
@@ -152,7 +194,8 @@ def main() -> int:
             print(
                 f"[sm4] tc={tc:>4} budget={budget:>6}: recall@10={p['recall_at_10']:.3f} "
                 f"lat={p['median_latency_ms']:.1f}ms examined={p['median_examined']:.0f} "
-                f"capped={p['budget_capped_fraction']:.0%}"
+                f"stream_end_unknown={p['stream_end_unknown_fraction']:.0%} "
+                f"graph_censored={p['graph_censored_fraction']:.0%}"
             )
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
@@ -168,8 +211,10 @@ def main() -> int:
                 "note": (
                     "SEEDLESS filtered-ANN SM-4 curve on stock PG17 + pgvector + tjs_pg "
                     "(ADR-0019); recall is (term_cond, budget)-shaped per ADR-0015 E3.3; "
-                    "budget_capped_fraction discloses stream-ended-on-budget points; "
-                    "latency client-clocked over TCP."
+                    "stream_end_unknown_fraction discloses points whose stream ended before "
+                    "term_cond (possibly budget-shaped, never a proven cap post-plan-074); "
+                    "graph_censored_fraction discloses points whose graph leg hit "
+                    "tjs.graph_work_budget (plan 077); latency client-clocked over TCP."
                 ),
             },
             indent=1,
