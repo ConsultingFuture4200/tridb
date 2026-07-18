@@ -706,6 +706,19 @@ Sequencing into the 072-086 order: 088/089 join the independent host wave; 090 j
 087 slots into the stock chain after 073→074 (same `tjs_pg.c`) and before 077; 091 after 079
 (same loader file); 092 closes the wiki serialize chain after 082.
 
+## 2026-07-17 follow-on batch (planned against `6de2e30`, post-077 merge + push)
+
+The three "next moves" from the 071-092 wrap-up, maintainer-selected for immediate execution.
+
+| Plan | Title | Priority | Effort | Risk | Depends on | Verify | Status |
+|------|-------|----------|--------|------|------------|--------|--------|
+| 093 | SM-4 seedless bench: honest censored-ending counters (replaces vacuous capped-fraction) | P1 | S | LOW | 074, 077 | Python + live stock validation | TODO |
+| 094 | Durable `gph_freeze` (XLogFlush before return; closes the 090 async-flush finding) | P1 | S | LOW–MED | 090 | crash drivers ×3 engines | TODO |
+| 095 | SPIKE: PPR-graded scoring (ADR-0012 reserves) on the bounded iterator, behind a HotpotQA recall gate | P2 | M–L | MED | 077 | stock gates (off) + new suite + measured table | TODO |
+
+All three are file-disjoint (bench python / graph_am.c+crash drivers / tjs_pg.c+bench) and run in
+parallel. 095 never flips a default; its product is a measured GO/NO-GO in an ADR-0012 addendum.
+
 ### New residuals surfaced during execution (not yet planned)
 
 - **`gph_freeze()` commit is async-flushed (090 finding, proven w/ pg_waldump):** the freeze txn
