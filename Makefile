@@ -135,6 +135,12 @@ stock-release-smoke:
 tjs-parity-test:
 	bash scripts/tjs_parity_test.sh
 
+# Wiki-scale membership-vs-PPR held-out link prediction gate (advisor plan 096): the
+# real 200k-article enwiki hyperlink slice, one persistent server/session (load once,
+# sweep with SETs). Heavy (200k vectors + ~15M edges) — a manual gate, NOT per-PR.
+wiki-ppr-gate:
+	bash scripts/wiki_ppr_gate.sh
+
 smoke-test:
 	@docker image inspect $(IMAGE) >/dev/null 2>&1 || \
 	  { echo "image $(IMAGE) not built — run scripts/x86build.sh --docker"; exit 1; }
