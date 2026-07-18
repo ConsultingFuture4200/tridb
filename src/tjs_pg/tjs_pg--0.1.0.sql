@@ -25,15 +25,23 @@ END $$;
 -- Graph leg (both paths): bounded by the tjs.graph_work_budget GUC (edge-steps, default
 -- 65536) -- see tjs_open_graph_censored()/tjs_open_graph_examined() below.
 --
--- tjs.graph_scoring (plan 095 SPIKE, opt-in, seedless path only): 'membership' (default,
--- ADR-0020) is the reachability-membership scoring the 071 parity harness pins -- BYTE-
--- INERT: leaving this GUC unset (or explicitly 'membership') is identical to pre-095. 'ppr'
--- runs bounded forward-push Personalized PageRank (ADR-0012 addendum) over the same bounded
--- traversal substrate, fusing vector similarity with the PPR reserve to rank graph-sourced
--- candidates instead of the binary bridge guarantee. NOT a query-language parameter (the
--- ADR-0008 pinned tjs_open surface above is unchanged) -- an operator setting, like
--- tjs.graph_work_budget. See docs/decisions/0012-tjs-open-multiseed-retrieval.md and its
--- 2026-07-17 addendum for the measured recall gate and GO/NO-GO recommendation.
+-- tjs.graph_scoring (ADR-0021 D1, seedless path only): 'ppr' (default) runs bounded
+-- forward-push Personalized PageRank (ADR-0012 addendum) over the same bounded traversal
+-- substrate, fusing vector similarity with the PPR reserve to rank graph-sourced candidates
+-- instead of the binary bridge guarantee -- measured to dominate membership on two
+-- independent-gold recall gates (ADR-0021). 'membership' is the ADR-0020-ratified
+-- reachability-membership scoring the 071 filter-first parity harness pins -- BYTE-INERT:
+-- explicitly SET tjs.graph_scoring = 'membership' is identical to pre-095, and is the
+-- fork-parity mode (ADR-0021 D4). NOT a query-language parameter (the ADR-0008 pinned
+-- tjs_open surface above is unchanged) -- an operator setting, like tjs.graph_work_budget.
+-- See docs/decisions/0021-ppr-default-graph-scoring.md for the evidence and rationale, and
+-- docs/decisions/0012-tjs-open-multiseed-retrieval.md and its addenda for the PPR design and
+-- measured recall gates.
+--
+-- tjs.ppr_alpha (default 0.15) / tjs.ppr_rmax (default 1e-3) (ADR-0021 D3): the forward-push
+-- teleport probability and residue-drain threshold, exposed as PGC_USERSET GUCs (formerly
+-- fixed C constants). UNSWEPT research knobs -- the defaults are the ONLY values ADR-0012's
+-- measured recall-gate addenda exercised; changing them moves outside the measured evidence.
 CREATE FUNCTION tjs_open(tbl regclass,
                          k integer,
                          term_cond integer,

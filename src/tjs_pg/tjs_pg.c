@@ -102,15 +102,17 @@ PG_MODULE_MAGIC;
 static int	tjs_graph_work_budget = 65536;
 
 /*
- * tjs.graph_scoring (plan 095 spike): opt-in graded graph scoring on the SEEDLESS path only.
- * 'membership' (default) is the ADR-0020-ratified reachability-membership scoring — BYTE-INERT:
- * with this default, no code path introduced by plan 095 executes (every new branch below is
- * gated on graph_scoring == TJS_SCORING_PPR), so results are identical to pre-095. 'ppr' runs
- * bounded forward-push Personalized PageRank (ADR-0012 addendum, Andersen-Chung-Lang FOCS'06)
- * over the SAME gs_open/gs_getnext engine the bounded traversal is built on, replacing the
- * binary bridge-guarantee ranking input with a fused (vector-similarity, PPR-reserve) score —
- * see graph_reach_ppr_push() below. NOT a query-language parameter (the ADR-0008 pinned tjs_open
- * surface is unchanged); a documented operator setting, like tjs.graph_work_budget.
+ * tjs.graph_scoring (ADR-0021 D1, was plan 095's opt-in spike): graph scoring on the SEEDLESS
+ * path only. 'ppr' (default) runs bounded forward-push Personalized PageRank (ADR-0012 addendum,
+ * Andersen-Chung-Lang FOCS'06) over the SAME gs_open/gs_getnext engine the bounded traversal is
+ * built on, fusing vector-similarity with a PPR-reserve score — see graph_reach_ppr_push() below.
+ * Measured to dominate membership on two independent-gold corpora (ADR-0012's 2026-07-17 and
+ * 2026-07-18 addenda; see ADR-0021 for the full evidence and rationale). 'membership' is the
+ * ADR-0020-ratified reachability-membership scoring — BYTE-INERT with pre-095 behavior (every
+ * branch gated on graph_scoring == TJS_SCORING_PPR is skipped), the fork-parity mode (ADR-0021
+ * D4) and the mode the 071 filter-first parity harness relies on. NOT a query-language parameter
+ * (the ADR-0008 pinned tjs_open surface is unchanged); a documented operator setting, like
+ * tjs.graph_work_budget.
  */
 typedef enum TjsGraphScoring
 {
@@ -124,7 +126,18 @@ static const struct config_enum_entry tjs_graph_scoring_options[] = {
 	{NULL, 0, false}
 };
 
-static int	tjs_graph_scoring = TJS_SCORING_MEMBERSHIP;
+static int	tjs_graph_scoring = TJS_SCORING_PPR;
+
+/*
+ * tjs.ppr_alpha / tjs.ppr_rmax (ADR-0021 D3): the forward-push PPR teleport probability and
+ * residue-drain threshold, formerly fixed C constants (TJS_PPR_ALPHA/TJS_PPR_RMAX). Exposed as
+ * PGC_USERSET GUCs so the alpha/r_max sweep ADR-0021 calls for has something to sweep. Defaults
+ * (0.15, 1e-3) reproduce the host reference (bench/tjs_open_ref.py) and are the ONLY values
+ * ADR-0012's two measured recall-gate addenda exercised — UNSWEPT research knobs; changing them
+ * moves outside the measured evidence.
+ */
+static double tjs_ppr_alpha = 0.15;
+static double tjs_ppr_rmax = 1e-3;
 
 void		_PG_init(void);
 void
@@ -146,15 +159,44 @@ _PG_init(void)
 							NULL, NULL, NULL);
 
 	DefineCustomEnumVariable("tjs.graph_scoring",
-							 "Seedless graph-leg scoring: 'membership' (default, ADR-0020) or "
-							 "'ppr' (plan 095 spike, opt-in graded forward-push PPR).",
-							 "'membership' is byte-inert with pre-095 behavior (the hard gate the "
-							 "spike must pass). 'ppr' replaces the bridge-guarantee ranking input "
-							 "with a fused vector-similarity + PPR-reserve score on the seedless "
-							 "path only; filter-first scoring is unaffected in both settings.",
+							 "Seedless graph-leg scoring: 'ppr' (default, ADR-0021) or "
+							 "'membership' (ADR-0020, fork-parity mode).",
+							 "'ppr' replaces the bridge-guarantee ranking input with a fused "
+							 "vector-similarity + PPR-reserve score; measured to dominate "
+							 "membership on two independent-gold recall gates (ADR-0021). "
+							 "'membership' is byte-inert with pre-095 behavior and is the mode "
+							 "the 071 filter-first parity harness and fork-parity posture rely "
+							 "on (ADR-0021 D4). Filter-first scoring is unaffected by either "
+							 "setting.",
 							 &tjs_graph_scoring,
-							 TJS_SCORING_MEMBERSHIP,
+							 TJS_SCORING_PPR,
 							 tjs_graph_scoring_options,
+							 PGC_USERSET,
+							 0,
+							 NULL, NULL, NULL);
+
+	DefineCustomRealVariable("tjs.ppr_alpha",
+							 "PPR forward-push teleport probability (ADR-0021 D3, unswept research knob).",
+							 "Fraction of residue banked to reserve at each pop; the rest pushes to "
+							 "out-neighbors. Default 0.15 reproduces the host reference and is the "
+							 "only value ADR-0012's measured recall-gate addenda exercised.",
+							 &tjs_ppr_alpha,
+							 0.15,
+							 0.0001,
+							 0.9999,
+							 PGC_USERSET,
+							 0,
+							 NULL, NULL, NULL);
+
+	DefineCustomRealVariable("tjs.ppr_rmax",
+							 "PPR forward-push residue-drain threshold (ADR-0021 D3, unswept research knob).",
+							 "A node's residue must reach this floor before it is (re-)enqueued for "
+							 "a push. Default 1e-3 reproduces the host reference and is the only "
+							 "value ADR-0012's measured recall-gate addenda exercised.",
+							 &tjs_ppr_rmax,
+							 1e-3,
+							 1e-12,
+							 1.0,
 							 PGC_USERSET,
 							 0,
 							 NULL, NULL, NULL);
@@ -529,13 +571,12 @@ graph_reach_pull(HTAB *reach, int64 seed, int hops, int edge_type,
 }
 
 /*
- * PPR forward-push constants (plan 095 spike): alpha and r_max mirror the host reference
- * defaults (bench/tjs_open_ref.py: alpha=0.15, r_max=1e-3) exactly. Not exposed as new GUCs --
- * the spike's only new knob is tjs.graph_scoring; tjs.graph_work_budget (ADR-0020) remains the
- * one shared work bound for both the membership BFS and this push.
+ * PPR forward-push alpha/r_max (ADR-0021 D3) now live in the tjs.ppr_alpha/tjs.ppr_rmax GUCs
+ * defined in _PG_init above (formerly fixed TJS_PPR_ALPHA/TJS_PPR_RMAX constants). Their
+ * defaults still mirror the host reference (bench/tjs_open_ref.py: alpha=0.15, r_max=1e-3)
+ * byte-for-byte. tjs.graph_work_budget (ADR-0020) remains the one shared work bound for both
+ * the membership BFS and this push.
  */
-#define TJS_PPR_ALPHA	0.15
-#define TJS_PPR_RMAX	1e-3
 
 typedef struct PprQItem
 {
@@ -650,7 +691,7 @@ graph_reach_ppr_push(HTAB *reach, TopkItem *seed_buf, int n_seeds, int hops, int
 		if (!found)
 			rse->residue = 0.0;
 		rse->residue += p;
-		if (rse->residue >= TJS_PPR_RMAX)
+		if (rse->residue >= tjs_ppr_rmax)
 			ppr_enqueue(&queue, &qcap, &qn, seed, 0);
 	}
 
@@ -670,14 +711,14 @@ graph_reach_ppr_push(HTAB *reach, TopkItem *seed_buf, int n_seeds, int hops, int
 
 		rse = (ResidueEntry *) hash_search(residue, &item.vid, HASH_FIND, &found);
 		cur_residue = found ? rse->residue : 0.0;
-		if (cur_residue < TJS_PPR_RMAX)
+		if (cur_residue < tjs_ppr_rmax)
 			continue;			/* stale queue entry: already drained since it was enqueued */
 
 		re = (ReachEntry *) hash_search(reach, &item.vid, HASH_ENTER, &found);
 		if (!found)
 			re->reserve = 0.0;
-		re->reserve += TJS_PPR_ALPHA * cur_residue;
-		push_mass = (1.0 - TJS_PPR_ALPHA) * cur_residue;
+		re->reserve += tjs_ppr_alpha * cur_residue;
+		push_mass = (1.0 - tjs_ppr_alpha) * cur_residue;
 		rse->residue = 0.0;		/* drained */
 
 		if (item.depth >= hops)
@@ -753,7 +794,7 @@ graph_reach_ppr_push(HTAB *reach, TopkItem *seed_buf, int n_seeds, int hops, int
 				if (!found)
 					dre->residue = 0.0;
 				dre->residue += share;
-				if (dre->residue >= TJS_PPR_RMAX)
+				if (dre->residue >= tjs_ppr_rmax)
 					ppr_enqueue(&queue, &qcap, &qn, dst, item.depth + 1);
 			}
 		}
