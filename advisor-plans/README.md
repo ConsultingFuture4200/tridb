@@ -719,6 +719,13 @@ The three "next moves" from the 071-092 wrap-up, maintainer-selected for immedia
 All three are file-disjoint (bench python / graph_am.c+crash drivers / tjs_pg.c+bench) and run in
 parallel. 095 never flips a default; its product is a measured GO/NO-GO in an ADR-0012 addendum.
 
+| 096 | Wiki-scale PPR re-measure: held-out link prediction at 200k (the default-adoption gate) | P1 | M–L | LOW–MED | 095, 091, 077 | host tests + 200k gate run | TODO |
+
+096 design notes: gold must be scoring-agnostic — the existing `wiki_h2h` oracle is
+membership-shaped and would bias the comparison, so the gate uses held-out hyperlinks
+(assets all local: `edges-*.tsv` + 200k×384 `dense_id_aligned.npy`); the sweep spans
+`term_cond` × `graph_work_budget` so the knobs HotpotQA left inert finally get exercised.
+
 ### New residuals surfaced during execution (not yet planned)
 
 - **`gph_freeze()` commit is async-flushed (090 finding, proven w/ pg_waldump):** the freeze txn
