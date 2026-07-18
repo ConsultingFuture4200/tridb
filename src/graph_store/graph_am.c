@@ -36,6 +36,7 @@
 #include "access/relation.h"
 #include "access/transam.h"
 #include "access/xact.h"
+#include "access/xlog.h"
 #include "catalog/namespace.h"
 #include "commands/vacuum.h"
 #include "executor/spi.h"
@@ -1032,9 +1033,11 @@ gph_freeze_xmax(uint32 *flags, TransactionId *xmax, TransactionId horizon)
  * exceed GenericXLog's 4-buffer/record cap, so pages are NOT batched). Returns the number of slots
  * frozen (es_xmin freezes + es_xmax freezes, see gph_freeze_xmax). A page with nothing to freeze is
  * GenericXLogAbort'd (no WAL churn), so a re-run over an already-frozen store is cheap (idempotency).
+ * *max_lsn is advanced to the highest GenericXLogFinish() end-LSN seen (caller flushes once, see
+ * gph_freeze).
  */
 static int64
-gph_freeze_adj_chain(Relation rel, BlockNumber head, TransactionId horizon)
+gph_freeze_adj_chain(Relation rel, BlockNumber head, TransactionId horizon, XLogRecPtr *max_lsn)
 {
 	BlockNumber	ablk = head;
 	int64		frozen = 0;
@@ -1068,7 +1071,12 @@ gph_freeze_adj_chain(Relation rel, BlockNumber head, TransactionId horizon)
 		next = GphPageSpecialPtr(apage)->gph_next_pageno;
 
 		if (frozen_here > 0)
-			GenericXLogFinish(state);
+		{
+			XLogRecPtr	lsn = GenericXLogFinish(state);
+
+			if (lsn > *max_lsn)
+				*max_lsn = lsn;
+		}
 		else
 			GenericXLogAbort(state);
 		UnlockReleaseBuffer(abuf);
@@ -1123,6 +1131,7 @@ gph_freeze(PG_FUNCTION_ARGS)
 	TransactionId oldest;
 	BlockNumber	vblk;
 	int64		frozen = 0;
+	XLogRecPtr	max_lsn = InvalidXLogRecPtr;
 
 	if (!TransactionIdIsNormal(horizon))
 		ereport(ERROR,
@@ -1203,7 +1212,12 @@ gph_freeze(PG_FUNCTION_ARGS)
 		vnext = GphPageSpecialPtr(vpage)->gph_next_pageno;
 
 		if (frozen_here > 0)
-			GenericXLogFinish(state);
+		{
+			XLogRecPtr	lsn = GenericXLogFinish(state);
+
+			if (lsn > max_lsn)
+				max_lsn = lsn;
+		}
 		else
 			GenericXLogAbort(state);	/* nothing changed on this page (idempotent re-run) */
 		UnlockReleaseBuffer(vbuf);
@@ -1213,7 +1227,7 @@ gph_freeze(PG_FUNCTION_ARGS)
 		/* Adjacency chains are walked AFTER releasing the vertex page: each page needs its own
 		 * GenericXLog record and a vertex's chain can exceed the 4-buffer/record cap. */
 		for (i = 0; i < nheads; i++)
-			frozen += gph_freeze_adj_chain(rel, heads[i], horizon);
+			frozen += gph_freeze_adj_chain(rel, heads[i], horizon, &max_lsn);
 		pfree(heads);
 
 		vblk = vnext;
@@ -1226,6 +1240,7 @@ gph_freeze(PG_FUNCTION_ARGS)
 		Page		metapage;
 		GenericXLogState *mstate;
 		GphMeta    *m;
+		XLogRecPtr	lsn;
 
 		metabuf = ReadBufferExtended(rel, MAIN_FORKNUM, GPH_META_BLKNO, RBM_NORMAL, NULL);
 		LockBuffer(metabuf, BUFFER_LOCK_EXCLUSIVE);
@@ -1233,7 +1248,9 @@ gph_freeze(PG_FUNCTION_ARGS)
 		metapage = GenericXLogRegisterBuffer(mstate, metabuf, 0);
 		m = (GphMeta *) GphPageRecordBase(metapage);
 		m->gm_frozen_horizon = horizon;
-		GenericXLogFinish(mstate);
+		lsn = GenericXLogFinish(mstate);
+		if (lsn > max_lsn)
+			max_lsn = lsn;
 		UnlockReleaseBuffer(metabuf);
 	}
 
@@ -1266,6 +1283,23 @@ gph_freeze(PG_FUNCTION_ARGS)
 						InvalidMultiXactId,
 						false);
 #endif
+
+	/*
+	 * Durability (plan 094 — pg_waldump-proven by plan 090): gph_freeze() is required to run in
+	 * AUTOCOMMIT (see above), so its enclosing transaction assigns no xid and its COMMIT takes
+	 * Postgres's ASYNC path (XLogSetAsyncXactLSN) — a crash inside the walwriter's flush window
+	 * silently loses an already-"committed" freeze. Force the freeze's own WAL to disk here,
+	 * synchronously, before returning. This is sufficient on its own: REDO replays a page from its
+	 * own WAL record, not from the transaction's commit record, and frozen slots are not xid-gated
+	 * for visibility (gph_freeze_xid / gph_freeze_xmax write Frozen/Invalid sentinels straight into
+	 * the page). So once max_lsn is on disk, crash replay reconstructs every frozen page regardless
+	 * of whether the (async, xid-less) commit record itself was ever flushed. Only flush if at least
+	 * one GenericXLogFinish() actually ran above — a no-op re-freeze (idempotent early-outs above,
+	 * or a horizon that touched nothing) must not force a flush. See scripts/crash_recovery_test.sh
+	 * and scripts/pg17_crash_recovery_test.sh scenario 5, which now test this contract directly.
+	 */
+	if (max_lsn != InvalidXLogRecPtr)
+		XLogFlush(max_lsn);
 
 	relation_close(rel, ShareUpdateExclusiveLock);
 	PG_RETURN_INT64(frozen);

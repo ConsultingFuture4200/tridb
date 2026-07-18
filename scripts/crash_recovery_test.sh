@@ -261,19 +261,14 @@ SQL
     exit 1;;
   esac
   echo "pre-crash gph_freeze($H) froze $N records (only in WAL)"
-  # Make the freeze WAL DURABLE without checkpointing (plan 090 finding): gph_freeze only
-  # REWRITES xids, so its transaction never assigns one — an xid-less WAL-writing txn commits
-  # asynchronously (XLogSetAsyncXactLSN; flushed by the walwriter "in due time", like HOT
-  # pruning), and an immediate crash right after it can lose the WHOLE freeze WAL. That is
-  # core-PG by-design lazy durability of xid-less work (safe here: the pass is idempotent —
-  # re-run it), NOT a REDO bug, but it would make this scenario racy. NOTE: a bare
-  # `SELECT txid_current()` is NOT a sufficient barrier (measured on stock PG17: a commit
-  # whose only WAL is its own commit record still takes the async path). A committed txn that
-  # writes DATA WAL does force a synchronous XLogFlush through its commit record, which
-  # follows every freeze record; the freeze pages themselves stay WAL-only, so the restart
-  # still proves GenericXLog REDO.
-  $PSQL -c "INSERT INTO graph_store.entities VALUES (9000, '"'"'wal-flush barrier'"'"', ARRAY[9000,0,0,0,0,0,0,0]::float8[]);" >/dev/null
-  # CRASH: the committed freeze rewrites (record pages + metapage horizon) are only in the WAL.
+  # No wal-flush barrier needed (plan 094): gph_freeze runs in its own xid-less transaction (it
+  # only REWRITES xids), so its COMMIT still takes Postgres async path (XLogSetAsyncXactLSN) --
+  # but gph_freeze() itself now issues a synchronous XLogFlush() of its own WAL before returning
+  # (src/graph_store/graph_am.c), closing the plan 090 window at the source instead of relying on
+  # a caller-side barrier. This scenario now tests that contract directly: crash immediately
+  # after the freeze call returns, with no intervening committed write of any kind.
+  # CRASH: the committed freeze rewrites (record pages + metapage horizon) must already be
+  # durable on disk via gph_freeze own flush -- nothing else forces them out here.
   $B/pg_ctl -D $D5 -m immediate -w stop >/dev/null 2>&1 || true
   $B/pg_ctl -D $D5 -o "-p 5432" -w start >/dev/null 2>&1
   # A SECOND, post-restart horizon for the record-page probe (burn xids so it precedes the
