@@ -1,7 +1,6 @@
 # ADR-0021: Make PPR-graded scoring the default for the stock seedless graph leg
 
-Status: **Proposed** (drafted by the advisor 2026-07-18; maintainer acceptance required —
-no behavior changes until Accepted and the implementation plan executes).
+Status: **Accepted (2026-07-18)**
 Supersedes: ADR-0020 "Resolved decisions" item 3 (membership-now) for the SEEDLESS path only.
 Builds on: ADR-0012 (bounded forward-push PPR design + both measured addenda), ADR-0019
 (stock rehome), ADR-0020 (bounded pull iterator, budget, censoring).

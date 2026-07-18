@@ -196,6 +196,8 @@ it is left open (§Open decisions).
 3. **Scoring**: **reachability-membership now** (byte-identical uncensored results; the plan
    071 parity harness is the acceptance gate). ADR-0012's PPR-graded reserves remain the
    documented follow-on that rides this same iterator — not adopted in Step 3.
+   Superseded by ADR-0021 (D1): the stock seedless default flips to `tjs.graph_scoring = ppr`;
+   membership remains supported via `SET tjs.graph_scoring = membership`.
 4. **Fate of `gph_traverse_bfs`**: **kept as the documented materializing TEST/ORACLE helper**,
    banned from the operator path by a static guard (Step 5) — not rewritten, not deprecated.
 5. **Censor surfacing in `graph_query`**: **deferred** — the lowering (ADR-0008/plan 075) is
