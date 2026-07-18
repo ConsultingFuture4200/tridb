@@ -381,3 +381,166 @@ not "the composition is proven at the scale that would justify defaulting it."
 - If a future pass ports the host reference's incremental NRA/FR merge into the C operator
   (replacing deviation 2's bounded finalize sort), re-measure before concluding the finalize-sort
   simplification cost real recall — this spike did not isolate that variable.
+
+## Addendum 2026-07-18 — plan 096: wiki-scale gate — held-out link prediction at 200k
+
+The re-measure the 2026-07-17 addendum named as the gate before any "make
+`tjs.graph_scoring = ppr` the default" ADR. Executed on the real 200k-article enwiki slice
+(the corpus TriDB's public evidence already stands on) with a SCORING-AGNOSTIC gold, on the
+stock engine (`tridb/pg17-unfork:dev`, `graph_store_am` + `tjs_pg` + pgvector, PG 17, 8KB
+pages). Harness: `bench/wiki_ppr_gate.py` + `scripts/wiki_ppr_gate.sh` (mirrors the
+2026-07-17 hotpot gate's gen-sql/parse/grade shape); host tests
+`tests/test_wiki_ppr_gate.py`. **No default was flipped**: `tjs.graph_scoring` remains
+`membership`, ADR-0020 decision 3 unmodified.
+
+### 1. Design — the membership-oracle trap and the gold used instead
+
+`bench/wiki_h2h.py`'s existing oracle is **membership-shaped** (exact ANN seeds ∪
+hops-reachable set, cosine-reranked): grading PPR against it would structurally penalize
+exactly the deviation PPR exists to make — a biased NO-GO machine. It was not used. The
+gold here is **held-out link prediction**: a seed-42 deterministic sample of 300 articles
+with ≥ 8 distinct within-slice out-links; per query, exactly 5 randomly held-out (same
+seed) link targets; the held-out edges are EXCLUDED from the loaded graph in BOTH
+directions (applied after symmetrization, so a genuine reverse hyperlink cannot resurrect
+a held-out pair); Gold(q) = the 5 targets; query vector = the article's own embedding;
+the query id itself is dropped from results before grading. Neither mode can reach a gold
+id via the removed edge; both saw the identical remaining graph; the gold comes from
+Wikipedia's editors, not from either scoring definition.
+
+**Tilt disclosure (do not launder this into "unbiased")**: link prediction inherently
+rewards graph-structure exploitation — that IS the capability under test — and gold
+targets are by construction semantically related to the query article. The comparison is
+relative between modes on identical inputs; the absolute recall level also reflects that
+~10.8 % of gold targets are not even hops-2-reachable in the loaded graph (diagnostic
+below) and that a 5-of-N-outlinks gold is a hard target for a k∈{10,20} retriever.
+
+### 2. Load (engine-observed)
+
+200,000 `articles` rows (`id bigint PK, title-less, embedding vector(384)`), embeddings
+`data/wiki/enwiki/emb/dense_id_aligned.npy` row i = dense id i — measured unit-normalized
+(norms 0.9995–1.0005 over all 200k rows), so the HNSW opclass is `vector_cosine_ops`
+(m=16, ef_construction=64), verified not assumed. Graph: within-slice (both endpoints
+< 200k) redirect-resolved hyperlinks, deduped per src, self-loops dropped, single edge
+type `related_to`, inserted in BOTH directions (the hotpot gate's and the reader's
+undirected-adjacency convention — disclosed): **14,683,060 directed pairs** loaded via
+COPY staging + the typed batched `gph_insert_edges(src, dsts[], type_id)` (plan 091),
+grouped by src, count-asserted (`gph_edge_count` = staged count, `gph_vertex_count` =
+200000, dense vid == id asserted per row, identity mode flipped only after that
+verification). Held-out-edge-absence probe (live, in-engine): a known held-out pair is
+absent from `gph_neighbors` in BOTH directions — passed. Mean degree ≈ 73 directed pairs
+per vertex — two orders of magnitude denser than HotpotQA's ≈ 2.
+
+### 3. The sweep (one persistent server; identical inputs both modes)
+
+Seedless `tjs_open`, `m_seeds=8`, `hops=2`, grid = 2 modes × k∈{10,20} ×
+`term_cond`∈{8,32,128} × `tjs.graph_work_budget`∈{2048,8192,65536}, all 300 queries at
+every point (n=300 throughout; strict parser, no silent drops); 10,800 operator calls in
+ONE psql session against ONE throwaway cluster (load once, `SET`s per point).
+`hnsw.iterative_scan = relaxed_order`, `hnsw.max_scan_tuples = 1000000`. Latency is psql
+`\timing` of the tagged call (includes the `SELECT embedding WHERE id=q` subquery) —
+informational, local-socket.
+
+Mode-independent diagnostic: mean fraction of gold reachable within `hops`=2 of the query
+in the LOADED (post-exclusion) graph = **0.892** — identical for both modes and for every
+budget (it is a property of the loaded topology, not of the budgeted traversal), so
+graded graph scoring had ≈ 89 % headroom; observed recalls sit far below it.
+
+| mode | k | term_cond | budget | n | recall | graph_examined (mean) | censored fraction | stream_end_unknown fraction | latency ms (mean) |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| membership | 10 | 8 | 2048 | 300 | 0.065 | 2048.0 | 1.000 | 0.000 | 27.70 |
+| membership | 10 | 8 | 8192 | 300 | 0.065 | 8182.6 | 0.997 | 0.000 | 114.70 |
+| membership | 10 | 8 | 65536 | 300 | 0.065 | 64651.4 | 0.970 | 0.000 | 659.06 |
+| membership | 10 | 32 | 2048 | 300 | 0.065 | 2048.0 | 1.000 | 0.000 | 24.70 |
+| membership | 10 | 32 | 8192 | 300 | 0.065 | 8182.6 | 0.997 | 0.000 | 117.60 |
+| membership | 10 | 32 | 65536 | 300 | 0.065 | 64651.4 | 0.970 | 0.000 | 655.36 |
+| membership | 10 | 128 | 2048 | 300 | 0.065 | 2048.0 | 1.000 | 0.000 | 26.99 |
+| membership | 10 | 128 | 8192 | 300 | 0.065 | 8182.6 | 0.997 | 0.000 | 109.92 |
+| membership | 10 | 128 | 65536 | 300 | 0.065 | 64651.4 | 0.970 | 0.000 | 659.96 |
+| membership | 20 | 8 | 2048 | 300 | 0.083 | 2048.0 | 1.000 | 0.000 | 25.76 |
+| membership | 20 | 8 | 8192 | 300 | 0.081 | 8182.6 | 0.997 | 0.000 | 114.40 |
+| membership | 20 | 8 | 65536 | 300 | 0.081 | 64651.4 | 0.970 | 0.000 | 644.66 |
+| membership | 20 | 32 | 2048 | 300 | 0.083 | 2048.0 | 1.000 | 0.000 | 25.42 |
+| membership | 20 | 32 | 8192 | 300 | 0.081 | 8182.6 | 0.997 | 0.000 | 110.49 |
+| membership | 20 | 32 | 65536 | 300 | 0.081 | 64651.4 | 0.970 | 0.000 | 636.92 |
+| membership | 20 | 128 | 2048 | 300 | 0.083 | 2048.0 | 1.000 | 0.000 | 27.05 |
+| membership | 20 | 128 | 8192 | 300 | 0.081 | 8182.6 | 0.997 | 0.000 | 115.65 |
+| membership | 20 | 128 | 65536 | 300 | 0.081 | 64651.4 | 0.970 | 0.000 | 640.84 |
+| ppr | 10 | 8 | 2048 | 300 | 0.075 | 2048.0 | 1.000 | 0.000 | 34.75 |
+| ppr | 10 | 8 | 8192 | 300 | 0.076 | 8177.8 | 0.993 | 0.000 | 130.13 |
+| ppr | 10 | 8 | 65536 | 300 | 0.074 | 62503.7 | 0.840 | 0.000 | 1515.42 |
+| ppr | 10 | 32 | 2048 | 300 | 0.075 | 2048.0 | 1.000 | 0.000 | 36.24 |
+| ppr | 10 | 32 | 8192 | 300 | 0.076 | 8177.8 | 0.993 | 0.000 | 131.82 |
+| ppr | 10 | 32 | 65536 | 300 | 0.074 | 62503.7 | 0.840 | 0.000 | 1512.22 |
+| ppr | 10 | 128 | 2048 | 300 | 0.075 | 2048.0 | 1.000 | 0.000 | 38.65 |
+| ppr | 10 | 128 | 8192 | 300 | 0.075 | 8177.8 | 0.993 | 0.000 | 131.95 |
+| ppr | 10 | 128 | 65536 | 300 | 0.074 | 62503.7 | 0.840 | 0.000 | 1528.37 |
+| ppr | 20 | 8 | 2048 | 300 | 0.119 | 2048.0 | 1.000 | 0.000 | 36.38 |
+| ppr | 20 | 8 | 8192 | 300 | 0.120 | 8177.8 | 0.993 | 0.000 | 134.70 |
+| ppr | 20 | 8 | 65536 | 300 | 0.123 | 62503.7 | 0.840 | 0.000 | 1522.60 |
+| ppr | 20 | 32 | 2048 | 300 | 0.119 | 2048.0 | 1.000 | 0.000 | 34.90 |
+| ppr | 20 | 32 | 8192 | 300 | 0.120 | 8177.8 | 0.993 | 0.000 | 127.60 |
+| ppr | 20 | 32 | 65536 | 300 | 0.123 | 62503.7 | 0.840 | 0.000 | 1526.85 |
+| ppr | 20 | 128 | 2048 | 300 | 0.119 | 2048.0 | 1.000 | 0.000 | 39.26 |
+| ppr | 20 | 128 | 8192 | 300 | 0.120 | 8177.8 | 0.993 | 0.000 | 135.29 |
+| ppr | 20 | 128 | 65536 | 300 | 0.123 | 62503.7 | 0.840 | 0.000 | 1532.76 |
+
+**HotpotQA headline for continuity** (2026-07-17 addendum §2, engine-measured, 1490
+nodes, mean degree ≈ 1, all points uncensored): PPR recall@5 0.927 vs membership 0.880,
+recall@10 0.983 vs 0.963; `term_cond` and budget byte-inert there.
+
+### 4. Findings
+
+1. **PPR beats membership at every one of the 18 matched grid points.** recall@10
+   0.074–0.076 vs 0.065 (+0.9–1.1 pt, ≈ +15 % relative); recall@20 0.119–0.123 vs
+   0.081–0.083 (+3.6–4.2 pt, ≈ +47 % relative). Same direction as HotpotQA, now on a
+   graph two orders of magnitude denser, under real budget pressure, on a gold neither
+   scoring definition shaped. Notably PPR achieves this while examining slightly FEWER
+   edge-steps than membership at the top budget (62.5k vs 64.7k mean) — the win is not
+   bought with extra graph work.
+2. **Knob pressure, the thing HotpotQA could not measure — the budget BITES, term_cond
+   is still inert.** Censored fraction moves hard across the budget axis: 1.000 → 0.997
+   → 0.970 (membership) and 1.000 → 0.993 → 0.840 (ppr); mean examined tracks the budget
+   almost exactly (2048 / ~8.18k / ~63–65k). This is the first engine measurement where
+   `tjs.graph_work_budget` is the binding constraint at almost every point. `term_cond`
+   ∈ {8,32,128} remains essentially inert even at 200k: within every (mode, k, budget)
+   row-group the recalls differ by at most 0.002 and the counters are identical — the
+   graph leg, not the vector-stream drop rule, decides termination in this regime.
+3. **Recall is nearly flat across a 32x budget range.** Membership: recall unchanged
+   (0.065 / 0.081–0.083) from 2048 to 65536 edge-steps despite 30x more graph work paid
+   in latency (26 ms → ~650 ms). PPR: +0.004 at k=20 (0.119 → 0.123). More budget buys
+   almost no additional gold — the useful graph signal for THIS gold is captured in the
+   first ~2k edge-steps; past that the traversal explores volume that the top-k cut
+   discards. Together with finding 2 this reframes the budget as a latency knob, not a
+   recall knob, at wiki scale.
+4. **Cost, honestly**: PPR latency ≈ 1.3–1.4x membership at budgets 2048/8192 and ≈ 2.3x
+   at 65536 (~1.52 s vs ~0.65 s mean per call). The 8192-budget PPR point (recall@20
+   0.120, 135 ms) dominates the 65536 membership point (0.081, ~640 ms) on BOTH axes —
+   at matched latency budgets the graded composition is strictly better on this gold.
+5. Sanity per the plan: membership at its loosest point retrieves gold (recall > 0
+   everywhere); absolute recall is low (≤ 0.123) as expected for 5-target link
+   prediction with k ≤ 20 — reported straight; the comparison is relative.
+   `stream_end_unknown` fraction = 0.000 at every point (every ending was a real
+   `term_cond`/finalize ending, none right-censored by the pgvector stream).
+
+### 5. Verdict
+
+**GO-for-default-ADR.** The graded PPR composition beats reachability-membership at every
+measured operating point on BOTH corpora the project has engine-measured — small/sparse
+(HotpotQA, uncensored) and wiki-scale/dense (200k enwiki, budget-censored, scoring-
+agnostic held-out-link gold) — with identical inputs per point and the win not
+attributable to extra graph work (PPR examined ≤ membership at the top budget). The
+knob-pressure gap the 2026-07-17 addendum named is now closed: the budget was exercised
+to the point of censoring 84–100 % of queries and the ranking-quality advantage held.
+The default-adoption ADR (which would supersede ADR-0020 decision 3) can now be proposed
+and must cite both tables and decide: (a) whether the ~1.3–2.3x graph-leg latency
+multiplier is acceptable as a default or gates the flip on a budget ceiling (the
+8192-budget dominance point in finding 4 is the natural argument), and (b) `alpha`/
+`r_max` exposure, still fixed at host defaults here and never swept on the engine.
+**Nothing is flipped by this addendum**: `tjs.graph_scoring` stays `membership`, and the
+harness (`make wiki-ppr-gate`) is the re-test vehicle.
+
+What would change it: a corpus/gold where PPR loses at matched points (none observed in
+two corpora); evidence the win disappears when `alpha`/`r_max` are swept off the host
+defaults; or a latency requirement that rules out even the 1.3x low-budget cost — that
+would argue keeping PPR opt-in rather than default, which is a cost call for the ADR,
+not a quality finding against the composition.
