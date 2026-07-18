@@ -101,6 +101,31 @@ PG_MODULE_MAGIC;
  */
 static int	tjs_graph_work_budget = 65536;
 
+/*
+ * tjs.graph_scoring (plan 095 spike): opt-in graded graph scoring on the SEEDLESS path only.
+ * 'membership' (default) is the ADR-0020-ratified reachability-membership scoring — BYTE-INERT:
+ * with this default, no code path introduced by plan 095 executes (every new branch below is
+ * gated on graph_scoring == TJS_SCORING_PPR), so results are identical to pre-095. 'ppr' runs
+ * bounded forward-push Personalized PageRank (ADR-0012 addendum, Andersen-Chung-Lang FOCS'06)
+ * over the SAME gs_open/gs_getnext engine the bounded traversal is built on, replacing the
+ * binary bridge-guarantee ranking input with a fused (vector-similarity, PPR-reserve) score —
+ * see graph_reach_ppr_push() below. NOT a query-language parameter (the ADR-0008 pinned tjs_open
+ * surface is unchanged); a documented operator setting, like tjs.graph_work_budget.
+ */
+typedef enum TjsGraphScoring
+{
+	TJS_SCORING_MEMBERSHIP = 0,
+	TJS_SCORING_PPR = 1
+} TjsGraphScoring;
+
+static const struct config_enum_entry tjs_graph_scoring_options[] = {
+	{"membership", TJS_SCORING_MEMBERSHIP, false},
+	{"ppr", TJS_SCORING_PPR, false},
+	{NULL, 0, false}
+};
+
+static int	tjs_graph_scoring = TJS_SCORING_MEMBERSHIP;
+
 void		_PG_init(void);
 void
 _PG_init(void)
@@ -119,6 +144,20 @@ _PG_init(void)
 							PGC_USERSET,
 							0,
 							NULL, NULL, NULL);
+
+	DefineCustomEnumVariable("tjs.graph_scoring",
+							 "Seedless graph-leg scoring: 'membership' (default, ADR-0020) or "
+							 "'ppr' (plan 095 spike, opt-in graded forward-push PPR).",
+							 "'membership' is byte-inert with pre-095 behavior (the hard gate the "
+							 "spike must pass). 'ppr' replaces the bridge-guarantee ranking input "
+							 "with a fused vector-similarity + PPR-reserve score on the seedless "
+							 "path only; filter-first scoring is unaffected in both settings.",
+							 &tjs_graph_scoring,
+							 TJS_SCORING_MEMBERSHIP,
+							 tjs_graph_scoring_options,
+							 PGC_USERSET,
+							 0,
+							 NULL, NULL, NULL);
 }
 
 /*
@@ -311,8 +350,60 @@ qident(const char *raw)
 }
 
 /*
+ * ReachEntry (plan 095): the seedless graph predicate's reach set is a vid -> reserve hash.
+ * `reserve` is the PPR forward-push reserve (plan 095, graph_reach_ppr_push below); it stays
+ * 0.0 and unread for the whole call when tjs.graph_scoring = membership (the default), which is
+ * how the default stays byte-inert -- the field's presence changes memory layout only, never a
+ * membership-mode value or control-flow decision. `seen` (a separate hash, stream-membership
+ * only) keeps using the same entrysize via reach_create() too; its extra bytes are unused.
+ */
+typedef struct ReachEntry
+{
+	int64		vid;			/* HASH_BLOBS key: first sizeof(int64) bytes */
+	float8		reserve;
+} ReachEntry;
+
+/*
+ * PprCand (plan 095): one candidate in the bounded finalize pool for the ppr-mode unified
+ * ranking pass -- (id, vector distance, PPR reserve) -- so vec-sim and reserve can be
+ * min-max normalized together over the WHOLE pool before any fused score is computed (the
+ * FR-fusion composition bench/tjs_open_ref.py measured as the winner: score = normalized
+ * vec-sim + normalized reserve). Bounded to <= topk.n + |reach| candidates, never the full
+ * corpus -- see tjs_open_pg's ppr finalize branch.
+ */
+typedef struct PprCand
+{
+	int64		id;
+	float8		dist;
+	float8		reserve;
+	bool		graph_sourced;	/* present in `reach` (vs. vector-only, reserve == 0 by construction) */
+} PprCand;
+
+/*
+ * Ascending "goodness" key (score_as_dist = -fused_score), ties by ascending id -- the plan
+ * 095 ppr finalize pool's comparator. PprCand's leading (id, dist) layout matches TopkItem's,
+ * but a dedicated comparator over the real PprCand type avoids relying on that coincidence.
+ */
+static int
+topk_cmp_dist_ppr_pool(const void *a, const void *b)
+{
+	const PprCand *ia = (const PprCand *) a;
+	const PprCand *ib = (const PprCand *) b;
+
+	if (ia->dist < ib->dist)
+		return -1;
+	if (ia->dist > ib->dist)
+		return 1;
+	if (ia->id < ib->id)
+		return -1;
+	if (ia->id > ib->id)
+		return 1;
+	return 0;
+}
+
+/*
  * Reachability set for the seedless graph predicate: union of the bounded traversal's reach
- * over the seed vids, collected into a per-call int64 hash. SPI must be connected.
+ * over the seed vids, collected into a per-call vid->reserve hash. SPI must be connected.
  */
 static HTAB *
 reach_create(void)
@@ -321,7 +412,7 @@ reach_create(void)
 
 	memset(&ctl, 0, sizeof(ctl));
 	ctl.keysize = sizeof(int64);
-	ctl.entrysize = sizeof(int64);
+	ctl.entrysize = sizeof(ReachEntry);
 	ctl.hcxt = CurrentMemoryContext;
 	return hash_create("tjs_open reach", 4096, &ctl, HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
 }
@@ -384,8 +475,12 @@ graph_reach_pull(HTAB *reach, int64 seed, int hops, int edge_type,
 	Portal		portal;
 	int64		v0,
 				v1;
+	ReachEntry *re;
+	bool		found;
 
-	(void) hash_search(reach, &seed, HASH_ENTER, NULL);
+	re = (ReachEntry *) hash_search(reach, &seed, HASH_ENTER, &found);
+	if (!found)
+		re->reserve = 0.0;
 
 	if (*budget_remaining <= 0)
 	{
@@ -415,8 +510,11 @@ graph_reach_pull(HTAB *reach, int64 seed, int hops, int edge_type,
 		if (!isnull)
 		{
 			int64		v = DatumGetInt64(d);
+			bool		vfound;
+			ReachEntry *ve = (ReachEntry *) hash_search(reach, &v, HASH_ENTER, &vfound);
 
-			(void) hash_search(reach, &v, HASH_ENTER, NULL);
+			if (!vfound)
+				ve->reserve = 0.0;
 		}
 	}
 	SPI_cursor_close(portal);
@@ -428,6 +526,244 @@ graph_reach_pull(HTAB *reach, int64 seed, int hops, int edge_type,
 		*budget_remaining = 0;
 	if (tjs_read_graph_censored())
 		*graph_censored = true;
+}
+
+/*
+ * PPR forward-push constants (plan 095 spike): alpha and r_max mirror the host reference
+ * defaults (bench/tjs_open_ref.py: alpha=0.15, r_max=1e-3) exactly. Not exposed as new GUCs --
+ * the spike's only new knob is tjs.graph_scoring; tjs.graph_work_budget (ADR-0020) remains the
+ * one shared work bound for both the membership BFS and this push.
+ */
+#define TJS_PPR_ALPHA	0.15
+#define TJS_PPR_RMAX	1e-3
+
+typedef struct PprQItem
+{
+	int64		vid;
+	int32		depth;
+} PprQItem;
+
+/* residue scratch state: vid -> not-yet-pushed probability mass, drained to `reserve` (in the
+ * caller's ReachEntry hash) alpha at a time as each active node is popped. */
+typedef struct ResidueEntry
+{
+	int64		vid;
+	float8		residue;
+} ResidueEntry;
+
+static void
+ppr_enqueue(PprQItem **queue, int *qcap, int *qn, int64 vid, int32 depth)
+{
+	if (*qn == *qcap)
+	{
+		*qcap *= 2;
+		*queue = (PprQItem *) repalloc(*queue, (*qcap) * sizeof(PprQItem));
+	}
+	(*queue)[*qn].vid = vid;
+	(*queue)[*qn].depth = depth;
+	(*qn)++;
+}
+
+/*
+ * graph_reach_ppr_push -- bounded forward-push Personalized PageRank (Andersen-Chung-Lang,
+ * FOCS'06; ADR-0012 addendum "Ranking") over ALL seedless seeds together, replacing
+ * graph_reach_pull's per-seed membership BFS when tjs.graph_scoring = ppr. Personalization
+ * mass per seed is proportional to its vector proximity (sim = 1/(1+dist)), normalized to sum
+ * 1 across the n_seeds, so residue naturally merges across seeds sharing a frontier -- the
+ * "seeds weighted by vector proximity" contract (plan 095), preserving 087's nearest-in-window
+ * seed selection (the caller already qsorts seed_buf and passes the nearest n_seeds).
+ *
+ * DEVIATION (documented): queue-based FIFO local push, not the strict max-residue-first
+ * priority pop the ADR-0012 addendum describes. Forward push's fixed point -- the reserve
+ * split once every active node's residue has dropped below r_max -- is order-independent
+ * (Andersen-Chung-Lang's local push is confluent: any sequence that keeps processing
+ * above-threshold nodes converges to the same reserve/residue split). FIFO order changes only
+ * the NUMBER of push operations en route to that fixed point, never its correctness, and avoids
+ * a decrease-key priority queue for this spike's bounded C operator.
+ *
+ * `hops` bounds EXPANSION exactly like the membership path's bounded traversal: a node at
+ * depth == hops still receives residue/reserve credit (it is "reached") but its own out-edges
+ * are never walked (mirrors gph_traverse_bounded's `item.depth >= ctx->max_depth => never
+ * expanded further`). This is depth-bounded PPR, not the unbounded original.
+ *
+ * Each out-edge enumerated -- via `SELECT (graph_store.gph_traverse_typed($1,$2,0,-1)).dst`, a
+ * target-list (not FROM-clause) SRF call over the SAME gs_open/gs_getnext single-hop engine
+ * gph_traverse_bounded is built on, pulled one row per SPI cursor fetch -- is one edge-step
+ * charged against the shared *budget_remaining pool (ADR-0020 decision 2 accounting, reused
+ * verbatim from graph_reach_pull). Hitting the budget mid-push stops the push (the reserve
+ * state already banked is kept, never discarded) and sets *graph_censored: a disclosed partial
+ * PPR, never silently exact -- same honesty contract ADR-0020 §3 pins for the membership path.
+ *
+ * `reach` (ReachEntry: vid, reserve) accumulates every touched vertex's alpha-reserve -- the
+ * SAME HTAB shape graph_reach_pull populates for membership mode (reserve stays 0 there). State
+ * is bounded by budget exactly like the membership path: residue/queue entries are created only
+ * on first touch, and touches <= edge-steps <= budget (ADR-0020 §2's O(min(budget,|V|)) bound,
+ * unchanged).
+ */
+static void
+graph_reach_ppr_push(HTAB *reach, TopkItem *seed_buf, int n_seeds, int hops, int edge_type,
+					  int64 *budget_remaining, int64 *graph_examined, bool *graph_censored)
+{
+	HASHCTL		rctl;
+	HTAB	   *residue;
+	PprQItem   *queue;
+	int			qcap,
+				qn,
+				qhead;
+	float8	   *simw = palloc(sizeof(float8) * Max(n_seeds, 1));
+	float8		simsum = 0.0;
+	int			i;
+
+	if (n_seeds <= 0)
+		return;					/* nothing to personalize on; leave reach untouched */
+
+	memset(&rctl, 0, sizeof(rctl));
+	rctl.keysize = sizeof(int64);
+	rctl.entrysize = sizeof(ResidueEntry);
+	rctl.hcxt = CurrentMemoryContext;
+	residue = hash_create("tjs_open ppr residue", 4096, &rctl, HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+
+	qcap = 256;
+	qn = 0;
+	qhead = 0;
+	queue = (PprQItem *) palloc(qcap * sizeof(PprQItem));
+
+	for (i = 0; i < n_seeds; i++)
+	{
+		simw[i] = 1.0 / (1.0 + seed_buf[i].dist);
+		simsum += simw[i];
+	}
+	if (simsum <= 0.0)
+		simsum = 1.0;			/* defensive; dist >= 0 so simw > 0 and simsum > 0 whenever n_seeds > 0 */
+
+	for (i = 0; i < n_seeds; i++)
+	{
+		int64		seed = seed_buf[i].id;
+		float8		p = simw[i] / simsum;
+		bool		found;
+		ReachEntry *re = (ReachEntry *) hash_search(reach, &seed, HASH_ENTER, &found);
+		ResidueEntry *rse;
+
+		if (!found)
+			re->reserve = 0.0;
+		rse = (ResidueEntry *) hash_search(residue, &seed, HASH_ENTER, &found);
+		if (!found)
+			rse->residue = 0.0;
+		rse->residue += p;
+		if (rse->residue >= TJS_PPR_RMAX)
+			ppr_enqueue(&queue, &qcap, &qn, seed, 0);
+	}
+
+	while (qhead < qn)
+	{
+		PprQItem	item = queue[qhead++];
+		bool		found;
+		ResidueEntry *rse;
+		ReachEntry *re;
+		float8		cur_residue;
+		float8		push_mass;
+		int64	   *nbrs;
+		int			ncap,
+					ndeg;
+
+		CHECK_FOR_INTERRUPTS();
+
+		rse = (ResidueEntry *) hash_search(residue, &item.vid, HASH_FIND, &found);
+		cur_residue = found ? rse->residue : 0.0;
+		if (cur_residue < TJS_PPR_RMAX)
+			continue;			/* stale queue entry: already drained since it was enqueued */
+
+		re = (ReachEntry *) hash_search(reach, &item.vid, HASH_ENTER, &found);
+		if (!found)
+			re->reserve = 0.0;
+		re->reserve += TJS_PPR_ALPHA * cur_residue;
+		push_mass = (1.0 - TJS_PPR_ALPHA) * cur_residue;
+		rse->residue = 0.0;		/* drained */
+
+		if (item.depth >= hops)
+			continue;			/* reached, never expanded further (mirrors the bounded
+								 * traversal's hop bound) */
+
+		if (*budget_remaining <= 0)
+		{
+			*graph_censored = true;
+			continue;			/* reserve already banked above; no budget to enumerate edges */
+		}
+
+		/* enumerate item.vid's out-edges: one SPI cursor fetch per edge = one edge-step. */
+		ncap = 16;
+		ndeg = 0;
+		nbrs = palloc(sizeof(int64) * ncap);
+		{
+			Oid			argtypes[4] = {INT8OID, INT4OID, INT4OID, INT8OID};
+			Datum		values[4];
+			Portal		portal;
+
+			values[0] = Int64GetDatum(item.vid);
+			values[1] = Int32GetDatum(edge_type);
+			values[2] = Int32GetDatum(0);	/* direction 0 = out */
+			values[3] = Int64GetDatum((int64) -1);	/* source_id -1 = unscoped */
+			portal = SPI_cursor_open_with_args(NULL,
+											   "SELECT (graph_store.gph_traverse_typed($1, $2, $3, $4)).dst",
+											   4, argtypes, values, NULL, true, 0);
+			for (;;)
+			{
+				bool		isnull;
+				Datum		d;
+
+				CHECK_FOR_INTERRUPTS();
+				if (*budget_remaining <= 0)
+				{
+					*graph_censored = true;
+					break;
+				}
+				SPI_cursor_fetch(portal, true, 1);
+				if (SPI_processed == 0)
+					break;
+				(*graph_examined)++;
+				(*budget_remaining)--;
+				d = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isnull);
+				if (!isnull)
+				{
+					if (ndeg == ncap)
+					{
+						ncap *= 2;
+						nbrs = (int64 *) repalloc(nbrs, sizeof(int64) * ncap);
+					}
+					nbrs[ndeg++] = DatumGetInt64(d);
+				}
+			}
+			SPI_cursor_close(portal);
+		}
+
+		if (ndeg > 0)
+		{
+			float8		share = push_mass / ndeg;
+			int			j;
+
+			for (j = 0; j < ndeg; j++)
+			{
+				int64		dst = nbrs[j];
+				ReachEntry *dre2 = (ReachEntry *) hash_search(reach, &dst, HASH_ENTER, &found);
+				ResidueEntry *dre;
+
+				if (!found)
+					dre2->reserve = 0.0;
+				dre = (ResidueEntry *) hash_search(residue, &dst, HASH_ENTER, &found);
+				if (!found)
+					dre->residue = 0.0;
+				dre->residue += share;
+				if (dre->residue >= TJS_PPR_RMAX)
+					ppr_enqueue(&queue, &qcap, &qn, dst, item.depth + 1);
+			}
+		}
+		/* dangling node (ndeg == 0): push_mass is discarded, standard forward-push handling --
+		 * its alpha-share is already banked in re->reserve above. */
+		pfree(nbrs);
+	}
+	pfree(queue);
+	/* residue is scratch state, allocated in CurrentMemoryContext like `reach`/`seen`; freed
+	 * with the surrounding per-call context, no explicit hash_destroy needed. */
 }
 
 /*
@@ -471,6 +807,37 @@ seedless_seed_and_admit(TopkItem *seed_buf, int n_buf, int m_seeds, int hops,
 			(void) topk_offer(bridge_topk, seed_buf[i].id, seed_buf[i].dist);
 			tjs_bridges_injected++;
 		}
+		if (topk_offer(topk, seed_buf[i].id, seed_buf[i].dist))
+			*drops = 0;
+	}
+}
+
+/*
+ * PPR twin of seedless_seed_and_admit (plan 095, tjs.graph_scoring = ppr): same nearest-in-
+ * window seed selection (087) and the same vector-pool admission of every buffered candidate
+ * (drop-counter reset on improve -- the TR-1 termination signal is unchanged in ppr mode), but
+ * the graph leg runs graph_reach_ppr_push (forward-push reserves) instead of per-seed
+ * membership BFS, and does NOT offer anything to bridge_topk here -- graph-sourced ranking is
+ * deferred to a single unified finalize pass (tjs_open_pg, PPR branch) so the fused score can
+ * be normalized over the whole reach set once, not per-candidate as it streams in.
+ */
+static void
+seedless_seed_and_admit_ppr(TopkItem *seed_buf, int n_buf, int m_seeds, int hops,
+							int edge_type, HTAB *reach, Topk *topk, int *drops,
+							int64 *budget_remaining, int64 *graph_examined,
+							bool *graph_censored)
+{
+	int			i;
+	int			n_seeds;
+
+	qsort(seed_buf, n_buf, sizeof(TopkItem), topk_cmp_dist);
+	n_seeds = Min(m_seeds, n_buf);
+
+	graph_reach_ppr_push(reach, seed_buf, n_seeds, hops, edge_type,
+						  budget_remaining, graph_examined, graph_censored);
+
+	for (i = 0; i < n_buf; i++)
+	{
 		if (topk_offer(topk, seed_buf[i].id, seed_buf[i].dist))
 			*drops = 0;
 	}
@@ -833,19 +1200,33 @@ tjs_open_pg(PG_FUNCTION_ARGS)
 					n_buf++;
 					if (n_buf < seed_window)
 						continue;
-					seedless_seed_and_admit(seed_buf, n_buf, m_seeds, hops, edge_type,
-											reach, &topk, &bridge_topk, &drops,
-											&graph_budget_remaining, &tjs_graph_examined,
-											&tjs_graph_censored);
+					if (tjs_graph_scoring == TJS_SCORING_PPR)
+						seedless_seed_and_admit_ppr(seed_buf, n_buf, m_seeds, hops, edge_type,
+													reach, &topk, &drops,
+													&graph_budget_remaining, &tjs_graph_examined,
+													&tjs_graph_censored);
+					else
+						seedless_seed_and_admit(seed_buf, n_buf, m_seeds, hops, edge_type,
+												reach, &topk, &bridge_topk, &drops,
+												&graph_budget_remaining, &tjs_graph_examined,
+												&tjs_graph_censored);
 					seeded = true;
 					continue;
 				}
 
-				(void) hash_search(reach, &cand, HASH_FIND, &found);
-				if (found)
+				/*
+				 * ppr mode (plan 095): graph-sourced ranking is deferred to the unified
+				 * finalize pass below (a fused score needs the whole reach set's min/max
+				 * to normalize against) -- no in-stream bridge_topk offer here.
+				 */
+				if (tjs_graph_scoring == TJS_SCORING_MEMBERSHIP)
 				{
-					(void) topk_offer(&bridge_topk, cand, dist);
-					tjs_bridges_injected++;
+					(void) hash_search(reach, &cand, HASH_FIND, &found);
+					if (found)
+					{
+						(void) topk_offer(&bridge_topk, cand, dist);
+						tjs_bridges_injected++;
+					}
 				}
 			}
 
@@ -866,10 +1247,16 @@ tjs_open_pg(PG_FUNCTION_ARGS)
 		 * parity — phase 1 breaks out and proceeds with what it has) */
 		if (reach != NULL && !seeded)
 		{
-			seedless_seed_and_admit(seed_buf, n_buf, m_seeds, hops, edge_type,
-									reach, &topk, &bridge_topk, &drops,
-									&graph_budget_remaining, &tjs_graph_examined,
-									&tjs_graph_censored);
+			if (tjs_graph_scoring == TJS_SCORING_PPR)
+				seedless_seed_and_admit_ppr(seed_buf, n_buf, m_seeds, hops, edge_type,
+											reach, &topk, &drops,
+											&graph_budget_remaining, &tjs_graph_examined,
+											&tjs_graph_censored);
+			else
+				seedless_seed_and_admit(seed_buf, n_buf, m_seeds, hops, edge_type,
+										reach, &topk, &bridge_topk, &drops,
+										&graph_budget_remaining, &tjs_graph_examined,
+										&tjs_graph_censored);
 			seeded = true;
 		}
 
@@ -889,138 +1276,374 @@ tjs_open_pg(PG_FUNCTION_ARGS)
 		index_close(index, AccessShareLock);
 		table_close(heap, AccessShareLock);
 
-		/*
-		 * PHASE 3b (fork parity): bridges the ANN stream never emitted before termination are
-		 * fetched DIRECTLY by id (filter respected) and offered to the guaranteed bridge
-		 * budget — "a graph-reachable candidate is admitted even when its vector rank is past
-		 * the frontier". Each direct fetch counts as examined work (the fork's work-bound
-		 * counts the drain the same way).
-		 */
-		if (reach != NULL)
+		if (tjs_graph_scoring == TJS_SCORING_PPR)
 		{
-			StringInfoData bq;
-			SPIPlanPtr	fetch_plan;
-			Oid			bargs[1] = {INT8OID};
-			HASH_SEQ_STATUS hs;
-			int64	   *bid;
+			/*
+			 * PPR unified finalize (plan 095): replaces membership's incremental
+			 * in-stream + phase-3b bridge_topk offers (which rank purely by vector
+			 * distance) with ONE bounded pass that fuses vector-similarity and PPR-
+			 * reserve -- the FR-fusion composition bench/tjs_open_ref.py measured as the
+			 * winner (score = min-max-normalized vec-sim + min-max-normalized reserve),
+			 * reproduced here via the operator's EXISTING bounded finalize-sort
+			 * machinery over <= topk.n + |reach| candidates (never the full corpus,
+			 * never a global reserve-map sort) rather than the host reference's
+			 * incremental two-leg NRA/FR streaming merge -- an explicit, documented
+			 * deviation the plan allows ("materializing all reserves then sorting once
+			 * at finalize over <=k+bridges is fine").
+			 *
+			 * DEVIATION from membership's two-heap (topk / bridge_topk) architecture:
+			 * ranking here is a SINGLE fused score applied to every candidate that could
+			 * matter (both the vector pool and every graph-reached vertex), not "vector
+			 * distance for the pool, a separate criterion for bridges only" -- because
+			 * emitting the FINAL order by two incompatible scales (raw distance vs a
+			 * fused score) would produce a meaningless merge sort. A reach member is
+			 * skipped by the fetch loop below iff it already made the bounded vector
+			 * top-k (topk, capacity k) -- its distance is already known from the stream.
+			 * Any reach member the top-k heap evicted or never streamed still needs its
+			 * distance fetched (a bounded, disclosed re-fetch of up to |reach| rows -- the
+			 * same cost class as membership's own phase-3b drain), since normalization
+			 * needs the complete pool up front. The bridge-cap floor(k/2)-min-1 guarantee
+			 * (087) still applies: graph-sourced candidates get first claim on up to
+			 * bridge_cap final slots (by fused score), the remaining slots go to the
+			 * next-best fused-score candidates of any origin.
+			 */
+			PprCand    *pool = palloc(sizeof(PprCand) * Max(k + 1, 16));
+			int			pcap = Max(k + 1, 16);
+			int			npool = 0;
+			float8		mind = 0,
+						maxd = 0,
+						minr = 0,
+						maxr = 0;
+			bool		first = true;
+			int			i,
+						j;
 
-			initStringInfo(&bq);
-			appendStringInfo(&bq, "SELECT %s FROM %s.%s WHERE %s = $1",
-							 qident(get_attname(reloid, vec_attno, false)),
-							 qident(get_namespace_name(get_rel_namespace(reloid))),
-							 qident(get_rel_name(reloid)), qident(id_col));
-			if (filter[0] != '\0')
-				appendStringInfo(&bq, " AND (%s)", filter);
-			fetch_plan = SPI_prepare(bq.data, 1, bargs);
-			if (fetch_plan == NULL)
-				ereport(ERROR, (errmsg("tjs_open: bridge fetch plan failed: %s", bq.data)));
-
-			hash_seq_init(&hs, reach);
-			while ((bid = (int64 *) hash_seq_search(&hs)) != NULL)
+			/* seed pool with the vector-pool candidates (dist already known, reserve
+			 * looked up if graph-reached) */
+			for (i = 0; i < topk.n; i++)
 			{
-				bool		in_stream;
-				Datum		fv[1];
-				int			rc;
+				bool		found;
+				ReachEntry *re = reach != NULL ?
+					(ReachEntry *) hash_search(reach, &topk.items[i].id, HASH_FIND, &found) : NULL;
 
-				CHECK_FOR_INTERRUPTS();
-				(void) hash_search(seen, bid, HASH_FIND, &in_stream);
-				if (in_stream)
-					continue;	/* already offered from the stream */
-				fv[0] = Int64GetDatum(*bid);
-				rc = SPI_execute_plan(fetch_plan, fv, NULL, true, 1);
-				if (rc != SPI_OK_SELECT)
-					ereport(ERROR, (errmsg("tjs_open: bridge fetch failed (%d)", rc)));
-				tjs_examined++;
-				if (SPI_processed == 1)
+				if (npool == pcap)
 				{
-					bool		vnull;
-					Datum		vd = SPI_getbinval(SPI_tuptable->vals[0],
-												   SPI_tuptable->tupdesc, 1, &vnull);
+					pcap *= 2;
+					pool = (PprCand *) repalloc(pool, sizeof(PprCand) * pcap);
+				}
+				pool[npool].id = topk.items[i].id;
+				pool[npool].dist = topk.items[i].dist;
+				pool[npool].reserve = (re != NULL) ? re->reserve : 0.0;
+				pool[npool].graph_sourced = (re != NULL);
+				npool++;
+			}
 
-					if (!vnull)
+			/* every reach member NOT already in the pool needs its distance fetched --
+			 * bounded to |reach|, the same class of work membership's phase-3b already
+			 * pays for the reach members it drains. */
+			if (reach != NULL)
+			{
+				StringInfoData bq;
+				SPIPlanPtr	fetch_plan;
+				Oid			bargs[1] = {INT8OID};
+				HASH_SEQ_STATUS hs;
+				ReachEntry *re;
+
+				initStringInfo(&bq);
+				appendStringInfo(&bq, "SELECT %s FROM %s.%s WHERE %s = $1",
+								 qident(get_attname(reloid, vec_attno, false)),
+								 qident(get_namespace_name(get_rel_namespace(reloid))),
+								 qident(get_rel_name(reloid)), qident(id_col));
+				if (filter[0] != '\0')
+					appendStringInfo(&bq, " AND (%s)", filter);
+				fetch_plan = SPI_prepare(bq.data, 1, bargs);
+				if (fetch_plan == NULL)
+					ereport(ERROR, (errmsg("tjs_open: bridge fetch plan failed: %s", bq.data)));
+
+				hash_seq_init(&hs, reach);
+				while ((re = (ReachEntry *) hash_seq_search(&hs)) != NULL)
+				{
+					bool		already = false;
+					Datum		fv[1];
+					int			rc;
+
+					CHECK_FOR_INTERRUPTS();
+					for (j = 0; j < npool; j++)
+						if (pool[j].id == re->vid)
+						{
+							already = true;
+							break;
+						}
+					if (already)
+						continue;	/* already in the pool via topk, above */
+
+					fv[0] = Int64GetDatum(re->vid);
+					rc = SPI_execute_plan(fetch_plan, fv, NULL, true, 1);
+					if (rc != SPI_OK_SELECT)
+						ereport(ERROR, (errmsg("tjs_open: bridge fetch failed (%d)", rc)));
+					tjs_examined++;
+					if (SPI_processed == 1)
 					{
-						float8		bdist = DatumGetFloat8(
-									FunctionCall2Coll(&distfn, InvalidOid, vd, query_vec));
+						bool		vnull;
+						Datum		vd = SPI_getbinval(SPI_tuptable->vals[0],
+													   SPI_tuptable->tupdesc, 1, &vnull);
 
-						/* counted per offer, landed or not — the fork counts every
-						 * materialized bridge row the same way (plan 087) */
-						(void) topk_offer(&bridge_topk, *bid, bdist);
-						tjs_bridges_injected++;
+						if (!vnull)
+						{
+							float8		bdist = DatumGetFloat8(
+										FunctionCall2Coll(&distfn, InvalidOid, vd, query_vec));
+
+							if (npool == pcap)
+							{
+								pcap *= 2;
+								pool = (PprCand *) repalloc(pool, sizeof(PprCand) * pcap);
+							}
+							pool[npool].id = re->vid;
+							pool[npool].dist = bdist;
+							pool[npool].reserve = re->reserve;
+							pool[npool].graph_sourced = true;
+							npool++;
+							/* counted per materialized bridge row, landed or not (whether
+							 * or not it survives finalize) -- mirrors membership's
+							 * tjs_open_bridges_injected() meaning (plan 087): a fetch that
+							 * the relational filter excluded or that had a null vector
+							 * never became a candidate, so it is not counted. */
+							tjs_bridges_injected++;
+						}
 					}
+				}
+			}
+
+			/* min-max normalize dist and reserve over the WHOLE bounded pool */
+			for (i = 0; i < npool; i++)
+			{
+				if (first)
+				{
+					mind = maxd = pool[i].dist;
+					minr = maxr = pool[i].reserve;
+					first = false;
+				}
+				else
+				{
+					if (pool[i].dist < mind)
+						mind = pool[i].dist;
+					if (pool[i].dist > maxd)
+						maxd = pool[i].dist;
+					if (pool[i].reserve < minr)
+						minr = pool[i].reserve;
+					if (pool[i].reserve > maxr)
+						maxr = pool[i].reserve;
+				}
+			}
+
+			/* fused score, stored as an ascending "goodness" key (-score) so topk_cmp_dist
+			 * (smaller = better, ties ascending id -- the plan's "ties by (score, id)")
+			 * sorts the pool correctly with no new comparator. */
+			for (i = 0; i < npool; i++)
+			{
+				float8		vecsim_norm = (maxd > mind) ? (maxd - pool[i].dist) / (maxd - mind) : 1.0;
+				float8		res_norm = (maxr > minr) ? (pool[i].reserve - minr) / (maxr - minr) : 1.0;
+
+				pool[i].dist = -(vecsim_norm + res_norm);	/* repurpose .dist as the sort key */
+			}
+			qsort(pool, npool, sizeof(PprCand), topk_cmp_dist_ppr_pool);
+
+			{
+				TopkItem   *final_items = palloc(sizeof(TopkItem) * k);
+				int			n_final = 0;
+				int			bridge_cap = reach != NULL ? k / 2 : 0;
+				bool		any_bridge = false;
+
+				for (i = 0; i < npool; i++)
+					if (pool[i].graph_sourced)
+					{
+						any_bridge = true;
+						break;
+					}
+				if (bridge_cap == 0 && any_bridge)
+					bridge_cap = 1;	/* min 1 when any bridge exists (087 rule, preserved) */
+
+				/* pass 1: graph-sourced candidates first claim, up to bridge_cap slots */
+				for (i = 0; i < npool && n_final < bridge_cap; i++)
+					if (pool[i].graph_sourced)
+					{
+						final_items[n_final].id = pool[i].id;
+						final_items[n_final].dist = pool[i].dist;
+						n_final++;
+					}
+				/* pass 2: fill the rest with the next-best fused-score candidates, any origin */
+				for (i = 0; i < npool && n_final < k; i++)
+				{
+					bool		dup = false;
+
+					for (j = 0; j < n_final; j++)
+						if (final_items[j].id == pool[i].id)
+						{
+							dup = true;
+							break;
+						}
+					if (!dup)
+					{
+						final_items[n_final].id = pool[i].id;
+						final_items[n_final].dist = pool[i].dist;
+						n_final++;
+					}
+				}
+
+				/*
+				 * final_items is NOT already in fused-score order: pass 1 can pull a
+				 * graph-sourced candidate ahead of a higher-scoring non-bridge one (that
+				 * IS the bridge-cap guarantee's point), so pass 2's in-order fill from the
+				 * front of `pool` again does not yield an overall-sorted sequence. Re-sort
+				 * the small (<= k) merged set by the same ascending "goodness" key
+				 * (score_as_dist = -fused_score, ties ascending id) before emission --
+				 * mirrors the membership branch's and filter-first's own final qsort.
+				 */
+				qsort(final_items, n_final, sizeof(TopkItem), topk_cmp_dist);
+				for (i = 0; i < n_final; i++)
+				{
+					Datum		row[1] = {Int64GetDatum(final_items[i].id)};
+					bool		nulls[1] = {false};
+
+					tuplestore_putvalues(tupstore, tupdesc, row, nulls);
 				}
 			}
 		}
-
-		/*
-		 * FINALIZE (fork parity, plan 087): bridges are GUARANTEED into the final budget
-		 * but their reserved share is CAPPED at k/2 (min 1 when any bridge exists) —
-		 * bridges-take-all would silently delete the vector modality on dense graphs.
-		 * Nearest bridges first up to the cap, vector winners fill the rest (dedup'd by
-		 * id), and only if the vector winners run out do remaining bridges backfill.
-		 * The merged set is emitted ascending by distance.
-		 */
+		else
 		{
-			TopkItem   *final_items = palloc(sizeof(TopkItem) * k);
-			int			n_final = 0;
-			int			i,
-					j;
-			int			bridge_cap = k / 2;
-
+			/*
+			 * PHASE 3b (fork parity): bridges the ANN stream never emitted before termination are
+			 * fetched DIRECTLY by id (filter respected) and offered to the guaranteed bridge
+			 * budget — "a graph-reachable candidate is admitted even when its vector rank is past
+			 * the frontier". Each direct fetch counts as examined work (the fork's work-bound
+			 * counts the drain the same way).
+			 */
 			if (reach != NULL)
 			{
-				if (bridge_cap == 0 && bridge_topk.n > 0)
-					bridge_cap = 1; /* min 1 when any bridge exists (fork rule) */
-				qsort(bridge_topk.items, bridge_topk.n, sizeof(TopkItem), topk_cmp_dist);
-				for (i = 0; i < bridge_topk.n && n_final < bridge_cap; i++)
+				StringInfoData bq;
+				SPIPlanPtr	fetch_plan;
+				Oid			bargs[1] = {INT8OID};
+				HASH_SEQ_STATUS hs;
+				ReachEntry *re;
+
+				initStringInfo(&bq);
+				appendStringInfo(&bq, "SELECT %s FROM %s.%s WHERE %s = $1",
+								 qident(get_attname(reloid, vec_attno, false)),
+								 qident(get_namespace_name(get_rel_namespace(reloid))),
+								 qident(get_rel_name(reloid)), qident(id_col));
+				if (filter[0] != '\0')
+					appendStringInfo(&bq, " AND (%s)", filter);
+				fetch_plan = SPI_prepare(bq.data, 1, bargs);
+				if (fetch_plan == NULL)
+					ereport(ERROR, (errmsg("tjs_open: bridge fetch plan failed: %s", bq.data)));
+
+				hash_seq_init(&hs, reach);
+				while ((re = (ReachEntry *) hash_seq_search(&hs)) != NULL)
 				{
-					bool		dup = false;
+					bool		in_stream;
+					Datum		fv[1];
+					int			rc;
 
-					for (j = 0; j < n_final; j++)
-						if (final_items[j].id == bridge_topk.items[i].id)
-						{
-							dup = true;
-							break;
-						}
-					if (!dup)
-						final_items[n_final++] = bridge_topk.items[i];
-				}
-			}
-			qsort(topk.items, topk.n, sizeof(TopkItem), topk_cmp_dist);
-			for (i = 0; i < topk.n && n_final < k; i++)
-			{
-				bool		dup = false;
-
-				for (j = 0; j < n_final; j++)
-					if (final_items[j].id == topk.items[i].id)
+					CHECK_FOR_INTERRUPTS();
+					(void) hash_search(seen, &re->vid, HASH_FIND, &in_stream);
+					if (in_stream)
+						continue;	/* already offered from the stream */
+					fv[0] = Int64GetDatum(re->vid);
+					rc = SPI_execute_plan(fetch_plan, fv, NULL, true, 1);
+					if (rc != SPI_OK_SELECT)
+						ereport(ERROR, (errmsg("tjs_open: bridge fetch failed (%d)", rc)));
+					tjs_examined++;
+					if (SPI_processed == 1)
 					{
-						dup = true;
-						break;
+						bool		vnull;
+						Datum		vd = SPI_getbinval(SPI_tuptable->vals[0],
+													   SPI_tuptable->tupdesc, 1, &vnull);
+
+						if (!vnull)
+						{
+							float8		bdist = DatumGetFloat8(
+										FunctionCall2Coll(&distfn, InvalidOid, vd, query_vec));
+
+							/* counted per offer, landed or not — the fork counts every
+							 * materialized bridge row the same way (plan 087) */
+							(void) topk_offer(&bridge_topk, re->vid, bdist);
+							tjs_bridges_injected++;
+						}
 					}
-				if (!dup)
-					final_items[n_final++] = topk.items[i];
+				}
 			}
-			/* backfill: only if the vector winners ran out (fork finalize step 3) */
-			if (reach != NULL)
-				for (i = 0; i < bridge_topk.n && n_final < k; i++)
+
+			/*
+			 * FINALIZE (fork parity, plan 087): bridges are GUARANTEED into the final budget
+			 * but their reserved share is CAPPED at k/2 (min 1 when any bridge exists) —
+			 * bridges-take-all would silently delete the vector modality on dense graphs.
+			 * Nearest bridges first up to the cap, vector winners fill the rest (dedup'd by
+			 * id), and only if the vector winners run out do remaining bridges backfill.
+			 * The merged set is emitted ascending by distance.
+			 */
+			{
+				TopkItem   *final_items = palloc(sizeof(TopkItem) * k);
+				int			n_final = 0;
+				int			i,
+						j;
+				int			bridge_cap = k / 2;
+
+				if (reach != NULL)
+				{
+					if (bridge_cap == 0 && bridge_topk.n > 0)
+						bridge_cap = 1; /* min 1 when any bridge exists (fork rule) */
+					qsort(bridge_topk.items, bridge_topk.n, sizeof(TopkItem), topk_cmp_dist);
+					for (i = 0; i < bridge_topk.n && n_final < bridge_cap; i++)
+					{
+						bool		dup = false;
+
+						for (j = 0; j < n_final; j++)
+							if (final_items[j].id == bridge_topk.items[i].id)
+							{
+								dup = true;
+								break;
+							}
+						if (!dup)
+							final_items[n_final++] = bridge_topk.items[i];
+					}
+				}
+				qsort(topk.items, topk.n, sizeof(TopkItem), topk_cmp_dist);
+				for (i = 0; i < topk.n && n_final < k; i++)
 				{
 					bool		dup = false;
 
 					for (j = 0; j < n_final; j++)
-						if (final_items[j].id == bridge_topk.items[i].id)
+						if (final_items[j].id == topk.items[i].id)
 						{
 							dup = true;
 							break;
 						}
 					if (!dup)
-						final_items[n_final++] = bridge_topk.items[i];
+						final_items[n_final++] = topk.items[i];
 				}
-			qsort(final_items, n_final, sizeof(TopkItem), topk_cmp_dist);
-			for (i = 0; i < n_final; i++)
-			{
-				Datum		row[1] = {Int64GetDatum(final_items[i].id)};
-				bool		nulls[1] = {false};
+				/* backfill: only if the vector winners ran out (fork finalize step 3) */
+				if (reach != NULL)
+					for (i = 0; i < bridge_topk.n && n_final < k; i++)
+					{
+						bool		dup = false;
 
-				tuplestore_putvalues(tupstore, tupdesc, row, nulls);
+						for (j = 0; j < n_final; j++)
+							if (final_items[j].id == bridge_topk.items[i].id)
+							{
+								dup = true;
+								break;
+							}
+						if (!dup)
+							final_items[n_final++] = bridge_topk.items[i];
+					}
+				qsort(final_items, n_final, sizeof(TopkItem), topk_cmp_dist);
+				for (i = 0; i < n_final; i++)
+				{
+					Datum		row[1] = {Int64GetDatum(final_items[i].id)};
+					bool		nulls[1] = {false};
+
+					tuplestore_putvalues(tupstore, tupdesc, row, nulls);
+				}
 			}
 		}
 	}

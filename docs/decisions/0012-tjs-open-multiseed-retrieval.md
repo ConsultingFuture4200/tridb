@@ -227,3 +227,157 @@ real HotpotQA (beating vector-only 0.967) via reachability-bridge injection + VB
 termination. The PPR-graded + FR-bound + RRF-fusion refinement specified in the 2026-06-29
 addendum above (host-validated at recall@10 0.987) is the next iteration on top of this
 first cut, not a prerequisite for it.
+
+## Addendum 2026-07-17 — plan 095 SPIKE: PPR-graded scoring on the stock bounded iterator, GATED
+
+Status: SPIKE, verdict below. Implements a `tjs.graph_scoring = membership | ppr` opt-in on the
+stock `tjs_open` seedless path (`src/tjs_pg/tjs_pg.c`), riding the SAME `gph_traverse_bounded`/
+`gph_traverse_typed` pull substrate ADR-0020 established, and measures it head-to-head against
+`membership` on the real local HotpotQA corpus (1490 paragraphs, 745 title-mention edges — undirected
+by insertion, both directions — 150 graded questions, BGE-768). This addendum does NOT change the
+default (`membership` stays default; ADR-0020 decision 3 is unmodified) and does NOT supersede
+ADR-0020 — it is the "documented follow-on" ADR-0020 §6 pointed to.
+
+### 1. Implementation summary
+
+- **GUC**: `tjs.graph_scoring` (`membership` default | `ppr`), `PGC_USERSET`, registered in
+  `_PG_init`. Not a query-language parameter — the ADR-0008 pinned `tjs_open` surface is
+  unchanged.
+- **Default inertness (the hard gate)**: every code path plan 095 added is gated on
+  `tjs_graph_scoring == TJS_SCORING_PPR`; the `membership` path is untouched control flow (the
+  `ReachEntry.reserve` field it now carries is written but never read in membership mode). Full
+  stock gate set (`make stock-graph-test PG_MAJOR=17`, 15 suites including the new
+  `test/tjs_ppr_test.sql`) green on PG16 and PG17; `scripts/tjs_parity_test.sh` 11/11 green.
+- **PPR mode (seedless only)**: bounded forward-push Personalized PageRank
+  (Andersen-Chung-Lang, FOCS'06) over ALL seedless seeds together, personalization weight
+  `sim_i = 1/(1+dist_i)` normalized to sum 1 (087's nearest-in-window seed selection preserved).
+  Each out-edge enumerated — via `SELECT (graph_store.gph_traverse_typed($1,$2,0,-1)).dst`, a
+  target-list (not FROM-clause) SRF call over the same `gs_open`/`gs_getnext` engine
+  `gph_traverse_bounded` is built on — is one edge-step charged against the shared
+  `tjs.graph_work_budget` pool (ADR-0020 decision 2 accounting, reused verbatim). `hops` bounds
+  expansion exactly like the membership path. `alpha = 0.15`, `r_max = 1e-3` (host reference
+  defaults, `bench/tjs_open_ref.py`) — fixed constants, not new GUCs.
+  - **Documented deviation 1 (push order)**: queue-based FIFO local push, not strict
+    max-residue-first priority pop. Forward push's fixed point is order-independent
+    (Andersen-Chung-Lang's local push is confluent); FIFO changes only the number of push
+    operations en route to it, never correctness. Avoids a decrease-key priority queue for this
+    spike's bounded C operator.
+  - **Documented deviation 2 (fusion → finalize, not incremental NRA/FR)**: the plan's fusion
+    contract is the FR composition `bench/tjs_open_ref.py` measured as the winner (score =
+    min-max-normalized vector similarity + min-max-normalized PPR reserve). We reproduce that
+    SCORE exactly, but via the operator's existing bounded finalize-sort machinery over
+    `<= topk.n + |reach|` candidates (never the full corpus, never a global reserve-map sort)
+    rather than re-implementing the host reference's incremental two-leg NRA/FR streaming merge
+    — an explicit deviation the plan allows ("materializing all reserves then sorting once at
+    finalize over `<=k+bridges` is fine"). The operator's own `term_cond` consecutive-drops rule
+    remains the TR-1 termination signal for the vector stream in both modes, unchanged.
+  - **Documented deviation 3 (unified ranking, not "bridges only")**: PPR mode ranks the WHOLE
+    finalize pool (vector-pool candidates ∪ graph-reached vertices) by the fused score, not just
+    the graph-sourced/bridge share — because emitting the final order by two incompatible scales
+    (raw vector distance for the pool, fused score for bridges only) would produce a meaningless
+    merge. Non-graph-reached candidates get `reserve = 0`, so they compete purely on
+    vector-similarity terms, same as membership mode's implicit behavior. The bridge-cap
+    `floor(k/2)`-min-1 guarantee (087) is preserved: graph-sourced candidates get first claim on
+    up to `bridge_cap` final slots (by fused score), the rest fill from the next-best fused-score
+    candidates of any origin. Ties by `(score, id)`.
+- **Fixture** (`test/tjs_ppr_test.sql`): 4-vertex deterministic graph, seed `S` with three
+  out-edges to `A`, `B`, `C` (all vector-distance-tied) plus a fourth edge `C -> A` that
+  reinforces `A` via a second path. Hand-computed forward push (shown in the file's header
+  comment) gives `reserve(A) = 0.078625 > reserve(B) = reserve(C) = 0.0425`; PPR promotes `A`
+  ahead of `B` (`{0,2,1,3}`) where membership's id tie-break puts `B` first (`{0,1,2,3}`) — the
+  graded order visibly differs, exactly as required. A negative control confirmed this assertion
+  FAILS pre-implementation (the `ppr` GUC value is accepted as a harmless custom-GUC placeholder
+  pre-095, so the query silently ran the pre-existing membership code path and returned
+  `{0,1,2,3}` instead of the graded order) — the engine now matches the hand derivation exactly.
+  A default-inertness assertion (no `SET`, and explicit `SET ... = membership`) both confirm
+  `{0,1,2,3}`.
+
+### 2. Recall gate — membership vs PPR on real HotpotQA (stock engine)
+
+Loader: `bench/hotpot_stock_gate.py` (`--gen-sql`) + `scripts/hotpot_stock_gate.sh` (build +
+run + parse). Corpus loaded verbatim from `data/hotpot/manifest.json` /`corpus_emb.npy`
+/`query_emb.npy` (the SAME data `bench/tjs_open_ref.py` uses) into a stock PG17
+(`tridb/pg17-unfork:dev`, `graph_store_am` + `tjs_pg`, no fork) image: 1490 `paragraphs` rows
+(`vector(768)`, HNSW `vector_l2_ops`), 1490 typed edges (745 `_edges` pairs inserted in BOTH
+directions — undirected, matching the host reference's `build_adjacency`). All 150 questions run
+through seedless `tjs_open` in both `tjs.graph_scoring` modes at `k ∈ {5,10}`,
+`term_cond ∈ {8,32,128}`, `m_seeds=5`, `hops=4` (fixed — the host reference's PPR is
+depth-unbounded; the engine bounds by `hops`, a required argument in both modes; 4 is generous
+on this sparse graph — mean degree ≈ 1 — so the bound should not be the limiting factor,
+disclosed as a host-vs-engine deviation), fixed `tjs.graph_work_budget` (ADR-0020 default,
+65536). Graded with `bench.graphrag_report.evidence_scores` (`recall`, `joint`) against
+`gold_ids` — the same reducer the plan names.
+
+| mode | k | term_cond | n | recall | joint | graph_examined (mean) | censored fraction |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| membership | 5 | 8 | 150 | 0.880 | 0.767 | 46.7 | 0.000 |
+| membership | 5 | 32 | 150 | 0.880 | 0.767 | 46.7 | 0.000 |
+| membership | 5 | 128 | 150 | 0.880 | 0.767 | 46.7 | 0.000 |
+| membership | 10 | 8 | 150 | 0.963 | 0.927 | 46.7 | 0.000 |
+| membership | 10 | 32 | 150 | 0.963 | 0.927 | 46.7 | 0.000 |
+| membership | 10 | 128 | 150 | 0.963 | 0.927 | 46.7 | 0.000 |
+| ppr | 5 | 8 | 150 | 0.927 | 0.860 | 113.2 | 0.000 |
+| ppr | 5 | 32 | 150 | 0.927 | 0.860 | 113.2 | 0.000 |
+| ppr | 5 | 128 | 150 | 0.927 | 0.860 | 113.2 | 0.000 |
+| ppr | 10 | 8 | 150 | 0.983 | 0.967 | 113.2 | 0.000 |
+| ppr | 10 | 32 | 150 | 0.983 | 0.967 | 113.2 | 0.000 |
+| ppr | 10 | 128 | 150 | 0.983 | 0.967 | 113.2 | 0.000 |
+
+All 150 questions scored, both modes, every point (no dropped queries; `n=150` throughout).
+`censored fraction = 0.000` everywhere — no query hit `tjs.graph_work_budget` (mean
+`graph_examined` is 46.7 membership / 113.2 ppr edge-steps, both `< 0.1 %` of the shared
+65536-edge-step budget and a small fraction of the 1490+1490-edge corpus) — the comparison is
+uncensored in both modes, so the recall delta below is not an artifact of one mode being capped
+tighter than the other. `term_cond` is INERT across `{8, 32, 128}` on this corpus (every row is
+byte-identical across the three term_cond values within a mode) — the same "small/sparse corpus
+doesn't exercise the termination knob" finding the 2026-06-29 host addendum reported for `r_max`,
+now confirmed for the engine's `term_cond` too on this same corpus.
+
+**PPR beats membership at every measured point**: recall@5 **0.927 vs 0.880** (+4.7 pt), joint@5
+**0.860 vs 0.767** (+9.3 pt); recall@10 **0.983 vs 0.963** (+2.0 pt), joint@10 **0.967 vs 0.927**
+(+4.0 pt). Cost: PPR's forward push touches ~2.4x the edge-steps membership's BFS does (113.2 vs
+46.7 mean) — real but still `<0.1%` of the shared budget, not a practical concern at this scale.
+
+**Host-reference context** (labeled host, not engine — `docs/decisions/0012-tjs-open-multiseed-retrieval.md`
+2026-06-29 addendum, `bench/tjs_open_ref.py`, real HotpotQA, `m_seeds=5, alpha=0.15,
+vec_limit=200`): recall@5 `fr_fused = 0.937` vs the blocking `A_oracle = 0.883`; recall@10
+`FR = 0.987` vs `vector_only = 0.967`; `nodes_examined ≈ 11` (`≈ 0.7 %` of the corpus). These are
+HOST numbers (pure Python, unbounded incremental NRA/FR merge, no engine machinery) — not
+directly comparable point-for-point to the engine table above (different termination mechanism,
+different `hops` treatment, different corpus load path), but they establish the CEILING the
+graded composition is capable of when its incremental merge is not compressed into a bounded
+finalize sort.
+
+### 3. Verdict
+
+**GO** (opt-in research knob; NOT a default flip). PPR-graded scoring beats reachability-membership
+at every measured operating point on the real, local, engine-loaded HotpotQA corpus — recall@5
++4.7 pt, joint@5 +9.3 pt, recall@10 +2.0 pt, joint@10 +4.0 pt — with identical inputs (same
+corpus, same 150 questions, same `m_seeds`/`hops`/budget), both modes uncensored throughout
+(`censored fraction = 0.000`), so the delta is a genuine ranking-quality win, not a side effect
+of one mode being budget-capped tighter than the other. This corroborates the 2026-06-29 host
+addendum's headline (FR-fused beats vector-only/the blocking oracle) with a SEPARATE, engine-
+measured, honestly-capped number — the host and engine results agree in direction even though
+their magnitudes are not directly comparable (different corpus load path, different termination
+mechanism, `hops`-bounded push here vs the host's unbounded push, engine's finalize-sort fusion
+vs the host's incremental NRA/FR merge — see deviations 1-3 above). The cost is real (~2.4x the
+graph-leg edge-steps) but negligible relative to the shared budget at this scale.
+
+This is a SPIKE verdict, not a ship decision: `tjs.graph_scoring` stays a `PGC_USERSET` research
+knob, default `membership`, ADR-0020 decision 3 unmodified. Per plan 095's explicit scope, default
+adoption is its own ADR (would supersede ADR-0020 decision 3) and needs the wiki/wikidata-scale
+re-measure below before anyone proposes it — HotpotQA is small (1490 nodes) and sparse (mean
+degree ≈ 1), and the 2026-06-29 addendum already found `r_max` inert on this exact corpus; §2
+above found `term_cond` equally inert here. Neither knob has been exercised under real pressure
+yet, so this GO is "the graded composition measurably helps and costs little at HotpotQA scale,"
+not "the composition is proven at the scale that would justify defaulting it."
+
+### 4. What would change the verdict
+
+- A GO would still need the wiki/wikidata-scale re-measure (denser graph, `ADR-0012`'s own
+  caveat that `r_max` is inert on HotpotQA's sparse title-mention graph) before any default-flip
+  ADR is proposed — this spike is HotpotQA-only, small-corpus, `alpha`/`r_max` fixed at host
+  defaults, no sweep of those two knobs.
+- If a future pass ports the host reference's incremental NRA/FR merge into the C operator
+  (replacing deviation 2's bounded finalize sort), re-measure before concluding the finalize-sort
+  simplification cost real recall — this spike did not isolate that variable.
