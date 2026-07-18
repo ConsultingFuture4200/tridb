@@ -68,6 +68,44 @@ CI runs the full 11-suite matrix on stock PG 16 and 17 (x86_64) on every push
 (GB10): the same suites pass on aarch64 stock PG17 — GitHub-hosted ARM runners are not
 available on this repository's plan, so ARM is not (yet) in the per-push matrix.
 
+## Seedless graph scoring (ADR-0021)
+
+`tjs_open`'s vector-first/seedless path (`src IS NULL`) defaults to **PPR-graded scoring**
+(`tjs.graph_scoring = 'ppr'`): a bounded forward-push Personalized PageRank pass fuses vector
+similarity with graph reinforcement to rank graph-sourced candidates, instead of the binary
+reachability guarantee. Measured to dominate reachability-membership scoring on two
+independent-gold recall gates (HotpotQA and a 200k-article/14.68M-edge enwiki hyperlink
+corpus — see `docs/decisions/0021-ppr-default-graph-scoring.md` for the full evidence).
+Filter-first (`src IS NOT NULL`) is unaffected by this setting — it stays exact membership
+semantics.
+
+**Membership escape hatch:** `SET tjs.graph_scoring = 'membership'` restores the ADR-0020
+reachability-membership scoring byte-identically. This is the mode the 071 filter-first parity
+harness relies on, and the one any fork↔stock seedless differential comparison should use
+(ADR-0021 D4 — the stock default now intentionally diverges from the fork's membership-scored
+seedless semantics).
+
+**Budget guidance:** `tjs.graph_work_budget` (default `65536`, unchanged) is a **latency knob,
+not a recall knob**, at hyperlink-density graph scale — recall stays nearly flat across a 32×
+budget range while latency scales with the budget:
+
+| budget | scoring | measured recall@20 (enwiki 200k) | measured latency | censored? |
+|---|---|---|---|---|
+| 8192 | ppr | 0.120 | ~135 ms | yes |
+| 65536 (default) | ppr | ~0.12 (flat) | higher (≈2.3× the 8192 cost) | yes |
+| 65536 (default) | membership | 0.081 | ~640 ms | yes |
+
+`PPR @ 8192` dominates `membership @ 65536` on both recall and latency. The default budget is
+left at `65536` deliberately (D2): lowering it would change membership-mode behavior too and
+make wiki-scale results censored-by-default. Tune `tjs.graph_work_budget` down for
+hyperlink-dense corpora if latency matters more than the (flat) recall curve. Every benchmark
+headline must report the censor flag (`tjs_open_graph_censored()`) alongside it — spec
+Addendum A3, unchanged by this ADR.
+
+New GUCs `tjs.ppr_alpha` (default `0.15`) and `tjs.ppr_rmax` (default `1e-3`) expose the
+forward-push teleport probability and residue-drain threshold. They are **unswept research
+knobs**: the recall gates above were measured only at these defaults.
+
 ## Harness environment variables
 
 The Wikidata head-to-head harness (`bench/wikidata_h2h.py`, and its sibling `bench/wiki_h2h.py`)
