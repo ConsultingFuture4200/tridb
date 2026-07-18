@@ -719,7 +719,7 @@ The three "next moves" from the 071-092 wrap-up, maintainer-selected for immedia
 All three are file-disjoint (bench python / graph_am.c+crash drivers / tjs_pg.c+bench) and run in
 parallel. 095 never flips a default; its product is a measured GO/NO-GO in an ADR-0012 addendum.
 
-| 096 | Wiki-scale PPR re-measure: held-out link prediction at 200k (the default-adoption gate) | P1 | M–L | LOW–MED | 095, 091, 077 | host tests + 200k gate run | TODO |
+| 096 | Wiki-scale PPR re-measure: held-out link prediction at 200k (the default-adoption gate) | P1 | M–L | LOW–MED | 095, 091, 077 | host tests + 200k gate run | **DONE — VERDICT: GO-for-default-ADR** (`aabdfe9`; advisor-reviewed APPROVE: 200k enwiki + 14.68M real hyperlink edges on stock PG17, scoring-agnostic held-out-link gold (hold-out probe verified both directions), 36 points × n=300 strict; PPR wins all 18 matched points — recall@20 +47% rel; FIRST measurement where `tjs.graph_work_budget` binds (censored 0.84-1.00) yet recall ~flat across 32× budget ⇒ budget = latency knob here; term_cond inert again; PPR@8192 dominates membership@65536 on recall AND latency; results JSON integrity re-verified by advisor; default untouched — the default-flip ADR is the next artifact) |
 
 096 design notes: gold must be scoring-agnostic — the existing `wiki_h2h` oracle is
 membership-shaped and would bias the comparison, so the gate uses held-out hyperlinks
