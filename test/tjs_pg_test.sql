@@ -187,7 +187,9 @@ SET hnsw.max_scan_tuples = 20000;
 
 -- (4) vector-first, filtered: matches the exact oracle at recall >= 4/5, examines > 0 and
 -- FEWER than the table (TR-1 early termination with term_cond). term_cond fired the stop,
--- so reason is 'term_cond' and capped is false — a known non-budget ending.
+-- so reason is 'term_cond' and capped is false — a known non-budget ending. This test pins
+-- MEMBERSHIP semantics (ADR-0021 D5); the stock default is now 'ppr' (ADR-0021 D1).
+SET tjs.graph_scoring = 'membership';
 DO $$
 DECLARE got bigint[]; oracle bigint[]; ex bigint; hits int := 0; i int;
         reason text; capped boolean;
@@ -214,6 +216,7 @@ BEGIN
   END IF;
   RAISE NOTICE 'PASS 4: vector-first filtered recall %/5, examined % (0 < ex < 2000), reason=term_cond', hits, ex;
 END $$;
+RESET tjs.graph_scoring;
 
 -- (5) seedless BRIDGE INJECTION (fork parity, ADR-0012 recipe B + plan 087): query
 -- [0.0011..] (~ id 2.2, no distance ties) makes id 2 the nearest candidate; with
@@ -224,7 +227,9 @@ END $$;
 -- bridge share is CAPPED at k/2 = 2 (fork rule, plan 087): {2, 1000} take the bridge
 -- slots, the vector winners 3,1,4 keep the rest. bridges_injected counts every
 -- filter-passing reach member offered to the bridge budget exactly once (the fork's
--- meaning): |{2} u {1000..1100}| = 102.
+-- meaning): |{2} u {1000..1100}| = 102. This test pins MEMBERSHIP semantics (ADR-0021 D5);
+-- the stock default is now 'ppr' (ADR-0021 D1).
+SET tjs.graph_scoring = 'membership';
 DO $$
 DECLARE got bigint[]; nb bigint;
 BEGIN
@@ -237,6 +242,7 @@ BEGIN
   IF nb <> 102 THEN RAISE EXCEPTION 'bridges_injected=% (expected 102 = |reach|)', nb; END IF;
   RAISE NOTICE 'PASS 5: bridges guaranteed past the frontier, capped at k/2: % (injected %)', got, nb;
 END $$;
+RESET tjs.graph_scoring;
 
 -- (6) censored-ending honesty (plan 074): a tiny scan budget ends the stream before
 -- term_cond fires. pgvector does NOT disclose whether hnsw.max_scan_tuples or natural
@@ -308,11 +314,14 @@ END $$;
 --   k=1 -> cap 0 -> min 1: the nearest bridge (= the seed = the global nearest) holds
 --          the only slot. (With m_seeds >= 1 the seed is always the nearest candidate
 --          AND a bridge, so k=1 locks the min-1 outcome rather than discriminating it.)
+-- This test pins MEMBERSHIP semantics (ADR-0021 D5); the stock default is now 'ppr'
+-- (ADR-0021 D1).
 SELECT set_config('tjs.ptype2', graph_store.register_edge_type('P2')::text, false);
 SELECT count(*) FROM (
   SELECT graph_store.gph_insert_edge(900, g, current_setting('tjs.ptype2')::int)
   FROM generate_series(901, 940) AS g
 ) s;
+SET tjs.graph_scoring = 'membership';
 DO $$
 DECLARE got bigint[];
 BEGIN
@@ -338,6 +347,7 @@ BEGIN
   END IF;
   RAISE NOTICE 'PASS 8: bridge share capped at k/2 (min 1) — k=5/3/2/1 match the fork rule';
 END $$;
+RESET tjs.graph_scoring;
 
 -- (9) SEED WINDOW (plan 087 fork parity): seeds come from a buffered window of the first
 -- seed_window = max(m_seeds*8, m_seeds+32) filter-passing stream candidates (m_seeds=1
@@ -350,6 +360,9 @@ END $$;
 -- built deterministically on stock pgvector — HNSW level assignment is randomized, so
 -- an emitted-order-divergence test would be flaky. The window-size + drop-exemption
 -- footprint is the deterministic lock on the fork's nearest-in-window rule.)
+-- This test pins MEMBERSHIP semantics (ADR-0021 D5); the stock default is now 'ppr'
+-- (ADR-0021 D1).
+SET tjs.graph_scoring = 'membership';
 DO $$
 DECLARE got bigint[]; ex bigint; reason text;
 BEGIN
@@ -368,6 +381,7 @@ BEGIN
   END IF;
   RAISE NOTICE 'PASS 9: 33-candidate seed window buffered, drop-exempt, nearest-in-window seed (examined %)', ex;
 END $$;
+RESET tjs.graph_scoring;
 
 -- (10) UNIFORM STREAM ACCOUNTING (plan 087 fork parity): hub 500 --P2--> {400..600}\{500}
 -- makes EVERY near-band candidate a bridge. The fork admits every streamed candidate to
@@ -385,6 +399,9 @@ SELECT count(*) FROM (
   FROM generate_series(400, 600) AS g WHERE g <> 500
 ) s;
 SET hnsw.max_scan_tuples = 100;
+-- This test pins MEMBERSHIP semantics (ADR-0021 D5); the stock default is now 'ppr'
+-- (ADR-0021 D1).
+SET tjs.graph_scoring = 'membership';
 DO $$
 DECLARE got bigint[]; ex bigint; reason text;
 BEGIN
@@ -403,6 +420,7 @@ BEGIN
   END IF;
   RAISE NOTICE 'PASS 10: bridges compete in the vector top-k and drop accounting (examined %, reason %)', ex, reason;
 END $$;
+RESET tjs.graph_scoring;
 SET hnsw.max_scan_tuples = 20000;
 
 \echo === tjs_pg (stock-PG fused operator, ADR-0019): ALL PASS ===
