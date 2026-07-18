@@ -726,6 +726,21 @@ membership-shaped and would bias the comparison, so the gate uses held-out hyper
 (assets all local: `edges-*.tsv` + 200k×384 `dense_id_aligned.npy`); the sweep spans
 `term_cond` × `graph_work_budget` so the knobs HotpotQA left inert finally get exercised.
 
+### Spike→product sequence (maintainer-approved 2026-07-18: "run the 1 2 3 sequence")
+
+| Plan | Title | Priority | Effort | Risk | Depends on | Status |
+|------|-------|----------|--------|------|------------|--------|
+| 097 | Execute ADR-0021: PPR default flip (seedless) + alpha/r_max GUCs + D5 test migration | P1 | S–M | MED | 095, 096, ADR-0021 | TODO |
+| 098 | MCP agent-memory server on the release image (first-user surface) | P1 | M | LOW | 097, 076 | TODO |
+| 099 | Logical backup/restore: audit pg_dump loss + dump/restore surface + round-trip gate | P1 | M | MED | 091, 097 | TODO |
+| 100 | Single-writer enforcement + versioned extension upgrade scripts (0.1.0→0.2.0) | P1 | M | MED | 099 | TODO |
+| 101 | Release-cut prep: v0.2.0 notes, tag-triggered GHCR publish workflow, checklist (triggers stay with maintainer) | P1 | S–M | LOW | 097–100 | TODO |
+
+Order: 097 → (098 ‖ 099) → 100 → 101. 099/100 share the extension SQL surface (serialized);
+098 is new-files-only. Advisor recon for 099: `gstore` is a heap table with custom-formatted
+pages and NO `pg_extension_config_dump` marks anywhere — pg_dump is expected to silently lose
+the whole graph; plan 099 Step 1 proves or disproves before fixing.
+
 ### New residuals surfaced during execution (not yet planned)
 
 - **`gph_freeze()` commit is async-flushed (090 finding, proven w/ pg_waldump):** the freeze txn
