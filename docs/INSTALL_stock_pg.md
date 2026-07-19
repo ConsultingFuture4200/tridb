@@ -152,6 +152,82 @@ records the observed edge/vertex counts (the graph really holds them), but its
 failure before the assertion publishes no engine count at all — the expected host slice
 counts stay under `counts` and never stand in for engine observations.
 
+## Backup and restore
+
+**Physical backup covers everything; logical backup needs the plan-099 procedure below.**
+
+The graph store rides the host cluster's single WAL (golden rule 2), so any *physical* backup —
+`pg_basebackup`, WAL archiving / PITR, filesystem snapshots of a stopped cluster — captures the
+graph pages byte-for-byte along with the relational and vector data. Nothing extra to do.
+
+*Logical* backup is different. `gstore`'s pages are custom-formatted (not heap tuples), so
+`pg_dump` can never carry the topology natively — and before plan 099 a dump/restore cycle
+**silently lost the entire graph leg** (topology, `gph_vid_map`, `edge_type` extras,
+`identity_mode`) in both `-Fc` and plain modes, with rc 0 and no warning, while relational and
+vector data round-tripped fine. The restored database *looked* healthy. Since plan 099:
+
+- `graph_store.edge_type` (minus the seeded `related_to` row, which `CREATE EXTENSION`
+  re-creates) and `graph_store.gph_vid_map` are `pg_extension_config_dump`-marked, so their
+  rows ride `pg_dump` natively;
+- the native topology is exported by two SRFs over the existing read paths:
+  `gph_dump_vertices()` (all allocated vids, in vid order — allocation-preserving, see caveats)
+  and `gph_dump_edges()` (every MVCC-visible, non-tombstoned edge as `(src, dst, type_id)` in
+  `(src, type_id, adjacency)` order).
+
+### Procedure
+
+Dump (as the extension owner):
+
+```sql
+-- alongside:  pg_dump -Fc -f backup.fc <db>
+COPY (SELECT * FROM graph_store.gph_dump_vertices()) TO '/path/vertices.copy';
+COPY (SELECT * FROM graph_store.gph_dump_edges())    TO '/path/edges.copy';
+-- record whether the identity fast-path was on:
+SELECT identity_mode FROM graph_store.gph_am_meta;
+```
+
+Restore into a fresh database (`pg_restore -d <newdb> backup.fc` recreates the extensions and
+the config-table rows), then replay the topology:
+
+```sql
+-- 1. re-materialize the FULL allocated vid range, in order, BEFORE any edge
+--    (n = line count of vertices.copy)
+SELECT count(graph_store.gph_insert_vertex()) FROM generate_series(1, :n);
+-- 2. replay edges grouped by (src, type_id), array order = dump order
+--    (the typed batched gph_insert_edges, plan 091)
+CREATE TEMP TABLE gph_edge_staging (src bigint, dst bigint, type_id int, ord bigserial);
+COPY gph_edge_staging (src, dst, type_id) FROM '/path/edges.copy';
+SELECT count(graph_store.gph_insert_edges(src, dsts, type_id)) FROM (
+    SELECT src, type_id, array_agg(dst ORDER BY ord) AS dsts
+    FROM gph_edge_staging GROUP BY src, type_id ORDER BY src, type_id
+) g;
+-- 3. only if the source had it on (the DEV-1352 guard re-verifies the restored map):
+SELECT graph_store.gph_set_identity_mode(true);
+```
+
+### What is NOT preserved (a logical dump is a logical snapshot)
+
+- **Tombstone history and frozen-xid state.** Tombstoned edges are simply absent from the
+  dump; tombstoned or aborted-insert vertices restore as live-but-isolated placeholder vids
+  (their edges were already invisible, so *visible topology and traversals are identical*, but
+  `gph_vertex_count()` may read higher post-restore and `gph_freeze` state starts fresh).
+- **The raw `gph_edge_count()` insert counter.** It restarts at the replayed edge count;
+  `gph_visible_edge_count()` is the preserved quantity.
+- **Any-type emission order on type-interleaved sources.** Replay groups a source's edges by
+  type, so `gph_traverse_typed(v, t, ...)` output is byte-identical *per type*, while the
+  type-0 (any) emission *order* may differ (same edge set). `gph_am_meta` does not ride the
+  dump (its seeded row would PK-conflict); step 3 above re-derives it.
+
+### The gate
+
+`make stock-dump-restore-test` (`scripts/graph_dump_restore_test.sh`, also `PG_MAJOR=16`) runs
+the full round trip in one container — corpus load, dump, restore into a fresh database,
+byte-equality diff of a tri-modal probe (per-type traversals, counts, id map, dictionary,
+vector top-k, `tjs_open` ids), plus a corrupted-dump negative control that must fail the diff.
+It needs two databases in one container, so it is deliberately **not** in the per-PR `stock-pg`
+CI job's `STOCK_TESTS` list (keeps per-PR runtime flat); run it locally before release cuts or
+wire it as a CI dispatch job alongside `tjs-parity-test`.
+
 ## What this does and does not include
 
 - **Included:** the native graph access method (typed/directional adjacency, `gph_*` SQL
