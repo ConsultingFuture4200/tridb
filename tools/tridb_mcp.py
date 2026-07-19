@@ -348,7 +348,7 @@ class MemoryStore:
 def build_server(store: MemoryStore):
     from mcp.server.fastmcp import FastMCP
 
-    mcp = FastMCP("tridb-memory")
+    mcp = FastMCP("tridb-memory", log_level="WARNING")
 
     @mcp.tool()
     def store_memory(

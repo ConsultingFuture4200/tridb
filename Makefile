@@ -1,4 +1,4 @@
-.PHONY: test lint graph-test stock-graph-test stock-crash-test stock-release-smoke tjs-parity-test smoke-test test-all baseline-up baseline-down seed bench bench-live sweep sm2 fetch-dataset bench-public bench-repro fetch-hotpot graphrag graphrag-live bench-filtered ablation recall-decay tjs-open-ref tjs-open-live graphrag-h2h rabitq-sim gpu-build-index gpu-setup gpu-verify gpu-lock wiki-fetch wiki-extract wiki-scale wiki-neo4j wiki-subgraph wiki-linkpred lock clean clean-data
+.PHONY: test lint graph-test stock-graph-test stock-crash-test stock-release-smoke tjs-parity-test smoke-test test-all baseline-up baseline-down seed bench bench-live sweep sm2 fetch-dataset bench-public bench-repro fetch-hotpot graphrag graphrag-live bench-filtered ablation recall-decay tjs-open-ref tjs-open-live graphrag-h2h rabitq-sim gpu-build-index gpu-setup gpu-verify gpu-lock wiki-fetch wiki-extract wiki-scale wiki-neo4j wiki-subgraph wiki-linkpred mcp-demo lock clean clean-data
 
 PUBLIC_DATASET ?= gist-960-euclidean
 
@@ -453,6 +453,13 @@ wiki-linkpred:
 	$(PY) -m tools.wiki_linkpredict --corpus "$(WIKI_LP_MANIFEST)" \
 	  --limit $(WIKI_LP_LIMIT) --sample $(WIKI_LP_SAMPLE) --print-n 15 \
 	  $(if $(WIKI_LP_EMB_OUT),--emb-out "$(WIKI_LP_EMB_OUT)")
+
+# MCP agent-memory demo (advisor plan 098): one command against the shipped
+# release image — store/connect/recall through tools/tridb_mcp.py's real stdio
+# JSON-RPC transport. Needs the release image (make stock-release-smoke) and
+# `pip install -r requirements-mcp.txt`. See docs/mcp_agent_memory_v0.1.0.md.
+mcp-demo:
+	bash scripts/tridb_mcp_demo.sh tridb/postgres-trimodal:pg$(PG_MAJOR)
 
 baseline-up:
 	docker compose -f baseline/docker-compose.yml up -d
