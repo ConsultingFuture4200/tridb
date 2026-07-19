@@ -59,6 +59,10 @@ CREATE TABLE edge_type (
 );
 INSERT INTO edge_type (id, name) VALUES (1, 'related_to');
 GRANT SELECT ON edge_type TO PUBLIC;
+-- Logical-backup contract (advisor plan 099): extension member tables are SKIPPED by pg_dump
+-- unless marked; unmarked, a dump/restore cycle silently reset the dictionary to the seed row.
+-- The filter excludes id 1 because CREATE EXTENSION re-seeds it on restore (PK conflict otherwise).
+SELECT pg_catalog.pg_extension_config_dump('graph_store.edge_type', 'WHERE id <> 1');
 
 -- register_edge_type(name) RETURNS int — idempotent: returns the existing id if the name is
 -- already registered, else allocates the next id (max+1) and inserts it. Owner-guarded
@@ -237,6 +241,9 @@ CREATE TABLE gph_vid_map (
 -- Read surface stays open (matches gph_neighbors); mutation goes through
 -- gph_upsert_vertex, which is REVOKEd below like the other mutators (plan 026).
 GRANT SELECT ON gph_vid_map TO PUBLIC;
+-- Logical-backup contract (advisor plan 099): ride pg_dump natively (unmarked, the whole ext->vid
+-- mapping was silently dropped by a dump/restore cycle). No seed rows, so no filter needed.
+SELECT pg_catalog.pg_extension_config_dump('graph_store.gph_vid_map', '');
 
 -- ----------------------------------------------------------------------------
 -- Identity fast-path flag (advisor plan 033 / PERF-02). One-row metadata table
@@ -255,6 +262,11 @@ CREATE TABLE gph_am_meta (
 );
 INSERT INTO gph_am_meta (only_row, identity_mode) VALUES (true, false);
 GRANT SELECT ON gph_am_meta TO PUBLIC;
+-- Logical-backup contract (advisor plan 099): DELIBERATELY NOT pg_extension_config_dump-marked.
+-- CREATE EXTENSION re-seeds the single (true,false) row on restore, so a dumped row would PK-
+-- conflict at COPY time; and identity_mode is only meaningful ONCE the topology has been replayed.
+-- The documented restore procedure (docs/INSTALL_stock_pg.md) re-applies it at the end via
+-- gph_set_identity_mode(true), whose DEV-1352 guard re-verifies the restored map first.
 
 -- gph_set_identity_mode(bool): the loader calls this ONLY after a VERIFIED
 -- dense-in-order load (ext ids 0..N-1 materialized in id order). Setting it ON
@@ -639,3 +651,75 @@ COMMENT ON FUNCTION graph_store.last_join_order() IS
     'graph_store.graph_query() call in this session; NULL before the first call. On DEV-1290 '
     'engines the decision is passed into tjs() and selects the physical body (see '
     'tjs_last_join_order() for what actually ran); on older engines it is recorded but inert.';
+
+-- ============================================================================
+-- Logical backup/restore surface (advisor plan 099). gstore's pages are custom-
+-- formatted (NOT heap tuples), so pg_dump can never carry the topology natively:
+-- unmarked extension member tables are skipped SILENTLY — the audited failure
+-- mode was a restored database that looks healthy but has an EMPTY graph while
+-- relational + vector data round-trip fine. Physical backup (basebackup/WAL)
+-- already covers everything; this section is the LOGICAL path:
+--   * the HEAP config tables (edge_type, gph_vid_map) ride pg_dump via the
+--     pg_extension_config_dump marks above (gph_am_meta is excluded, see its
+--     comment);
+--   * the native topology is exported by the two SRFs below and replayed via
+--     gph_insert_vertex + the typed batched gph_insert_edges (plan 091) — the
+--     full procedure and its caveats live in docs/INSTALL_stock_pg.md, and
+--     scripts/graph_dump_restore_test.sh is the round-trip gate.
+-- A logical dump is a LOGICAL SNAPSHOT: tombstone history, frozen-xid state and
+-- the raw gph_edge_count() insert counter are NOT preserved; visible topology is.
+-- ============================================================================
+
+-- gph_allocated_vids(): the allocated-vid horizon (metapage gm_next_vid) — every vid ever
+-- assigned is in [0, horizon). NOT the visible count: aborted inserts leave allocated-but-
+-- invisible holes, and a vid-preserving restore must re-materialize the FULL range or every
+-- restored gph_vid_map row / edge endpoint above the first hole would silently re-bind to a
+-- compacted (wrong) vid. Read-only probe; surface stays open like gph_vertex_count.
+CREATE FUNCTION gph_allocated_vids() RETURNS bigint
+  AS 'MODULE_PATHNAME' LANGUAGE C VOLATILE;
+
+-- gph_dump_vertices() — the vertex replay set: ALL allocated vids, in vid order. Deliberately
+-- allocation-preserving rather than visible-only (see gph_allocated_vids above): tombstoned or
+-- aborted vids are emitted too and restore as live-but-isolated placeholder vids — their edges
+-- are already excluded by the visible-edge dump below, so the restored VISIBLE topology is
+-- identical; only gph_vertex_count() may read higher post-restore (documented).
+CREATE FUNCTION gph_dump_vertices() RETURNS SETOF bigint
+LANGUAGE sql VOLATILE
+AS $$
+    SELECT g FROM generate_series(0, graph_store.gph_allocated_vids() - 1) g
+$$;
+
+-- gph_dump_edges() — every MVCC-visible, non-tombstoned edge as (src, dst, type_id), streamed
+-- over the EXISTING typed read path (gph_traverse_typed per (vertex, registered type) — no new
+-- page-walk code): tombstoned edges, edges to tombstoned vertices and aborted inserts are all
+-- filtered exactly as reads filter them. Emission order is (src vid, type_id, adjacency slot
+-- order) — WITH ORDINALITY pins it — so a replay that groups by (src, type_id) in this order
+-- preserves per-type traversal order byte-for-byte. CAVEAT (documented): edges of DIFFERENT
+-- types on one source are regrouped by type, so a type-interleaved insertion history replays
+-- type-grouped — gph_traverse_typed(v, t, ...) output is byte-identical per type, while the
+-- any-type (type_id 0) emission ORDER may differ (same edge SET). The FROM-clause FunctionScan
+-- warning on gph_traverse_typed does not apply here: a dump drains every row (no LIMIT to
+-- early-terminate). Cost is O(types x (vertices + edges)) chain walks — a maintenance surface,
+-- not a query path.
+CREATE FUNCTION gph_dump_edges()
+RETURNS TABLE (src bigint, dst bigint, type_id int)
+LANGUAGE sql VOLATILE
+AS $$
+    SELECT v.vid, tr.dst, t.id
+    FROM graph_store.gph_dump_vertices() WITH ORDINALITY AS v(vid, vord)
+    CROSS JOIN graph_store.edge_type t
+    CROSS JOIN LATERAL graph_store.gph_traverse_typed(v.vid, t.id, 0, -1)
+         WITH ORDINALITY AS tr(esrc, dst, ord)
+    ORDER BY v.vord, t.id, tr.ord
+$$;
+
+COMMENT ON FUNCTION graph_store.gph_dump_vertices() IS
+    'TriDB logical dump (plan 099): the vertex replay set — all allocated vids in vid order '
+    '(allocation-preserving, includes tombstoned/aborted placeholder vids). Restore: call '
+    'graph_store.gph_insert_vertex() once per row, in order, BEFORE any edge replay. '
+    'See docs/INSTALL_stock_pg.md.';
+COMMENT ON FUNCTION graph_store.gph_dump_edges() IS
+    'TriDB logical dump (plan 099): every visible, non-tombstoned edge as (src, dst, type_id) '
+    'in (src, type_id, adjacency) order. Restore: group by (src, type_id) preserving row order '
+    'and replay via graph_store.gph_insert_edges(src, dst_array, type_id). '
+    'See docs/INSTALL_stock_pg.md.';

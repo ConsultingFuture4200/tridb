@@ -2648,6 +2648,38 @@ gph_vertex_count(PG_FUNCTION_ARGS)
 	PG_RETURN_INT64(n);
 }
 
+PG_FUNCTION_INFO_V1(gph_allocated_vids);
+
+/*
+ * gph_allocated_vids() RETURNS bigint — the allocated-vid horizon (metapage gm_next_vid), read
+ * under a share lock: every vid ever assigned is in [0, gph_allocated_vids()). Unlike
+ * gph_vertex_count() this is NOT an MVCC-visible count — an aborted insert's vid stays allocated
+ * (the GenericXLog page change survives an in-process abort; only crash REDO rolls it back), so
+ * the horizon can exceed the visible count. That is exactly why the logical dump surface (advisor
+ * plan 099) needs it: a vid-preserving restore must re-materialize the FULL allocated range —
+ * replaying only the visible count would compact vids across invisible holes and silently
+ * mis-bind every restored gph_vid_map row and edge endpoint above the first hole. No SQL surface
+ * can derive the horizon (it lives only on the metapage), hence this C probe.
+ */
+Datum
+gph_allocated_vids(PG_FUNCTION_ARGS)
+{
+	Relation	rel = gph_open_store(AccessShareLock);
+	GphMeta		meta;
+	int64		n;
+
+	if (RelationGetNumberOfBlocks(rel) == 0)
+	{
+		relation_close(rel, AccessShareLock);
+		PG_RETURN_INT64(0);
+	}
+
+	gph_read_meta(rel, &meta);
+	n = (int64) meta.gm_next_vid;
+	relation_close(rel, AccessShareLock);
+	PG_RETURN_INT64(n);
+}
+
 PG_FUNCTION_INFO_V1(gph_edge_count);
 
 /*
