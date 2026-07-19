@@ -730,7 +730,7 @@ membership-shaped and would bias the comparison, so the gate uses held-out hyper
 
 | Plan | Title | Priority | Effort | Risk | Depends on | Status |
 |------|-------|----------|--------|------|------------|--------|
-| 097 | Execute ADR-0021: PPR default flip (seedless) + alpha/r_max GUCs + D5 test migration | P1 | S–M | MED | 095, 096, ADR-0021 | TODO |
+| 097 | Execute ADR-0021: PPR default flip (seedless) + alpha/r_max GUCs + D5 test migration | P1 | S–M | MED | 095, 096, ADR-0021 | **DONE** (`1beeaa6`; advisor-verified: ADR-0021 Accepted, stock seedless `tjs.graph_scoring` default now `ppr`, `tjs.ppr_alpha`/`tjs.ppr_rmax` PGC_USERSET (defaults reproduce fixed constants), D5 migration incl. a gate-caught miss — `tjs_pg_tr1_test` C4/C4b/C8 needed membership pins (C4 read 1000 vs 1200 under ppr, the negative control in the live gate); gates green: stock-graph-test PG17+PG16 all suites, parity 11/11, stock-crash-test PG17, pytest 576, ruff. Note: executed post-crash — worktree lost, branch commits recovered + verified by advisor) |
 | 098 | MCP agent-memory server on the release image (first-user surface) | P1 | M | LOW | 097, 076 | TODO |
 | 099 | Logical backup/restore: audit pg_dump loss + dump/restore surface + round-trip gate | P1 | M | MED | 091, 097 | TODO |
 | 100 | Single-writer enforcement + versioned extension upgrade scripts (0.1.0→0.2.0) | P1 | M | MED | 099 | TODO |
