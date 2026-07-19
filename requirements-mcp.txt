@@ -1,0 +1,13 @@
+# Optional extras for the MCP agent-memory server (tools/tridb_mcp.py) — advisor
+# plan 098. Not needed for `make test`/`make lint`/CI (the server module imports
+# `mcp` lazily; the unit suite mocks the connection). Installs on top of the core
+# floors (psycopg + fastembed are already in requirements.txt / the lock):
+#   pip install -r requirements-mcp.txt
+#
+# Extras pattern per advisor plan 058 (requirements-vdbb.txt): the `mcp` package
+# pulls a web-transport subtree (sse-starlette, pydantic-settings, pyjwt,
+# httpx-sse) that has no place in the core lock — this file pins only the direct
+# extra. Transitives installed alongside mcp==1.28.1 on 2026-07-18: httpx-sse
+# 0.4.3, pydantic-settings 2.14.2, pyjwt 2.13.0, sse-starlette 3.4.5.
+-r requirements.txt
+mcp==1.28.1
