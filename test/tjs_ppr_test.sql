@@ -72,19 +72,19 @@ SELECT graph_store.gph_insert_edge(3, 2, current_setting('tjs.ptype')::int);  --
 
 SET hnsw.iterative_scan = relaxed_order;
 
--- (1) NEGATIVE CONTROL / default inertness: tjs.graph_scoring defaults to 'membership' with
--- NO explicit SET. Vector distance ties among A/B/C break by ascending id (B < A < C):
--- {S, B, A, C} = {0, 1, 2, 3}. This is the byte-inertness assertion (plan 095's hard gate):
--- the default path must be untouched by anything plan 095 added.
+-- (1) DEFAULT ASSERTION (ADR-0021 D1/D5): tjs.graph_scoring defaults to 'ppr' with NO explicit
+-- SET. A is promoted ahead of B by its reinforcing second path (via C), even though A and B
+-- are vector-distance-tied -- the same graded order as the explicit-ppr case (3). This is the
+-- default-flip assertion: the default path must produce the PPR order without any SET.
 DO $$
 DECLARE got bigint[];
 BEGIN
   SELECT array_agg(t) INTO got FROM tjs_open('entities', 4, 1000, 1, 2, 'id', '',
     '[0.0]'::vector) AS t;
-  IF got <> ARRAY[0,1,2,3]::bigint[] THEN
-    RAISE EXCEPTION 'default (no SET) scoring: got % (expected {0,1,2,3}, membership order)', got;
+  IF got <> ARRAY[0,2,1,3]::bigint[] THEN
+    RAISE EXCEPTION 'default (no SET) scoring: got % (expected {0,2,1,3}, ppr order)', got;
   END IF;
-  RAISE NOTICE 'PASS 1: default tjs.graph_scoring (no SET) = membership order {0,1,2,3}';
+  RAISE NOTICE 'PASS 1: default tjs.graph_scoring (no SET) = ppr order {0,2,1,3}';
 END $$;
 
 -- (2) Explicit membership: identical to (1) -- byte-inert restatement of the default.
