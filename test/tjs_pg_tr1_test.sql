@@ -170,6 +170,9 @@ END $$;
 -- injection needs full membership, unlike filter-first's rank-early-stop), so at a default
 -- budget far above the reach (1200) this is UNCHANGED from the pre-077 contract: uncensored,
 -- full reach examined. The TR-1 win for seedless is the BUDGET bound (C4b), not term_cond.
+-- C4/C4b pin MEMBERSHIP edge-step accounting (ADR-0021 D5); the stock default is now 'ppr'
+-- (ADR-0021 D1), whose push loop converges below the full reach.
+SET tjs.graph_scoring = 'membership';
 SET hnsw.iterative_scan = relaxed_order;
 SET hnsw.max_scan_tuples = 20000;
 DO $$
@@ -220,6 +223,7 @@ BEGIN
     '1200 full reach), censored=true, examined()=300', d;
 END $$;
 RESET tjs.graph_work_budget;
+RESET tjs.graph_scoring;
 SET hnsw.max_scan_tuples = 20000;
 
 -- (C5) CENSORING HONESTY, FILTER-FIRST: a budget below the reach stops at a deterministic
@@ -327,6 +331,8 @@ END $$;
 -- (nearest) seed's pull can spend up to the whole 300, leaving the second seed whatever
 -- remains (possibly zero). Total graph work across both seeds must still equal exactly the
 -- shared budget (not 2x it) -- proof the pool is SHARED, not doubled.
+-- Pins MEMBERSHIP edge-step accounting (ADR-0021 D5); the stock default is now 'ppr'.
+SET tjs.graph_scoring = 'membership';
 SET tjs.graph_work_budget = 300;
 DO $$
 DECLARE v0 bigint; d bigint;
@@ -342,6 +348,7 @@ BEGIN
   RAISE NOTICE 'C8 PASS: seedless m_seeds=2 shares ONE budget=300 across both seeds (total work=%)', d;
 END $$;
 RESET tjs.graph_work_budget;
+RESET tjs.graph_scoring;
 SET hnsw.iterative_scan = DEFAULT;
 SET hnsw.max_scan_tuples = DEFAULT;
 
