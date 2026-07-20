@@ -36,6 +36,9 @@ the "Honest limits" section stays in. The GitHub Release body is this file, verb
 
 ## 2. Make the repository public
 
+At the v0.2.0 cut the repo was ALREADY public, so this step was a no-op — check
+before running it:
+
 ```bash
 gh repo edit ConsultingFuture4200/tridb --visibility public --accept-visibility-change-consequences
 ```
@@ -91,12 +94,17 @@ runtime gate, and the GHCR push; the Release exists with the notes attached. Ima
 docker pull ghcr.io/consultingfuture4200/tridb/postgres-trimodal:pg17-v0.2.0
 ```
 
-## 6. Make the GHCR packages public
+## 6. Confirm the GHCR packages are public
 
-The FIRST push of a GHCR package creates it **private**, even under a public repo.
-Flip it once (per package) in the web UI: package -> Package settings -> Change
-visibility -> Public (github.com/users/ConsultingFuture4200/packages), or via the
-packages API. Subsequent version pushes keep the visibility.
+OBSERVED at the v0.2.0 cut (2026-07-20): no flip was needed. The first workflow
+push created `tridb/postgres-trimodal` already **public**, inheriting the public
+repo's visibility. The pre-release guidance that GHCR always creates packages
+private did not hold here.
+
+Still verify rather than assume — if a future package does come out private, flip
+it once in the web UI (package -> Package settings -> Change visibility -> Public,
+github.com/users/ConsultingFuture4200/packages). Subsequent version pushes keep
+whatever visibility the package has.
 
 Verify (must succeed logged out / from a clean machine):
 
