@@ -119,9 +119,77 @@ removed. Commits early and often: `fix(tjs): ...`, `test(tjs): ...`, `bench(tjs)
 REPORT FORMAT: STATUS / STEP-1 FINDING TABLE verbatim / FIX (incl. version-discipline choice) /
 GATES / STEP-4 BEFORE-AFTER TABLE verbatim vs targets / FILES CHANGED / NOTES / WORKTREE+commits.
 
-## Step 1 evidence (filled in during execution)
+## Step 1 evidence (executed 2026-07-20, Spark, container `tridb-wikidata-pg17` read-only)
 
-_Pending._
+Harness: `~/issue30/diag30.py` + `diag30_d.py` on the Spark (results `~/issue30/diag30.json`);
+same 50 seeded queries (seed 1354) as the published leg, live exact oracle, median of 3
+client-clocked reps. Note: this container's extensions are 0.1.0 (`tjs_open_termination_reason()`
+absent — `tjs_open_budget_capped()` used instead); the stream/probe architecture under test is
+unchanged through 0.2.0.
+
+### Per-outlier trace (the finding table)
+
+Reproduced sweep: tc=16/80k median 0.79 ms p95 ~68 ms; tc=64/20k median 1.53 ms p95 ~110 ms;
+tc=256/20k median 10.96 ms p95 ~202 ms (matches the published defect signature). Slowest queries
+at tc=256/20k ("m" = filter-type members of 1,002,331; est. passers = examined x m/N — a uniform
+lower bound; passers actually cluster vector-near for typical queries, which is why medians
+terminate fast):
+
+| x | m (members) | examined | est. passers | wall ms | us/tuple | recall |
+|---:|---:|---:|---:|---:|---:|---:|
+| 506575 | 122 | 21312 | 2.6 | 208.8 | 9.8 | 0.60 |
+| 379121 | 155 | 21072 | 3.3 | 206.3 | 9.8 | 1.00 |
+| 858662 | 544 | 20490 | 11.1 | 201.7 | 9.9 | 1.00 |
+| 373513 | 344 | 20612 | 7.1 | 201.7 | 9.8 | 1.00 |
+| 875781 | 126 | 21160 | 2.7 | 199.7 | 9.4 | 1.00 |
+| 454669 | 239 | 22595 | 5.4 | 195.5 | 8.7 | 1.00 |
+| (median query) | — | ~90–900 | — | 0.7–4.1 | — | — |
+
+Every p95 outlier is a very-selective-filter query that drains to pgvector's internal stream end
+(~20–25k tuples — `hnsw.scan_mem_multiplier` memory bound and/or `max_scan_tuples`, with
+per-round overshoot) at ~9–10 us/drained tuple. 25 of 50 queries examine < 1000 tuples and take
+< ~4 ms; 9 of 50 drain >= 10k and take ~200 ms at tc=256.
+
+### H1 — superlinear drain: CONFIRMED (pgvector-intrinsic, amplified by the passer-only rule)
+
+Pure drain (tc=0, filter='', NO SPI probe), same box, per-query:
+
+| max_scan_tuples | examined | wall ms | us/tuple |
+|---:|---:|---:|---:|
+| 1000 | ~1.3–1.9k | 0.9–1.5 | 0.65–0.81 |
+| 5000 | ~5.4–6.6k | 5.5–5.9 | 0.83–1.08 |
+| 20000 | ~20–25k | 85–97 | 3.8–4.5 |
+| 80000 | ~21–26k (stream self-ends) | 89–98 | 3.8–4.5 |
+
+Marginal cost per drained tuple rises ~6x between shallow and deep (0.7 -> 4.5 us/t; 3.7x more
+tuples between the 5k and 20k points costs 15x more time). ef_search is NOT the driver: a
+follow-up sweep (ef in {40,100,200,800}) leaves drain, tjs, and native-pgvector times flat.
+Native pgvector pays the SAME deep-drain cost (its own starved-filter queries measured 82–120 ms
+same-day, incl. one returning 0 rows at 120 ms) — the drain cost is pgvector-iterative-scan-
+intrinsic, not tjs-added. The tjs-specific amplifier is termination: the ADR-0007 drop rule
+counts only filter-PASSING candidates (DEV-1169, correct and non-negotiable), so when passers
+stop appearing the operator has NO bound of its own and always rides to the stream end. That is
+the E3.3 gap: termination is not shaped by any caller budget.
+
+### H2 — per-candidate probe cost: CONFIRMED (~5 us/candidate; plan already cached)
+
+Fixed-drain ablation (tc=0, mst=20000, ~20–25k candidates/query, 10 queries): filter=''
+(no probe) 81–98 ms vs filter='true' (trivially-true probe) 184–231 ms vs the real filter
+192–244 ms. The probe adds **4.7–5.5 us per candidate** — it roughly DOUBLES the deep-drain
+wall (~105 ms of the ~200 ms outliers). The real filter's array-containment adds ~nothing over
+'true': the cost is SPI per-execution machinery, NOT planning — the plan is already prepared
+once per call (`SPI_prepare` at tjs_pg.c:1154, `SPI_execute_plan` per candidate), so the
+pre-authorized "cache it" remedy is already in place and measured insufficient on its own.
+Direct-heap/ExprState probe evaluation is NOT implemented per the plan's constraint — flagged
+in Notes as the remaining per-candidate lever.
+
+### Verdict
+
+Both hypotheses CONFIRMED -> proceed to Step 2 as planned: `tjs.vector_scan_budget` caps the
+drain (bounding BOTH the H1 superlinear region and the H2 probe volume), disclosed via
+'scan_budget'/budget_capped()=true. Same-day note for Step 4: native pgvector's own tails on
+the starved queries measured 82–120 ms today (the published 26–30 ms p95 sat below the 3rd
+slowest query of 50); the gate table re-measures all rows same-day.
 
 ## Step 4 evidence (filled in during execution)
 
