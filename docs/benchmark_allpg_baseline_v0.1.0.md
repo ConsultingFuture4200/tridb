@@ -250,3 +250,78 @@ directly against the already-fetched heap slot, SPI fallback for the general fra
 The honest guidance of this doc stands: for pure filtered-ANN with no graph leg, use
 pgvector's iterative scan directly; `tjs_open`'s value is the fused graph+filter+vector
 composition — the budget makes its seedless tail bounded and honest, not free.
+
+## Addendum A2 (2026-07-20) — issue #31 filter-probe fast path: post-103 table (plan 103)
+
+**What changed:** plan 103 attacks the residual A1 flagged — the ~5 µs/candidate SPI filter
+probe (plan already cached; the cost was per-execution SPI machinery). The seedless stream now
+compiles an eligible filter fragment ONCE per call to an `ExprState` and evaluates it against
+the heap slot the loop had already fetched for the distance recompute (`tjs.filter_probe =
+auto`, the default; subqueries / `$n` / off-relation references / callers without table-level
+SELECT silently keep the cached-SPI probe; `= spi` forces it). Byte-parity between the two
+paths is gated by `test/tjs_filter_probe_test.sql` (stock suite) plus a live 15-query
+spot-check on THIS 1M container (ids, examined, termination reason identical, fast path
+engagement proven via the `tjs.last_filter_probe_mode` report register).
+
+**Setup:** same 50 seeded queries (seed 1354), live exact oracle, median of 7, same
+single-connection boundary, same box (`tridb-issue30-pg17`, port 5460, the A1 NEW container —
+HNSW index untouched), same day. PRE = the container's plan-102 build, measured BEFORE the new
+`.so` was installed; POST = the plan-103 build; pgvector rows re-measured in the same
+invocation as the tjs rows they pair with (the harness shows ±1–2 pt recall jitter across
+same-day invocations at identical settings — pgv ef=800 graded 0.814/0.810/0.806/0.802 across
+the four runs below — so matched-recall pairs are read WITHIN one invocation, never across).
+Artifacts: `bench/results/wd_1m_issue31_{pre103,post103,post103_ops,post103_lowmst}.json`.
+
+| Point (same-day, invocation-grouped) | recall@10 | median | p95 |
+|---|---:|---:|---:|
+| PRE `tjs_open` tc=16 mst=80k vsb=0 | 0.794 | 0.775 ms | 71.4 ms |
+| PRE `tjs_open` tc=64 mst=20k vsb=0 | 0.802 | 1.484 ms | 112.8 ms |
+| PRE `tjs_open` tc=256 mst=20k vsb=0 | 0.810 | 6.004 ms | 213.3 ms |
+| PRE pgvector ef=100 | 0.796 | 0.614 ms | 29.8 ms |
+| PRE pgvector ef=800 | 0.814 | 4.521 ms | 31.7 ms |
+| POST `tjs_open` tc=16 mst=80k vsb=0 | 0.780 | 0.684 ms | 57.1 ms |
+| POST `tjs_open` tc=64 mst=20k vsb=0 | 0.788 | 0.960 ms | 71.3 ms |
+| POST `tjs_open` tc=256 mst=20k vsb=0 | 0.796 | 3.456 ms | 101.4 ms |
+| POST pgvector ef=40 | 0.766 | 0.443 ms | 29.4 ms |
+| POST pgvector ef=100 | 0.786 | 0.615 ms | 30.4 ms |
+| POST pgvector ef=200 | 0.796 | 1.233 ms | 31.6 ms |
+| POST pgvector ef=800 | 0.810 | 4.680 ms | 32.3 ms |
+| POST-ops `tjs_open` tc=64 mst=20k vsb=2000 | 0.784 | 0.913 ms | 47.3 ms |
+| POST-ops `tjs_open` tc=64 mst=20k vsb=10000 | 0.796 | 1.014 ms | 70.6 ms |
+| POST-ops `tjs_open` tc=256 mst=20k vsb=2000 | 0.792 | 3.413 ms | 53.9 ms |
+| POST-ops `tjs_open` tc=256 mst=20k vsb=10000 | 0.804 | 3.552 ms | 75.1 ms |
+| POST-ops pgvector ef=40 | 0.774 | 0.353 ms | 28.6 ms |
+| POST-ops pgvector ef=100 | 0.804 | 0.767 ms | 29.9 ms |
+| POST-lowmst `tjs_open` tc=16 mst=5000 vsb=2000 | 0.762 | 0.576 ms | 3.4 ms |
+| POST-lowmst `tjs_open` tc=64 mst=5000 vsb=2000 | 0.770 | 0.911 ms | 3.6 ms |
+| POST-lowmst `tjs_open` tc=256 mst=2000 vsb=2000 | 0.750 | 1.451 ms | 2.2 ms |
+| POST-lowmst pgvector ef=40 | 0.774 | 0.473 ms | 30.2 ms |
+| POST-lowmst pgvector ef=800 | 0.802 | 5.253 ms | 36.0 ms |
+
+**Effect of the fix at identical settings (PRE → POST):** tc=64 median 1.484 → 0.960 ms
+(−35%), p95 112.8 → 71.3 ms (−37%); tc=256 median 6.004 → 3.456 ms (−42%), p95 213.3 →
+101.4 ms (−52%); tc=16 p95 71.4 → 57.1 ms (−20%). Fixed-drain ablation on THIS build
+(tc=0, mst=20k, ~20.9k candidates/query, 10 queries): no-filter 4.25 µs/candidate; real
+filter via the expr path **3.79 µs/candidate** (the probe now costs ~nothing — at or below
+drain noise); the same filter forced through SPI 9.32 µs/candidate. The ~5 µs/candidate SPI
+constant A1 measured is GONE on the default path.
+
+**Verdict vs the #31 targets (median ≤ ~1.1×, p95 ≤ 2× pgvector at matched recall) — NOT
+met; reported straight.** Nearest within-invocation matched pairs: tc=16 mst=80k vsb=0
+(0.780) vs pgv ef=40 (0.766) = median 1.54×, **p95 1.94× (inside the 2× target)**; tc=64
+mst=20k vsb=0 (0.788) vs pgv ef=100 (0.786) = median 1.56×, p95 2.35×; tc=64 mst=20k
+vsb=10000 (0.796) vs pgv ef=100 (0.804) = median 1.32×, p95 2.36×; with the plan-102 budget
+at vsb=2000, p95 1.65× (47.3 vs 28.6 ms) at ~1 pt higher recall than ef=40, median 2.59×.
+The honest residual and its attribution: at recall parity both engines drain the same starved
+queries to ~21k tuples; plain pgvector pays ~1.4 µs/tuple all-in inside its executor loop,
+while the operator's stream pays ~3.8–4.3 µs/tuple with NO probe at all — the residual is the
+**pure drain constant**: pgvector's deep-drain superlinearity (plan 102 H1, intrinsic) plus
+the operator's per-candidate heap fetch + 384-dim distance recompute (ADR-0015 E3 gap 1:
+pgvector's iterator exposes no per-candidate distance, so the operator must recompute from
+the heap value it fetches). No probe-side change can close that; the levers left are
+per-candidate distance exposure from pgvector (an upstream API change) or skipping the
+recompute where the index's relaxed order can be trusted — both out of plan-103 scope. The
+A1 guidance softens but stands: seedless `tjs_open` is now ~1.3–1.6× pgvector at the median
+at matched recall (was 1.4–2.3×) with a bounded, disclosed tail; for pure filtered-ANN with
+no graph leg, pgvector's iterative scan remains the direct choice, and `tjs_open`'s value
+stays the fused graph+filter+vector composition.
