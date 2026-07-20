@@ -1,4 +1,4 @@
-.PHONY: test lint graph-test stock-graph-test stock-crash-test stock-release-smoke tjs-parity-test smoke-test test-all baseline-up baseline-down seed bench bench-live sweep sm2 fetch-dataset bench-public bench-repro fetch-hotpot graphrag graphrag-live bench-filtered ablation recall-decay tjs-open-ref tjs-open-live graphrag-h2h rabitq-sim gpu-build-index gpu-setup gpu-verify gpu-lock wiki-fetch wiki-extract wiki-scale wiki-neo4j wiki-subgraph wiki-linkpred mcp-demo lock clean clean-data
+.PHONY: test lint graph-test stock-graph-test stock-crash-test stock-dump-restore-test stock-release-smoke tjs-parity-test smoke-test test-all baseline-up baseline-down seed bench bench-live sweep sm2 fetch-dataset bench-public bench-repro fetch-hotpot graphrag graphrag-live bench-filtered ablation recall-decay tjs-open-ref tjs-open-live graphrag-h2h rabitq-sim gpu-build-index gpu-setup gpu-verify gpu-lock wiki-fetch wiki-extract wiki-scale wiki-neo4j wiki-subgraph wiki-linkpred mcp-demo lock clean clean-data
 
 PUBLIC_DATASET ?= gist-960-euclidean
 
@@ -118,6 +118,16 @@ stock-graph-test:
 stock-crash-test:
 	docker build --build-arg PG_MAJOR=$(PG_MAJOR) -t $(STOCK_IMAGE) scripts/pg17/
 	bash scripts/pg17_crash_recovery_test.sh $(STOCK_IMAGE)
+
+# Logical backup/restore round-trip gate (advisor plan 099): pg_dump -Fc + the
+# gph_dump_vertices()/gph_dump_edges() logical topology dump, restored into a FRESH
+# database and byte-compared (typed traversals, counts, id map, tjs_open ids), plus a
+# corrupted-dump negative control. Needs two databases in one container, so it is NOT
+# in STOCK_TESTS / the per-PR stock-pg CI job — run locally or via CI dispatch
+# (docs/INSTALL_stock_pg.md "Backup and restore").
+stock-dump-restore-test:
+	docker build --build-arg PG_MAJOR=$(PG_MAJOR) -t $(STOCK_IMAGE) scripts/pg17/
+	bash scripts/graph_dump_restore_test.sh $(STOCK_IMAGE)
 
 # Runtime smoke of the SHIPPED release image (advisor plan 076): build the prebaked
 # tridb/postgres-trimodal image for PG_MAJOR, start it as a user would, install all
