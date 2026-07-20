@@ -67,6 +67,13 @@ not merely on `master`.
 - **Decisions that lock in structure get an ADR** in `docs/decisions/NNNN-*.md` (numbered).
 - **Specs evolve by addendum / version bump**, not silent rewrite.
 - **Python:** `ruff` for lint + format, `pytest` for tests, `requirements.txt` (no `setup.py`).
+- **Extension versioning (plan 100):** from 0.2.0 on, released surface changes to
+  `graph_store_am` / `tjs_pg` ship as `--X--Y.sql` **upgrade scripts** (`ALTER EXTENSION ...
+  UPDATE`); editing the base `--X.Y.Z.sql` in place is only allowed pre-release within a
+  version. Bump `default_version` in the `.control`, add the upgrade script to the extension
+  `Makefile`'s `DATA`, and keep `scripts/extension_upgrade_test.sh` green (it installs the
+  vendored previous-release fixtures from `test/fixtures/upgrade/` and proves data survives
+  the upgrade).
 - **C:** targets both the **PostgreSQL 13.4 fork** and **stock PostgreSQL 16/17** access-method APIs
   (zero measured PG 13→17 drift, ADR-0015 E2). The graph AM is BLCKSZ-capability, not fixed
   (`gph_page.h`: `BLCKSZ >= 8192` — 8KB works on stock PG, 32KB is the high-degree performance target

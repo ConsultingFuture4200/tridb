@@ -591,7 +591,7 @@ apply_tridb_fork_patches() {
   #     graph probe moves off the v0 heap-backed extension onto the v1 NATIVE access method:
   #     graphReachableT and expandMultiSeedO now SPI-call graph_store.gph_neighbors_ext
   #     (external-id traversal over the gph_upsert_vertex id map hosted in
-  #     src/graph_store/graph_store_am--0.1.0.sql). Probe shape/caching/SPI nesting unchanged.
+  #     src/graph_store/graph_store_am--0.2.0.sql). Probe shape/caching/SPI nesting unchanged.
   #     Diffed against the post-arg-hardening tree, so it MUST apply after
   #     tridb_operator_arg_hardening.patch (last in the tjs chain).
   local v1rw_patch="${_MSVBASE_LIB_DIR}/../patches/tridb_graph_v1_rewire.patch"

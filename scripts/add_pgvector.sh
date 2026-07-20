@@ -19,7 +19,7 @@ SRC_IMAGE="${1:-tridb/msvbase:gx10-v1}"
 DST_IMAGE="${2:-tridb/msvbase:gx10-v1-pgv}"
 # pgvector >= 0.8 floor: keep this in lockstep with the stock-image base tag
 # (scripts/pg17/Dockerfile* -> PGVECTOR_VERSION) and the CREATE EXTENSION tjs_pg
-# version guard (src/tjs_pg/tjs_pg--0.1.0.sql). The vector-first path needs
+# version guard (src/tjs_pg/tjs_pg--0.2.0.sql). The vector-first path needs
 # hnsw.iterative_scan = relaxed_order, which pgvector only exposes from 0.8.
 PGV_TAG="${3:-v0.8.0}"
 PGCONFIG=/u01/app/postgres/product/13.4/bin/pg_config
