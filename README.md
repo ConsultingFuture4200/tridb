@@ -31,9 +31,44 @@
 
 ---
 
+**Current release: v0.2.0** — [release notes](docs/releases/v0.2.0.md) · [install guide](docs/INSTALL_stock_pg.md) · extensions install on **stock PostgreSQL 16/17 + pgvector**, no fork.
+
+## Try It
+
+One command to a running tri-modal Postgres (stock PG + pgvector + the TriDB extensions, prebaked):
+
+```bash
+docker build -f scripts/pg17/Dockerfile.release -t tridb/postgres-trimodal:pg17 .
+docker run -d --name trimodal -e POSTGRES_PASSWORD=secret tridb/postgres-trimodal:pg17
+docker exec -it trimodal psql -U postgres \
+  -c 'CREATE EXTENSION vector;' \
+  -c 'CREATE EXTENSION graph_store_am;' \
+  -c 'CREATE EXTENSION tjs_pg;'
+```
+
+Or use it as **agent memory over MCP** (store / connect / recall through the fused operator — [docs](docs/mcp_agent_memory_v0.1.0.md)):
+
+```bash
+pip install -r requirements-mcp.txt
+make mcp-demo        # container up -> store/connect/recall over real stdio JSON-RPC -> teardown
+```
+
+### Proven, at what scale
+
+| Claim | Scale it was measured at | Evidence |
+|---|---|---|
+| Fused filter-first query **23.68×** faster than Milvus+Neo4j+Postgres at matched recall (0.992/0.986), on stock PG 17 | 1,002,331-entity Wikidata slice | [`docs/gate_b_spike_v0.1.0.md`](docs/gate_b_spike_v0.1.0.md) |
+| Fused seedless retrieval **3.3–16.7×** faster than the app-side multi-store pipeline at matched recall@10 | 200k Wikipedia articles, 14.68M hyperlink edges | [`docs/benchmark_wiki_fusion_v0.1.0.md`](docs/benchmark_wiki_fusion_v0.1.0.md) |
+| One-WAL consistency: **0** torn cross-store writes under injected failure (baseline 42/42); torn reads 1.0% vs 76.7% | live crash/failure harness, same corpus | [`docs/benchmark_wiki_consistency_v0.1.0.md`](docs/benchmark_wiki_consistency_v0.1.0.md) |
+| PPR-graded seedless default beats reachability scoring: **+47% rel** link-pred recall@20; **+4.7 pt** HotpotQA recall@5 | 200k/14.68M-edge enwiki + HotpotQA | [ADR-0021](docs/decisions/0021-ppr-default-graph-scoring.md) |
+| Graph-bridge injection lifts multi-hop joint evidence recall@5 by **+15.6 pt** over vector-only (reproducible host-side, pinned data) | HotpotQA dev slice | [`docs/benchmark_public_repro_v0.1.0.md`](docs/benchmark_public_repro_v0.1.0.md) |
+
+**Not yet measured:** the 128 GB headline benchmark (GX10-gated) and the 1M seedless head-to-head (blocked; documented in the fusion doc). Honest-limits list: [release notes](docs/releases/v0.2.0.md#honest-limits--read-before-benchmarking).
+
 <details>
 <summary>Table of Contents</summary>
 
+- [Try It](#try-it)
 - [About](#about)
 - [Features](#features)
 - [Architecture](#architecture)
