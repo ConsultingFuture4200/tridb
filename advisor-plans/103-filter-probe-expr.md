@@ -160,3 +160,61 @@ often (`fix(tjs):`, `test(tjs):`, `bench(tjs):`, `docs(...)`).
 REPORT FORMAT: STATUS / DESIGN AS BUILT (eligibility guard, ACL choice, observability
 choice) / PARITY SUITE coverage + results / GATES / ACCEPTANCE TABLE verbatim vs #31
 targets / FILES CHANGED / NOTES / WORKTREE+commits.
+
+## Evidence (executed 2026-07-20)
+
+### Design as built
+
+Exactly as planned, one simplification confirmed against the code: the seedless loop already
+fetches the heap tuple BEFORE the probe (`index_fetch_heap` at the top of the candidate loop
+feeds both the id extraction and the distance recompute), so no order-of-operations change
+was needed — the ExprState evaluates the slot in hand. The SPI fallback plan is prepared
+first, unconditionally (error-parity anchor); eligibility = raw guard (SubLink/ParamRef) +
+cooked guard (Vars varno==1/varlevelsup==0 only; no SubPlan/Param/Aggref/WindowFunc/
+GroupingFunc/CurrentOfExpr) + `pg_class_aclcheck(ACL_SELECT)` table-level; observability =
+the `tjs.last_filter_probe_mode` report GUC (a new SQL function was rejected as a surface
+change). Compiles clean on stock PG 16 AND 17 (no API drift in the parse/executor calls used).
+
+### Parity suite (test/tjs_filter_probe_test.sql, in STOCK_TESTS)
+
+P1 eligible matrix (8 fragments: simple, `@>`, `IS NULL`, NULL-comparison, numeric coercion,
+builtin fn, STABLE user fn, compound) — identical ids/examined/reason/capped, fast path
+proven engaged on every one. P2 SubLink fragments fall back under auto and agree. P3 empty
+filter = mode `none`. P4 unknown column = 42703 both modes; P5 per-row cast failure = 22P02
+both modes. P6 `tjs.vector_scan_budget=50`: examined exactly 50, `scan_budget`/capped=true,
+identical ids on both paths. P7 DEV-1169 deep drain (~500-failer prefix) identical and
+exempt on the fast path. P8 seeded (m_seeds=2) call identical. P9 column-grant-only role
+falls back to SPI with the same answer. PASSED on stock PG17 AND PG16.
+
+Live spot-check on the 1M Spark container (post-103 build): 15 bench-shaped queries
+(seed-1354 sampling CTE), auto vs spi in one session — ids, examined, reason identical;
+mode 'expr' on every auto run.
+
+### Gates
+
+- `make stock-graph-test PG_MAJOR=17`: all 17 suites incl. the new one — PASS
+- `make stock-graph-test PG_MAJOR=16`: PASS (16 pass banners = all banner-emitting suites;
+  fail-fast run completed with zero errors)
+- `make stock-crash-test PG_MAJOR=17`: PASS (all 5 scenarios incl. freeze)
+- `bash scripts/tjs_parity_test.sh`: 11/11 PARITY OK
+- `make test PY=...`: 600 passed; `make lint PY=...`: clean; `git diff --check`: clean
+
+### Acceptance gate (Spark, tridb-issue30-pg17, 2026-07-20)
+
+Full table + verdict: `docs/benchmark_allpg_baseline_v0.1.0.md` **Addendum A2**; raw
+artifacts `bench/results/wd_1m_issue31_{pre103,post103,post103_ops,post103_lowmst}.json`.
+Summary: PRE→POST at identical settings — tc=64 median 1.484→0.960 ms, p95 112.8→71.3 ms;
+tc=256 median 6.004→3.456 ms, p95 213.3→101.4 ms. Fixed-drain ablation (tc=0, mst=20k,
+~20.9k cands): no-filter 4.25 µs/cand, real filter expr **3.79 µs/cand** (probe cost
+eliminated), forced SPI 9.32 µs/cand. **#31 numeric targets NOT met**: nearest matched
+pairs median 1.32–1.56× (target ~1.1×), p95 1.94–2.36× (target 2×; the tc=16 pair is
+inside it). Residual attributed by measurement to the PURE drain constant (~3.8–4.3
+µs/cand with no probe at all vs pgvector's ~1.4 µs/tuple): pgvector deep-drain
+superlinearity (plan 102 H1) + the operator's per-candidate heap fetch and 384-dim
+distance recompute (ADR-0015 E3 gap 1 — no per-candidate distance exposure from
+pgvector). Probe-side levers are exhausted; remaining levers (upstream distance exposure,
+trusting relaxed order to skip the recompute) are out of scope and flagged.
+
+## Status: DONE (2026-07-20) — fast path landed, byte-parity proven (suite + live 1M),
+gates green, probe constant eliminated (~5 µs/cand -> ~0); #31 numeric targets honestly
+missed on the residual drain constant, attribution measured and flagged.
