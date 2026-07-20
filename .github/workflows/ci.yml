@@ -88,4 +88,7 @@ jobs:
         with:
           submodules: false
       - run: scripts/x86build.sh --docker
-      - run: make test-all
+      # Engine-specific gates only: the pytest/ruff legs of test-all already run in the
+      # `python` job on every trigger (including this schedule), and this runner has no
+      # Python deps installed — test-all here failed every nightly on "No module named pytest".
+      - run: make smoke-test graph-test
