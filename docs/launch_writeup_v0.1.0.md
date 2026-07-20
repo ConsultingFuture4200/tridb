@@ -97,8 +97,9 @@ Two honest conclusions:
 And one finding that currently cuts against us: at the **seedless** (open-retrieval,
 filtered-ANN) query class, plain pgvector's iterative scan matches or beats our `tjs_open`
 operator at every matched-recall point, with 3–4× better tail latency. That is an open
-defect with a signature we understand, tracked publicly. We could have left this leg out
-of the writeup. It's in.
+defect with a signature we understand, tracked publicly
+([#30](https://github.com/ConsultingFuture4200/tridb/issues/30)). We could have left this
+leg out of the writeup. It's in.
 
 ## The half that isn't speed
 

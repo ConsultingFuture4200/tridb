@@ -186,3 +186,71 @@ reachable, relevant audience that already trusts the substrate.
 3. Draft the technical writeup (architecture → lineage → public benchmark → honest limits).
 4. Repo hygiene checklist above; record the 2-min Spark demo.
 5. Soft-launch r/LocalLLaMA → iterate → Show HN.
+
+## Addendum 2026-07-20 — v0.2.0 shipped; the positioning blocker is closed; revised launch story
+
+Everything below supersedes the stale premises above (append, not rewrite). State as of the
+v0.2.0 release cut:
+
+**What changed since 06-28:**
+
+1. **The v2 multi-seed operator shipped and matured.** `tjs_open` (ADR-0012) closed the
+   single-source gap (recall@10 0.980 vs the 0.223 that motivated the warning above), was
+   re-homed on stock PG (ADR-0019), gained the TR-1-bounded graph leg (ADR-0020), and now
+   defaults to PPR-graded scoring after winning all 18 matched points on the 200k held-out
+   link-prediction gate (ADR-0021). The "do not launch as an open retriever" restriction is
+   lifted — with the seedless-tail caveat below.
+2. **The platform story inverted (D2 un-fork).** The launch artifact is three extensions on
+   stock PostgreSQL 16/17 + pgvector; the fusion win DOUBLED off the fork (23.68x, Gate B).
+   The Spark is a supporting story, not the lead. Public images:
+   `ghcr.io/consultingfuture4200/tridb/postgres-trimodal:pg16|pg17`.
+3. **v0.2.0 is released** (2026-07-20): public repo, GHCR images anonymously pullable,
+   GitHub Release with evidence-cited notes; backup/restore, upgrade paths, single-writer
+   enforcement all landed and gated.
+4. **A wedge this plan never considered: the MCP agent-memory server** (`make mcp-demo`,
+   `docs/mcp_agent_memory_v0.1.0.md`). Product-led entry for any MCP-capable agent.
+5. **The all-Postgres baseline was run** (`docs/benchmark_allpg_baseline_v0.1.0.md`) — the
+   post-unfork hostile question answered with data, and the answer reshapes the pitch:
+   - Anchored class: fused 0.049 ms vs plain-SQL-one-Postgres 0.065 ms vs multi-store
+     3.34 ms. The enemy is the three-system stack, not Postgres.
+   - Seedless class: plain pgvector currently WINS at matched recall with 3-4x better
+     tails — filed publicly as issue #30 BEFORE launch, deliberately.
+
+**Revised messaging:**
+
+- One-liner: "Collapse your RAG stack into one Postgres — TriDB makes tri-modal retrieval
+  a first-class operator and a native graph store on stock PG 16/17."
+- The funnel logic: if a reader's takeaway is "I'll just add a links table to my existing
+  Postgres," the thesis still won and they are one CREATE EXTENSION from being a user.
+  Never argue against that reader; recruit them.
+- The credibility asset is now the published near-tie + self-filed defect, not only the
+  24-60x multi-store rows. Lead the writeup with honesty as the differentiator (the
+  original plan's instinct, now with sharper teeth).
+
+**Revised launch sequence (channel-split leads):**
+
+| # | Channel | Lead | Gate |
+|---|---|---|---|
+| 1 | r/LocalLLaMA | MCP agent memory, one docker run, local | READY NOW (post draft below) |
+| 2 | Show HN | `docs/launch_writeup_v0.1.0.md` (the honest three-way story) | Maintainer voice-pass + 2-min demo recording |
+| 3 | pgvector/Postgres X | "three extensions on stock PG" + Gate B + the near-tie | After 2 |
+| 4 | RAG ecosystem | storage layer for GraphRAG; gBrain integration as the follow-up post | After gBrain adapter ships |
+
+**Draft — r/LocalLLaMA post (edit voice before posting):**
+
+> Title: I put my agent's memory in one Postgres — vector + graph + relational in a single
+> query plan (open source, runs on a DGX Spark or any box)
+>
+> Body sketch: the three-database problem for agent memory -> one docker run + claude mcp
+> add -> store/connect/recall demo (memory + embedding + graph edge commit atomically) ->
+> the honest benchmark table incl. the plain-Postgres near-tie -> "we filed issue #30
+> against ourselves before posting" -> repo + release links.
+
+**Draft — Show HN title options:**
+
+> Show HN: TriDB – vector, graph, and relational retrieval in one Postgres query plan
+> Show HN: We un-forked our research DB into stock Postgres extensions and the speedup doubled
+> Show HN: We benchmarked our DB against plain Postgres and published the tie
+
+**Remaining pre-HN items (owner: maintainer):** voice-pass the writeup; record the 2-min
+demo (asciinema of `make mcp-demo` + one fused query EXPLAIN); choose the HN title.

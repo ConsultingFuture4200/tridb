@@ -11,7 +11,7 @@
 <h1 align="center">TriDB</h1>
 
 <p align="center">
-  <strong>One database engine that runs vector search, graph traversal, and relational filtering inside a single query plan, for Omni-RAG retrieval on local hardware.</strong>
+  <strong>Collapse your RAG stack into one Postgres: vector search, graph traversal, and relational filtering in a single query plan — three extensions on stock PostgreSQL 16/17.</strong>
 </p>
 
 <p align="center">
@@ -62,6 +62,7 @@ make mcp-demo        # container up -> store/connect/recall over real stdio JSON
 | One-WAL consistency: **0** torn cross-store writes under injected failure (baseline 42/42); torn reads 1.0% vs 76.7% | live crash/failure harness, same corpus | [`docs/benchmark_wiki_consistency_v0.1.0.md`](docs/benchmark_wiki_consistency_v0.1.0.md) |
 | PPR-graded seedless default beats reachability scoring: **+47% rel** link-pred recall@20; **+4.7 pt** HotpotQA recall@5 | 200k/14.68M-edge enwiki + HotpotQA | [ADR-0021](docs/decisions/0021-ppr-default-graph-scoring.md) |
 | Graph-bridge injection lifts multi-hop joint evidence recall@5 by **+15.6 pt** over vector-only (reproducible host-side, pinned data) | HotpotQA dev slice | [`docs/benchmark_public_repro_v0.1.0.md`](docs/benchmark_public_repro_v0.1.0.md) |
+| **Honest tie we published anyway:** plain SQL in the *same* Postgres (pgvector + a tuned `links` CTE) comes within 16 µs of the fused operator at the anchored query class — the big win is one-system-vs-three; at the seedless class plain pgvector currently wins ([#30](https://github.com/ConsultingFuture4200/tridb/issues/30)) | same 1M Wikidata slice, same DB, same session | [`docs/benchmark_allpg_baseline_v0.1.0.md`](docs/benchmark_allpg_baseline_v0.1.0.md) |
 
 **Not yet measured:** the 128 GB headline benchmark (GX10-gated) and the 1M seedless head-to-head (blocked; documented in the fusion doc). Honest-limits list: [release notes](docs/releases/v0.2.0.md#honest-limits--read-before-benchmarking).
 
