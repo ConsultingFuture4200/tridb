@@ -165,6 +165,19 @@ graph budget, a capped answer is a censored operating point: benchmark headlines
 the termination-reason mix alongside any latency won this way
 (`docs/benchmark_allpg_baseline_v0.1.0.md`, issue #30 addendum).
 
+**Filter-probe mode (plan 103 / issue #31):** `tjs.filter_probe` (default `auto`) selects how
+the seedless stream evaluates its relational filter per candidate. `auto` compiles an eligible
+fragment once per call to a native expression evaluated against the already-fetched heap tuple
+(removing the measured ~5 µs/candidate SPI execution that kept seedless `tjs_open` behind plain
+pgvector at matched recall); fragments with subqueries, `$n` references, references outside the
+scanned relation, or callers without table-level `SELECT` silently keep the cached-SPI probe.
+`spi` forces the SPI probe unconditionally — a debugging/compat switch. Results are
+byte-identical between the modes on the supported subset (`test/tjs_filter_probe_test.sql`);
+under concurrent updates the SPI probe re-fetches by PK and may evaluate a different tuple
+version than the one the distance was computed on, while the fast path evaluates the same
+version the scan yielded. The read-only report register `tjs.last_filter_probe_mode`
+(`none` | `expr` | `spi`) says which path the last seedless call took.
+
 ## Harness environment variables
 
 The Wikidata head-to-head harness (`bench/wikidata_h2h.py`, and its sibling `bench/wiki_h2h.py`)
