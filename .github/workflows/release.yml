@@ -1,0 +1,86 @@
+name: Release
+
+# Tag-triggered publish (advisor plan 101): on a `v*` tag, rebuild BOTH release
+# images from the tagged tree, re-run the SAME runtime smoke gate CI runs (a green
+# build alone is not verification), push the images to GHCR with the default
+# GITHUB_TOKEN (packages: write — no new secrets), and attach
+# docs/releases/<tag>.md to a GitHub Release.
+#
+# workflow_dispatch is the DRY-RUN mode: build + smoke only — no push, no Release.
+# Safe to run any time (every publishing step is gated on `refs/tags/`).
+#
+# Byte-consistency contract: the build and smoke `run:` lines below are IDENTICAL
+# to the `stock-pg` job's release steps in ci.yml and to what
+# `make stock-release-smoke PG_MAJOR=16|17` runs locally.
+# tests/test_release_coherence.py enforces this.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch: {}
+
+# Least privilege at the top; jobs that publish escalate individually.
+permissions:
+  contents: read
+
+# Never cancel a half-finished publish; queue instead.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-smoke-publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        pg: [16, 17]
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      # Version lockstep: refuse a tag that does not equal `v` + the extension
+      # .control version — a mistagged push must fail before anything publishes.
+      - name: tag matches extension versions
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          gph="$(sed -n "s/^default_version = '\(.*\)'$/\1/p" src/graph_store/graph_store_am.control)"
+          tjs="$(sed -n "s/^default_version = '\(.*\)'$/\1/p" src/tjs_pg/tjs_pg.control)"
+          test -n "$gph" && test "$gph" = "$tjs" || { echo "extension .control versions disagree: graph_store_am='$gph' tjs_pg='$tjs'"; exit 1; }
+          test "$GITHUB_REF_NAME" = "v$gph" || { echo "tag $GITHUB_REF_NAME != v$gph (extension .control version)"; exit 1; }
+      - name: release image builds (prebaked extension)
+        run: docker build --build-arg PG_MAJOR=${{ matrix.pg }} -f scripts/pg17/Dockerfile.release -t tridb/postgres-trimodal:pg${{ matrix.pg }} .
+      - name: release runtime smoke (start image, install extensions, run canonical query)
+        run: bash scripts/pg17_release_smoke.sh tridb/postgres-trimodal:pg${{ matrix.pg }}
+      # Publish leg — tag pushes only. GHCR requires a lowercase path; the image is
+      # ghcr.io/<owner>/<repo>/postgres-trimodal:pg<major>[-<tag>], one immutable
+      # versioned tag plus a floating major tag.
+      - name: push to GHCR
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          IMAGE="ghcr.io/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')/postgres-trimodal"
+          docker tag "tridb/postgres-trimodal:pg${{ matrix.pg }}" "$IMAGE:pg${{ matrix.pg }}-$GITHUB_REF_NAME"
+          docker tag "tridb/postgres-trimodal:pg${{ matrix.pg }}" "$IMAGE:pg${{ matrix.pg }}"
+          docker push "$IMAGE:pg${{ matrix.pg }}-$GITHUB_REF_NAME"
+          docker push "$IMAGE:pg${{ matrix.pg }}"
+
+  # Runs only after BOTH matrix legs built, smoked, and pushed.
+  github-release:
+    runs-on: ubuntu-latest
+    needs: build-smoke-publish
+    if: startsWith(github.ref, 'refs/tags/')
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: create GitHub Release with the notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          NOTES="docs/releases/$GITHUB_REF_NAME.md"
+          test -f "$NOTES" || { echo "$NOTES missing — write the release notes before tagging"; exit 1; }
+          gh release create "$GITHUB_REF_NAME" \
+            --title "TriDB $GITHUB_REF_NAME" \
+            --notes-file "$NOTES" \
+            --verify-tag
