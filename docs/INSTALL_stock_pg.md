@@ -68,6 +68,52 @@ CI runs the full 11-suite matrix on stock PG 16 and 17 (x86_64) on every push
 (GB10): the same suites pass on aarch64 stock PG17 — GitHub-hosted ARM runners are not
 available on this repository's plan, so ARM is not (yet) in the per-push matrix.
 
+## Upgrading (versioned extension scripts, plan 100)
+
+Both extensions ship versioned upgrade scripts from 0.2.0 on. An existing install upgrades in
+place — install the new build (`make install`, or pull the new release image), then:
+
+```sql
+ALTER EXTENSION graph_store_am UPDATE TO '0.2.0';
+ALTER EXTENSION tjs_pg UPDATE TO '0.2.0';
+```
+
+Install the new shared library **before** the `UPDATE`: the upgrade DDL binds symbols that only
+exist in the new `.so`. Data written under 0.1.0 (topology, id map, edge-type dictionary,
+`identity_mode`) is untouched by the upgrade — `make stock-upgrade-test`
+(`scripts/extension_upgrade_test.sh`, also `PG_MAJOR=16`) is the gate: it installs a genuine
+0.1.0 (vendored fixtures in `test/fixtures/upgrade/`), loads the plan-099 tri-modal corpus,
+upgrades, and asserts a byte-identical probe plus the 0.2.0-only surface on the pre-existing
+data. Convention (see `CONTRIBUTING.md`): released surface changes ship as `--X--Y.sql` upgrade
+scripts; in-place base-script edits are only allowed pre-release within a version.
+
+## Concurrency: enforced single writer (plan 100)
+
+**Structural writes serialize per graph; a concurrent writer blocks; readers are
+MVCC-consistent.** Every structural-write entry point (`gph_insert_vertex`,
+`gph_insert_edge(s)`, `gph_tombstone_*`, `gph_freeze` — and everything built on them:
+`gph_upsert_vertex`, `add_edge`, `remove_edge`, the batch loaders) takes a
+**transaction-scoped EXCLUSIVE advisory lock** keyed on the `gstore` relation OID before
+touching any page. The v1 single-writer contract that used to live in a `graph_am.c` comment
+is now enforced:
+
+- A second concurrent writer **blocks** (normal Postgres lock-wait, not an error) until the
+  holder's transaction commits or aborts, then proceeds on the committed state. Blocking was
+  chosen over erroring so batch loaders and interleaved sessions serialize instead of failing;
+  there is deliberately no GUC for it.
+- The lock is held to **transaction end** (automatic release on commit, rollback, and error),
+  so a multi-statement writing transaction is serialized as a unit.
+- **Readers never take the lock**: traversal and counts proceed while a writer holds it, with
+  the usual MVCC visibility filtering (an uncommitted write stays invisible).
+- The lock is visible in `pg_locks` (`locktype = 'advisory'`, `classid` = `gstore`'s OID,
+  `objid = 0`) — equivalent to `pg_advisory_xact_lock(gstore_oid::int, 0)`. Do not use that
+  advisory key pair for anything else in the same database.
+
+Gate: `make stock-writer-lock-test` (`scripts/graph_writer_lock_test.sh`) — writer-blocks-writer
+(scalar and batch), reader-proceeds-under-held-lock, and exact final counts for interleaved
+autocommit writers. Multi-writer concurrency (per-tuple snapshot isolation) remains deferred
+(DEV-1166); the v1 posture is *enforced*-single-writer.
+
 ## Seedless graph scoring (ADR-0021)
 
 `tjs_open`'s vector-first/seedless path (`src IS NULL`) defaults to **PPR-graded scoring**

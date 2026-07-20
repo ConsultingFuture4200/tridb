@@ -1,4 +1,4 @@
-.PHONY: test lint graph-test stock-graph-test stock-crash-test stock-dump-restore-test stock-release-smoke tjs-parity-test smoke-test test-all baseline-up baseline-down seed bench bench-live sweep sm2 fetch-dataset bench-public bench-repro fetch-hotpot graphrag graphrag-live bench-filtered ablation recall-decay tjs-open-ref tjs-open-live graphrag-h2h rabitq-sim gpu-build-index gpu-setup gpu-verify gpu-lock wiki-fetch wiki-extract wiki-scale wiki-neo4j wiki-subgraph wiki-linkpred mcp-demo lock clean clean-data
+.PHONY: test lint graph-test stock-graph-test stock-crash-test stock-dump-restore-test stock-upgrade-test stock-writer-lock-test stock-release-smoke tjs-parity-test smoke-test test-all baseline-up baseline-down seed bench bench-live sweep sm2 fetch-dataset bench-public bench-repro fetch-hotpot graphrag graphrag-live bench-filtered ablation recall-decay tjs-open-ref tjs-open-live graphrag-h2h rabitq-sim gpu-build-index gpu-setup gpu-verify gpu-lock wiki-fetch wiki-extract wiki-scale wiki-neo4j wiki-subgraph wiki-linkpred mcp-demo lock clean clean-data
 
 PUBLIC_DATASET ?= gist-960-euclidean
 
@@ -128,6 +128,21 @@ stock-crash-test:
 stock-dump-restore-test:
 	docker build --build-arg PG_MAJOR=$(PG_MAJOR) -t $(STOCK_IMAGE) scripts/pg17/
 	bash scripts/graph_dump_restore_test.sh $(STOCK_IMAGE)
+
+# 0.1.0 -> 0.2.0 ALTER EXTENSION UPDATE gate (advisor plan 100): install the vendored
+# 0.1.0 fixture SQL (test/fixtures/upgrade/, verbatim from the last pushed master),
+# load a tri-modal corpus, upgrade both extensions in place, and prove the probe is
+# byte-identical across the upgrade + the 0.2.0-only surface works on the old data.
+stock-upgrade-test:
+	docker build --build-arg PG_MAJOR=$(PG_MAJOR) -t $(STOCK_IMAGE) scripts/pg17/
+	bash scripts/extension_upgrade_test.sh $(STOCK_IMAGE)
+
+# Single-writer enforcement gate (advisor plan 100): two-session probes for the writer
+# advisory lock — a second writer (scalar AND batch) BLOCKS, readers answer promptly,
+# and interleaved autocommit writers serialize to exact final counts.
+stock-writer-lock-test:
+	docker build --build-arg PG_MAJOR=$(PG_MAJOR) -t $(STOCK_IMAGE) scripts/pg17/
+	bash scripts/graph_writer_lock_test.sh $(STOCK_IMAGE)
 
 # Runtime smoke of the SHIPPED release image (advisor plan 076): build the prebaked
 # tridb/postgres-trimodal image for PG_MAJOR, start it as a user would, install all

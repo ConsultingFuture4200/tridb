@@ -69,6 +69,12 @@ jobs:
       # FR-7 on the ship surface: WAL crash-recovery (REDO) driver, 5 scenarios incl. freeze.
       - name: crash-recovery (WAL redo) on stock PG${{ matrix.pg }}
         run: make stock-crash-test PG_MAJOR=${{ matrix.pg }}
+      # Plan 100: 0.1.0 -> 0.2.0 ALTER EXTENSION UPDATE gate (data survives the upgrade).
+      - name: extension upgrade gate on stock PG${{ matrix.pg }}
+        run: make stock-upgrade-test PG_MAJOR=${{ matrix.pg }}
+      # Plan 100: single-writer enforcement (second writer blocks, readers unaffected).
+      - name: writer-lock gate on stock PG${{ matrix.pg }}
+        run: make stock-writer-lock-test PG_MAJOR=${{ matrix.pg }}
       - name: release image builds (prebaked extension)
         run: docker build --build-arg PG_MAJOR=${{ matrix.pg }} -f scripts/pg17/Dockerfile.release -t tridb/postgres-trimodal:pg${{ matrix.pg }} .
       - name: release runtime smoke (start image, install extensions, run canonical query)
