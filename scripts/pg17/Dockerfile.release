@@ -24,6 +24,14 @@ RUN cd /tmp/graph_store && make PG_CONFIG=/usr/lib/postgresql/${PG_MAJOR}/bin/pg
 
 FROM pgvector/pgvector:${PGVECTOR_VERSION}-pg${PG_MAJOR}
 ARG PG_MAJOR
+# Version stamp — MUST match the extension .control default_version values
+# (src/graph_store/graph_store_am.control, src/tjs_pg/tjs_pg.control) and the
+# release tag. tests/test_release_coherence.py greps these into lockstep.
+LABEL org.opencontainers.image.title="tridb/postgres-trimodal" \
+      org.opencontainers.image.description="Stock PostgreSQL + pgvector + the TriDB native graph store (graph_store_am) and fused tri-modal operator (tjs_pg), prebaked" \
+      org.opencontainers.image.version="0.2.0" \
+      org.opencontainers.image.source="https://github.com/ConsultingFuture4200/tridb" \
+      org.opencontainers.image.licenses="MIT"
 COPY --from=builder /usr/lib/postgresql/${PG_MAJOR}/lib/graph_store_am.so \
     /usr/lib/postgresql/${PG_MAJOR}/lib/tjs_pg.so \
     /usr/lib/postgresql/${PG_MAJOR}/lib/
