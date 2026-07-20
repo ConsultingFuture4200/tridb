@@ -1,6 +1,11 @@
-/* graph_store_am 0.1.0 — TriDB native adjacency-list graph store (DEV-1164) */
+/* graph_store_am 0.2.0 — TriDB native adjacency-list graph store (DEV-1164) */
 -- complain if script is sourced in psql, rather than via CREATE EXTENSION
 \echo Use "CREATE EXTENSION graph_store_am" to load this file. \quit
+
+-- Versioning convention (advisor plan 100): from 0.2.0 on, released surface changes ship as
+-- --X--Y.sql upgrade scripts (ALTER EXTENSION graph_store_am UPDATE); in-place edits to this
+-- base script are only allowed pre-release within a version. graph_store_am--0.1.0--0.2.0.sql
+-- carries a genuine 0.1.0 install forward; the upgrade gate is scripts/extension_upgrade_test.sh.
 
 /*
  * The container relation. Its 32KB blocks hold the native graph pages (metapage, vertex pages,
@@ -9,7 +14,9 @@
  */
 CREATE TABLE gstore (dummy "char") WITH (autovacuum_enabled = false);
 COMMENT ON TABLE gstore IS
-  'TriDB graph store page container (DEV-1164): 32KB blocks hold native graph pages. Do NOT access as a heap; use the gph_* functions.';
+  'TriDB graph store page container (DEV-1164): 32KB blocks hold native graph pages. Do NOT access as a heap; use the gph_* functions. '
+  'Structural writes serialize per graph via a transaction-scoped advisory lock keyed on this relation''s OID (advisor plan 100): '
+  'concurrent writers BLOCK until the holder''s transaction ends; readers are unaffected (MVCC-consistent).';
 
 CREATE FUNCTION gph_insert_vertex() RETURNS bigint
   AS 'MODULE_PATHNAME' LANGUAGE C VOLATILE;

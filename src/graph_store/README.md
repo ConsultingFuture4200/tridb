@@ -22,7 +22,7 @@ benchmark remain hardware-gated.
 | `graph_am.c` | The implementation: page store, `gph_insert_vertex` / `gph_insert_edge` (WAL-logged via GenericXLog, MVCC-visibility-filtered reads), the shared `gs_open`/`gs_getnext`/`gs_close` traversal engine, and the `gph_neighbors` / `gph_traverse` SRFs + `gph_visits` / `gph_vertex_count` probes. |
 | `gph_page.h` | On-disk page format (metapage, vertex pages, packed adjacency `GphEdgeSlot`s, chain pointers). Layout is BLCKSZ-derived; static-asserts `BLCKSZ >= 8192` (8KB works on stock PG, 32KB is the fork's high-degree performance target). |
 | `graphstore.h` | Shared types (`GraphVertexId`, `GraphElement`, kind/direction enums, constants) + the documented traversal contract. Compiled (included by `graph_am.c`). |
-| `graph_store_am--0.1.0.sql` / `.control` | The `graph_store_am` extension: the `gstore` page container + the `gph_*` functions. |
+| `graph_store_am--0.2.0.sql` / `--0.1.0--0.2.0.sql` / `.control` | The `graph_store_am` extension: the `gstore` page container + the `gph_*` functions. |
 
 ## Invariants this store upholds
 

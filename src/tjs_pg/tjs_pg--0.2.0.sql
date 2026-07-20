@@ -1,5 +1,10 @@
--- tridb_tjs 0.1.0 — the fused tri-modal operator on stock PostgreSQL (ADR-0019).
+-- tridb_tjs 0.2.0 — the fused tri-modal operator on stock PostgreSQL (ADR-0019).
 \echo Use "CREATE EXTENSION tjs_pg" to load this file. \quit
+
+-- Versioning convention (advisor plan 100): from 0.2.0 on, released surface changes ship as
+-- --X--Y.sql upgrade scripts (ALTER EXTENSION tjs_pg UPDATE); in-place edits to this base
+-- script are only allowed pre-release within a version. tjs_pg--0.1.0--0.2.0.sql carries a
+-- genuine 0.1.0 install forward; the upgrade gate is scripts/extension_upgrade_test.sh.
 
 -- pgvector version floor. The control file's `requires = 'vector'` guarantees the
 -- extension is present, but not that it is >= 0.8 — the vector-first path REQUIRES

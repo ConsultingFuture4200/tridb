@@ -4,7 +4,7 @@
 MODULE_big = tjs_pg
 OBJS = tjs_pg.o
 EXTENSION = tjs_pg
-DATA = tjs_pg--0.1.0.sql
+DATA = tjs_pg--0.2.0.sql tjs_pg--0.1.0--0.2.0.sql
 PGFILEDESC = "tjs_pg - TriDB fused tri-modal operator on stock PostgreSQL"
 
 PG_CONFIG ?= pg_config

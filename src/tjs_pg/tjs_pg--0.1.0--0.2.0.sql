@@ -1,0 +1,20 @@
+-- tjs_pg 0.1.0 -> 0.2.0 upgrade (advisor plan 100).
+--
+--   ALTER EXTENSION tjs_pg UPDATE TO '0.2.0';
+--
+-- No SQL object changes: the ADR-0008 pinned tjs_open surface and every counter
+-- function are identical in 0.1.0 and 0.2.0. The version bump marks the behavior
+-- boundary carried by the SHARED LIBRARY, not by DDL:
+--   * ADR-0021 D1: tjs.graph_scoring defaults to 'ppr' on the seedless path
+--     ('membership' remains the byte-inert fork-parity mode);
+--   * ADR-0021 D3: tjs.ppr_alpha (0.15) / tjs.ppr_rmax (1e-3) exposed as
+--     PGC_USERSET GUCs (formerly fixed C constants).
+-- Installing the 0.2.0 .so is what changes behavior; this script exists so a
+-- 0.1.0 install can record the version it is actually running via the standard
+-- ALTER EXTENSION UPDATE path (upgrade gate: scripts/extension_upgrade_test.sh).
+--
+-- DDL derivation (plan 100, with the advisor's base-commit correction): the practical
+-- "0.1.0" release boundary is the last PUSHED master, 997b679 — NOT the a780b46 SHA the
+-- plan text pinned (stale). `git diff 997b679..HEAD -- src/tjs_pg/tjs_pg--0.1.0.sql`
+-- is comment-only, hence the empty DDL body below.
+\echo Use "ALTER EXTENSION tjs_pg UPDATE TO '0.2.0'" to load this file. \quit
