@@ -478,16 +478,28 @@ def cmd_seedless(args) -> int:
             f"(SELECT embedding FROM entities WHERE id = {int(q['x'])}) LIMIT {K}"
         )
 
+    # plan 102 (issue #30): optionally sweep tjs.vector_scan_budget across the tjs points.
+    # Empty (default) = no SET at all — byte-identical to the pre-102 harness (and safe
+    # against containers whose tjs_pg predates the GUC). 0 in the list = the GUC's
+    # explicit disabled value (the negative-control row).
+    vsb_sweep = (
+        [int(b) for b in args.tjs_vector_scan_budgets.split(",")]
+        if args.tjs_vector_scan_budgets
+        else [None]
+    )
     tjs_points = [
         measure(
-            f"tjs_open tc={tc} budget={budget}",
+            f"tjs_open tc={tc} budget={budget}"
+            + (f" vsb={vsb}" if vsb is not None else ""),
             [
                 "SET hnsw.iterative_scan = relaxed_order",
                 f"SET hnsw.max_scan_tuples = {budget}",
-            ],
+            ]
+            + ([f"SET tjs.vector_scan_budget = {vsb}"] if vsb is not None else []),
             tjs_sql(tc),
         )
         for tc, budget in TJS_POINTS
+        for vsb in vsb_sweep
     ]
     pgv_points = [
         measure(
@@ -612,6 +624,13 @@ def main(argv: list[str] | None = None) -> int:
         p.add_argument("--queries", type=int, default=50)
         p.add_argument("--seed", type=int, default=1354)
         p.add_argument("--explain-qi", type=int, default=0)
+        p.add_argument(
+            "--tjs-vector-scan-budgets",
+            default="",
+            help="seedless only (plan 102 / issue #30): comma-separated "
+            "tjs.vector_scan_budget sweep for the tjs_open points (e.g. '0,2000,5000'); "
+            "empty = no SET (pre-102 behavior)",
+        )
         p.add_argument("--force", action="store_true")
         p.add_argument(
             "--metrics",
