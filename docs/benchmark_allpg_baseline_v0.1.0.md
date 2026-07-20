@@ -188,3 +188,65 @@ PYTHONPATH=~/code/tridb python bench/wd_allpg_baseline.py seedless --host 172.17
 python -m bench.wd_allpg_baseline report --metrics bench/results/wd_1m_allpg_metrics.json \
     --out bench/results/wd_1m_allpg_report.md
 ```
+
+## Addendum A1 (2026-07-20) — issue #30 seedless-tail fix: post-fix table (plan 102)
+
+**What changed:** plan 102 diagnosed the seedless p95 defect (per-query traces, Spark, this
+container read-only + a new one): the outliers are very-selective-filter queries whose
+filter-passing candidates stop appearing in the stream — the ADR-0007 drop rule counts only
+passers (DEV-1169, deliberately), so those queries had NO operator-side bound and drained to
+pgvector's internal stream end (~21k tuples) at ~10 µs/tuple (~4–5 µs pgvector deep-drain cost,
+superlinear in depth and ef_search-independent; ~5 µs/candidate SPI filter probe — plan cached,
+the cost is per-execution SPI machinery). Fix: **`tjs.vector_scan_budget`** (default 0 =
+disabled, byte-identical) — an operator-owned examined-candidates cap, disclosed via
+`tjs_open_termination_reason() = 'scan_budget'` / `tjs_open_budget_capped() = true`. The tail
+is bounded by BOTH knobs together: `hnsw.max_scan_tuples` bounds pgvector's internal iteration
+work (emitting tuple ~2000 under a high `max_scan_tuples` can still cost ~50 ms of re-walk);
+the vector-scan budget bounds and DISCLOSES the operator's stream.
+
+**Setup:** same 50 seeded queries (seed 1354), live exact oracle, median of 7, same
+single-connection boundary, same box, same day. (a) OLD = this doc's container
+`tridb-wikidata-pg17` (extensions 0.1.0), re-run; (b) NEW = `tridb-issue30-pg17` (port 5460,
+extensions 0.2.0 + the plan-102 fix), same slice reloaded with the committed loader
+(edge-parity gate 7,422,959 == native AM count, PASSED); (c) plain pgvector iterative in the
+NEW container. NB the NEW container's HNSW is an independent (parallel) build with a slightly
+weaker recall curve — pgvector's own ef=800 point grades 0.814 there vs 0.874 on OLD — so
+matched-recall comparisons are WITHIN a container, never across. Artifacts:
+`bench/results/wd_1m_issue30_{old_seedless,new_seedless,new_lowmst}.json`.
+
+| Point (same-day) | recall@10 | median | p95 |
+|---|---:|---:|---:|
+| OLD `tjs_open` tc=16 mst=80k | 0.824 | 0.865 ms | 70.4 ms |
+| OLD `tjs_open` tc=64 mst=20k | 0.834 | 1.483 ms | 125.9 ms |
+| OLD `tjs_open` tc=256 mst=20k | 0.844 | 11.798 ms | 217.4 ms |
+| OLD pgvector ef=100 | 0.822 | 0.787 ms | 25.8 ms |
+| NEW `tjs_open` tc=16 mst=80k vsb=0 | 0.796 | 0.786 ms | 70.1 ms |
+| NEW `tjs_open` tc=64 mst=20k vsb=0 | 0.804 | 1.463 ms | 115.1 ms |
+| NEW `tjs_open` tc=256 mst=20k vsb=0 | 0.812 | 6.620 ms | 226.5 ms |
+| NEW `tjs_open` tc=64 mst=20k vsb=2000 | 0.792 | 1.481 ms | 60.7 ms |
+| NEW `tjs_open` tc=256 mst=20k vsb=10000 | 0.812 | 6.414 ms | 135.7 ms |
+| NEW `tjs_open` tc=16 mst=5000 vsb=2000 | 0.764 | 0.621 ms | 13.2 ms |
+| NEW `tjs_open` tc=64 mst=5000 vsb=2000 | 0.772 | 1.593 ms | 15.5 ms |
+| NEW `tjs_open` tc=256 mst=2000 vsb=2000 | 0.752 | 3.329 ms | 11.5 ms |
+| NEW pgvector ef=40 | 0.782 | 0.345 ms | 28.9 ms |
+| NEW pgvector ef=100 | 0.802 | 0.640 ms | 26.3 ms |
+| NEW pgvector ef=200 | 0.800 | 0.987 ms | 28.0 ms |
+| NEW pgvector ef=800 | 0.814 | 4.568 ms | 32.1 ms |
+
+**Verdict vs the #30 targets (median ≤ ~1.1×, p95 ≤ 2× pgvector at matched recall) — NOT met
+at matched recall; reported straight.** Nearest matched pairs in the NEW container: tc=256
+mst=20k vsb=10000 (0.812) vs pgv ef=800 (0.814) = median 1.40×, p95 4.2×; tc=64 mst=20k
+vsb=2000 (0.792) vs pgv ef=100 (0.802) = median 2.31×, p95 2.31×. What the fix DOES deliver:
+(1) the runaway tail is gone as a defect signature — with both knobs set the tjs p95 is FLAT
+and BELOW pgvector's own curve (11.5–15.5 ms vs 26–32 ms) at a disclosed ~3–6 pt recall cost,
+where the pre-fix operator sat at 70–226 ms with NO cap and NO disclosure; (2) every capped
+ending is now honest (`scan_budget`/true — closing ADR-0015 E3.3's budget-shaped-termination
+gap). The remaining gap to the numeric targets is the **per-candidate constant**: at equal
+drain depth tjs pays ~5 µs/candidate of SPI probe machinery (plan already cached) vs
+pgvector's native executor qual (~sub-µs) — at the ~21k-tuple drains recall parity requires,
+that is ~+105 ms of p95 neither budget knob can remove. Flagged follow-up (NOT implemented,
+per plan-102 scope): a guarded ExprState fast path evaluating simple single-table filters
+directly against the already-fetched heap slot, SPI fallback for the general fragment surface.
+The honest guidance of this doc stands: for pure filtered-ANN with no graph leg, use
+pgvector's iterative scan directly; `tjs_open`'s value is the fused graph+filter+vector
+composition — the budget makes its seedless tail bounded and honest, not free.

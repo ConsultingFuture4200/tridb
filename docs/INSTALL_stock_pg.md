@@ -152,6 +152,19 @@ New GUCs `tjs.ppr_alpha` (default `0.15`) and `tjs.ppr_rmax` (default `1e-3`) ex
 forward-push teleport probability and residue-drain threshold. They are **unswept research
 knobs**: the recall gates above were measured only at these defaults.
 
+**Vector-leg budget (plan 102 / issue #30):** `tjs.vector_scan_budget` (default `0` =
+disabled, byte-identical pre-102 behavior) caps how many visible heap candidates one
+seedless/vector-first `tjs_open()` call may examine. The ADR-0007 drop rule counts only
+filter-*passing* candidates (DEV-1169 — deliberately, so predicate rejections can never
+terminate a query into an empty answer), which means a query whose passers stop appearing has
+no operator-side bound and drains to pgvector's internal stream end — the measured issue #30
+p95 tail. Setting the budget bounds that tail; hitting it is **disclosed, never silent**:
+`tjs_open_termination_reason() = 'scan_budget'` and `tjs_open_budget_capped() = true` (the
+only true case — pgvector's own stream end remains `'stream_end_unknown'`/`NULL`). Like the
+graph budget, a capped answer is a censored operating point: benchmark headlines must report
+the termination-reason mix alongside any latency won this way
+(`docs/benchmark_allpg_baseline_v0.1.0.md`, issue #30 addendum).
+
 ## Harness environment variables
 
 The Wikidata head-to-head harness (`bench/wikidata_h2h.py`, and its sibling `bench/wiki_h2h.py`)

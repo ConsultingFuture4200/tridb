@@ -478,16 +478,39 @@ def cmd_seedless(args) -> int:
             f"(SELECT embedding FROM entities WHERE id = {int(q['x'])}) LIMIT {K}"
         )
 
+    # plan 102 (issue #30): optionally sweep tjs.vector_scan_budget across the tjs points,
+    # and/or override the (term_cond, hnsw.max_scan_tuples) points themselves — the tail is
+    # bounded by BOTH knobs (max_scan_tuples bounds pgvector's internal iteration work; the
+    # vector-scan budget bounds the operator's examined stream and DISCLOSES the cap).
+    # Empty defaults = no SET / the published TJS_POINTS — byte-identical to the pre-102
+    # harness (and safe against containers whose tjs_pg predates the GUC). 0 in the vsb
+    # list = the GUC's explicit disabled value (the negative-control row).
+    points = (
+        [
+            (int(tc), int(mst))
+            for tc, mst in (p.split(":") for p in args.tjs_points.split(","))
+        ]
+        if args.tjs_points
+        else TJS_POINTS
+    )
+    vsb_sweep = (
+        [int(b) for b in args.tjs_vector_scan_budgets.split(",")]
+        if args.tjs_vector_scan_budgets
+        else [None]
+    )
     tjs_points = [
         measure(
-            f"tjs_open tc={tc} budget={budget}",
+            f"tjs_open tc={tc} budget={budget}"
+            + (f" vsb={vsb}" if vsb is not None else ""),
             [
                 "SET hnsw.iterative_scan = relaxed_order",
                 f"SET hnsw.max_scan_tuples = {budget}",
-            ],
+            ]
+            + ([f"SET tjs.vector_scan_budget = {vsb}"] if vsb is not None else []),
             tjs_sql(tc),
         )
-        for tc, budget in TJS_POINTS
+        for tc, budget in points
+        for vsb in vsb_sweep
     ]
     pgv_points = [
         measure(
@@ -612,6 +635,19 @@ def main(argv: list[str] | None = None) -> int:
         p.add_argument("--queries", type=int, default=50)
         p.add_argument("--seed", type=int, default=1354)
         p.add_argument("--explain-qi", type=int, default=0)
+        p.add_argument(
+            "--tjs-points",
+            default="",
+            help="seedless only (plan 102): override the tjs (term_cond:max_scan_tuples) "
+            "points, e.g. '16:5000,64:5000'; empty = the published TJS_POINTS",
+        )
+        p.add_argument(
+            "--tjs-vector-scan-budgets",
+            default="",
+            help="seedless only (plan 102 / issue #30): comma-separated "
+            "tjs.vector_scan_budget sweep for the tjs_open points (e.g. '0,2000,5000'); "
+            "empty = no SET (pre-102 behavior)",
+        )
         p.add_argument("--force", action="store_true")
         p.add_argument(
             "--metrics",
