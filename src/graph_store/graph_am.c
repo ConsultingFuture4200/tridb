@@ -24,10 +24,16 @@
  * and transaction-level atomicity, which satisfies the DEV-1164 acceptance criteria.
  *
  * CONCURRENCY CONTRACT (v1 core): physical page allocation is race-safe (extends hold the
- * relation extension lock). The LOGICAL graph structure assumes a SINGLE WRITER — the Phase-0
- * seed loader is single-connection. Concurrent writers appending to the SAME vertex can still
- * lose an adjacency update; concurrent multi-writer isolation (and the per-tuple snapshot
- * machinery it needs) is DEV-1166, not this issue. Reads are always MVCC-visibility-filtered.
+ * relation extension lock). The LOGICAL graph structure assumes a SINGLE WRITER — and since
+ * advisor plan 100 that contract is ENFORCED, not just documented: every structural-write
+ * entry point (gph_insert_vertex, gph_insert_edge, gph_insert_edges, gph_tombstone_edge,
+ * gph_tombstone_vertex, gph_freeze) takes a transaction-scoped EXCLUSIVE advisory lock keyed
+ * on gstore's relation OID (gph_acquire_writer_lock below) before touching any page. A second
+ * concurrent writer BLOCKS until the holder's transaction ends (normal Postgres lock-wait
+ * behavior — chosen over erroring so batch loaders and interleaved sessions serialize instead
+ * of failing), then proceeds on the committed state. Readers never take the lock and stay
+ * MVCC-visibility-filtered; concurrent multi-writer isolation (per-tuple snapshot machinery)
+ * remains DEV-1166-deferred — the v1 posture is enforced-single-writer, not multi-writer.
  */
 #include "postgres.h"
 
@@ -144,6 +150,32 @@ gph_open_store(LOCKMODE lockmode)
 	Oid			relid = RangeVarGetRelid(rv, lockmode, false);
 
 	return relation_open(relid, NoLock);	/* RangeVarGetRelid already took lockmode */
+}
+
+/*
+ * Enforce the single-writer contract (advisor plan 100): serialize every structural write
+ * behind a transaction-scoped EXCLUSIVE advisory lock keyed on the gstore relation OID.
+ * SET_LOCKTAG_ADVISORY(db, classid=relid, objid=0, 2) is byte-identical to the SQL-level
+ * pg_advisory_xact_lock(gstore_oid::int, 0) two-key form, so the lock is observable in
+ * pg_locks (locktype 'advisory', classid = gstore's OID) and tests can assert on it — do
+ * not use that (relid, 0) advisory key pair for anything else in this database.
+ *
+ * Semantics (documented in docs/INSTALL_stock_pg.md + the gstore comment): a second
+ * concurrent writer BLOCKS (dontWait = false) until the holder's transaction commits or
+ * aborts, then proceeds — writers serialize rather than error. sessionLock = false makes
+ * release automatic at transaction end (LockReleaseAll), covering commit, rollback, and
+ * error paths; re-acquisition within one transaction just bumps the local lock count.
+ * Ordering: always relation lock (gph_open_store) first, THEN this, THEN buffer locks —
+ * identical in every writer, so writers cannot deadlock against each other. Readers never
+ * acquire this lock.
+ */
+static void
+gph_acquire_writer_lock(Relation rel)
+{
+	LOCKTAG		tag;
+
+	SET_LOCKTAG_ADVISORY(tag, MyDatabaseId, (uint32) RelationGetRelid(rel), 0, 2);
+	(void) LockAcquire(&tag, ExclusiveLock, false, false);
 }
 
 /*
@@ -389,6 +421,7 @@ gph_insert_vertex(PG_FUNCTION_ARGS)
 	BlockNumber	vblk;
 	uint64		vid;
 
+	gph_acquire_writer_lock(rel);	/* single-writer contract (plan 100) */
 	gph_ensure_meta(rel);
 
 	metabuf = ReadBufferExtended(rel, MAIN_FORKNUM, GPH_META_BLKNO, RBM_NORMAL, NULL);
@@ -535,6 +568,9 @@ gph_insert_edge(PG_FUNCTION_ARGS)
 	 * so a passed arg is never NULL. */
 	if (PG_NARGS() >= 3)
 		type_id = (uint32) PG_GETARG_INT32(2);
+
+	gph_acquire_writer_lock(rel);	/* single-writer contract (plan 100): held before the locates
+									 * so the adjacency we read stays ours to append to */
 
 	/* Both endpoints must exist. Locate dst first (validate only), src last so
 	 * vblk/vslot/src_rec describe the source vertex we are about to update. The
@@ -752,6 +788,8 @@ gph_insert_edges(PG_FUNCTION_ARGS)
 		PG_RETURN_INT64(0);
 	}
 
+	gph_acquire_writer_lock(rel);	/* single-writer contract (plan 100): held before the meta
+									 * snapshot so gm_next_vid cannot move mid-batch */
 	gph_ensure_meta(rel);
 	gph_read_meta(rel, &meta0);		/* snapshot: bounds (gm_next_vid) + gm_first_vertex_blk */
 
@@ -1138,8 +1176,11 @@ gph_freeze(PG_FUNCTION_ARGS)
 				(errmsg("graph_store: freeze horizon must be a normal transaction id (got %u)",
 						horizon)));
 
-	/* Serialize freezes; readers + gph_* writers proceed (design §5). */
+	/* ShareUpdateExclusive serializes freezes against each other (design §5); readers proceed.
+	 * Since plan 100 the writer advisory lock below ALSO serializes a freeze against gph_*
+	 * structural writers (freeze rewrites the same xids writers stamp), same block semantics. */
 	rel = gph_open_store(ShareUpdateExclusiveLock);
+	gph_acquire_writer_lock(rel);	/* single-writer contract (plan 100) */
 
 	if (RelationGetNumberOfBlocks(rel) == 0)
 	{
@@ -1427,9 +1468,12 @@ gph_tombstone_edge(PG_FUNCTION_ARGS)
 	if (PG_NARGS() >= 3)
 		type_id = (uint32) PG_GETARG_INT32(2);
 
+	gph_acquire_writer_lock(rel);	/* single-writer contract (plan 100) */
+
 	/* vr_adj_head is stable once set (only vr_adj_tail moves on chaining) and the single-writer
-	 * contract excludes a concurrent mutator, so the head read here drives a correct chain walk;
-	 * each page is re-read under its own exclusive lock inside gph_tombstone_adjacency. */
+	 * contract (ENFORCED by the lock above, plan 100) excludes a concurrent mutator, so the head
+	 * read here drives a correct chain walk; each page is re-read under its own exclusive lock
+	 * inside gph_tombstone_adjacency. */
 	if (gph_locate_vertex(rel, src, &vblk, &vslot, &src_rec))
 		gph_tombstone_adjacency(rel, src_rec.vr_adj_head, dst, false, type_id,
 								GetCurrentTransactionId());
@@ -1466,6 +1510,8 @@ gph_tombstone_vertex(PG_FUNCTION_ARGS)
 	GenericXLogState *state;
 	Page		wpage;
 	GphVertexRecord *vr;
+
+	gph_acquire_writer_lock(rel);	/* single-writer contract (plan 100) */
 
 	if (!gph_locate_vertex(rel, vid, &vblk, &vslot, &src_rec))
 	{
