@@ -94,11 +94,15 @@ Two honest conclusions:
    [evidence](benchmark_gbrain_graph_v0.1.0.md)); and one operator call instead of a
    bespoke CTE per query shape.
 
-And one finding that currently cuts against us: at the **seedless** (open-retrieval,
-filtered-ANN) query class, plain pgvector's iterative scan matches or beats our `tjs_open`
-operator at every matched-recall point, with 3–4× better tail latency. That is an open
-defect with a signature we understand, tracked publicly
-([#30](https://github.com/ConsultingFuture4200/tridb/issues/30)). We could have left this
+And one finding that currently cuts against us: at the **pure filtered-ANN** (seedless,
+no graph leg) query class, plain pgvector's iterative scan beats our `tjs_open` operator.
+When we first measured it the gap was ugly — worse medians and 3–4× worse tails. Two fix
+rounds later (a disclosed scan budget, then compiling the filter to a native expression
+instead of an SPI probe per candidate) the tails are bounded *below* pgvector's and the
+median gap is down to 1.3–1.6×; the remaining constant is a per-candidate distance
+recompute forced by pgvector's scan API, tracked upstream-shaped
+([#32](https://github.com/ConsultingFuture4200/tridb/issues/32), history in #30/#31). Our
+own docs tell you to use pgvector directly for that query class. We could have left this
 leg out of the writeup. It's in.
 
 ## The half that isn't speed
