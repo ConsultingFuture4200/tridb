@@ -191,6 +191,30 @@ drain (bounding BOTH the H1 superlinear region and the H2 probe volume), disclos
 the starved queries measured 82–120 ms today (the published 26–30 ms p95 sat below the 3rd
 slowest query of 50); the gate table re-measures all rows same-day.
 
-## Step 4 evidence (filled in during execution)
+## Step 4 evidence (executed 2026-07-20, Spark)
 
-_Pending._
+New container **`tridb-issue30-pg17`** (host port **5460**, container IP 172.17.0.7, image
+`tridb/pg17-unfork:dev`, `--shm-size=9g`), extensions built from this branch (0.2.0 + fix,
+pgvector 0.8.5 — same as OLD), same 1M slice via the committed loader: **edge-parity gate
+PASSED** (entities 1,002,331; `gph_edge_count()` = 7,422,959; HNSW health-probed; manifest
+`~/issue30/wd_1m_issue30_engine_load_manifest.json`, load_status complete). Left RUNNING for
+advisor verification.
+
+Gate table + verdict: `docs/benchmark_allpg_baseline_v0.1.0.md` **Addendum A1** (appended,
+original untouched). Raw artifacts committed:
+`bench/results/wd_1m_issue30_{old_seedless,new_seedless,new_lowmst}.json`.
+
+Summary vs the #30 targets: **NOT met at matched recall** (nearest matched pairs: median
+1.40–2.31x vs the ≤1.1x target; p95 2.3–4.2x vs the ≤2x target). The runaway-tail DEFECT
+signature is fixed: with `hnsw.max_scan_tuples` + `tjs.vector_scan_budget` set together the
+p95 is flat and BELOW pgvector's curve (11.5–15.5 ms vs 26–32 ms) at a disclosed ~3–6 pt
+recall cost, where the pre-fix operator sat at 70–226 ms unbounded and undisclosed. Remaining
+lever to the numeric targets (flagged, out of plan-102 scope): the ~5 us/candidate SPI probe
+constant — a guarded ExprState fast path over the already-fetched heap slot (SPI fallback for
+the general fragment surface) is the sketched follow-up.
+
+Live disclosure smoke on the worst outlier (x=506575, m=122): budget 500 -> examined=500,
+reason='scan_budget', capped=true; budget off -> examined=21240, 'stream_end_unknown', NULL.
+
+## Status: DONE (2026-07-20) — fix landed, gates green, #30 targets honestly missed at
+matched recall; tail defect signature closed; follow-up flagged.

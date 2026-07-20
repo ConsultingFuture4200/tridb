@@ -1,0 +1,68 @@
+{
+ "seedless": {
+  "created": "2026-07-20T09:55:26.837046+00:00",
+  "note": "filtered-ANN shape from bench/wikidata_sm4_seedless (live exact oracle, same seeded queries); tjs_open seedless vs plain pgvector iterative relaxed_order scan \u2014 NO TriDB extension in the pgvector leg",
+  "seed": 1354,
+  "runs_per_query": 7,
+  "tjs_open": [
+   {
+    "point": "tjs_open tc=16 budget=80000",
+    "recall_at_10": 0.824,
+    "median_ms": 0.865,
+    "p95_ms": 70.369,
+    "n_queries": 50
+   },
+   {
+    "point": "tjs_open tc=64 budget=20000",
+    "recall_at_10": 0.834,
+    "median_ms": 1.483,
+    "p95_ms": 125.917,
+    "n_queries": 50
+   },
+   {
+    "point": "tjs_open tc=256 budget=20000",
+    "recall_at_10": 0.844,
+    "median_ms": 11.798,
+    "p95_ms": 217.365,
+    "n_queries": 50
+   }
+  ],
+  "pgvector_sql": [
+   {
+    "point": "pgvector ef_search=40",
+    "recall_at_10": 0.808,
+    "median_ms": 0.57,
+    "p95_ms": 26.114,
+    "n_queries": 50
+   },
+   {
+    "point": "pgvector ef_search=100",
+    "recall_at_10": 0.822,
+    "median_ms": 0.787,
+    "p95_ms": 25.769,
+    "n_queries": 50
+   },
+   {
+    "point": "pgvector ef_search=200",
+    "recall_at_10": 0.832,
+    "median_ms": 1.25,
+    "p95_ms": 28.022,
+    "n_queries": 50
+   },
+   {
+    "point": "pgvector ef_search=400",
+    "recall_at_10": 0.862,
+    "median_ms": 2.264,
+    "p95_ms": 25.805,
+    "n_queries": 50
+   },
+   {
+    "point": "pgvector ef_search=800",
+    "recall_at_10": 0.874,
+    "median_ms": 5.333,
+    "p95_ms": 28.451,
+    "n_queries": 50
+   }
+  ]
+ }
+}

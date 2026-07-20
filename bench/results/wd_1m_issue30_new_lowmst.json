@@ -1,0 +1,131 @@
+{
+ "seedless": {
+  "created": "2026-07-20T10:01:37.338123+00:00",
+  "note": "filtered-ANN shape from bench/wikidata_sm4_seedless (live exact oracle, same seeded queries); tjs_open seedless vs plain pgvector iterative relaxed_order scan \u2014 NO TriDB extension in the pgvector leg",
+  "seed": 1354,
+  "runs_per_query": 7,
+  "tjs_open": [
+   {
+    "point": "tjs_open tc=16 budget=2000 vsb=0",
+    "recall_at_10": 0.746,
+    "median_ms": 0.734,
+    "p95_ms": 13.85,
+    "n_queries": 50
+   },
+   {
+    "point": "tjs_open tc=16 budget=2000 vsb=2000",
+    "recall_at_10": 0.746,
+    "median_ms": 0.668,
+    "p95_ms": 12.695,
+    "n_queries": 50
+   },
+   {
+    "point": "tjs_open tc=64 budget=2000 vsb=0",
+    "recall_at_10": 0.752,
+    "median_ms": 1.679,
+    "p95_ms": 15.589,
+    "n_queries": 50
+   },
+   {
+    "point": "tjs_open tc=64 budget=2000 vsb=2000",
+    "recall_at_10": 0.752,
+    "median_ms": 1.698,
+    "p95_ms": 13.39,
+    "n_queries": 50
+   },
+   {
+    "point": "tjs_open tc=256 budget=2000 vsb=0",
+    "recall_at_10": 0.752,
+    "median_ms": 3.955,
+    "p95_ms": 16.378,
+    "n_queries": 50
+   },
+   {
+    "point": "tjs_open tc=256 budget=2000 vsb=2000",
+    "recall_at_10": 0.752,
+    "median_ms": 3.329,
+    "p95_ms": 11.464,
+    "n_queries": 50
+   },
+   {
+    "point": "tjs_open tc=16 budget=5000 vsb=0",
+    "recall_at_10": 0.766,
+    "median_ms": 0.752,
+    "p95_ms": 23.263,
+    "n_queries": 50
+   },
+   {
+    "point": "tjs_open tc=16 budget=5000 vsb=2000",
+    "recall_at_10": 0.764,
+    "median_ms": 0.621,
+    "p95_ms": 13.24,
+    "n_queries": 50
+   },
+   {
+    "point": "tjs_open tc=64 budget=5000 vsb=0",
+    "recall_at_10": 0.774,
+    "median_ms": 1.428,
+    "p95_ms": 32.921,
+    "n_queries": 50
+   },
+   {
+    "point": "tjs_open tc=64 budget=5000 vsb=2000",
+    "recall_at_10": 0.772,
+    "median_ms": 1.593,
+    "p95_ms": 15.463,
+    "n_queries": 50
+   },
+   {
+    "point": "tjs_open tc=256 budget=5000 vsb=0",
+    "recall_at_10": 0.778,
+    "median_ms": 6.35,
+    "p95_ms": 36.834,
+    "n_queries": 50
+   },
+   {
+    "point": "tjs_open tc=256 budget=5000 vsb=2000",
+    "recall_at_10": 0.776,
+    "median_ms": 5.587,
+    "p95_ms": 15.336,
+    "n_queries": 50
+   }
+  ],
+  "pgvector_sql": [
+   {
+    "point": "pgvector ef_search=40",
+    "recall_at_10": 0.776,
+    "median_ms": 0.462,
+    "p95_ms": 25.672,
+    "n_queries": 50
+   },
+   {
+    "point": "pgvector ef_search=100",
+    "recall_at_10": 0.802,
+    "median_ms": 0.637,
+    "p95_ms": 26.436,
+    "n_queries": 50
+   },
+   {
+    "point": "pgvector ef_search=200",
+    "recall_at_10": 0.8,
+    "median_ms": 1.191,
+    "p95_ms": 31.869,
+    "n_queries": 50
+   },
+   {
+    "point": "pgvector ef_search=400",
+    "recall_at_10": 0.802,
+    "median_ms": 2.39,
+    "p95_ms": 27.79,
+    "n_queries": 50
+   },
+   {
+    "point": "pgvector ef_search=800",
+    "recall_at_10": 0.808,
+    "median_ms": 4.966,
+    "p95_ms": 35.473,
+    "n_queries": 50
+   }
+  ]
+ }
+}
