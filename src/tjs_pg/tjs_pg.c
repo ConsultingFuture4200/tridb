@@ -29,13 +29,21 @@
  *   ADR-0015 E3 gap 1, closed), test the relational filter and (optionally, m_seeds > 0) the
  *   graph reachability predicate via cached SPI plans, and feed a bounded top-k. TR-1 early
  *   termination = ADR-0007 consecutive-drops term_cond over the recomputed distances; when it
- *   fires the scan is closed mid-stream. If the stream ends first, pgvector does NOT
+ *   fires the scan is closed mid-stream. A second, operator-OWNED bound (plan 102 / issue
+ *   #30, closing ADR-0015 E3.3's budget-shaped-termination gap): tjs.vector_scan_budget
+ *   (GUC, 0 = disabled = pre-102 behavior) caps the visible heap candidates the stream may
+ *   examine; hitting it ends the scan with an OBSERVABLE, disclosed ending —
+ *   tjs_open_termination_reason() = 'scan_budget', tjs_open_budget_capped() = true. The
+ *   drop-rule semantics are untouched (DEV-1169: filter-failers never count as drops); the
+ *   budget exists precisely because a query whose passers stop appearing gives the drop
+ *   counter nothing to count, leaving the drain bounded only by pgvector's internal limits
+ *   (the issue #30 tail signature). If the stream itself ends first, pgvector does NOT
  *   disclose whether its scan budget (hnsw.max_scan_tuples) or natural index exhaustion
  *   ended it — the ending is RIGHT-CENSORED and reported as such (plan 074):
  *   tjs_open_termination_reason() = 'stream_end_unknown', tjs_open_budget_capped() = SQL
- *   NULL. The boolean is never true without an observable upstream budget signal, which
- *   pgvector's iterator API does not expose today (the honest E3.3 consequence, disclosed
- *   not manufactured).
+ *   NULL. That boolean is true ONLY on an observable budget signal — since plan 102 that
+ *   means the operator's own tjs.vector_scan_budget; pgvector's iterator API still exposes
+ *   none of its own (the honest E3.3 consequence, disclosed not manufactured).
  *
  * SEEDLESS GRAPH BRIDGES (m_seeds > 0) — fork-parity semantics (plan 087): the operator
  * buffers the first seed_window = max(m_seeds*8, m_seeds+32) FILTER-PASSING stream
@@ -55,9 +63,11 @@
  * Counters (per-backend, read via SQL): tjs_open_candidates_examined() — vector-first: heap
  * tuples examined by the last call; filter-first: qualifying rows examined (post-filter,
  * BEFORE the top-k LIMIT — a count capped at k carries no information, plan 074).
- * tjs_open_termination_reason() — 'filter_first' | 'term_cond' | 'stream_end_unknown'.
- * tjs_open_budget_capped() — compat shim over the reason: false for known non-budget
- * endings, SQL NULL for 'stream_end_unknown'; never true (no observable budget signal).
+ * tjs_open_termination_reason() — 'filter_first' | 'term_cond' | 'scan_budget' |
+ * 'stream_end_unknown'. tjs_open_budget_capped() — compat shim over the reason: true for
+ * 'scan_budget' (the operator's own observable tjs.vector_scan_budget cap, plan 102),
+ * false for known non-budget endings, SQL NULL for 'stream_end_unknown' (pgvector's own
+ * stream end stays unobservable).
  * tjs_open_graph_examined() / tjs_open_graph_censored() (plan 077 / ADR-0020) — edge-steps
  * the graph leg consumed, and whether tjs.graph_work_budget was hit before the bounded
  * reach exhausted naturally; orthogonal to the stream-termination metrics above.
@@ -100,6 +110,21 @@ PG_MODULE_MAGIC;
  * read across the extension boundary). Default 65536, range 128..2^30 (ADR-0020 decision 1).
  */
 static int	tjs_graph_work_budget = 65536;
+
+/*
+ * tjs.vector_scan_budget (plan 102 / issue #30): per-backend GUC, VECTOR-leg twin of
+ * tjs.graph_work_budget. Units: visible heap candidates examined by the vector-first stream
+ * (the unit tjs_open_candidates_examined() reports). 0 (default) = disabled — behavior
+ * byte-identical to pre-102. When > 0, the seedless/vector-first candidate stream ends at
+ * the cap with an HONEST disclosure (tjs_open_termination_reason() = 'scan_budget',
+ * tjs_open_budget_capped() = true) — never silently. Closes ADR-0015 E3.3's budget-shaped-
+ * termination gap: the ADR-0007 drop rule only counts filter-PASSING candidates (DEV-1169,
+ * deliberately), so a query whose passers stop appearing in the stream has no operator-side
+ * bound and drains to pgvector's internal limits at a measured ~10 us/tuple — the issue #30
+ * p95 signature. Filter-first is unaffected (its graph leg is bounded by
+ * tjs.graph_work_budget already).
+ */
+static int	tjs_vector_scan_budget = 0;
 
 /*
  * tjs.graph_scoring (ADR-0021 D1, was plan 095's opt-in spike): graph scoring on the SEEDLESS
@@ -158,6 +183,24 @@ _PG_init(void)
 							0,
 							NULL, NULL, NULL);
 
+	DefineCustomIntVariable("tjs.vector_scan_budget",
+							"Visible-heap-candidate budget for one tjs_open() call's vector-first stream (plan 102 / issue #30).",
+							"0 (default) disables the cap — byte-identical to pre-102 behavior. "
+							"When > 0, the seedless candidate stream ends after examining this "
+							"many visible heap candidates (the tjs_open_candidates_examined() "
+							"unit), disclosed via tjs_open_termination_reason() = 'scan_budget' "
+							"and tjs_open_budget_capped() = true — never silently. Bounds the "
+							"tail of queries whose filter-passing candidates stop appearing "
+							"(the ADR-0007/DEV-1169 drop rule counts only passers, so such "
+							"queries otherwise drain to pgvector's internal stream end).",
+							&tjs_vector_scan_budget,
+							0,
+							0,
+							1073741824,	/* 2^30 */
+							PGC_USERSET,
+							0,
+							NULL, NULL, NULL);
+
 	DefineCustomEnumVariable("tjs.graph_scoring",
 							 "Seedless graph-leg scoring: 'ppr' (default, ADR-0021) or "
 							 "'membership' (ADR-0020, fork-parity mode).",
@@ -211,6 +254,7 @@ typedef enum TjsTermReason
 {
 	TJS_TERM_FILTER_FIRST,		/* single fused statement; no candidate stream */
 	TJS_TERM_TERM_COND,			/* TR-1 consecutive-drops fired mid-stream */
+	TJS_TERM_SCAN_BUDGET,		/* tjs.vector_scan_budget cap hit (plan 102) — observable */
 	TJS_TERM_STREAM_END_UNKNOWN	/* stream ended: budget OR exhaustion, unobservable */
 } TjsTermReason;
 
@@ -1114,6 +1158,7 @@ tjs_open_pg(PG_FUNCTION_ARGS)
 		Topk		topk;
 		int			drops = 0;
 		bool		terminated = false;
+		bool		budget_ended = false;	/* tjs.vector_scan_budget hit (plan 102) */
 		SPIPlanPtr	filter_plan = NULL;
 		HTAB	   *reach = NULL;
 		HTAB	   *seen = NULL;
@@ -1177,7 +1222,7 @@ tjs_open_pg(PG_FUNCTION_ARGS)
 		index_rescan(scan, NULL, 0, &orderby, 1);
 		slot = table_slot_create(heap, NULL);
 
-		while ((tid = index_getnext_tid(scan, ForwardScanDirection)) != NULL)
+		for (;;)
 		{
 			Datum		idd,
 					vecd;
@@ -1188,6 +1233,22 @@ tjs_open_pg(PG_FUNCTION_ARGS)
 			bool		passes = true;
 
 			CHECK_FOR_INTERRUPTS();
+
+			/*
+			 * E3 budget-shaped termination (plan 102 / issue #30): the check runs BEFORE
+			 * the next index_getnext_tid pull, because one more pull can trigger a whole
+			 * further iterative-scan round inside pgvector (the expensive part of the
+			 * deep drain). With the GUC at 0 (default) the condition is never true and
+			 * the loop is byte-identical to the pre-102 while-loop.
+			 */
+			if (tjs_vector_scan_budget > 0 && tjs_examined >= tjs_vector_scan_budget)
+			{
+				budget_ended = true;
+				break;			/* disclosed below: reason 'scan_budget', capped = true */
+			}
+
+			if ((tid = index_getnext_tid(scan, ForwardScanDirection)) == NULL)
+				break;			/* stream end: pgvector budget OR exhaustion, unobservable */
 			if (!index_fetch_heap(scan, slot))
 				continue;		/* not visible */
 
@@ -1302,15 +1363,20 @@ tjs_open_pg(PG_FUNCTION_ARGS)
 		}
 
 		/*
-		 * Termination bookkeeping (plan 074). When term_cond fired, the ending is KNOWN
-		 * and not budget-shaped. When the stream ended first, pgvector's iterator API
-		 * does not say whether hnsw.max_scan_tuples or natural index exhaustion did it:
-		 * the ending stays TJS_TERM_STREAM_END_UNKNOWN (the reset default) — a
-		 * right-censored measurement the harness must treat as possibly budget-shaped
-		 * (ADR-0015 E3.3), never a manufactured boolean.
+		 * Termination bookkeeping (plan 074, extended by plan 102). When term_cond fired,
+		 * the ending is KNOWN and not budget-shaped. When tjs.vector_scan_budget ended the
+		 * stream, the ending is KNOWN and IS budget-shaped — an observable signal this
+		 * operator owns (same epistemic class as tjs_open_graph_censored()), reported as
+		 * 'scan_budget' / budget_capped() = true. When the stream ended first, pgvector's
+		 * iterator API does not say whether hnsw.max_scan_tuples or natural index
+		 * exhaustion did it: the ending stays TJS_TERM_STREAM_END_UNKNOWN (the reset
+		 * default) — a right-censored measurement the harness must treat as possibly
+		 * budget-shaped (ADR-0015 E3.3), never a manufactured boolean.
 		 */
 		if (terminated)
 			tjs_term_reason = TJS_TERM_TERM_COND;
+		else if (budget_ended)
+			tjs_term_reason = TJS_TERM_SCAN_BUDGET;
 
 		ExecDropSingleTupleTableSlot(slot);
 		index_endscan(scan);
@@ -1751,6 +1817,9 @@ tjs_open_termination_reason_pg(PG_FUNCTION_ARGS)
 		case TJS_TERM_TERM_COND:
 			reason = "term_cond";
 			break;
+		case TJS_TERM_SCAN_BUDGET:
+			reason = "scan_budget";
+			break;
 		case TJS_TERM_STREAM_END_UNKNOWN:
 		default:
 			reason = "stream_end_unknown";
@@ -1760,9 +1829,11 @@ tjs_open_termination_reason_pg(PG_FUNCTION_ARGS)
 }
 
 /*
- * Compat shim over the termination reason: false for known non-budget endings, SQL NULL
- * when the stream ended for an unobservable reason (budget OR exhaustion — pgvector does
- * not disclose which). Never true today: there is no upstream budget signal to observe.
+ * Compat shim over the termination reason: true when the operator's OWN
+ * tjs.vector_scan_budget ended the stream (plan 102 — an observable signal we own), false
+ * for known non-budget endings, SQL NULL when the stream ended for an unobservable reason
+ * (pgvector budget OR exhaustion — pgvector does not disclose which). Still never true
+ * WITHOUT an observable budget signal — plan 102 added one; pgvector's own has none.
  */
 PG_FUNCTION_INFO_V1(tjs_open_budget_capped_pg);
 Datum
@@ -1770,5 +1841,5 @@ tjs_open_budget_capped_pg(PG_FUNCTION_ARGS)
 {
 	if (tjs_term_reason == TJS_TERM_STREAM_END_UNKNOWN)
 		PG_RETURN_NULL();
-	PG_RETURN_BOOL(false);
+	PG_RETURN_BOOL(tjs_term_reason == TJS_TERM_SCAN_BUDGET);
 }
