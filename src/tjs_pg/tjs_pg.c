@@ -26,8 +26,10 @@
  *   this is what makes the MSVBASE executor fork unnecessary here). Per candidate: fetch the
  *   heap tuple (visibility-checked), RECOMPUTE the distance from the heap value via the
  *   pgvector distance function resolved by name (pgvector does not populate xs_orderbyvals —
- *   ADR-0015 E3 gap 1, closed), test the relational filter and (optionally, m_seeds > 0) the
- *   graph reachability predicate via cached SPI plans, and feed a bounded top-k. TR-1 early
+ *   ADR-0015 E3 gap 1, closed), test the relational filter — a once-per-call compiled
+ *   ExprState over the fetched slot when eligible, the cached-SPI probe otherwise (plan 103 /
+ *   issue #31; tjs.filter_probe forces 'spi') — and (optionally, m_seeds > 0) the graph
+ *   reachability predicate via cached SPI plans, and feed a bounded top-k. TR-1 early
  *   termination = ADR-0007 consecutive-drops term_cond over the recomputed distances; when it
  *   fires the scan is closed mid-stream. A second, operator-OWNED bound (plan 102 / issue
  *   #30, closing ADR-0015 E3.3's budget-shaped-termination gap): tjs.vector_scan_budget
@@ -86,10 +88,19 @@
 #include "catalog/pg_opclass.h"
 #include "commands/defrem.h"
 #include "catalog/pg_type.h"
+#include "executor/executor.h"
 #include "executor/spi.h"
 #include "fmgr.h"
 #include "funcapi.h"
 #include "miscadmin.h"
+#include "nodes/nodeFuncs.h"
+#include "optimizer/optimizer.h"
+#include "parser/parse_clause.h"
+#include "parser/parse_collate.h"
+#include "parser/parse_node.h"
+#include "parser/parse_relation.h"
+#include "parser/parser.h"
+#include "utils/acl.h"
 #include "utils/builtins.h"
 #include "utils/guc.h"
 #include "utils/lsyscache.h"
@@ -164,6 +175,44 @@ static int	tjs_graph_scoring = TJS_SCORING_PPR;
 static double tjs_ppr_alpha = 0.15;
 static double tjs_ppr_rmax = 1e-3;
 
+/*
+ * tjs.filter_probe (plan 103 / issue #31): how the SEEDLESS stream evaluates the relational
+ * filter fragment per candidate. 'auto' (default) compiles the fragment once per call to an
+ * ExprState evaluated against the candidate's already-fetched heap slot when the fragment is
+ * eligible (single-relation, no subqueries/params, table-level SELECT privilege held) and
+ * silently uses the cached-SPI probe otherwise; 'spi' forces the per-candidate cached-SPI
+ * probe unconditionally (the pre-103 behavior) — a debugging/compat switch. The SPI plan is
+ * ALWAYS prepared first, so every fragment SPI would reject errors identically in both modes
+ * (error parity by construction). Result sets, disclosure counters, and termination reasons
+ * are byte-identical between the two modes on the supported subset (test/
+ * tjs_filter_probe_test.sql); under concurrent updates the SPI probe re-fetches by PK and may
+ * see a different tuple version than the one the distance was computed on, while the expr
+ * path evaluates the SAME version the scan yielded (documented, not hidden).
+ */
+typedef enum TjsFilterProbe
+{
+	TJS_PROBE_AUTO = 0,
+	TJS_PROBE_SPI = 1
+} TjsFilterProbe;
+
+static const struct config_enum_entry tjs_filter_probe_options[] = {
+	{"auto", TJS_PROBE_AUTO, false},
+	{"spi", TJS_PROBE_SPI, false},
+	{NULL, 0, false}
+};
+
+static int	tjs_filter_probe = TJS_PROBE_AUTO;
+
+/*
+ * tjs.last_filter_probe_mode (plan 103): a per-backend REPORT register, not a knob — the
+ * seedless path sets it at the probe decision point of every call ('none' when the filter is
+ * empty or the call is filter-first, 'expr' when the fast path engaged, 'spi' when the
+ * cached-SPI probe ran). Readable via current_setting(); lets the parity suite prove the fast
+ * path actually engaged (non-vacuity) WITHOUT a new SQL-surface function. Setting it manually
+ * is a harmless no-op (the next call overwrites it).
+ */
+static char *tjs_last_filter_probe_mode = NULL;
+
 void		_PG_init(void);
 void
 _PG_init(void)
@@ -230,6 +279,36 @@ _PG_init(void)
 							 PGC_USERSET,
 							 0,
 							 NULL, NULL, NULL);
+
+	DefineCustomEnumVariable("tjs.filter_probe",
+							 "Seedless per-candidate relational filter evaluation: 'auto' "
+							 "(default, guarded ExprState fast path) or 'spi' (force the "
+							 "cached-SPI probe — plan 103 / issue #31 compat switch).",
+							 "'auto' compiles an eligible filter fragment once per call and "
+							 "evaluates it against the candidate's already-fetched heap tuple "
+							 "(~sub-us vs the ~5 us/candidate SPI execution), falling back to "
+							 "the cached-SPI probe for subqueries, $n references, non-scanned-"
+							 "relation references, or callers without table-level SELECT. "
+							 "Results are byte-identical between the modes on the supported "
+							 "subset.",
+							 &tjs_filter_probe,
+							 TJS_PROBE_AUTO,
+							 tjs_filter_probe_options,
+							 PGC_USERSET,
+							 0,
+							 NULL, NULL, NULL);
+
+	DefineCustomStringVariable("tjs.last_filter_probe_mode",
+							   "REPORT register (plan 103): how the last seedless tjs_open() "
+							   "call evaluated its relational filter — 'none' | 'expr' | 'spi'.",
+							   "Set by the operator at each call's probe decision point; "
+							   "setting it manually is a harmless no-op. Exists so tests can "
+							   "assert the fast path engaged without a new SQL function.",
+							   &tjs_last_filter_probe_mode,
+							   "none",
+							   PGC_USERSET,
+							   0,
+							   NULL, NULL, NULL);
 
 	DefineCustomRealVariable("tjs.ppr_rmax",
 							 "PPR forward-push residue-drain threshold (ADR-0021 D3, unswept research knob).",
@@ -433,6 +512,122 @@ static const char *
 qident(const char *raw)
 {
 	return quote_identifier(raw);
+}
+
+/* ---------------------------------------------------------------------------------- */
+
+/*
+ * Seedless filter-probe fast path (plan 103 / issue #31): compile the filter fragment ONCE
+ * per call to an ExprState evaluated against the already-fetched heap slot, replacing the
+ * measured ~4.7–5.5 us/candidate SPI execution (plan 102 H2) with a native executor qual.
+ *
+ * ELIGIBILITY (silently SPI otherwise — same observable behavior as today):
+ *   raw tree:    no SubLink (subqueries need a real executor), no ParamRef (the SPI probe
+ *                binds $1 = candidate id; a fragment referencing it cannot be compiled
+ *                standalone — pathological, undocumented, but must not silently diverge);
+ *   cooked tree: every Var references the scanned relation only (varno == 1, the single
+ *                RTE, varlevelsup == 0), no SubPlan/Param/Aggref/WindowFunc/GroupingFunc/
+ *                CurrentOfExpr (belt-and-braces: EXPR_KIND_WHERE already rejects most);
+ *   ACL:         table-level SELECT on the scanned relation (pg_class_aclcheck) — the SPI
+ *                path enforces privileges through the executor, incl. column-level grants;
+ *                rather than replicate column-level enforcement, a caller without the
+ *                strictly-stronger table grant keeps the SPI path.
+ *
+ * ERROR PARITY BY CONSTRUCTION: the caller prepares the SPI fallback plan FIRST,
+ * unconditionally (exactly as pre-103), so every fragment SPI_prepare rejects — unknown
+ * column, syntax error, aggregate/SRF in WHERE — errors identically before this compiler
+ * ever runs. A fragment that passed SPI_prepare cannot then fail the standalone transform
+ * on the supported subset: the only textual difference is the removed "id = $1 AND"
+ * conjunct, and ParamRef is excluded pre-transform.
+ *
+ * The fragment is parsed with the same search_path and no elevated context — it is ALREADY
+ * interpolated into SPI SQL today (SECURITY.md: internal-only argument); no widening.
+ */
+
+/* raw-tree guard: true = ineligible */
+static bool
+tjs_filter_raw_walker(Node *node, void *context)
+{
+	if (node == NULL)
+		return false;
+	if (IsA(node, SubLink) || IsA(node, ParamRef))
+		return true;
+	return raw_expression_tree_walker(node, tjs_filter_raw_walker, context);
+}
+
+/* cooked-tree guard: true = ineligible */
+static bool
+tjs_filter_cooked_walker(Node *node, void *context)
+{
+	if (node == NULL)
+		return false;
+	if (IsA(node, Var))
+	{
+		Var		   *var = (Var *) node;
+
+		if (var->varno != 1 || var->varlevelsup != 0)
+			return true;
+		return false;
+	}
+	if (IsA(node, SubLink) || IsA(node, SubPlan) || IsA(node, Param) ||
+		IsA(node, Aggref) || IsA(node, WindowFunc) || IsA(node, GroupingFunc) ||
+		IsA(node, CurrentOfExpr))
+		return true;
+	return expression_tree_walker(node, tjs_filter_cooked_walker, context);
+}
+
+/*
+ * Compile `filter` for direct evaluation against `heap`'s tuples. Returns NULL when the
+ * fragment is ineligible (caller keeps the SPI probe). Allocates in CurrentMemoryContext
+ * (the per-call SPI proc context — freed at SPI_finish). `heap` must be open and locked.
+ */
+static ExprState *
+tjs_compile_filter_expr(Relation heap, const char *filter)
+{
+	StringInfoData sql;
+	List	   *raw;
+	RawStmt    *rstmt;
+	SelectStmt *sstmt;
+	Node	   *where_raw;
+	ParseState *pstate;
+	ParseNamespaceItem *nsitem;
+	Node	   *cooked;
+	Expr	   *planned;
+
+	if (pg_class_aclcheck(RelationGetRelid(heap), GetUserId(), ACL_SELECT) != ACLCHECK_OK)
+		return NULL;			/* column-level-only grants: the executor (SPI) enforces those */
+
+	initStringInfo(&sql);
+	appendStringInfo(&sql, "SELECT 1 FROM %s.%s WHERE (%s)",
+					 qident(get_namespace_name(RelationGetNamespace(heap))),
+					 qident(RelationGetRelationName(heap)), filter);
+	raw = raw_parser(sql.data, RAW_PARSE_DEFAULT);
+	if (list_length(raw) != 1)
+		return NULL;			/* unreachable given SPI_prepare succeeded; stay defensive */
+	rstmt = linitial_node(RawStmt, raw);
+	if (!IsA(rstmt->stmt, SelectStmt))
+		return NULL;
+	sstmt = (SelectStmt *) rstmt->stmt;
+	where_raw = sstmt->whereClause;
+	if (where_raw == NULL)
+		return NULL;
+	if (tjs_filter_raw_walker(where_raw, NULL))
+		return NULL;			/* SubLink / ParamRef: SPI path */
+
+	pstate = make_parsestate(NULL);
+	pstate->p_sourcetext = sql.data;
+	nsitem = addRangeTableEntryForRelation(pstate, heap, AccessShareLock, NULL, true, true);
+	addNSItemToQuery(pstate, nsitem, true, true, true);
+	cooked = transformWhereClause(pstate, where_raw, EXPR_KIND_WHERE, "WHERE");
+	assign_expr_collations(pstate, cooked);
+	free_parsestate(pstate);
+
+	if (tjs_filter_cooked_walker(cooked, NULL))
+		return NULL;			/* off-relation Var or executor-needing node: SPI path */
+
+	planned = expression_planner((Expr *) cooked);
+	/* qual semantics (NULL = false), exactly the WHERE the SPI probe applies */
+	return ExecInitQual(list_make1(planned), NULL);
 }
 
 /*
@@ -997,6 +1192,8 @@ tjs_open_pg(PG_FUNCTION_ARGS)
 	tjs_term_reason = TJS_TERM_STREAM_END_UNKNOWN;
 	tjs_graph_examined = 0;
 	tjs_graph_censored = false;
+	/* plan 103 report register: 'none' unless the seedless probe decision overwrites it */
+	SetConfigOption("tjs.last_filter_probe_mode", "none", PGC_USERSET, PGC_S_SESSION);
 
 	if (SPI_connect() != SPI_OK_CONNECT)
 		ereport(ERROR, (errmsg("tjs_open: SPI_connect failed")));
@@ -1160,6 +1357,8 @@ tjs_open_pg(PG_FUNCTION_ARGS)
 		bool		terminated = false;
 		bool		budget_ended = false;	/* tjs.vector_scan_budget hit (plan 102) */
 		SPIPlanPtr	filter_plan = NULL;
+		ExprState  *filter_expr = NULL; /* plan 103 fast path (NULL = SPI probe) */
+		ExprContext *filter_econtext = NULL;
 		HTAB	   *reach = NULL;
 		HTAB	   *seen = NULL;
 		Topk		bridge_topk;
@@ -1199,6 +1398,23 @@ tjs_open_pg(PG_FUNCTION_ARGS)
 			filter_plan = SPI_prepare(fq.data, 1, fargs);
 			if (filter_plan == NULL)
 				ereport(ERROR, (errmsg("tjs_open: filter plan preparation failed: %s", fq.data)));
+
+			/*
+			 * Plan 103 (issue #31): guarded ExprState fast path. The SPI plan above is
+			 * ALWAYS prepared first — it is the universal fallback AND the error-parity
+			 * anchor (any fragment SPI rejects has already errored, identically to
+			 * pre-103, before this compiler runs). tjs.filter_probe = spi forces the
+			 * fallback; an ineligible fragment (subquery, $n, off-relation reference,
+			 * no table-level SELECT) silently keeps it. The decision is disclosed in
+			 * the tjs.last_filter_probe_mode report register, never guessed at.
+			 */
+			if (tjs_filter_probe == TJS_PROBE_AUTO)
+				filter_expr = tjs_compile_filter_expr(heap, filter);
+			if (filter_expr != NULL)
+				filter_econtext = CreateStandaloneExprContext();
+			SetConfigOption("tjs.last_filter_probe_mode",
+							filter_expr != NULL ? "expr" : "spi",
+							PGC_USERSET, PGC_S_SESSION);
 		}
 		if (m_seeds > 0)
 		{
@@ -1261,7 +1477,19 @@ tjs_open_pg(PG_FUNCTION_ARGS)
 			cand = DatumGetInt64(idd);
 
 			/* relational filter */
-			if (filter_plan != NULL)
+			if (filter_expr != NULL)
+			{
+				/*
+				 * Plan 103 fast path: evaluate the compiled qual on the SAME tuple
+				 * version the scan yielded (the slot index_fetch_heap just filled) —
+				 * no per-candidate SPI execution, no PK re-descent. Qual semantics
+				 * (NULL = false) match the SPI probe's WHERE exactly.
+				 */
+				filter_econtext->ecxt_scantuple = slot;
+				ResetExprContext(filter_econtext);
+				passes = ExecQual(filter_expr, filter_econtext);
+			}
+			else if (filter_plan != NULL)
 			{
 				Datum		fv[1] = {Int64GetDatum(cand)};
 				int			rc = SPI_execute_plan(filter_plan, fv, NULL, true, 1);
@@ -1378,6 +1606,8 @@ tjs_open_pg(PG_FUNCTION_ARGS)
 		else if (budget_ended)
 			tjs_term_reason = TJS_TERM_SCAN_BUDGET;
 
+		if (filter_econtext != NULL)
+			FreeExprContext(filter_econtext, false);	/* before the slot it points at goes away */
 		ExecDropSingleTupleTableSlot(slot);
 		index_endscan(scan);
 		index_close(index, AccessShareLock);
