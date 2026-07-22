@@ -53,6 +53,10 @@ pip install -r requirements-mcp.txt
 make mcp-demo        # container up -> store/connect/recall over real stdio JSON-RPC -> teardown
 ```
 
+<p align="center">
+  <img src="assets/tridb-mcp-demo.gif" alt="make mcp-demo: store 5 memories, connect 2 edges, fused graph-weighted recall, one Postgres" width="780">
+</p>
+
 ### Proven, at what scale
 
 | Claim | Scale it was measured at | Evidence |
