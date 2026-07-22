@@ -60,6 +60,33 @@ claude mcp add tridb-memory \
   -- python -m tools.tridb_mcp
 ```
 
+## The wiki demo corpus (the README recording)
+
+The README's recording runs this same server, unmodified, against a release-image
+container pre-loaded with the 200,000-article enwiki slice (14,686,050 real
+hyperlink edges) as the memories corpus — the corpus the plan-096 PPR gate
+measured. Recipe (needs `data/wiki/enwiki` from `make wiki-extract` and its
+`emb/dense_id_aligned.npy` embeddings, both bge-small-384 — the server's default
+model, so query-text recall is semantically meaningful):
+
+1. Generate the gate's load SQL and cut it at the sweep boundary:
+   `python -m bench.wiki_ppr_gate --n 200000 --q 1 --gen-sql load.sql ...`,
+   keep lines up to `\echo #WPG LOAD_DONE`.
+2. Run it against a release-image container (`--shm-size=2g`, generous
+   `maintenance_work_mem` for the HNSW build).
+3. Project to the memories schema: add `kind` (default `'wikipedia_article'`)
+   and `text` (article title, from the `articles-*.jsonl` shards) columns, then
+   `ALTER TABLE articles RENAME TO memories` and
+   `ALTER INDEX articles_hnsw RENAME TO memories_hnsw`.
+4. `TRIDB_DSN=... python scripts/tridb_mcp_wiki_demo.py`
+
+Notes: the corpus HNSW is `vector_cosine_ops` (fused `tjs_open` resolves the
+distance operator from the index opclass; the server's pure-`vector` mode
+hardcodes `<->`, which on normalized bge vectors ranks identically but will not
+use this index — use `mode='fused'` here). At this graph scale the default
+`tjs.graph_work_budget` binds, so recall responses honestly report
+`graph_censored=True`.
+
 ## Configuration (env)
 
 | Var | Default | Meaning |

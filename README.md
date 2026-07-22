@@ -54,7 +54,12 @@ make mcp-demo        # container up -> store/connect/recall over real stdio JSON
 ```
 
 <p align="center">
-  <img src="assets/tridb-mcp-demo.gif" alt="make mcp-demo: store 5 memories, connect 2 edges, fused graph-weighted recall, one Postgres" width="780">
+  <img src="assets/tridb-mcp-demo.gif" alt="MCP agent-memory session against a 200k-article English Wikipedia corpus: store two memories, link them to articles, fused recall pulls the linked article into the top-5" width="780">
+  <br>
+  <em>Shown: the same MCP session against a 200,000-article / 14.7M-edge English Wikipedia corpus
+  (recipe in the <a href="docs/mcp_agent_memory_v0.1.0.md">MCP docs</a>) — the stored memory's
+  <code>about</code>-edge pulls the linked article into fused recall. <code>make mcp-demo</code>
+  runs the self-contained 5-memory version.</em>
 </p>
 
 ### Proven, at what scale
