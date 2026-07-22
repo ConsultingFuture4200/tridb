@@ -1,0 +1,352 @@
+{
+  "hop": 2,
+  "tridb_knobs": {
+    "m_seeds": 8,
+    "term_cond": 32
+  },
+  "baseline_knobs": {
+    "seeds": 16,
+    "ef": 64
+  },
+  "sweep_eps_matched_point": {
+    "tridb": {
+      "combo": "m8t32",
+      "recall": 0.9966666666666666,
+      "p50_ms": 54.974038852378726
+    },
+    "baseline": {
+      "combo": "m16e64",
+      "recall": 1.0,
+      "p50_ms": 323.338576592505
+    }
+  },
+  "sweep_matched_point": {
+    "target": 0.9,
+    "feasible": 0.9967,
+    "tridb": {
+      "combo": "m8t32",
+      "recall": 0.9966666666666666,
+      "p50_ms": 54.974038852378726,
+      "p95_ms": 106.77286107093096,
+      "examined": 96.0,
+      "bridges": 12553.5,
+      "pages": 91766.0
+    },
+    "baseline": {
+      "combo": "m8e256",
+      "recall": 0.9399999999999998,
+      "p50_ms": 208.46333098597825,
+      "p95_ms": 358.8269512401893,
+      "round_trips": 3,
+      "seeds_med": 8.0,
+      "reached_med": 12553.5,
+      "cand_med": 12553.5,
+      "bytes_shipped_med": 202456.0
+    },
+    "recall_matched": false,
+    "recall_delta": 0.0567,
+    "tridb_faster_x": 3.79
+  },
+  "queries": [
+    {
+      "qi": 0,
+      "qid": 2726,
+      "tridb_ms": 115.816,
+      "baseline_ms": 537.614,
+      "tridb_recall": 1.0,
+      "baseline_recall": 1.0
+    },
+    {
+      "qi": 1,
+      "qid": 6039,
+      "tridb_ms": 104.303,
+      "baseline_ms": 506.426,
+      "tridb_recall": 1.0,
+      "baseline_recall": 1.0
+    },
+    {
+      "qi": 2,
+      "qid": 25165,
+      "tridb_ms": 48.143,
+      "baseline_ms": 302.477,
+      "tridb_recall": 1.0,
+      "baseline_recall": 1.0
+    },
+    {
+      "qi": 3,
+      "qid": 29490,
+      "tridb_ms": 45.892,
+      "baseline_ms": 209.183,
+      "tridb_recall": 1.0,
+      "baseline_recall": 1.0
+    },
+    {
+      "qi": 4,
+      "qid": 37114,
+      "tridb_ms": 44.62,
+      "baseline_ms": 201.247,
+      "tridb_recall": 1.0,
+      "baseline_recall": 1.0
+    },
+    {
+      "qi": 5,
+      "qid": 37317,
+      "tridb_ms": 55.494,
+      "baseline_ms": 298.95,
+      "tridb_recall": 1.0,
+      "baseline_recall": 1.0
+    },
+    {
+      "qi": 6,
+      "qid": 66369,
+      "tridb_ms": 57.487,
+      "baseline_ms": 260.346,
+      "tridb_recall": 1.0,
+      "baseline_recall": 1.0
+    },
+    {
+      "qi": 7,
+      "qid": 68527,
+      "tridb_ms": 57.405,
+      "baseline_ms": 376.291,
+      "tridb_recall": 1.0,
+      "baseline_recall": 1.0
+    },
+    {
+      "qi": 8,
+      "qid": 69776,
+      "tridb_ms": 53.923,
+      "baseline_ms": 380.482,
+      "tridb_recall": 1.0,
+      "baseline_recall": 1.0
+    },
+    {
+      "qi": 9,
+      "qid": 71252,
+      "tridb_ms": 46.735,
+      "baseline_ms": 294.653,
+      "tridb_recall": 1.0,
+      "baseline_recall": 1.0
+    }
+  ],
+  "tridb_median_ms": 54.709,
+  "baseline_median_ms": 300.713,
+  "ratio": 5.5,
+  "notes": [
+    "race-subset mean recall@10: tridb=1.000 baseline=1.000 (sweep matched target 0.9)",
+    "baseline combo m16e64 chosen for recall parity (eps=0.03) instead of the harness matched_points pick m8e256 (recall 0.940, flagged recall_matched=False)"
+  ],
+  "hop1": {
+    "hop": 1,
+    "tridb_knobs": {
+      "m_seeds": 8,
+      "term_cond": 32
+    },
+    "baseline_knobs": {
+      "seeds": 16,
+      "ef": 256
+    },
+    "sweep_eps_matched_point": {
+      "tridb": {
+        "combo": "m8t32",
+        "recall": 0.9966666666666666,
+        "p50_ms": 2.6010614819824696
+      },
+      "baseline": {
+        "combo": "m16e256",
+        "recall": 1.0,
+        "p50_ms": 44.540432980284095
+      }
+    },
+    "sweep_matched_point": {
+      "target": 0.9,
+      "feasible": 0.9967,
+      "tridb": {
+        "combo": "m8t32",
+        "recall": 0.9966666666666666,
+        "p50_ms": 2.6010614819824696,
+        "p95_ms": 3.3927019452676173,
+        "examined": 96.0,
+        "bridges": 253.0,
+        "pages": 2114.0
+      },
+      "baseline": {
+        "combo": "m16e256",
+        "recall": 1.0,
+        "p50_ms": 44.540432980284095,
+        "p95_ms": 48.24157247785479,
+        "round_trips": 3,
+        "seeds_med": 16.0,
+        "reached_med": 512.5,
+        "cand_med": 521.0,
+        "bytes_shipped_med": 9932.0
+      },
+      "recall_matched": true,
+      "recall_delta": 0.0033,
+      "tridb_faster_x": 17.12
+    },
+    "queries": [
+      {
+        "qi": 0,
+        "qid": 2726,
+        "tridb_ms": 3.073,
+        "baseline_ms": 46.181,
+        "tridb_recall": 1.0,
+        "baseline_recall": 1.0
+      },
+      {
+        "qi": 1,
+        "qid": 6039,
+        "tridb_ms": 3.346,
+        "baseline_ms": 53.343,
+        "tridb_recall": 1.0,
+        "baseline_recall": 1.0
+      },
+      {
+        "qi": 2,
+        "qid": 25165,
+        "tridb_ms": 2.612,
+        "baseline_ms": 48.316,
+        "tridb_recall": 1.0,
+        "baseline_recall": 1.0
+      },
+      {
+        "qi": 3,
+        "qid": 29490,
+        "tridb_ms": 2.617,
+        "baseline_ms": 44.81,
+        "tridb_recall": 1.0,
+        "baseline_recall": 1.0
+      },
+      {
+        "qi": 4,
+        "qid": 37114,
+        "tridb_ms": 1.866,
+        "baseline_ms": 43.393,
+        "tridb_recall": 1.0,
+        "baseline_recall": 1.0
+      },
+      {
+        "qi": 5,
+        "qid": 37317,
+        "tridb_ms": 2.158,
+        "baseline_ms": 50.745,
+        "tridb_recall": 1.0,
+        "baseline_recall": 1.0
+      },
+      {
+        "qi": 6,
+        "qid": 66369,
+        "tridb_ms": 2.338,
+        "baseline_ms": 43.883,
+        "tridb_recall": 1.0,
+        "baseline_recall": 1.0
+      },
+      {
+        "qi": 7,
+        "qid": 68527,
+        "tridb_ms": 1.977,
+        "baseline_ms": 43.673,
+        "tridb_recall": 1.0,
+        "baseline_recall": 1.0
+      },
+      {
+        "qi": 8,
+        "qid": 69776,
+        "tridb_ms": 1.737,
+        "baseline_ms": 43.805,
+        "tridb_recall": 1.0,
+        "baseline_recall": 1.0
+      },
+      {
+        "qi": 9,
+        "qid": 71252,
+        "tridb_ms": 2.118,
+        "baseline_ms": 39.592,
+        "tridb_recall": 1.0,
+        "baseline_recall": 1.0
+      }
+    ],
+    "tridb_median_ms": 2.248,
+    "baseline_median_ms": 44.347,
+    "ratio": 19.73,
+    "notes": [
+      "race-subset mean recall@10: tridb=1.000 baseline=1.000 (sweep matched target 0.9)"
+    ]
+  },
+  "sweep": {
+    "n": 200000,
+    "k": 10,
+    "queries": 30,
+    "eps": 0.03,
+    "runs": 3,
+    "cold_loadindex_ms": 95211.95178385824,
+    "floor_ms": {
+      "tridb_libpq": 0.359,
+      "baseline_grpc": 2.118
+    },
+    "matched": {
+      "1": {
+        "target": 0.9,
+        "feasible": 0.9967,
+        "tridb": {
+          "combo": "m8t32",
+          "recall": 0.9966666666666666,
+          "p50_ms": 2.6010614819824696,
+          "p95_ms": 3.3927019452676173,
+          "examined": 96.0,
+          "bridges": 253.0,
+          "pages": 2114.0
+        },
+        "baseline": {
+          "combo": "m16e256",
+          "recall": 1.0,
+          "p50_ms": 44.540432980284095,
+          "p95_ms": 48.24157247785479,
+          "round_trips": 3,
+          "seeds_med": 16.0,
+          "reached_med": 512.5,
+          "cand_med": 521.0,
+          "bytes_shipped_med": 9932.0
+        },
+        "recall_matched": true,
+        "recall_delta": 0.0033,
+        "tridb_faster_x": 17.12
+      },
+      "2": {
+        "target": 0.9,
+        "feasible": 0.9967,
+        "tridb": {
+          "combo": "m8t32",
+          "recall": 0.9966666666666666,
+          "p50_ms": 54.974038852378726,
+          "p95_ms": 106.77286107093096,
+          "examined": 96.0,
+          "bridges": 12553.5,
+          "pages": 91766.0
+        },
+        "baseline": {
+          "combo": "m8e256",
+          "recall": 0.9399999999999998,
+          "p50_ms": 208.46333098597825,
+          "p95_ms": 358.8269512401893,
+          "round_trips": 3,
+          "seeds_med": 8.0,
+          "reached_med": 12553.5,
+          "cand_med": 12553.5,
+          "bytes_shipped_med": 202456.0
+        },
+        "recall_matched": false,
+        "recall_delta": 0.0567,
+        "tridb_faster_x": 3.79
+      }
+    }
+  },
+  "provenance": {
+    "seed": 1354,
+    "race_queries": "first 10 of the seeded 30-query set",
+    "repeats": 3,
+    "timing": "client wall-clock, loopback, warm, same machine both sides",
+    "corpus": "enwiki 200k, dim 384"
+  }
+}

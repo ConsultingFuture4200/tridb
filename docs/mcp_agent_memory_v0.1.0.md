@@ -60,9 +60,13 @@ claude mcp add tridb-memory \
   -- python -m tools.tridb_mcp
 ```
 
-## The wiki demo corpus (the README recording)
+## The wiki demo corpus
 
-The README's recording runs this same server, unmodified, against a release-image
+<p align="center">
+  <img src="../assets/tridb-mcp-demo.gif" alt="MCP session against the 200k-article corpus: store two memories, link them to articles, fused recall pulls the linked Mushroom article into the top-5" width="780">
+</p>
+
+The recording above runs this same server, unmodified, against a release-image
 container pre-loaded with the 200,000-article enwiki slice (14,686,050 real
 hyperlink edges) as the memories corpus — the corpus the plan-096 PPR gate
 measured. Recipe (needs `data/wiki/enwiki` from `make wiki-extract` and its

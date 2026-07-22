@@ -33,6 +33,16 @@
 
 **Current release: v0.2.0** — [release notes](docs/releases/v0.2.0.md) · [install guide](docs/INSTALL_stock_pg.md) · extensions install on **stock PostgreSQL 16/17 + pgvector**, no fork.
 
+<p align="center">
+  <img src="assets/tridb-race.gif" alt="Live race: the same fused query over 200k Wikipedia articles — TriDB in one Postgres process, median 2.2 ms, vs Milvus+Neo4j+Postgres app-side, median 44.3 ms; 19.7x faster with identical answers" width="820">
+  <br>
+  <em>Measured live (warm, client-clocked, all-localhost — the multi-store's <b>best</b> case): the same
+  1-hop fused query over 200,000 Wikipedia articles / 14.7M hyperlinks, recall 1.0 on both sides,
+  every query shown. Per-query data:
+  <a href="bench/results/wiki_fusion_race_v0.1.0.json">bench/results/wiki_fusion_race_v0.1.0.json</a> ·
+  method: <a href="docs/benchmark_wiki_fusion_v0.1.0.md">the fusion benchmark</a>.</em>
+</p>
+
 ## Try It
 
 One command to a running tri-modal Postgres (stock PG + pgvector + the TriDB extensions, prebaked):
@@ -53,14 +63,9 @@ pip install -r requirements-mcp.txt
 make mcp-demo        # container up -> store/connect/recall over real stdio JSON-RPC -> teardown
 ```
 
-<p align="center">
-  <img src="assets/tridb-mcp-demo.gif" alt="MCP agent-memory session against a 200k-article English Wikipedia corpus: store two memories, link them to articles, fused recall pulls the linked article into the top-5" width="780">
-  <br>
-  <em>Shown: the same MCP session against a 200,000-article / 14.7M-edge English Wikipedia corpus
-  (recipe in the <a href="docs/mcp_agent_memory_v0.1.0.md">MCP docs</a>) — the stored memory's
-  <code>about</code>-edge pulls the linked article into fused recall. <code>make mcp-demo</code>
-  runs the self-contained 5-memory version.</em>
-</p>
+A recording of this session against the 200k-article Wikipedia corpus (stored memories and
+articles in one graph, fused recall pulling a linked article in) is in the
+[MCP docs](docs/mcp_agent_memory_v0.1.0.md).
 
 ### Proven, at what scale
 
